@@ -116,6 +116,8 @@ tests|~/bin/test-auto-module-not-found-hint.py
 tests|~/bin/test-auto-multi-module.py
 tests|~/bin/test-auto-park-escalate.py
 tests|~/bin/test-auto-refine-batching.py
+tests|~/bin/test-auto-routing-fallback.py
+tests|~/bin/test-slicer-gap-yield.py
 tests|~/bin/test-auto-resume-driver.py
 tests|~/bin/test-auto-skip.py
 tests|~/bin/test-auto-stale-restart.py
@@ -295,6 +297,7 @@ tests|~/bin/test-fixtures-gate-finding-check
 tests|~/bin/test-fixtures-gate-verify-exit
 tests|~/bin/test-fixtures-review-false-code-high
 tests|~/bin/test-fixtures-slice-plan-context
+tests|~/bin/test-fixtures-live-artifacts
 tests|~/bin/test-fixtures-source-text-harness
 config|~/bin/agentic-tool-call-system-prompt.txt
 config|~/bin/devstral-system-prompt.txt
@@ -459,10 +462,10 @@ tests|~/bin/test-handoff-triage.py
 tests|~/bin/test-harness-gates.py
 tests|~/bin/test-model-profile-conformance.py
 tests|~/bin/test-sampling-ladder.py
+tests|~/bin/test-worker-fanout-guard.py
 tests|~/bin/test-esc-review-bounds.py
 tests|~/bin/test-phase2-replay-corpus.py
 tests|~/bin/test-preflight-harness-gates.py
-tests|~/bin/test-worker-fanout-guard.py
 tests|~/bin/test-selfcheck-hang.py
 tests|~/bin/test-slice-spec-satisfiability.py
 tests|~/bin/test-worker-robust.py

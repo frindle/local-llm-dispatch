@@ -201,6 +201,19 @@ def build(root: Path, *, target=TARGET_BUGGY, task=TASK, verify=VERIFY,
     return root
 
 
+_EMPTY_QS = None
+
+
+def _empty_queue_state():
+    global _EMPTY_QS
+    if _EMPTY_QS is None:
+        import tempfile
+        d = tempfile.mkdtemp(prefix="pf-emptyqs-")
+        _EMPTY_QS = str(Path(d) / "queue.json")
+        Path(_EMPTY_QS).write_text(json.dumps({"jobs": []}))
+    return _EMPTY_QS
+
+
 def gate(root: Path, *extra, refimpl="fix.patch", env=None):
     cmd = [sys.executable, str(GATE), str(root), "--json"]
     if refimpl:
@@ -211,9 +224,9 @@ def gate(root: Path, *extra, refimpl="fix.patch", env=None):
     # A case may point the gate at a FIXTURE queue state; without this the gate
     # would read the operator's live queue and the test would be nondeterministic
     # (and, worse, its verdict would depend on what happens to be dispatched).
-    kw = {}
-    if env:
-        kw["env"] = {**os.environ, **env}
+    # Default to a hermetic EMPTY queue state so the verdict never depends on the live
+    # ~/bin/ollama-queue-state.json (absent under a fake $HOME -> cwd-exclusive UNPR).
+    kw = {"env": {**os.environ, "OLLAMA_QUEUE_STATE": _empty_queue_state(), **(env or {})}}
     p = run(cmd, **kw)
     try:
         data = json.loads(p.stdout)

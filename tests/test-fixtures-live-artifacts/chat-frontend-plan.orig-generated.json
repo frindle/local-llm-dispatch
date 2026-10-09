@@ -1,0 +1,173 @@
+{
+  "label": "chat-frontend-plan",
+  "repo": "/Users/user/Desktop/GitHub Projects/dashboard-chat",
+  "target": "dashboard_chat.py",
+  "lang": "python",
+  "slices": [
+    {
+      "id": "s1-session-store",
+      "title": "write_session (uuid4 validation, JSON persistence, atomic writes, stdlib-only)",
+      "intent": "Create dashboard_chat.py with write_session(base_dir: str, session_id: str, session_data: dict) -> None that validates session_id against ^[0-9a-f]{32}$ raising ValueError on mismatch, resolves base_dir from env DASHBOARD_CHAT_HOME or defaulting to ~/.ollama-dispatch/chat/, writes JSON to <base_dir>/sessions/<id>.json containing keys id, project, created, messages with each message having role, content, images, files, ts, status, using atomic writes via temp file + os.replace, and get_base_dir() returning the directory from env DASHBOARD_CHAT_HOME or defaulting to ~/.ollama-dispatch/chat/. The module is ONE self-contained stdlib-only Python 3 module with no third-party imports.",
+      "depends_on": [],
+      "must_contain": [
+        "write_session",
+        "validate_session_id",
+        "get_base_dir",
+        "DASHBOARD_CHAT_HOME",
+        "^[0-9a-f]{32}$",
+        "os.replace",
+        "sessions"
+      ],
+      "verify_shape": "behavioral: validate_session_id('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4') returns the same 32-char hex string; write_session writes valid JSON to <base_dir>/sessions/<id>.json. ADVERSARIAL: with a 33-char hex string or non-hex characters validate_session_id MUST raise ValueError -- an implementation that truncates or silently accepts it fails this."
+    },
+    {
+      "id": "s2-project-access",
+      "title": "read_project_file (allowlist, path resolution, read-only, file reading, tree listing)",
+      "intent": "Create dashboard_chat.py with read_project_file(base_dir: str, project_name: str, path: str) -> str that resolves os.path.realpath, rejects '..' path components, absolute paths, and symlinks escaping the allowlisted root loaded from <base_dir>/projects.json as [{name, path}], skips directories .git, node_modules, .venv, __pycache__, rejects binary files containing NUL in the first 8KB, and rejects files over 256KB, and list_project_tree(base_dir: str, project_name: str, path: str = '') -> list[str] returning the file tree listing for the project. The model proposes changes as unified-diff text; nothing is ever written into the project.",
+      "depends_on": [
+        "s1-session-store"
+      ],
+      "must_contain": [
+        "read_project_file",
+        "list_project_tree",
+        "os.path.realpath",
+        "projects.json",
+        "NUL",
+        "256KB"
+      ],
+      "verify_shape": "behavioral: read_project_file with a valid path within an allowlisted root returns file content; list_project_tree returns a list of relative paths. ADVERSARIAL: with path='../etc/passwd' the function MUST reject it by raising an error -- an implementation that follows the symlink or resolves outside the root fails this."
+    },
+    {
+      "id": "s3-validate-image",
+      "title": "validate_image (magic bytes only)",
+      "intent": "Create dashboard_chat.py with validate_image(data: bytes) -> str | None that checks magic bytes for png (89504e47), jpeg (ffd8ff), webp (52494646...57454250), gif (47494638), returns the extension string or None if invalid, accepting png/jpeg/webp/gif by MAGIC BYTES only not declared type or extension.",
+      "depends_on": [],
+      "must_contain": [
+        "validate_image",
+        "89504e47",
+        "ffd8ff",
+        "52494646",
+        "47494638"
+      ],
+      "verify_shape": "behavioral: validate_image(b'\\x89PNG\\r\\n\\x1a\\n') returns 'png'; validate_image(b'not an image') returns None. ADVERSARIAL: with a file having .png extension but JPEG magic bytes (ffd8ff) the function MUST return 'jpeg' based on magic bytes only -- an implementation that trusts the file extension fails this."
+    },
+    {
+      "id": "s3-store-image",
+      "title": "stores_image (image storage under base dir)",
+      "intent": "Create dashboard_chat.py with stores_image(base_dir: str, session_id: str, data: bytes) -> str storing valid images under <base_dir>/images/<session_id>/<n>.<ext> with max 8MB each and max 6 per message.",
+      "depends_on": [
+        "s1-session-store"
+      ],
+      "must_contain": [
+        "stores_image",
+        "8MB",
+        "6"
+      ],
+      "verify_shape": "behavioral: stores_image with valid PNG data stores it under <base_dir>/images/<session_id>/1.png and returns the path. ADVERSARIAL: with data exceeding 8MB the function MUST reject it -- an implementation that stores oversized images fails this."
+    },
+    {
+      "id": "s3-check-image-limits",
+      "title": "check_image_limits (max 6 per message, max 8MB each)",
+      "intent": "Create dashboard_chat.py with check_image_limits(images: list[bytes]) -> bool returning True if all images are valid by magic bytes and within the 8MB size limit and 6-per-message limit.",
+      "depends_on": [
+        "s3-validate-image"
+      ],
+      "must_contain": [
+        "check_image_limits",
+        "8MB",
+        "6"
+      ],
+      "verify_shape": "behavioral: check_image_limits with 3 valid images returns True; check_image_limits with 7 images returns False. ADVERSARIAL: with 6 valid images and 1 invalid (bad magic bytes) the function MUST return False -- an implementation that only counts without validating fails this."
+    },
+    {
+      "id": "s4-request-builder",
+      "title": "build_request (system prompt, file prefixes, image content parts)",
+      "intent": "Create dashboard_chat.py with build_request(project_name: str, messages: list[dict], files: list[str], images: list[dict]) -> dict that constructs the API request with a system prompt containing the project name and read-only instruction to answer with fenced ```diff blocks, attaches files each prefixed with its relative path, includes prior turns from the messages list, and adds images as content parts {type: 'image_url', image_url: {url: 'data:<mime>;base64,<encoded>'}}.",
+      "depends_on": [
+        "s2-project-access",
+        "s3-validate-image",
+        "s3-store-image"
+      ],
+      "must_contain": [
+        "build_request",
+        "image_url",
+        "data:",
+        "base64"
+      ],
+      "verify_shape": "behavioral: build_request with project_name='myproject', messages=[{'role':'user','content':'hello'}], files=['main.py'], images=[{'mime':'image/png','data_base64':'abc'}] returns a dict with messages containing the system prompt, file content prefixed with 'main.py', and image content part with type 'image_url'. ADVERSARIAL: with files=[] and images=[] the function MUST still return a valid request with just the system prompt and messages -- an implementation that crashes on empty lists fails this."
+    },
+    {
+      "id": "s5-model-call",
+      "title": "call_model (API key, POST request, status handling)",
+      "intent": "Create dashboard_chat.py with call_model(request: dict, http_func: callable = None) -> dict that reads the API key from ~/.darkbloom/local.json per call, NEVER logs it, returns it to a caller, or writes it to a session file, POSTs to http://127.0.0.1:8000/v1/chat/completions with model 'qwen3.6-35b-a3b-vl-mtp-mxfp8' and chat_template_kwargs {'enable_thinking': False}, uses a bounded timeout via the injectable http_func parameter, and returns assistant text with status 'done' or status 'error' with short text.",
+      "depends_on": [
+        "s4-request-builder"
+      ],
+      "must_contain": [
+        "call_model",
+        "~/.darkbloom/local.json",
+        "127.0.0.1:8000/v1/chat/completions",
+        "qwen3.6-35b-a3b-vl-mtp-mxfp8",
+        "enable_thinking",
+        "http_func",
+        "status",
+        "done",
+        "error"
+      ],
+      "verify_shape": "behavioral: call_model with a valid request returns a dict with status 'done' and assistant text. ADVERSARIAL: with an unreachable server the function MUST return status 'error' with short text -- an implementation that raises an unhandled exception fails this."
+    },
+    {
+      "id": "s6-routes",
+      "title": "routes (handle function, all endpoints, server-independent)",
+      "intent": "Create dashboard_chat.py with handle(method: str, path: str, query: dict, body_bytes: bytes) -> tuple[int, dict, bytes] implementing server-independent routing: GET /chat serves chat.html; GET /api/chat/projects returns the project list; GET /api/chat/projects/<name>/tree?path= returns the file tree listing; GET /api/chat/projects/<name>/file?path= returns file content; POST /api/chat/sessions {project} creates a session; GET /api/chat/sessions lists sessions; GET /api/chat/sessions/<id> returns a session; POST /api/chat/sessions/<id>/messages {text, files, images: [{data_base64}]} appends the user message plus an assistant placeholder with status 'queued', calls an injectable enqueue(session_id, message_index) defaulting to shell out to python3 ~/bin/ollama-queue.py enqueue with bundle tag chat, and returns 202; unknown route returns 404; bad input returns 400 with {error}; chat_template_kwargs {'enable_thinking': False} is passed to the model.",
+      "depends_on": [
+        "s1-session-store",
+        "s2-project-access",
+        "s3-validate-image",
+        "s3-store-image",
+        "s3-check-image-limits",
+        "s4-request-builder",
+        "s5-model-call"
+      ],
+      "must_contain": [
+        "handle",
+        "/chat",
+        "/api/chat/projects",
+        "/api/chat/projects/<name>/tree",
+        "/api/chat/projects/<name>/file",
+        "/api/chat/sessions",
+        "/api/chat/sessions/<id>",
+        "/api/chat/sessions/<id>/messages",
+        "202",
+        "404",
+        "400",
+        "queued",
+        "chat_template_kwargs"
+      ],
+      "verify_shape": "behavioral: handle('GET', '/api/chat/projects', {}, b'') returns 200 with project list; handle('POST', '/api/chat/sessions/<id>/messages', {}, b'{\"text\":\"hello\"}') returns 202. ADVERSARIAL: with an unknown path like '/unknown' the function MUST return 404 -- an implementation that returns 200 or crashes fails this."
+    },
+    {
+      "id": "s7-cli",
+      "title": "cli (job entrypoint, session processing)",
+      "intent": "Create dashboard_chat.py with a CLI entrypoint where `python3 dashboard_chat.py job <session_id> <message_index>` runs the request builder and model call for that message, reading the session via read_session, building the request via build_request, calling the model via call_model, and writing the assistant response with status 'done' or status 'error' back to the session file via write_session.",
+      "depends_on": [
+        "s4-request-builder",
+        "s5-model-call"
+      ],
+      "must_contain": [
+        "job",
+        "session_id",
+        "message_index",
+        "dashboard_chat.py",
+        "read_session",
+        "build_request",
+        "call_model",
+        "write_session"
+      ],
+      "verify_shape": "behavioral: running 'python3 dashboard_chat.py job <session_id> <message_index>' processes the message and updates the session with status 'done' and assistant text. ADVERSARIAL: with an invalid session_id the CLI MUST print an error and exit non-zero -- an implementation that crashes with a traceback fails this."
+    }
+  ],
+  "intent": "Build dashboard_chat.py: ONE self-contained stdlib-only Python 3 module (no third-party imports) that adds a chat front end to the Ollama-queue dashboard. A user chats with a local vision-capable model about a PROJECT FOLDER, attaches code files and images, and works through issues in conversation. Read-only toward the project: the model proposes changes as unified-diff text; nothing is ever written into the project.\nProperties to pin, one slice each: (1) confined project access: allowlist in <base>/projects.json = [{name,path}]; every file read resolves os.path.realpath and must stay inside an allowlisted root -- '..', absolute paths and symlinks escaping the root rejected; skip .git/node_modules/.venv/__pycache__, binary files (NUL in first 8KB) and files over 256KB; file tree listing. (2) image validation: png/jpeg/webp/gif accepted by MAGIC BYTES only (not declared type/extension), max 8MB each, max 6 per message, stored under <base>/images/<session>/<n>.<ext>. (3) session store: ids are uuid4 hex validated against ^[0-9a-f]{32}$ before any path is built; JSON at <base>/sessions/<id>.json = {id,project,created,messages:[{role,content,images,files,ts,status}]}; atomic writes via temp file + os.replace; base dir defaults to ~/.ollama-dispatch/chat/ and is overridden by env DASHBOARD_CHAT_HOME. (4) request builder: messages list = system prompt (project name, read-only, answer with fenced ```diff blocks) + attached files each prefixed with its relative path + prior turns + images as content parts {type:image_url,image_url:{url:data:<mime>;base64,...}}. (5) model call: read the API key from ~/.darkbloom/local.json per call, NEVER log it, return it to a caller, or write it to a session file; POST http://127.0.0.1:8000/v1/chat/completions model qwen3.6-35b-a3b-vl-mtp-mxfp8 with chat_template_kwargs {enable_thinking:false} and a bounded timeout via an injectable http function; write assistant text with status done, or status error with short text. (6) routes: handle(method, path, query, body_bytes) -> (status:int, headers:dict, body:bytes), server-independent so it can be mounted into an existing http.server handler: GET /chat serves chat.html; GET /api/chat/projects; GET /api/chat/projects/<name>/tree?path=; GET /api/chat/projects/<name>/file?path=; POST /api/chat/sessions {project}; GET /api/chat/sessions; GET /api/chat/sessions/<id>; POST /api/chat/sessions/<id>/messages {text,files,images:[{data_base64}]} appends the user message plus an assistant placeholder status queued, then calls an injectable enqueue(session_id, message_index) (default: shell out to `python3 ~/bin/ollama-queue.py enqueue` with a bundle tag chat) and returns 202; unknown route 404; bad input 400 with {error}. (7) CLI: `python3 dashboard_chat.py job <session_id> <message_index>` is the queue job entrypoint running (4)+(5) for that message.",
+  "shared_worktree": true,
+  "note": "GENERATED by ollama-dispatch-plan (qwen decomposition, 1 round(s), structural gate CLEAN). Single-file OMNIBUS: all slices edit dashboard_chat.py in a sequential chain on branch slice/chat-frontend-plan, each authored via ollama-dispatch-auto --repo <chain-wt> and gated on its OWN adversarial verify. Integrate by copying the finished branch tree onto main, never merge."
+}

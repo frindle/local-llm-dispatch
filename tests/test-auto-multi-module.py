@@ -21,7 +21,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 AUTO = Path(os.environ.get("AUTO", HERE / "ollama-dispatch-auto"))
-LOG = Path.home() / "bin/ollama-queue-logs/f089442e2e8b-auto-author-chat-frontend.log"
+# frozen copy of the real f089442e2e8b authoring log (hermetic: no live ~/bin/ollama-queue-logs read)
+LOG = HERE / "test-fixtures-live-artifacts" / "chat-frontend-auto-author.txt"
 fails = 0
 
 

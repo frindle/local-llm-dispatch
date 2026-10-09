@@ -8448,7 +8448,7 @@ def _self_test():
           "last_auto_error" in _sa, False)
     _ex_src = inspect.getsource(execute)
     check("execute() tees AUTO's output so the reason is capturable",
-          "cp = run_tee([AUTO" in _ex_src, True)
+          "cp = run_tee(auto_launch_argv(" in _ex_src, True)
     check("a deterministic AUTO failure escalates on the FIRST attempt",
           (_ex_src.find("if deterministic:")
            < _ex_src.find("s[\"status\"] = ESCALATED", _ex_src.find("if deterministic:"))
@@ -8456,9 +8456,11 @@ def _self_test():
     check("the authoring path refuses to re-author once the streak is reached",
           "streak >= MAX_IDENTICAL_AUTHOR_FAILURES" in _ex, True)
     check("the retry-storm escalation leaves the worktree INTACT as evidence "
-          "(no remove_worktree before the return)",
-          _ex.index("streak >= MAX_IDENTICAL_AUTHOR_FAILURES")
-          < _ex.index("remove_worktree(cwt, wt)"), True)
+          "(no remove_worktree between the escalation reason and its return)",
+          (lambda _b, _i: _i >= 0 and "remove_worktree" not in _b[_i:_b.index("return False", _i)])(
+              inspect.getsource(bound_stale_worktree_retry),
+              inspect.getsource(bound_stale_worktree_retry).find("authoring made no progress across")),
+          True)
 
     # --- harness_authored is language-aware (2026-09-27, bfmr s2) ------------------
     # It used to require test_fixture.py, so every complete JS/TS harness read as

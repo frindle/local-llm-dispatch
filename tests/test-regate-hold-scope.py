@@ -116,6 +116,13 @@ def test_gate_gets_lane(q):
 
 def main():
     q = _load()
+    # Hermetic: the studio lane IS the Darkbloom endpoint, which exists only when a
+    # local.json record is present. Point the queue at a fixture record rather than
+    # depending on the operator's live ~/.darkbloom (absent under a fake $HOME).
+    import tempfile
+    fx = Path(tempfile.mkdtemp(prefix="regate-hold-")) / "local.json"
+    fx.write_text('{"api_key": "fixture-key"}')
+    q.DARKBLOOM_LOCAL_JSON = fx
     test_hold_scope(q)
     test_gate_gets_lane(q)
     if failures:

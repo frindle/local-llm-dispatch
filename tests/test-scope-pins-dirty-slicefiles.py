@@ -240,18 +240,19 @@ def slice_cases(sl):
 
 
 def plan_cases(pl, sl):
-    plan = json.loads((Path.home() / ".ollama-dispatch/slice-plans/rt-egift-link-s1.slices.json.bak-scope").read_text()) \
-        if (Path.home() / ".ollama-dispatch/slice-plans/rt-egift-link-s1.slices.json.bak-scope").exists() else None
-    if plan is None:
-        check("plan: pre-fix plan backup present", False, "missing .bak-scope")
+    fxd = BIN / "test-fixtures-live-artifacts"  # frozen copies (hermetic: no live ~/.ollama-dispatch read)
+    pre = fxd / "rt-egift-link-s1.pre-scope.json"
+    check("plan: pre-fix plan fixture present", pre.exists(), str(pre))
+    if not pre.exists():
         return
+    plan = json.loads(pre.read_text())
     codes = [c for c, _ in pl.gate_plan(plan)]
     check("planner: pre-fix egift plan rejected with UNSCOPED_EDIT_FILE",
           codes.count("UNSCOPED_EDIT_FILE") == 4, codes)
     agree = all(pl.unscoped_edit_files(plan, s) == sl.uncovered_edit_files(plan, s)
                 for s in plan["slices"])
     check("planner and slicer detectors agree on every pre-fix slice", agree)
-    fixed = json.loads((Path.home() / ".ollama-dispatch/slice-plans/rt-egift-link-s1.slices.json.fixed").read_text())
+    fixed = json.loads((fxd / "rt-egift-link-s1.fixed.json").read_text())
     fcodes = [c for c, _ in pl.gate_plan(fixed)]
     # ROOT CAUSE of the old failure (2026-10-09): this test pins a FROZEN snapshot of the plan
     # (`.slices.json.fixed`, 2026-10-05) as "the fixed plan". plan_lint's HEADER_PAIR_LITERAL

@@ -25,7 +25,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PLAN = Path(os.environ.get("PLAN", HERE / "ollama-dispatch-plan"))
-REAL_PLAN = Path.home() / ".ollama-dispatch/slice-plans/replay-endorse.slices.json.bak-datacontract"
+REAL_PLAN = HERE / "test-fixtures-live-artifacts" / "replay-endorse.datacontract.json"  # frozen copy (hermetic)
 fails = 0
 
 
@@ -53,6 +53,13 @@ def safe(fn, *a, default="ABSENT"):
 
 pl = load(PLAN, "plan_t")
 plan = json.loads(REAL_PLAN.read_text())
+# hermetic: point the plan's repo at a temp dir holding a frozen copy of its target
+# (scrub.sh rewrites the recorded repo path, and the live testproject may be gone)
+import tempfile, shutil
+_REPO = Path(tempfile.mkdtemp(prefix="prose-gates-repo-"))
+(_REPO / plan["target"]).parent.mkdir(parents=True, exist_ok=True)
+shutil.copy(HERE / "test-fixtures-live-artifacts" / "bfmrLinkReconcile.target.ts", _REPO / plan["target"])
+plan["repo"] = str(_REPO)
 tgt_raw = pl._baseline_target_text(plan) if hasattr(pl, "_baseline_target_text") else None
 chk("real target readable", bool(tgt_raw), True)
 tgt = pl._code_only(tgt_raw) if hasattr(pl, "_code_only") else tgt_raw

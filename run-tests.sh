@@ -3,9 +3,7 @@
 # The tests expect to sit next to the scripts they test (as in ~/bin), so this builds an overlay
 # (bin/ + tests/ + dashboard/src merged) under a throwaway fake $HOME and runs there. Nothing under
 # the real ~/bin, ~/.ollama-dispatch or the live queue is read or written.
-# Known non-hermetic tests (read live ~/.ollama-dispatch plans/logs/.bak files or live queue state): test-auto-multi-module,
-# test-plan-cross-slice, test-plan-prose-gates, test-scope-pins-dirty-slicefiles, test-ollama-dispatch-preflight(good-scaffold),
-# test-regate-hold-scope, test-scaffold-migration-gate(slow), test-selftest-hermetic; test-slice-chain-state-bugs is stale vs ollama-dispatch-slice.
+# Tests read frozen fixtures (tests/test-fixtures-live-artifacts) and a fake $HOME with installed-layout hooks; none read the live tree.
 # Usage: ./run-tests.sh [-j N] [-t SECS] [name-glob ...]     (default: all except the SKIP list)
 set -u
 REPO="$(cd "$(dirname "$0")" && pwd)"
@@ -24,6 +22,8 @@ for t in "$REPO"/dashboard/tests/test*.py; do cp "$t" "$OV"/; done
 # minimal identity + config the tests expect (git commits in temp repos, default model)
 printf '[user]\n\tname = test\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n' > "$FH/.gitconfig"
 mkdir -p "$FH/.ollama-dispatch"; cp "$REPO"/config/defaults.json "$REPO"/config/model-ladder.json "$FH/.ollama-dispatch"/
+# installed-layout hooks (~/.claude/hooks) for the self-tests that run the real SessionStart hooks
+mkdir -p "$FH/.claude/hooks"; cp "$REPO"/hooks/*.sh "$FH/.claude/hooks"/
 export HOME="$FH" OLLAMA_QUEUE_NO_NOTIFY=1 PYTHONDONTWRITEBYTECODE=1
 cd "$OV"
 PAT=("$@"); [ ${#PAT[@]} -eq 0 ] && PAT=('test-*.py')

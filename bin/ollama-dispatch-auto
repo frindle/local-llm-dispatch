@@ -240,6 +240,13 @@ def foreign_module_files(text: str, target: str, root=None) -> list:
     return out
 
 
+def _is_test_file_name(path):
+    """PURE. True for a test/spec file by name (test_x.py, x_test.py, x.test.ts, x.spec.js, tests/)."""
+    b = str(path).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return bool(re.match(r"^(test_.*|.*_test\.\w+|.*\.(test|spec)\.\w+)$", b)) \
+        or "/tests/" in "/" + str(path).lower()
+
+
 def multi_module_check(intent, interface, target, root, allow=False, lenient=False):
     """PURE-ish (reads the tree under `root`). -> (None|'warn'|'refuse', message).
     Refuse when the intent/interface names >= 2 not-yet-existing source files
@@ -255,6 +262,11 @@ def multi_module_check(intent, interface, target, root, allow=False, lenient=Fal
            f"while the intent needs the others (chat-frontend f089442e2e8b). Split "
            f"it: one run per module (each its own --target, intent scoped to that "
            f"module), or a single-target plan via ollama-dispatch-plan.")
+    tests = [f for f in mm if _is_test_file_name(f)]
+    if tests:
+        msg += (f" The new test file(s) {', '.join(tests)} are not in the scope: drop the test "
+                f"file from the intent, or add --edit-file {tests[0]} (so TASK.md's scope "
+                f"covers it).")
     if len(mm) >= 2 and not allow and not lenient:
         return "refuse", msg + " Pass --allow-multi-module to override."
     return "warn", msg
@@ -4029,6 +4041,53 @@ CONTAMINATED_PREFIX = "CONTAMINATED: "
 # dies with the `SPEC_DEFECT: ` line the slicer re-specs on -- never auto-sliced, never a
 # further model round (same destination as the pre-dispatch contradiction gate).
 SPEC_DEFECT_ROUTE_PREFIX = "SPEC_DEFECT: "
+# WORKER EXIT REASONS from the sampling-escalation ladder (worker_robust, 2026-10-09). They are
+# queue-row `terminal_reason`s and must not read as bare "did not converge":
+#   spec_defect_repeat_abort -> two aborts on the SAME failing check: the SPEC is wrong, so it takes
+#                               the existing spec-defect path (SPEC_DEFECT: line, no more rounds).
+#   sampling_ladder_exhausted -> three aborts, still looping even with the sampling steps: re-spec
+#                               (top level: decompose via the slicer; under a slicer: its bounded
+#                               first-sight re-spec, which keys on the SPEC_DEFECT mark inside).
+WORKER_EXIT_SPEC_DEFECT = "spec_defect_repeat_abort"
+WORKER_EXIT_LADDER = "sampling_ladder_exhausted"
+WORKER_EXIT_RUNAWAY = ("tool_fanout_loop", "read_past_eof_loop")   # worker_robust REASON_TOOL_FANOUT / REASON_READ_PAST_EOF
+RESPEC_ROUTE_PREFIX = "RESPEC: "
+
+
+def worker_exit_route(terminal_reason, job=None, why=""):
+    """PURE. (kind, message) for a worker exit reason that names a SPEC problem, else
+    (None, ""). kind is "spec_defect" (message starts SPEC_DEFECT_ROUTE_PREFIX) or "respec"
+    (message starts RESPEC_ROUTE_PREFIX and embeds the SPEC_DEFECT mark for the slicer)."""
+    tr = str(terminal_reason or "")
+    tail = f" Last result: {str(why or '').strip()[:300]}" if why else ""
+    who = f"job {job} " if job else ""
+    if tr == WORKER_EXIT_SPEC_DEFECT:
+        return "spec_defect", (
+            f"{SPEC_DEFECT_ROUTE_PREFIX}{who}aborted twice on the SAME failing check "
+            f"({WORKER_EXIT_SPEC_DEFECT}) -- the spec, not the sampling, is what fails; "
+            f"NOT burning another model round. Fix the plan/intent, then re-run.{tail}")
+    if tr == WORKER_EXIT_LADDER:
+        return "respec", (
+            f"{RESPEC_ROUTE_PREFIX}{who}kept looping through the whole sampling ladder "
+            f"({WORKER_EXIT_LADDER}) -- more rounds will not help; re-spec it. "
+            f"{SPEC_DEFECT_ROUTE_PREFIX}sampling ladder exhausted on this spec.{tail}")
+    if tr in WORKER_EXIT_RUNAWAY:
+        # Per-turn fan-out / past-EOF read runaway (job c8f4f6ed95c1): a degenerate decode, not a
+        # coding verdict. Blind-retrying the same prompt reproduces it; re-spec / re-sample instead.
+        return "respec", (
+            f"{RESPEC_ROUTE_PREFIX}{who}had a runaway turn ({tr}) -- the model emitted a degenerate "
+            f"mass of tool calls; a blind retry repeats it. Re-spec (smaller, more concrete steps) or "
+            f"re-sample on a different seed/model. "
+            f"{SPEC_DEFECT_ROUTE_PREFIX}runaway tool-call turn on this spec.{tail}")
+    return None, ""
+
+
+def worker_exit_failure(a, why=""):
+    """The routed failure message for the job this run last polled, or None (the usual
+    case). Reads the terminal_reason the poller recorded on `a._last_job_outcome`."""
+    o = getattr(a, "_last_job_outcome", None) or {}
+    kind, msg = worker_exit_route(o.get("terminal_reason"), o.get("job"), why)
+    return msg if kind else None
 
 
 def _failure_route(why: str) -> str:
@@ -4676,6 +4735,10 @@ def _author_with_continuations(a, wt: Path, target: str, verify_cmd: str,
     prev_check = None
     prev_unsat = None
     for rnd in range(1, max(0, a.author_continue_rounds) + 1):
+        _wx = worker_exit_failure(a, why)
+        if _wx:
+            log_decision("spec-defect", a, "worker exit reason names a spec problem", _wx[:300])
+            return False, _wx
         print(f"\n[auto] authoring did not converge ({why}). The harness it wrote "
               f"is still in the worktree -- continuation round {rnd}/"
               f"{a.author_continue_rounds} against the SAME tree rather than "
@@ -4753,7 +4816,7 @@ def _author_with_continuations(a, wt: Path, target: str, verify_cmd: str,
                            f"harness byte-identical, so more rounds cannot help "
                            f"(genuinely stuck, not out of runway)")
         sig = new_sig
-    return False, why
+    return False, (worker_exit_failure(a, why) or why)
 
 
 # --------------------------------------------------------------------------
@@ -5368,8 +5431,12 @@ def _author_entry(a, wt, target, verify_cmd):
         return ok, why
     if last_job_non_attempt(a):
         return False, why
-    if (why or "").startswith(SPEC_DEFECT_ROUTE_PREFIX):
+    if (why or "").startswith((SPEC_DEFECT_ROUTE_PREFIX, RESPEC_ROUTE_PREFIX)):
         return False, why           # the SPEC is wrong: the continuation ladder cannot fix it
+    _wx = worker_exit_failure(a, why)
+    if _wx:
+        log_decision("spec-defect", a, "worker exit reason names a spec problem", _wx[:300])
+        return False, _wx
     print(f"\n[auto] staged authoring did not finish ({why[:300]}). Falling back to the "
           f"continuation ladder on the SAME tree.")
     return _author_with_continuations(a, wt, target, verify_cmd, resumed_why=why)
@@ -5401,7 +5468,7 @@ def _author_escalate(a, wt, target, verify_cmd, why):
     Returns (ok, why)."""
     if (why or "").startswith((CONTAMINATED_PREFIX, HARNESS_ENV_PREFIX,
                                BASELINE_GREEN_PREFIX, PLAN_SUSPECT_PREFIX,
-                               SPEC_DEFECT_ROUTE_PREFIX)) or a.drafter_cmd:
+                               SPEC_DEFECT_ROUTE_PREFIX, RESPEC_ROUTE_PREFIX)) or a.drafter_cmd:
         return False, why
     last_check, contaminated = _harness_check_output(wt, verify_cmd, target, chain_key(a))
     if contaminated:
@@ -5882,6 +5949,21 @@ def _autoslice_on_failure(a, target, reason):
             num_ctx=a.num_ctx, reason=f"failure requeue: {reason}",
             bundle=getattr(a, "bundle", None))
         return rc
+    # cannot-slice-escalate: the regex slicer found no clean decomposition (one target, one
+    # prose property). Before parking for a human, ask the LLM planner for a gated slice plan
+    # and execute it under this dispatch's bundle (bounded: the plan file / slice-run state
+    # make it once-per-label). A small target is already one slice -- planning cannot help.
+    if (action == "cannot-slice-escalate"
+            and not omnibus_slice.target_is_small(Path(a.repo) / target)[0]
+            and hasattr(omnibus_slice, "planner_fallback_and_handoff")):
+        print(f"\n[auto] dispatch FAILED: {reason}")
+        rc = omnibus_slice.planner_fallback_and_handoff(
+            repo=a.repo, target=target, lang=a.lang, label=a.label, intent=a.intent,
+            interface=a.interface, model=a.model, host=a.host, num_ctx=a.num_ctx,
+            reason=f"failure requeue: {reason[:200]}", bundle=getattr(a, "bundle", None))
+        if rc == 0:
+            return rc
+        print("[auto] planner fallback failed -- escalating as before.", file=sys.stderr)
     # escalate / cannot-slice-escalate -> surface to a human, do not spin.
     why = ("the sliced chain already recorded a failed slice -- re-slicing again "
            "would spin" if action == "escalate"

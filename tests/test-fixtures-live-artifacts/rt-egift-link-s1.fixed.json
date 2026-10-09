@@ -1,0 +1,105 @@
+{
+  "label": "rt-egift-link-s1",
+  "repo": "/Users/user/Desktop/GitHub Projects/resell-tracker",
+  "target": "lib/egiftLink.ts",
+  "lang": "ts",
+  "intent": "Add a per-order stored Costco eGift delivery link that is treated as a secret. (1) prisma/schema.prisma + new migration: model OrderEgiftLink { id Int @id @default(autoincrement()); orderId Int @unique; order Order @relation(fields:[orderId], references:[id], onDelete: Cascade); linkEnc String; linkHash String; createdAt DateTime @default(now()); updatedAt DateTime @updatedAt } and back-relation Order.egiftLink OrderEgiftLink?. Do NOT add any column to Order and do not change any existing Order query. (2) New pure module lib/egiftLink.ts exporting parseCostcoDeliveryLink(raw: string): {ok:true, normalized:string}|{ok:false, error:string} (accept only https: with hostname exactly www.memberedelivery.com, no userinfo, non-empty login query param; reject lookalike hosts like memberedelivery.com.evil.io, http:, javascript:, and links whose host is elsewhere but mention memberedelivery in path/query; error strings must never contain the input), maskDeliveryLink(): string (a fixed mask, contains no part of the login value), hashLink(normalized: string): string (sha256 hex). (3) New route app/api/orders/[id]/egift-link/route.ts: cookie session auth via getSessionUserId scoped like app/api/orders/[id]/gift-cards/route.ts; GET returns {hasLink, masked, updatedAt} and never the link; GET ?reveal=1 returns {link}; PUT {link} validates with parseCostcoDeliveryLink then upserts linkEnc=encryptSetting(normalized) from lib/secrets.ts and linkHash; DELETE removes; every response sets Cache-Control: no-store; never console.log the link or echo it in errors. (4) New components/EgiftLink.tsx mounted in app/orders/[id]/page.tsx next to OrderAttachments: shows masked value, Reveal and Copy buttons that fetch ?reveal=1 on click, an input to save/replace, and remove.",
+  "slices": [
+    {
+      "id": "s0-db-schema",
+      "title": "OrderEgiftLink model + migration + upsertOrderEgiftLink data-access helper",
+      "intent": "(1) Add a new Prisma model block 'OrderEgiftLink' to prisma/schema.prisma: id Int @id @default(autoincrement()); orderId Int @unique; order Order @relation(fields:[orderId], references:[id], onDelete: Cascade); linkEnc String; linkHash String; createdAt DateTime @default(now()); updatedAt DateTime @updatedAt. Add the back-relation field 'egiftLink OrderEgiftLink?' on the existing Order model (a relation field only, NOT a column). Do NOT add any column to Order and do not change any existing Order query. Do NOT touch User. Create the SQLite migration prisma/migrations/20261005000000_add_order_egift_link/migration.sql that creates exactly this table (CREATE TABLE \"OrderEgiftLink\" with the FOREIGN KEY ... ON DELETE CASCADE and the UNIQUE INDEX on orderId), so the replayed migration chain has no drift from the schema. Create new lib/egiftLinkStore.ts exporting async upsertOrderEgiftLink(orderId: number, linkEnc: string, linkHash: string) that upserts by the unique orderId using the shared prisma client exported by lib/db.ts (one row per order: a second call replaces linkEnc/linkHash on the same row) and returns the row.",
+      "depends_on": [],
+      "must_contain": [
+        "OrderEgiftLink",
+        "upsertOrderEgiftLink"
+      ],
+      "verify_shape": "behavioral: against a throwaway SQLite DB built by replaying every prisma/migrations/*/migration.sql, upsertOrderEgiftLink(order.id,'enc1','hash1') returns {orderId, linkEnc:'enc1', linkHash:'hash1'}; a second call with 'enc2','hash2' leaves exactly ONE OrderEgiftLink row for that order with the same id and the new values. ADVERSARIAL: deleting the Order deletes its OrderEgiftLink (onDelete: Cascade); upsert for a non-existent orderId rejects (foreign key); the Order table gains no new column; the OrderEgiftLink table has exactly the columns id, orderId, linkEnc, linkHash, createdAt, updatedAt.",
+      "target": "lib/egiftLinkStore.ts",
+      "edit_files": [
+        "prisma/schema.prisma",
+        "prisma/migrations/20261005000000_add_order_egift_link/migration.sql"
+      ],
+      "reads": [
+        "lib/db.ts"
+      ]
+    },
+    {
+      "id": "s1-parse-link",
+      "title": "parseCostcoDeliveryLink function in lib/egiftLink.ts",
+      "intent": "(2a) Create new pure module 'lib/egiftLink.ts' exporting parseCostcoDeliveryLink(raw: string): {ok:true, normalized:string}|{ok:false, error:string} that accepts only https: with hostname exactly www.memberedelivery.com (no userinfo subdomain), non-empty login query param; rejects lookalike hosts like memberedelivery.com.evil.io, http:, javascript:, and links whose host is elsewhere but mention memberedelivery in path/query; error strings must never contain the input string.",
+      "depends_on": [],
+      "must_contain": [
+        "parseCostcoDeliveryLink"
+      ],
+      "verify_shape": "behavioral: parseCostcoDeliveryLink('https://www.memberedelivery.com/?login=ABC123&lang=EN') returns {ok:true, normalized:'https://www.memberedelivery.com/?login=ABC123&lang=EN'}; ADVERSARIAL: parseCostcoDeliveryLink('http://www.memberedelivery.com/?login=x'), 'javascript:void(0)', 'https://memberedelivery.evil.io', 'https://www.otherdomain.com/memberedelivery/redirect' all return {ok:false} with error strings that do NOT contain any substring of the input."
+    },
+    {
+      "id": "s2-mask-link",
+      "title": "maskDeliveryLink function in lib/egiftLink.ts (edit file created by s1-parse-link)",
+      "intent": "(2b) Edit 'lib/egiftLink.ts' to export maskDeliveryLink(normalized: string): string that returns a fixed-format masked representation containing no part of the login value from any valid link.",
+      "depends_on": [
+        "s1-parse-link"
+      ],
+      "must_contain": [
+        "maskDeliveryLink"
+      ],
+      "verify_shape": "behavioral: maskDeliveryLink('https://www.memberedelivery.com/?login=ABC123&lang=EN') returns a fixed string like 'Costco eGift \u2022\u2022\u2022' that does not contain the substring 'login' or 'ABC123'; ADVERSARIAL: calling with any two different valid normalized links produces identical masked output, confirming no login value leaks."
+    },
+    {
+      "id": "s3-hash-link",
+      "title": "hashLink function in lib/egiftLink.ts (edit file created by s1-parse-link)",
+      "intent": "(2c) Edit 'lib/egiftLink.ts' to export hashLink(normalized: string): string that returns the SHA-256 hex digest of the normalized link.",
+      "depends_on": [
+        "s1-parse-link"
+      ],
+      "must_contain": [
+        "hashLink"
+      ],
+      "verify_shape": "behavioral: hashLink('https://www.memberedelivery.com/?login=ABC&lang=EN') returns a 64-character lowercase hex string; ADVERSARIAL: two different normalized inputs produce different hashes (no collision), and the output is deterministic across calls with identical input."
+    },
+    {
+      "id": "s4-api-route",
+      "title": "GET/PUT/DELETE API route for Costco eGift link management",
+      "intent": "(3) Create new route 'app/api/orders/[id]/egift-link/route.ts' with cookie session auth via getSessionUserId scoped like app/api/orders/[id]/gift-cards/route.ts; GET returns {hasLink, masked, updatedAt} and never the raw link in response body; GET ?reveal=1 returns {link}; PUT {link: string} validates input using parseCostcoDeliveryLink from lib/egiftLink.ts then calls upsertOrderEgiftLink from lib/egiftLinkStore.ts with linkEnc = encryptSetting(normalized) imported from 'lib/secrets.ts' and linkHash = hashLink(normalized); DELETE removes the existing record; every response sets header Cache-Control: no-store; never console.log the normalized or raw link, nor echo it in error messages. lib/secrets.ts settings behaviour unchanged (encryptSetting/decryptSetting still work identically for all other keys).",
+      "depends_on": [
+        "s0-db-schema",
+        "s1-parse-link",
+        "s2-mask-link",
+        "s3-hash-link"
+      ],
+      "must_contain": [
+        "getSessionUserId",
+        "Cache-Control: no-store"
+      ],
+      "verify_shape": "behavioral: GET /api/orders/42/egift-link returns {hasLink:false, masked:null, updatedAt:null} when none exists; after PUT with valid link it returns {hasLink:true, masked:'Costco eGift \u2022\u2022\u2022', updatedAt:<timestamp>}; ADVERSARIAL: GET ?reveal=1 on a fresh order (no stored record) still returns hasLink=false and does not leak any ciphertext or plaintext; PUT with invalid input from parseCostcoDeliveryLink returning {ok:false} must return 400 without storing anything.",
+      "target": "app/api/orders/[id]/egift-link/route.ts",
+      "reads": [
+        "app/api/orders/[id]/gift-cards/route.ts",
+        "lib/egiftLink.ts",
+        "lib/egiftLinkStore.ts",
+        "lib/secrets.ts"
+      ]
+    },
+    {
+      "id": "s5-component",
+      "title": "EgiftLink React component mounted in orders/[id]/page.tsx next to OrderAttachments",
+      "intent": "(4) Create new 'components/EgiftLink.tsx' (mounted in app/orders/[id]/page.tsx next to <OrderAttachments>): shows masked value from GET /api/orders/[id]/egift-link, Reveal button that fetches ?reveal=1 and displays the raw link for copy, Copy button copies it, an input field with Save/Replace button calling PUT {link} (validated by parseCostcoDeliveryLink), dismissal/remove button calling DELETE. Must hold: lookalike/scheme/userinfo inputs are rejected; mask never contains the login value.",
+      "depends_on": [
+        "s0-db-schema",
+        "s1-parse-link",
+        "s2-mask-link"
+      ],
+      "must_contain": [
+        "EgiftLink.tsx"
+      ],
+      "verify_shape": "behavioral: renders masked display with Reveal and Copy buttons; clicking Reveal fetches ?reveal=1 from the API route to show raw link in a copyable field; typing into input and pressing Save calls PUT /api/orders/[id]/egift-link; ADVERSARIAL: pasting 'https://memberedelivery.evil.io' or 'javascript:' into the save input must be rejected by parseCostcoDeliveryLink with no API call to store it.",
+      "target": "components/EgiftLink.tsx",
+      "edit_files": [
+        "app/orders/[id]/page.tsx"
+      ]
+    }
+  ],
+  "shared_worktree": true,
+  "note": "GENERATED by ollama-dispatch-plan (qwen decomposition, 2 round(s), structural gate CLEAN). Multi-file OMNIBUS (per-slice target/edit_files, fixed 2026-10-05): slices edit lib/egiftLink.ts unless they set their own target/edit_files in a sequential chain on branch slice/rt-egift-link-s1, each authored via ollama-dispatch-auto --repo <chain-wt> and gated on its OWN adversarial verify. Integrate by copying the finished branch tree onto main, never merge."
+}

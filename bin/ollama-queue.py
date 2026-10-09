@@ -1714,6 +1714,13 @@ BUNDLE_LEASE_S = float(os.environ.get("QUEUE_COMMIT_LEASE_S", "360") or 0)
                                     # H4: a committed bundle that has not MOVED for this long while
                                     # another bundle is waiting has lost its lease (0 = off; the idle
                                     # ceilings stay as backstops)
+SLICER_GAP_YIELD_S = float(os.environ.get("QUEUE_SLICER_GAP_YIELD_S", "45") or 0)
+                                    # a slicer advance that has run this long with NO running/live row of
+                                    # its bundle is a CPU/driver gap (harness authoring prep, integrate,
+                                    # gate enqueue): the bundle holds no GPU lane ("waiting", parked
+                                    # cpu_wait), so other bundles' pending rows backfill, and it resumes
+                                    # FIRST the moment its next row exists. Shorter gaps keep the lane
+                                    # (model stays resident, no interleave). 0 = off.
 BUNDLE_DWELL_S = 60.0               # H5: a parked blocked/stalled bundle is not auto-resumed ahead of
                                     # a fresh candidate sooner than this after it parked
 BUNDLE_FLAP_MAX = 8                 # H5: park/resume transitions of one bundle inside the window
@@ -2095,6 +2102,9 @@ def slice_plan_runnability(key, runs_dir=None, alive=None, now=None, esc_seen=No
             payload = None
         if isinstance(payload, dict) and payload.get("pid") is not None and alive(payload.get("pid")):
             out["driver_live"] = True
+            _st = _parse_iso_ts(payload.get("started_at"))
+            if _st is not None and (out.get("driver_since") is None or _st < out["driver_since"]):
+                out["driver_since"] = _st
         if (d_path / f"{label}.advance.requested").exists():
             out["marker"] = True
     return out
@@ -2435,6 +2445,14 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
         return "working", (f"gate-on-complete still writing the verdict for "
                            f"{', '.join(str(x) for x in list(settling)[:3])}"), True
     if plan.get("driver_live"):
+        # SLICER GAP (2026-10-09): nothing running, no live row, no gate settling -- the advance is
+        # CPU/driver work. Past SLICER_GAP_YIELD_S it holds no GPU lane (the owner: the GPU must not wait on
+        # CPU work); bundle_commit_step parks it and resumes it first when its next row appears.
+        _since = plan.get("driver_since")
+        _gap = ((time.time() if now is None else now) - _since) if _since else 0.0
+        if SLICER_GAP_YIELD_S > 0 and _since and _gap >= SLICER_GAP_YIELD_S:
+            return "waiting", (f"slicer advance in flight {_gap:.0f}s with no GPU row (CPU/driver gap) "
+                               f"-- holds no GPU lane"), False
         return "working", "slicer advance in flight", True
     if _chain_cpu_only:
         return "waiting", (f"{chain.get('why') or 'chain driver advancing'} -- CPU-only stage, "
@@ -5819,6 +5837,7 @@ _FAILURE_CONTEXT_REASONS = frozenset({"context_starved", "read_thrash", "write_t
                                       "wall_budget", "repeated_format_error", "loop_detected",
                                       "stop_gate_failed", "reasoning_runaway",
                                       "error_loop", "monologue_loop", "alternation_loop", "nav_loop",
+                                      "tool_fanout_loop", "read_past_eof_loop",
                                       # fixed repair-and-validate lane (fixed_lane.py, 2026-10-09):
                                       # the lane gave up (no verify pass in its samples) / its edit
                                       # could not be applied -- scaffold outcomes, not model verdicts
@@ -5837,7 +5856,6 @@ def _log_tail(log_path, nbytes=_FAILURE_SCAN_BYTES):
     """The last `nbytes` of a job log as text, '' when unreadable."""
     if not log_path:
         return ""
-                                      "tool_fanout_loop", "read_past_eof_loop",
     try:
         with open(log_path, "rb") as f:
             f.seek(0, 2)

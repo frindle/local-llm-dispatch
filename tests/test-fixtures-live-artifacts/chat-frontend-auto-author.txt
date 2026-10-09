@@ -1,0 +1,386 @@
+[worker] model=qwen3.6-35b-a3b-vl-mtp-mxfp8 host=http://127.0.0.1:8000 cwd=/Users/user/Desktop/GitHub Projects/dashboard-chat
+[worker] task: # AUTHORING TASK -- write a verify-gated dispatch harness
+
+You are authoring the HARNESS for a bounded build, not shipping to production.
+`verify.sh` and `check_literals.py` are ALREADY written for you and must NOT be
+edited -- verify.sh runs the literal check, parses the target, and runs your
+fixture, printing `VERIFY_OK` on success. Author exactly these three files, then
+let the self-check bounce you until it is green.
+
+## Whose rules are in TASK.md's `## Scope` line
+TASK.md's line "Only edit `dashboard_chat/routes.py`; do not edit `verify.sh`, `test_fixture.py` or `TASK.md`" is addressed to the CODING job that runs AFTER this harness is sealed. It does NOT apply to you. You, the harness author, MUST fill every TODO in `TASK.md` (keep that scope line in it), REPLACE the SCAFFOLD guard in `test_fixture.py` with real adversarial cases, and write `refimpl.py`. You must NOT edit `dashboard_chat/routes.py` directly -- its change lives in `refimpl.py` (if you run `python3 refimpl.py` by hand, `git checkout -- dashboard_chat/routes.py` afterwards).
+
+## Runtime is already set up -- do NOT re-verify it
+The scaffold has ALREADY installed dependencies and generated any clients for this worktree (e.g. `npm ci`, `prisma generate`, or a venv). `node_modules`, generated clients, and native deps (e.g. sharp) are present, and Node 26 provides `node:test` + `mock.module`. Do NOT spend iterations `ls`-ing or grepping to confirm any of this exists -- assume the runtime is ready and AUTHOR THE FILES. Re-running the same read-only check is the #1 way this task fails to converge.
+
+## What to build
+INTENT: Build dashboard_chat: a self-contained, stdlib-only Python 3 package that adds a chat front end to the Ollama-queue dashboard. A user chats with a local vision-capable model about a PROJECT FOLDER they choose, can attach code files and pasted/uploaded images (screenshots), and works through issues in conversation. v1 is READ-ONLY toward the project: the model may propose changes as unified-diff text in its reply, it never writes into the project.
+TARGET FILE (the code lives here): `dashboard_chat/routes.py`
+INTERFACE / CONTRACT NOTES: Package layout (all stdlib, no third-party imports): dashboard_chat/projects.py (allowlisted project roots + confined file tree/read), dashboard_chat/sessions.py (JSON session store), dashboard_chat/images.py (image validation/storage), dashboard_chat/messages.py (builds the OpenAI-style chat request), dashboard_chat/job.py (the queue job entrypoint that calls the model), dashboard_chat/routes.py (HTTP handler), dashboard_chat/static/chat.html (single-file UI, vanilla JS, no CDN).
+SAFETY (must be tested, these are the core properties): (1) every file read resolves os.path.realpath and must stay inside an allowlisted project root -- '..', absolute paths, and symlinks pointing outside are rejected; (2) skip .git, node_modules, .venv, __pycache__, binary files (NUL byte in first 8KB) and files > 256KB; (3) images: accept only png/jpeg/webp/gif by MAGIC BYTES (not the declared type or extension), max 8MB each, max 6 per message; (4) session ids are uuid4 hex and validated against ^[0-9a-f]{32}$ before any path is built; (5) the model API key is read from ~/.darkbloom/local.json per call and NEVER logged, returned to the browser, or written into a session file.
+Storage: sessions as JSON files under a base dir (default ~/.ollama-dispatch/chat/, overridable by env DASHBOARD_CHAT_HOME for tests): sessions/<id>.json = {id, project, created, messages:[{role, content, images:[filename], files:[relpath], ts, status}]}, images/<id>/<n>.<ext>. Writes are atomic (temp file + os.replace). Project allowlist: <base>/projects.json = [{name, path}].
+Routes (routes.handle(method, path, query, body_bytes) -> (status:int, headers:dict, body:bytes), pure of any server so it can be mounted into an existing http.server handler): GET /chat -> chat.html; GET /api/chat/projects; GET /api/chat/projects/<name>/tree?path= ; GET /api/chat/projects/<name>/file?path= ; POST /api/chat/sessions {project} -> {id}; GET /api/chat/sessions; GET /api/chat/sessions/<id>; POST /api/chat/sessions/<id>/messages {text, files:[relpath], images:[{data_base64}]} -> appends the user message with status 'user' and an assistant placeholder with status 'queued', then calls an injectable enqueue(session_id, message_index) callable (default shells out to `python3 ~/bin/ollama-queue.py enqueue` for the Darkbloom lane with a bundle tag chat) and returns 202. Unknown route 404, bad input 400 with {error}.
+job.py: `python3 -m dashboard_chat.job <session_id> <message_index>` loads the session, builds messages (system prompt stating the project name and that it is read-only and should answer with diffs in fenced ```diff blocks; the attached files' contents each prefixed with their relative path; prior turns; images as content parts {type:image_url, image_url:{url:data:<mime>;base64,...}}), POSTs to http://127.0.0.1:8000/v1/chat/completions with model qwen3.6-35b-a3b-vl-mtp-mxfp8, chat_template_kwargs {enable_thinking:false}, a bounded timeout, then writes the assistant text into that message with status 'done' (or status 'error' and a short error text). The HTTP call goes through an injectable function so tests stub it.
+UI chat.html: project picker, file tree with checkboxes to attach files, message box that accepts paste/drag-drop of images, conversation view that polls GET /api/chat/sessions/<id> every 2s while the last assistant message is queued/running, renders ```diff blocks monospaced with +/- coloured, dark theme.
+
+## 1. `refimpl.py` -- the REFERENCE implementation
+A script run as `python3 refimpl.py` FROM this worktree (its cwd is the
+worktree; `sys.argv[1]` if present is the worktree path, else `.`). It WRITES
+the correct, complete solution into `dashboard_chat/routes.py` (create parent dirs as needed).
+Even for a TS/JS/Swift target, `refimpl.py` stays a small PYTHON *writer* script
+that emits the solution file -- that is expected, do not rewrite it in the
+target language. This is the proof the task is satisfiable: the gate runs it,
+checks the verify, then reverts it, so the dispatched model still solves the
+task itself. Replace the stub body entirely if that is simplest -- BUT FIRST
+READ `dashboard_chat/routes.py` AS IT EXISTS NOW. If it already contains real code (imports,
+functions, classes) beyond a placeholder stub -- the usual case in a slice
+chain, where earlier slices already landed work in this same file -- your
+refimpl must ADD what INTENT asks for and PRESERVE everything already there.
+Do not delete, rewrite, or replace existing imports/functions/classes that
+INTENT does not mention. A refimpl that wipes out prior slices' landed work to
+write a fresh from-scratch module fails every sibling slice that depends on
+what it deleted, even though its own verify may go green.
+
+## 2. `test_fixture.py` -- the ADVERSARIAL fixture
+Fill in the cases (keep the file's existing runner/harness). The cases must
+catch a plausible-but-wrong implementation -- a fixture that also passes a
+BENIGN or empty implementation certifies nothing.
+Assert the actual behaviour (values, status codes, error shapes) and include the
+boundary and failure cases, not just the happy path. At least 3 cases.
+
+IF INTENT ABOVE ALREADY SPELLS OUT HOW TO PROVE IT (a named technique, e.g. "stub
+X and assert Y", "kill test: revert -> red"): follow THAT exactly and stop there
+-- it already defines what "adversarial" means for this task. Do NOT also invent
+extra boundary/failure cases about OTHER functions or behavior the intent never
+mentioned just to satisfy this generic instruction; a bare import or one-line
+statement has no boundary of its own, and manufacturing one by testing unrelated
+code (e.g. a caller several slices away) makes the fixture test the WRONG thing.
+Scope creep here is the #1 way a narrow slice fails to converge.
+
+## 3. `TASK.md` -- the spec the DISPATCHED model will read
+Replace every `TODO` with: the goal, the exact contract, a `## Must contain`
+list of the literal tokens the solution must contain (prefer PLAIN identifiers and
+names -- no regexes, no backslashes or escape sequences; every literal must appear
+byte-for-byte in what refimpl.py writes, so copy it from there) (function/route
+signatures, key strings -- these get frozen and enforced), and KEEP the scope
+line ``Only edit `dashboard_chat/routes.py`; ...``. Leave no TODO behind.
+
+## Escaping rule -- read this before you write `refimpl.py`
+If `refimpl.py` embeds a block of TARGET source inside a triple-quoted Python
+string (the usual `OLD = "..."` / `NEW = '''...'''` replacement shape), make
+that string RAW -- `NEW = r'''...'''`. In a non-raw string every `\n` you meant
+as two literal characters of target source becomes a REAL newline, which breaks
+any string literal in the emitted code and the target then fails to PARSE
+(`SyntaxError: unterminated string literal`). A raw string fixes all of them at
+once. If the block must contain a real newline, put it there literally rather
+than escaping it. When the self-check reports a SyntaxError in the target, this
+is nearly always the cause -- check it FIRST before rewriting anything.
+
+## Done when
+`bash verify.sh` FAILS at the stub baseline and PASSES only after
+`python3 refimpl.py`. The self-check enforces exactly this: run
+`python3 auto-harness-check.py` (NOT `bash verify.sh` on its own) until it prints
+VERIFY_OK. The self-check first FREEZES your `## Must contain` list into
+`check_literals.py` -- run bare, verify.sh reports "no frozen literals" until then,
+and that is not yours to fix by hand.
+
+[worker] CONTEXT BUDGET: num_ctx=131072, no bumps.
+[worker] BASELINE PROVEN FAILING at enqueue: a still-failing verify cannot show the fix landed, so it is fed back as work to do, not accepted.
+[worker] checking llama-server is up at http://127.0.0.1:8000...
+[worker] llama-server is up.
+[worker] preflight: verifying http://127.0.0.1:8000 accepts tool-calling requests...
+[worker] preflight on the Darkbloom lane: first request to qwen3.6-35b-a3b-vl-mtp-mxfp8 may lazy-load it (cold start) -- allowing up to 900s.
+[worker] DARKBLOOM SLOTS BUSY (model load refused while other requests hold the slots) -- waiting 5s and retrying, not charged (5/1800s): HTTP Error 429: Too Many Requests -- body: {"error":{"message":"Provider capacity is temporarily unavailable.","type":"invalid_request_error"}}
+[worker] DARKBLOOM SLOTS BUSY (model load refused while other requests hold the slots) -- waiting 10s and retrying, not charged (15/1800s): HTTP Error 429: Too Many Requests -- body: {"error":{"message":"Provider capacity is temporarily unavailable.","type":"invalid_request_error"}}
+[worker] preflight OK: http://127.0.0.1:8000 accepts tool-calling requests.
+[worker] baseline verify FAILED at dispatch start with 1 pre-existing diagnostic(s) -- these will be subtracted from later verify runs so the model is only asked to fix what its own diff introduces. (A large count here usually means the worktree wasn't fully provisioned, e.g. a missing codegen/`prisma generate` step.)
+[worker] --- iteration 1/24 ---
+[worker] iteration 1/24 generated 43 tokens in 3.4s (12.5 tok/s)
+[worker] model: Let me start by understanding the project structure and existing files before writing anything.
+</think>
+[worker] tool list_files({"path": "."}) -> .git/  (skipped: large/generated)
+dashboard_chat/
+.dispatch-harness.json  (242 bytes)
+AUTO-TASK.md  (9620 bytes)
+TASK.md  (2983 bytes)
+auto-harness-check.py  (27459 bytes)
+check_literals.py  (4607 bytes)
+refimpl.py  (811 bytes)
+requirements.txt  (0 bytes)
+test_fixture.py  (2504 bytes)
+verify.sh  (20
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 2/24 ---
+[worker] iteration 2/24 generated 210 tokens in 2.0s (105.2 tok/s)
+[worker] model: Let me read all the existing files to understand what's already there before writing anything.
+</think>
+[worker] tool read_file({"path": "TASK.md"}) -> # TASK: chat-frontend
+
+## Confirmed defect (observed, not suspected)
+
+TODO -- state the CONFIRMED defect: the observed symptom and how you
+verified it. Not a suspected mechanism, not a named culprit. If you
+have not actually reproduced it, stop and reproduce it first: a task
+asserting a defect that 
+[worker] tool read_file({"path": "verify.sh"}) -> #!/usr/bin/env bash
+# verify for: chat-frontend
+# Counting idiom, NOT `set -e` -- an aborting verify never prints why it failed.
+cd "$(dirname "$0")" || exit 1
+
+fails=0
+
+# --- env parity ------------------------------------------------------------
+# System pip is PEP-668 blocked; the worker runs ver
+[worker] tool read_file({"path": "check_literals.py"}) -> 
+"""Assert every `## Must contain` literal from TASK.md is in the right file.
+
+ADDITIONAL to the behavioural cases, never a replacement: a literal check is a
+proxy and passes on a file that contains the right text and does the wrong
+thing. But a verify asserting NO spec literal cannot tell a correct
+[worker] tool read_file({"path": "test_fixture.py"}) -> """Adversarial fixture for: chat-frontend
+
+>>> THE ONE THING THE GENERATOR CANNOT WRITE FOR YOU <<<
+
+CASES is empty and the verify FAILS until you fill it in. That is deliberate.
+A generator can emit a verify that DISCRIMINATES (fails at baseline, passes on
+a fix). It cannot decide whether the verif
+[worker] tool read_file({"path": "refimpl.py"}) -> #!/usr/bin/env python3
+"""Reference impl for: chat-frontend
+
+The gate applies this, runs the verify, and reverts it. It proves two things at
+once: the task is SATISFIABLE as specified, and the verify actually ENFORCES the
+spec (a refimpl that goes green while a "Must contain" literal is absent means
+[worker] tool read_file({"path": "auto-harness-check.py"}) -> [read_file auto-harness-check.py: lines 1-329 of 499 (27457 bytes total), page truncated at 16000 chars]
+#!/usr/bin/env python3
+"""Author/refine self-check (written by ollama-dispatch-auto). Proves the
+harness DISCRIMINATES (verify fails at baseline) and is SATISFIABLE (refimpl.py
+makes it green), l
+[worker] tool read_file({"path": ".dispatch-harness.json"}) -> {
+  "authored": [
+    "TASK.md",
+    "check_literals.py",
+    "refimpl.py",
+    "requirements.txt",
+    "test_fixture.py",
+    "verify.sh"
+  ],
+  "target": "dashboard_chat/routes.py",
+  "fixture": "test_fixture.py",
+  "creation_task": false
+}
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 3/24 ---
+[worker] iteration 3/24 generated 84 tokens in 7.5s (11.2 tok/s)
+[worker] model: Now let me read the current state of `dashboard_chat/routes.py` and the `dashboard_chat/` directory to understand what exists.
+</think>
+[worker] tool list_files({"path": "dashboard_chat"}) -> routes.py  (37 bytes)
+[worker] tool read_file({"path": "dashboard_chat/routes.py"}) -> """TODO -- the target under test."""
+
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 4/24 ---
+[worker] iteration 4/24 generated 339 tokens in 9.9s (34.3 tok/s)
+[worker] model: Let me understand the task:
+
+1. I need to author three files: `refimpl.py`, `test_fixture.py`, and `TASK.md`
+2. `verify.sh` and `check_literals.py` are already written and must NOT be edited
+3. `dashboard_chat/routes.py` currently contains just a placeholder stub
+4. I need to fill in all TODOs in `TASK.md`, replace the SCAFFOLD guard in `test_fixture.py` with real adversarial cases, and write `refimpl.py`
+5. Then run `python3 auto-harness-check.py` until it prints VERIFY_OK
+
+Let me read the rest
+[worker] tool read_file({"offset": 330, "path": "auto-harness-check.py"}) -> [read_file auto-harness-check.py: lines 330-499 of 499 (27457 bytes total)]
+    # a different bug from "the verify asserts too much", and the generic
+    # message sends the model hunting in the wrong file. All four
+    # esim-global/s3 attempts burned 5+ iterations each guessing at this.
+    _hint 
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 5/24 ---
+[worker] iteration 5/24 generated 8192 tokens in 83.1s (98.5 tok/s)
+[worker] model: Now I understand the full picture. Let me plan what I need to build:
+
+1. **TASK.md** - Fill in all TODOs with the chat-frontend spec, including a "## Must contain" list with literal tokens that `refimpl.py` will write into `dashboard_chat/routes.py`
+
+2. **test_fixture.py** - Replace the SCAFFOLD guard (empty CASES list) with at least 3 adversarial cases that test the actual behavior of `dashboard_chat.routes`
+
+3. **refimpl.py** - Write a Python script that, when run, writes the correct implement
+[worker] iteration 5/24 was CUT OFF at the 8192-token output cap mid-prose with no tool call -- not a final answer; telling the model to act and continuing.
+[worker] --- iteration 6/24 ---
+[worker] iteration 6/24 generated 852 tokens in 19.0s (44.8 tok/s)
+[worker] model: My last response was cut off before I made any tool calls. I need to actually write the three files now: TASK.md, test_fixture.py, and refimpl.py. Let me start by writing TASK.md with all TODOs filled in, then test_fixture.py with adversarial cases, then refimpl.py with the full implementation.
+
+Let me be concise and actually make the tool calls.
+</think>
+[worker] tool write_file({"content": "# TASK: chat-frontend\n\n## Confirmed defect (observed, not suspected)\n\nThe dashboard has no chat frontend. `dashboard_chat/routes.py` contains only a placeholder docstring `\"\"\"TODO ) -> OK: wrote 2864 bytes to TASK.md
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 7/24 ---
+[worker] iteration 7/24 generated 1303 tokens in 13.8s (94.1 tok/s)
+[worker] model: Good, TASK.md is written. Now I need to write test_fixture.py and refimpl.py. Let me first write the test_fixture.py with adversarial cases, then write refimpl.py with the full implementation.
+
+The test fixture needs to:
+1. Set up a test environment (DASHBOARD_CHAT_HOME env var)
+2. Create a test project structure
+3. Import dashboard_chat.routes as target
+4. Define CASES with at least 3 adversarial cases
+
+The refimpl.py needs to:
+1. Read the current dashboard_chat/routes.py
+2. Replace the placeho
+[worker] tool write_file({"content": "\"\"\"Adversarial fixture for: chat-frontend\n\n>>> THE ONE THING THE GENERATOR CANNOT WRITE FOR YOU <<<\n\nCASES is empty and the verify FAILS until you fill it in. That is deliberate.\n) -> OK: wrote 4111 bytes to test_fixture.py
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 8/24 ---
+[worker] iteration 8/24 generated 3461 tokens in 36.0s (96.2 tok/s)
+[worker] model: Good, test_fixture.py is written. Now I need to write refimpl.py with the full implementation of dashboard_chat/routes.py. The refimpl needs to:
+
+1. Read the current dashboard_chat/routes.py (which is `"""TODO -- the target under test."""`)
+2. Replace it with the full implementation using a raw string
+
+The key challenge is writing the implementation as a raw string inside refimpl.py. I need to use `r'''...'''` to avoid escaping issues.
+
+Let me write the refimpl.py now.
+</think>
+
+Now let me write
+[worker] tool write_file({"content": "#!/usr/bin/env python3\n\"\"\"Reference impl for: chat-frontend\n\nThe gate applies this, runs the verify, and reverts it. It proves two things at\nonce: the task is SATISFIABLE as specif) -> OK: wrote 12593 bytes to refimpl.py
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 9/24 ---
+[worker] iteration 9/24 generated 86 tokens in 5.5s (15.6 tok/s)
+[worker] model: Good, all three files are written. Now let me run the self-check to see if it works. Let me run `python3 auto-harness-check.py` to verify.
+</think>
+
+Now let me run the self-check:
+[worker] tool run_bash({"command": "python3 auto-harness-check.py 2>&1"}) -> {"exit_code": 1, "stdout": "  FAIL: TASK.md still has TODO placeholders -- fill them in\n", "stderr": "", "cwd": "/Users/user/Desktop/GitHub Projects/dashboard-chat"}
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 10/24 ---
+[worker] iteration 10/24 generated 52 tokens in 7.0s (7.4 tok/s)
+[worker] model: The check says TASK.md still has TODO placeholders. Let me re-read TASK.md to see what TODOs remain.
+</think>
+[worker] tool read_file({"path": "TASK.md"}) -> # TASK: chat-frontend
+
+## Confirmed defect (observed, not suspected)
+
+The dashboard has no chat frontend. `dashboard_chat/routes.py` contains only a placeholder docstring `"""TODO -- the target under test."""` and provides no HTTP handling. Verified by importing the module and confirming `handle` is
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 11/24 ---
+[worker] iteration 11/24 generated 228 tokens in 5.9s (38.7 tok/s)
+[worker] model: The check is looking for "TODO" in TASK.md. The issue is that my "Confirmed defect" section references `"""TODO -- the target under test."""` which contains the string "TODO". The check does a simple `"TODO" in task` check. I need to remove that reference.
+</think>
+
+The check does `"TODO" in task` - my defect description references the placeholder text containing "TODO". Let me fix that:
+[worker] tool edit_file({"new_string": "The dashboard has no chat frontend. `dashboard_chat/routes.py` contains only a placeholder docstring and provides no HTTP handling. Verified by importing the module and confirming `han) -> OK: replaced 1 occurrence in TASK.md (2825 bytes total)
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 12/24 ---
+[worker] iteration 12/24 generated 49 tokens in 1.6s (31.2 tok/s)
+[worker] model: Now let me run the check again.
+</think>
+[worker] tool run_bash({"command": "python3 auto-harness-check.py 2>&1"}) -> {"exit_code": 1, "stdout": "  FAIL: the reference impl (refimpl.py) does not make verify.sh print VERIFY_OK -- the task is unsatisfiable as written, or the verify asserts more than the spec:\n FAIL: a Must-contain literal is missing\n=== behavioural cases ===\n  FAIL: adversarial cases failed\n--- 3
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 13/24 ---
+[worker] iteration 13/24 generated 838 tokens in 37.6s (22.3 tok/s)
+[worker] model: The issue is that the OLD anchor `"""TODO -- the target under test"""` doesn't match the actual file content which is `"""TODO -- the target under test."""` (with a period at the end). Let me check the actual file content and fix the refimpl.
+
+The error shows: `"""\"\"\"Dashboard chat routes...` - triple quotes are being doubled. This means the OLD anchor matched but the replacement created `"""` + `"""Dashboard...` = `""""""Dashboard...`.
+
+The original file is:
+```
+"""TODO -- the target under t
+[worker] tool edit_file({"new_string": "OLD = \"\"\"TODO -- the target under test.\"\"\"", "old_string": "OLD = \"\"\"TODO -- the target under test\"\"\"", "path": "refimpl.py"}) -> OK: replaced 1 occurrence in refimpl.py (12594 bytes total)
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 14/24 ---
+[worker] iteration 14/24 generated 612 tokens in 10.8s (56.7 tok/s)
+[worker] model: Wait, that's still wrong. The issue is that `"""TODO -- the target under test."""` in the file is a triple-quoted string. In my refimpl.py, I wrote:
+
+```python
+OLD = """TODO -- the target under test."""
+```
+
+But this is a Python string literal. The value of `OLD` would be `TODO -- the target under test.` (without the triple quotes). But the file content is literally `"""TODO -- the target under test."""` (with the triple quotes).
+
+So I need to match the literal triple quotes. Let me use a raw st
+[worker] tool edit_file({"new_string": "OLD = '\"\"\"TODO -- the target under test.\"\"\"'", "old_string": "OLD = \"\"\"TODO -- the target under test.\"\"\"", "path": "refimpl.py"}) -> OK: replaced 1 occurrence in refimpl.py (12596 bytes total)
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 15/24 ---
+[worker] iteration 15/24 generated 150 tokens in 8.1s (18.4 tok/s)
+[worker] model: Now let me also check the NEW string. The NEW starts with `"""Dashboard chat routes..."""`. Since it's a raw string `r'''...'''`, the value of NEW starts with `"""Dashboard chat routes..."""`. So when we replace the OLD (which is `"""TODO -- the target under test."""`) with NEW (which starts with `"""Dashboard chat routes..."""`), the result should be:
+
+```
+"""Dashboard chat routes..."""
+```
+
+That looks correct. Let me run the check again.
+</think>
+[worker] tool run_bash({"command": "python3 auto-harness-check.py 2>&1"}) -> {"exit_code": 1, "stdout": "  FAIL: the reference impl (refimpl.py) does not make verify.sh print VERIFY_OK -- the task is unsatisfiable as written, or the verify asserts more than the spec:\n=== target parses ===\n  ok: dashboard_chat/routes.py parses\n=== spec literals ===\n  MISSING literal in da
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 16/24 ---
+[worker] iteration 16/24 generated 732 tokens in 11.5s (63.5 tok/s)
+[worker] model: The test fixture passes (5/5), but the literal check fails. Several literals are missing from the emitted routes.py:
+- `~/.darkbloom/local.json`
+- `qwen3.6-35b-a3b-vl-mtp-mxfp8`
+- `127.0.0.1:8000`
+- `v1/chat/completions`
+- `enable_thinking`
+- `ollama-queue.py`
+
+These are strings that need to appear in the routes.py file. The task says the model API key is read from `~/.darkbloom/local.json`, the model name is `qwen3.6-35b-a3b-vl-mtp-mxfp8`, the API endpoint is `127.0.0.1:8000/v1/chat/completions
+[worker] tool read_file({"offset": 1, "path": "refimpl.py"}) -> #!/usr/bin/env python3
+"""Reference impl for: chat-frontend
+
+The gate applies this, runs the verify, and reverts it. It proves two things at
+once: the task is SATISFIABLE as specified, and the verify actually ENFORCES the
+spec (a refimpl that goes green while a "Must contain" literal is absent means
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 17/24 ---
+[worker] iteration 17/24 generated 678 tokens in 15.5s (43.7 tok/s)
+[worker] model: I need to add the missing literals to the routes.py output. The missing ones are:
+- `~/.darkbloom/local.json` - currently `_get_api_key` uses `Path.home() / ".darkbloom" / "local.json"` which doesn't contain the literal string
+- `qwen3.6-35b-a3b-vl-mtp-mxfp8` - model name, not referenced anywhere
+- `127.0.0.1:8000` - API endpoint, not referenced
+- `v1/chat/completions` - API path, not referenced
+- `enable_thinking` - chat template kwarg, not referenced
+- `ollama-queue.py` - queue script, not ref
+[worker] tool edit_file({"new_string": "BASE = Path(os.environ.get(\"DASHBOARD_CHAT_HOME\", Path.home() / \".ollama-dispatch\" / \"chat\"))\nPROJECTS_FILE = BASE / \"projects.json\"\nSESSIONS_DIR = BASE / \"sessions\"\nIMAGE) -> OK: replaced 1 occurrence in refimpl.py (12898 bytes total)
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 18/24 ---
+[worker] iteration 18/24 generated 270 tokens in 7.2s (37.4 tok/s)
+[worker] model: Now I also need to update the `_get_api_key` function to use the `API_KEY_PATH` constant instead of constructing the path from `Path.home()`. This way the literal `~/.darkbloom/local.json` will appear in the file.
+</think>
+
+Now update `_get_api_key` to use the constant:
+[worker] tool edit_file({"new_string": "def _get_api_key():\n    key_file = Path(API_KEY_PATH.replace(\"~\", str(Path.home())))\n    if not key_file.is_file():\n        return None\n    try:\n        config = json.loads(key_) -> OK: replaced 1 occurrence in refimpl.py (12906 bytes total)
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 19/24 ---
+[worker] iteration 19/24 generated 57 tokens in 8.4s (6.8 tok/s)
+[worker] model: Let me run the self-check again to see if the literals are now present.
+</think>
+[worker] tool run_bash({"command": "python3 auto-harness-check.py 2>&1"}) -> {"exit_code": 0, "stdout": "VERIFY_OK: harness discriminates and is satisfiable\n", "stderr": "", "cwd": "/Users/user/Desktop/GitHub Projects/dashboard-chat"}
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 20/24 ---
+[worker] iteration 20/24 generated 80 tokens in 4.8s (16.8 tok/s)
+[worker] model: The self-check passed with VERIFY_OK. Let me verify the state is clean by running verify.sh directly to confirm, then call task_complete.
+</think>
+
+The harness is complete and verified. Let me do a final confirmation:
+[worker] tool run_bash({"command": "bash verify.sh 2>&1"}) -> {"exit_code": 1, "stdout": "=== target parses ===\n  ok: dashboard_chat/routes.py parses\n=== spec literals ===\n  MISSING literal in dashboard_chat/routes.py (searched for these exact 6 chars, shown verbatim between the >>> <<< marks): >>>handle<<<\n  MISSING literal in dashboard_chat/routes.py (se
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 21/24 ---
+[worker] iteration 21/24 generated 177 tokens in 4.4s (40.0 tok/s)
+[worker] model: The `bash verify.sh` fails at baseline (no refimpl applied) because routes.py is still the stub. That's expected - the harness is designed to fail at baseline and pass after refimpl.py is applied. The `auto-harness-check.py` already confirmed VERIFY_OK (it applies refimpl, checks, then reverts).
+
+Let me verify this is the expected behavior by running the full self-check again:
+</think>
+
+The `bash verify.sh` failing at baseline is expected - that's the whole point of the harness. The `auto-harnes
+[worker] tool run_bash({"command": "python3 auto-harness-check.py 2>&1"}) -> {"exit_code": 0, "stdout": "VERIFY_OK: harness discriminates and is satisfiable\n", "stderr": "", "cwd": "/Users/user/Desktop/GitHub Projects/dashboard-chat"}
+[worker] CHECKPOINT TRANSCRIPT: /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] --- iteration 22/24 ---
+[worker] iteration 22/24 generated 377 tokens in 7.0s (53.9 tok/s)
+[worker] model: The harness is verified - `auto-harness-check.py` prints `VERIFY_OK: harness discriminates and is satisfiable`. The task is complete. Let me call task_complete.
+</think>
+[worker] tool task_complete({"summary": "Authored three files for the verify-gated dispatch harness:\n\n1. **TASK.md** - Filled all TODOs with the chat-frontend spec, including a \"## Must contain\" list of 14 literal tokens (ha) -> ACCEPTED: verify passed.
+[worker] full transcript written to /Users/user/bin/ollama-worker-logs/20261004T053129Z.json
+[worker] running verify command: python3 auto-harness-check.py
+[worker] verify stdout:
+VERIFY_OK: harness discriminates and is satisfiable
+
+[worker] VERIFY PASSED (exit 0).
+[worker] zero-diff ACCEPTED: the verify reports 'VERIFY_OK: harness discriminates and is satisfiable', so this dispatch's deliverable is the harness STATE, not a diff -- an already-complete harness is a correct outcome, not a vacuous pass. (The unchanged-tree guard still applies to every verify that does NOT emit this marker.)
+[worker] dispatch logged to Obsidian vault.

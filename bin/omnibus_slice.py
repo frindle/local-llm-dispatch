@@ -1120,6 +1120,63 @@ def handoff_to_slicer(plan_path, model=None, host=None, num_ctx=None, _run=None)
     return runner(cmd, env)
 
 
+PLANNER = BIN / "ollama-dispatch-plan"
+PLANNER_FALLBACK_OFF_ENV = "OLLAMA_DISPATCH_NO_PLANNER_FALLBACK"
+
+
+def planner_fallback_cmd(*, repo, target, lang, label, intent, interface=None, bundle=None):
+    """argv for the LLM planner (ollama-dispatch-plan --generate): qwen decomposes the
+    omnibus, the structural gate refuses a bad plan, and --auto-confirm-plan (WITHOUT
+    --then-execute) writes ~/.ollama-dispatch/slice-plans/<label>.slices.json and returns.
+    Execution is the caller's: handoff_to_slicer() exports NO_SPLIT so the per-slice AUTO
+    calls never re-slice, which planner --then-execute would not."""
+    full = (intent or "").strip()
+    if interface and str(interface).strip():
+        full += "\n\nINTERFACE / CONTRACT NOTES: " + str(interface).strip()
+    cmd = ["python3", str(PLANNER), "--generate", "--repo", str(repo), "--target", str(target),
+           "--lang", str(lang), "--label", str(label), "--intent", full,
+           "--auto-confirm-plan"]
+    if bundle:
+        cmd += ["--bundle", str(bundle)]
+    return cmd
+
+
+def planner_fallback_and_handoff(*, repo, target, lang, label, intent, interface=None,
+                                 model=None, host=None, num_ctx=None, reason="",
+                                 bundle=None, _run=None, _handoff=None):
+    """The regex slicer found no clean decomposition (a single target whose intent is one
+    prose property) but the dispatch cannot run as one job (e.g. ctx ceiling). Fall back to
+    the LLM planner, then execute the gated plan through the slicer under the dispatch's
+    bundle. Idempotent: an existing plan file for this label is reused, never regenerated.
+    Returns an exit code (0 = chain handed off); nonzero = planner failed / gate never
+    clean -- the caller then escalates exactly as before."""
+    if os.environ.get(PLANNER_FALLBACK_OFF_ENV):
+        print(f"[auto] planner fallback disabled ({PLANNER_FALLBACK_OFF_ENV}).", file=sys.stderr)
+        return 1
+    pth = plan_path_for(label)
+    runner = _run or (lambda c: subprocess.run(c).returncode)
+    if pth.exists():
+        print(f"[auto] PLANNER FALLBACK ({reason}): reusing the existing plan {pth}")
+    else:
+        cmd = planner_fallback_cmd(repo=repo, target=target, lang=lang, label=label,
+                                   intent=intent, interface=interface, bundle=bundle)
+        print(f"[auto] PLANNER FALLBACK ({reason}): the regex slicer found no clean "
+              f"decomposition; asking the LLM planner (qwen) for a gated slice plan...")
+        rc = runner(cmd)
+        if rc != 0 or not pth.exists():
+            print(f"[auto] planner fallback did not produce a clean plan (rc={rc}).",
+                  file=sys.stderr)
+            return rc or 1
+    try:   # stamp the bundle on a reused/older plan too, so the chain stays grouped
+        plan = json.loads(pth.read_text())
+        if bundle and plan.get("bundle") != str(bundle):
+            plan["bundle"] = str(bundle)
+            pth.write_text(json.dumps(plan, indent=2) + "\n")
+    except (OSError, ValueError):
+        pass
+    return (_handoff or handoff_to_slicer)(pth, model=model, host=host, num_ctx=num_ctx)
+
+
 def autoslice_and_handoff(*, repo, target, lang, label, intent, interface=None,
                           threshold=DEFAULT_THRESHOLD, model=None, host=None,
                           num_ctx=None, reason="", _run=None, bundle=None):

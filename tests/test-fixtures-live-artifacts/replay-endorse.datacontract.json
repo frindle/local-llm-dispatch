@@ -1,0 +1,147 @@
+{
+  "label": "replay-endorse",
+  "repo": "/Users/user/.ollama-dispatch/testprojects/replay-endorse-20261003",
+  "target": "lib/bfmrLinkReconcile.ts",
+  "lang": "ts",
+  "intent": "selectCanonicalBfmrLinks in lib/bfmrLinkReconcile.ts collapses duplicate tracking numbers ORDER-WIDE (smallest link id wins per trackingNumber). That is wrong: one Amazon order can hold SEVERAL separate BFMR reservations whose units ship together under ONE tracking number, and BFMR itself confirms this by putting that same tracking number on each reservation row. CONFIRMED LIVE 2026-09-22 against production data: order 929 has link 188 (reservation 307956, qty 3, value 1176, tracking 9339589725268581127361) and link 189 (reservation 307955, qty 3, value 1176, same tracking) and BOTH reservations carry that exact tracking number themselves; the current rule drops link 189 so recalcBfmrSalePrice returns 1176 instead of the true 2352. The opposite case must keep working: order 906 link 153 (reservation 164353, status purchased, reservation trackingNumber NULL) shares tracking 1Z82AA931379787130 with link 190 (reservation 238161, whose own trackingNumber IS 1Z82AA931379787130); link 153 is a stale mislink and must still be dropped (true total 1893, not 3155). Same shape on order 767: links 104 and 105 sit on reservation 6480 whose own trackingNumber is 9339589725265621672225, yet they claim trackings 9339589725265621788780 and 9339589725265622369872 which belong to reservations 216284 and 216283 respectively; those two unendorsed links must be dropped so the order totals 1196 (4 x 299), not 1794. FIX: resolve a tracking-number collision by RESERVATION ENDORSEMENT, not by link id. A link is ENDORSED when its own reservation reports that same tracking number. Within one normalized tracking group (trim + lowercase, treat empty string as no tracking): first collapse links that share a reservationId down to the smallest id; then, if any link in the group is endorsed, keep every endorsed link (one per reservation) and drop all unendorsed ones; if NO link in the group is endorsed, fall back to the existing behaviour and keep only the smallest id. Untracked links and the existing step-1 parent-drop rule are unchanged. The function must stay PURE (no prisma, no imports) and keep its generic signature so recalcBfmrSalePrice can pass its richer link rows through unchanged.",
+  "slices": [
+    {
+      "id": "s1-normalize-tracking",
+      "title": "normalizeTracking helper (trim + lowercase, empty-as-null)",
+      "intent": "Add a pure helper function normalizeTracking(trackingNumber: string | null): string | null to lib/bfmrLinkReconcile.ts that trims whitespace, lowercases the string, and returns null when the input is null or an empty string after trimming. This helper is used by the endorsement logic to normalize tracking numbers for comparison within a tracking group.",
+      "depends_on": [],
+      "must_contain": [
+        "normalizeTracking",
+        "trim",
+        "lowercase",
+        "null"
+      ],
+      "verify_shape": "behavioral: normalizeTracking('  ABC  ') returns 'abc'; normalizeTracking('') returns null; normalizeTracking(null) returns null; normalizeTracking('Z123') returns 'z123'. ADVERSARIAL: with input '  ' (whitespace-only string) the function MUST return null, not an empty string -- an implementation that returns '' fails this."
+    },
+    {
+      "id": "s2-per-reservation-collapse",
+      "title": "per-reservation collapse within tracking group",
+      "intent": "Within selectCanonicalBfmrLinks in lib/bfmrLinkReconcile.ts, after grouping tracked links by their normalized tracking number, collapse links that share the same reservationId down to the single link with the smallest id. This per-reservation collapse is the first step within each normalized tracking group, performed before the endorsement-based selection. Links with different reservationIds are not collapsed by this step.",
+      "depends_on": [
+        "s1-normalize-tracking"
+      ],
+      "must_contain": [
+        "reservationId",
+        "smallest id",
+        "collapse"
+      ],
+      "verify_shape": "behavioral: given links with tracking 'ABC' and reservationIds [1,1,2] with ids [10,5,7], the per-reservation collapse keeps link id 5 (smallest for reservationId 1) and link id 7 (only link for reservationId 2), producing 2 links. ADVERSARIAL: with all links having different reservationIds, no collapse occurs and all links pass through unchanged -- an implementation that collapses across reservationIds fails this."
+    },
+    {
+      "id": "s3-endorsement-selection",
+      "title": "endorsement-based selection within tracking group",
+      "intent": "Within selectCanonicalBfmrLinks in lib/bfmrLinkReconcile.ts, after per-reservation collapse, if any link in the normalized tracking group is endorsed (its own reservation reports that same tracking number), keep every endorsed link (one per reservation) and drop all unendorsed ones; if NO link in the group is endorsed, fall back to the existing behaviour and keep only the smallest id. A link is ENDORSED when its reservation's trackingNumber matches the link's trackingNumber after normalization. This replaces the old order-wide smallest-link-id rule for endorsed groups.",
+      "depends_on": [
+        "s2-per-reservation-collapse"
+      ],
+      "must_contain": [
+        "endorsed",
+        "endorsement",
+        "smallest id",
+        "drop all unendorsed",
+        "fall back"
+      ],
+      "verify_shape": "behavioral: given 2 links in a group where link A (reservation 100) is endorsed (reservation 100's trackingNumber matches link A's trackingNumber) and link B (reservation 200) is not endorsed, keep link A and drop link B. ADVERSARIAL: with 0 endorsed links in the group, the smallest-id fallback MUST still apply and keep exactly one link -- an implementation that drops all links in an unendorsed group fails this."
+    },
+    {
+      "id": "s4a-integrate-normalize",
+      "title": "integrate normalizeTracking call into selectCanonicalBfmrLinks grouping",
+      "intent": "Modify selectCanonicalBfmrLinks in lib/bfmrLinkReconcile.ts to call normalizeTracking on each link's trackingNumber when grouping tracked links by their tracking number, replacing the raw trackingNumber key with the normalized result. This ensures empty strings and whitespace-padded tracking numbers are treated as no-tracking consistently, matching the existing isTracked check behavior.",
+      "depends_on": [
+        "s1-normalize-tracking"
+      ],
+      "must_contain": [
+        "normalizeTracking",
+        "selectCanonicalBfmrLinks",
+        "grouping"
+      ],
+      "verify_shape": "behavioral: links with tracking '  ABC  ' and 'abc' are grouped together under the normalized key 'abc'; links with tracking '' or null are treated as untracked and pass through unchanged. ADVERSARIAL: a link with tracking '  ' (whitespace-only) must be treated as untracked, not grouped with other tracked links -- an implementation that normalizes but still groups whitespace-only strings as a valid key fails this."
+    },
+    {
+      "id": "s4b-integrate-collapse",
+      "title": "integrate per-reservation collapse into selectCanonicalBfmrLinks",
+      "intent": "Modify selectCanonicalBfmrLinks in lib/bfmrLinkReconcile.ts to apply per-reservation collapse within each normalized tracking group: after grouping tracked links by their normalized tracking number, collapse links that share the same reservationId down to the single link with the smallest id. This is done before the endorsement-based selection step. Links with different reservationIds within the same tracking group are not collapsed by this step.",
+      "depends_on": [
+        "s2-per-reservation-collapse",
+        "s4a-integrate-normalize"
+      ],
+      "must_contain": [
+        "per-reservation collapse",
+        "reservationId",
+        "smallest id",
+        "selectCanonicalBfmrLinks"
+      ],
+      "verify_shape": "behavioral: within a tracking group, links with reservationIds [1,1,2] and ids [10,5,7] are collapsed to ids [5,7] (one per reservationId). ADVERSARIAL: links with different reservationIds but the same tracking must NOT be collapsed together -- an implementation that collapses across reservationIds fails this."
+    },
+    {
+      "id": "s4c-integrate-endorsement",
+      "title": "integrate endorsement-based selection into selectCanonicalBfmrLinks",
+      "intent": "Modify selectCanonicalBfmrLinks in lib/bfmrLinkReconcile.ts to apply endorsement-based selection within each normalized tracking group: after per-reservation collapse, if any link in the group is endorsed (its own reservation reports that same tracking number), keep every endorsed link (one per reservation) and drop all unendorsed ones; if NO link in the group is endorsed, fall back to keeping only the smallest id. A link is ENDORSED when its reservation's trackingNumber matches the link's trackingNumber after normalization.",
+      "depends_on": [
+        "s3-endorsement-selection",
+        "s4b-integrate-collapse"
+      ],
+      "must_contain": [
+        "endorsement-based selection",
+        "endorsed",
+        "drop all unendorsed",
+        "fall back",
+        "selectCanonicalBfmrLinks"
+      ],
+      "verify_shape": "behavioral: within a tracking group, if link A (reservation 100) is endorsed and link B (reservation 200) is not, keep link A and drop link B. ADVERSARIAL: with 0 endorsed links in the group, the smallest-id fallback MUST still apply and keep exactly one link -- an implementation that drops all links in an unendorsed group fails this."
+    },
+    {
+      "id": "s4d-purity-signature",
+      "title": "ensure selectCanonicalBfmrLinks stays PURE and keeps generic signature",
+      "intent": "Ensure selectCanonicalBfmrLinks in lib/bfmrLinkReconcile.ts stays PURE (no prisma, no imports) and keeps its generic signature selectCanonicalBfmrLinks<T extends BfmrLinkLike>(links: T[]): T[] so recalcBfmrSalePrice can pass its richer link rows through unchanged. The function must not import any database or external modules, and its type signature must remain generic with the same parameter and return types.",
+      "depends_on": [],
+      "must_contain": [
+        "selectCanonicalBfmrLinks",
+        "BfmrLinkLike",
+        "PURE",
+        "generic signature",
+        "no prisma",
+        "no imports"
+      ],
+      "verify_shape": "behavioral: the function signature selectCanonicalBfmrLinks<T extends BfmrLinkLike>(links: T[]): T[] is preserved exactly. ADVERSARIAL: an implementation that adds prisma imports or changes the generic signature to a non-generic void function fails this."
+    },
+    {
+      "id": "s5-order-906-stale-mislink",
+      "title": "order 906: link 153 is a stale mislink and must still be dropped (true total 1893)",
+      "intent": "In lib/bfmrLinkReconcile.ts, ensure that order 906 link 153 (reservation 164353, status purchased, reservation trackingNumber NULL) shares tracking 1Z82AA931379787130 with link 190 (reservation 238161, whose own trackingNumber IS 1Z82AA931379787130); link 153 is a stale mislink and must still be dropped (true total 1893, not 3155). The endorsement logic must correctly identify link 190 as endorsed (its reservation 238161 reports trackingNumber 1Z82AA931379787130 matching link 190's trackingNumber) and link 153 as not endorsed (its reservation 164353 has trackingNumber NULL, which does not match), so link 153 is dropped and link 190 is kept, yielding total 1893.",
+      "depends_on": [
+        "s4c-integrate-endorsement"
+      ],
+      "must_contain": [
+        "link 153",
+        "stale mislink",
+        "must still be dropped",
+        "1893",
+        "1Z82AA931379787130",
+        "reservation 238161"
+      ],
+      "verify_shape": "behavioral: order 906 with link 153 (tracking 1Z82AA931379787130, reservation 164353, NOT endorsed because reservation trackingNumber is NULL) and link 190 (same tracking, reservation 238161, endorsed because reservation trackingNumber IS 1Z82AA931379787130) keeps only link 190, total 1893. ADVERSARIAL: if the implementation incorrectly treats NULL as matching empty string, it would keep both links and return 3155 -- an implementation that does not distinguish NULL from empty-string endorsements fails this."
+    },
+    {
+      "id": "s6-preserve-parent-drop-rule",
+      "title": "preserve existing step-1 parent-drop rule and untracked links",
+      "intent": "In lib/bfmrLinkReconcile.ts, preserve the existing step-1 parent-drop rule exactly as before: if a reservation has at least one tracked link, drop that reservation's no-tracking 'parent' link(s) -- superseded by the split. A reservation with NO tracked link keeps its no-tracking link (an un-split reservation must NOT be emptied). Untracked links and the existing step-1 parent-drop rule are unchanged. The function must stay PURE (no prisma, no imports) and keep its generic signature selectCanonicalBfmrLinks<T extends BfmrLinkLike>(links: T[]): T[] so recalcBfmrSalePrice can pass its richer link rows through unchanged.",
+      "depends_on": [],
+      "must_contain": [
+        "parent-drop",
+        "no-tracking",
+        "PURE",
+        "generic signature",
+        "BfmrLinkLike"
+      ],
+      "verify_shape": "behavioral: a reservation with no tracked links keeps its no-tracking parent link; a reservation with at least one tracked link has its no-tracking parent link dropped. ADVERSARIAL: a single untracked link (no-tracking) with no tracked siblings MUST be returned unchanged -- an implementation that drops it fails this."
+    }
+  ],
+  "shared_worktree": true,
+  "note": "GENERATED by ollama-dispatch-plan (qwen decomposition, 3 round(s), structural gate CLEAN). Single-file OMNIBUS: all slices edit lib/bfmrLinkReconcile.ts in a sequential chain on branch slice/replay-endorse, each authored via ollama-dispatch-auto --repo <chain-wt> and gated on its OWN adversarial verify. Integrate by copying the finished branch tree onto main, never merge."
+}

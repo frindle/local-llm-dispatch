@@ -25,9 +25,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PLAN = Path(os.environ.get("PLAN", HERE / "ollama-dispatch-plan"))
-PLANS = Path.home() / ".ollama-dispatch/slice-plans"
-ORIG = PLANS / "chat-frontend-plan.slices.json.orig-generated"
-LIVE = PLANS / "chat-frontend-plan.slices.json"
+# frozen copies of the real plans (hermetic: no live ~/.ollama-dispatch/slice-plans read)
+PLANS = HERE / "test-fixtures-live-artifacts"
+ORIG = PLANS / "chat-frontend-plan.orig-generated.json"
+LIVE = PLANS / "chat-frontend-plan.hand-corrected.json"
 NEW = ("FOREIGN_PROPERTY_LITERAL", "GENERIC_LITERAL", "VACUOUS_AT_CHAIN_BASELINE")
 fails = 0
 
@@ -201,7 +202,9 @@ chk("GATE_RULES_TEXT names the three new defect codes",
 
 # ---- 8. whole corpus still gates without raising ----
 errs = []
-for f in sorted(PLANS.glob("*.slices.json")):
+corpus = sorted(PLANS.glob("*.json"))
+chk("frozen plan corpus is non-empty", len(corpus) >= 2, True)
+for f in corpus:
     try:
         m.gate_plan(json.loads(f.read_text()))
     except Exception as e:  # noqa: BLE001
