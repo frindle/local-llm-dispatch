@@ -2042,6 +2042,23 @@ def check_invariants(sb: Sandbox, R: Result, mon: Monitor, chaos: Chaos, before,
 # `proof_fail` (optional): a substring the RED output must contain, so a revert
 # proves the RIGHT assertion went red (not an import error).
 SEAMS = (
+    dict(id="cpuprefetch",
+         name="CPU prefetch: queued work's CPU prep starts early, bounded by GPU runway + CPU headroom, never on held/parked/owned trees, never twice (GPU never waits on CPU)",
+         tool="test-cpu-prefetch.py", marker="CPU_PREFETCH_OK",
+         proofs=[
+                 [{"mut": "cpu-prefetch.py", "old": '            if j.get("status") == "needs_opus":\n                return', "new": '            if False:\n                return', "why": 'a needs_opus bundle is started'}],
+                 [{"mut": "cpu-prefetch.py", "old": '        if pv and pv.get("kind") not in BENIGN_PARKS:', "new": '        if False:', "why": 'a blocked/stalled parked bundle is started'}],
+                 [{"mut": "cpu-prefetch.py", "old": '            return _cmd_is_driver(c, label)\n    return False', "new": '            return True\n    return False', "why": 'pid reuse: any live pid counts as a driver'}],
+                 [{"mut": "cpu-prefetch.py", "old": '    return max(0, min(cfg["max_prep"] - n_advancing, cfg["target_ready"] - (n_ready + n_advancing)))', "new": '    return cfg["max_prep"]', "why": 'CPU prep unbounded by runway / in-flight drivers'}],
+                 [{"mut": "cpu-prefetch.py", "old": '            queued = [e for e in entries if e.get("status") == "queued"]', "new": '            queued = list(entries)', "why": 'an already launched entry is launched again'}],
+                 [{"mut": "cpu-prefetch.py", "old": '        if (h.get("tree_lock_held") or tree_lock_held)(wt):', "new": '        if False:', "why": 'a worktree another process holds the tree lock of is started'}],
+                 [{"mut": "cpu-prefetch.py", "old": '        miss = [f for f in HARNESS_FILES if not (Path(wt) / f).exists()]', "new": '        miss = []', "why": 'a resume of an unauthored harness is started'}],
+                 [{"mut": "cpu-prefetch.py", "old": '    if driver_pids(label, rows):\n        return True', "new": '    if False:\n        return True', "why": 'a second driver is launched beside a live one'}],
+                 [{"mut": "cpu-prefetch.py", "old": '            return [("*", "skip", "another pass holds launch.lock")]', "new": '            pass', "why": 'concurrent passes both launch'}],
+                 [{"mut": "cpu-prefetch.py", "old": '    if (h.get("slicer_owns") or slicer_owns)(bundle):', "new": '    if False:', "why": 'a slicer-owned bundle gets a rival driver'}],
+                 [{"mut": "cpu-prefetch.py", "old": '    hit = (h.get("open_index_rows") or open_index_rows)(keys)\n    if hit:', "new": '    hit = None\n    if hit:', "why": 'a held READY-TO-LAND / HARNESS GO chain is started'}],
+                 [{"mut": "cpu-prefetch.py", "old": '    if KILL_FILE.exists():', "new": '    if False:', "why": 'kill switch ignored'}],
+                 [{"mut": "cpu-prefetch.py", "old": '    return (first, 0 if e.get("kind") == "resume" else 1, -int(e.get("priority") or 0),', "new": '    return (0, 0, 0,', "why": 'candidates not ordered by when the GPU needs them'}]]),
     dict(id="harnesslint",
          name="harness-lint: a failing spec (near-miss literal, literal the refimpl never writes, scope contradiction, stale prompt, repeat failure) is a named SPEC_DEFECT before any model run",
          tool="test-harness-lint.py", marker="HARNESS_LINT_OK",

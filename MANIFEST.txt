@@ -308,6 +308,7 @@ launchd|~/Library/LaunchAgents/com.*.ollama-queue-daemon.plist
 launchd|~/Library/LaunchAgents/com.*.ollama-queue-api.plist
 launchd|~/Library/LaunchAgents/com.*.dispatch-ack-reconcile.plist
 launchd|~/Library/LaunchAgents/com.*.dispatch-escalation-watcher.plist
+launchd|~/Library/LaunchAgents/com.*.cpu-prefetch.plist
 hooks|~/.claude/hooks/dispatch-handauthor-gate.sh
 hooks|~/.claude/hooks/dispatch-handauthor-guard.sh
 hooks|~/.claude/hooks/dispatch-to-qwen-reminder.sh
@@ -428,6 +429,8 @@ bin|~/bin/cpu_dispatch.py
 bin|~/bin/cpu_job.py
 bin|~/bin/cpu_lane.py
 bin|~/bin/cpu_stage.py
+bin|~/bin/cpu-prefetch.py
+bin|~/bin/escalation_verdict.py
 bin|~/bin/cpu_vr_measure.py
 bin|~/bin/dispatch_harness_gates.py
 bin|~/bin/failure_ledger.py
@@ -443,6 +446,7 @@ tests|~/bin/test-auto-continue-go.py
 tests|~/bin/test-bloom-control.py
 tests|~/bin/test-cpu-lane-api.py
 tests|~/bin/test-cpu-lane-queue.py
+tests|~/bin/test-cpu-prefetch.py
 tests|~/bin/test-cpu-stage.py
 tests|~/bin/test-darkbloom-apply.py
 tests|~/bin/test-gate-harness-refine.py
@@ -456,6 +460,7 @@ tests|~/bin/test-slice-spec-satisfiability.py
 tests|~/bin/test-worker-robust.py
 docs|~/Desktop/GitHub Projects/machine-config/docs/bloom-control.md
 docs|~/Desktop/GitHub Projects/machine-config/docs/cpu-lane.md
+docs|~/Desktop/GitHub Projects/machine-config/docs/cpu-prefetch.md
 docs|~/Desktop/GitHub Projects/machine-config/docs/harness-gates.md
 docs|~/Desktop/GitHub Projects/machine-config/docs/worker-robustness.md
 docs|~/Desktop/GitHub Projects/machine-config/docs/macos-pipe-starvation-heredoc-hang.md
