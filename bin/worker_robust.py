@@ -52,13 +52,9 @@ REASON_REVIEW_CAP = "output_cap_review"     # a turn hit the (explicit, small) o
 # SAMPLING ESCALATION LADDER (A/B arm, default OFF; model_profiles.yaml `sampling_escalation`).
 REASON_SPEC_DEFECT_REPEAT = "spec_defect_repeat_abort"   # 2 aborts on the SAME failing check: spec path first
 REASON_LADDER_EXHAUSTED = "sampling_ladder_exhausted"    # step 3: still looping -> scheduler re-specs
-# PER-TURN FAN-OUT (job c8f4f6ed95c1, 2026-10-09: ONE turn emitted 582 read_file calls, offset +100 past
-# EOF, 328s of decode; the run then ended as a generic nav_loop). Applies to EVERY task kind.
-REASON_TOOL_FANOUT = "tool_fanout_loop"       # a turn emitted more than the per-turn cap of tool calls, repeatedly
-REASON_READ_PAST_EOF = "read_past_eof_loop"   # consecutive read_file calls whose offset is past end of file
 NEW_EXIT_REASONS = (REASON_FORMAT, REASON_LOOP, REASON_STOPGATE, REASON_REASONING,
                     REASON_ERROR_LOOP, REASON_MONOLOGUE, REASON_ALTERNATION, REASON_NAV_LOOP,
-                    REASON_REPEAT_CALL, REASON_REVIEW_CAP, REASON_TOOL_FANOUT, REASON_READ_PAST_EOF,
+                    REASON_REPEAT_CALL, REASON_REVIEW_CAP,
                     REASON_SPEC_DEFECT_REPEAT, REASON_LADDER_EXHAUSTED)
 REVIEW_REPEAT_CONSECUTIVE = 2   # the identical read-only call twice in a row ends the run
 REVIEW_REPEAT_TOTAL = 3         # ... or the third time overall (A,B,A,B,A re-reading evades "in a row")
@@ -110,56 +106,6 @@ class RepeatCallGuard:
         if self.counts[key] >= self.total:
             return "%s issued %d times in total" % (" ".join(map(str, key)), self.counts[key])
         return None
-
-
-class TurnFanoutGuard:
-    """PURE. Per-turn tool-call cap + consecutive past-EOF read counter, for ALL task kinds.
-
-    on_turn(n_calls): None while n_calls <= cap. Over the cap: the 1st offence -> ("warn", reason,
-      message) (the excess is discarded by the caller and the model is told why); the `max_offences`-th
-      -> ("stop", REASON_TOOL_FANOUT, detail).
-    on_call(name, past_eof): called for each EXECUTED call. A past-EOF read_file extends a consecutive
-      streak (warn at `eof_warn`, stop at `eof_stop` -> REASON_READ_PAST_EOF); any other call resets it."""
-
-    def __init__(self, cap=12, max_offences=2, eof_warn=3, eof_stop=6):
-        self.cap, self.max_offences = int(cap), int(max_offences)
-        self.eof_warn, self.eof_stop = int(eof_warn), int(eof_stop)
-        self.offences = 0
-        self.eof_streak = 0
-
-    def on_turn(self, n_calls):
-        if n_calls <= self.cap:
-            return None
-        self.offences += 1
-        detail = ("a single turn emitted %d tool calls (cap %d); the extra %d were discarded"
-                  % (n_calls, self.cap, n_calls - self.cap))
-        if self.offences >= self.max_offences:
-            return ("stop", REASON_TOOL_FANOUT, "%s -- offence #%d" % (detail, self.offences))
-        return ("warn", REASON_TOOL_FANOUT,
-                "Your last turn contained %d tool calls; only the first %d were run and the rest were "
-                "DISCARDED. Make at most %d tool calls per turn, one step at a time, and look at each "
-                "result before deciding the next call. Do not page through a file with many offsets "
-                "in one turn." % (n_calls, self.cap, self.cap))
-
-    def on_call(self, name, past_eof=False):
-        if name == "read_file" and past_eof:
-            self.eof_streak += 1
-            if self.eof_streak >= self.eof_stop:
-                return ("stop", REASON_READ_PAST_EOF,
-                        "%d consecutive read_file calls with an offset past end of file" % self.eof_streak)
-            if self.eof_streak == self.eof_warn:
-                return ("warn", REASON_READ_PAST_EOF,
-                        "Your last %d read_file calls used an offset past the END of the file. The "
-                        "file is shorter than you think: re-read it from offset 1 (or grep for the "
-                        "line you want) instead of stepping the offset forward." % self.eof_streak)
-        else:
-            self.eof_streak = 0
-        return None
-
-
-def is_past_eof_result(result):
-    """PURE. True for tool_read_file's 'offset N is past the end of ...' refusal."""
-    return isinstance(result, str) and result.startswith("ERROR: offset ") and "past the end of" in result[:200]
 
 
 def review_capped_text(reason, detail, iteration=None):

@@ -245,6 +245,7 @@ tests|~/bin/test-scope-pins-dirty-slicefiles.py
 tests|~/bin/test-secondop-diff-archived.py
 tests|~/bin/test-self-heal-extract-tree.py
 tests|~/bin/test-self-heal-hygiene.py
+tests|~/bin/test-self-heal-lineage-pass.py
 tests|~/bin/test-selfheal-hand-edits.py
 tests|~/bin/test-selftest-hermetic.py
 tests|~/bin/test-slice-accept-resolves-row.py

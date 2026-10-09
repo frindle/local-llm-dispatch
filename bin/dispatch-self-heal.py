@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Act on an escalation watcher diagnosis for a HARNESS-side slice escalation.
 
-THE GAP THIS CLOSES (the owner 2026-09-26: "I shouldn't be having to manually override
+THE GAP THIS CLOSES (Penn 2026-09-26: "I shouldn't be having to manually override
 things to get my queue to do what I want")
 -----------------------------------------------------------------------------
 dispatch-escalation-watcher.py detects an ESCALATED slice, has a headless reviewer
@@ -208,7 +208,7 @@ def record(plan, sid, entry, ctx=None, count=False, ledger_path=None):
 
 
 # ----------------------------------------------------------------------------
-# verified auto-skip (the owner 2026-10-02: "when our own gates decide a slice is
+# verified auto-skip (Penn 2026-10-02: "when our own gates decide a slice is
 # already satisfied, the retirement must happen automatically, not by hand")
 # ----------------------------------------------------------------------------
 # A review that says VERDICT (a) / already satisfied is a CLAIM, never trusted as
@@ -555,7 +555,7 @@ def _slicer_detached(plan_path, args, log_path):
 
 
 # ----------------------------------------------------------------------------
-# the rung ladder (the owner 2026-10-02: "take Claude and me out of the loop for
+# the rung ladder (Penn 2026-10-02: "take Claude and me out of the loop for
 # escalations so nothing hangs for days")
 # ----------------------------------------------------------------------------
 # After the esc-review verdict the system ACTS, within MAX_ATTEMPTS per slice:
@@ -571,7 +571,7 @@ def _slicer_detached(plan_path, args, log_path):
 #                             Darkbloom model and Darkbloom sizes its own KV.
 # FINAL RUNG (the only one that parks for a human): the budget is spent, or the
 # escalation itself is "PIPELINE BUG SUSPECTED". It is never silent: ONE alert to
-# The owner (notify-owner.py, deduped) naming the slice and the exact qctl commands, and
+# Penn (notify-penn.py, deduped) naming the slice and the exact qctl commands, and
 # a decisions.jsonl entry that `qctl status` shows.
 DECISIONS = DISPATCH_DIR / "decisions.jsonl"
 _VERDICT_RE = re.compile(r"^\W*VERDICT\W*\(?\s*([abcd])\b", re.I)
@@ -646,7 +646,7 @@ def final_rung(plan, sid, why, ctx=None, ledger_path=None, notifier=None):
         if notifier is None:
             import importlib.util as _ilu
             _s = _ilu.spec_from_file_location(
-                "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+                "notify_penn", Path(__file__).resolve().parent / "notify-penn.py")
             _m = _ilu.module_from_spec(_s)
             _s.loader.exec_module(_m)
             notifier = _m.notify
@@ -688,7 +688,7 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
     st = _load(Path(slice_runs or SLICE_RUNS) / f"{plan}.json") or {}
     s = (st.get("slices") or {}).get(sid) or {}
     # A HUMAN cancel is terminal (plan_cancel.py): the ev-service-screen retry of
-    # 2026-09-27 18:42Z re-enqueued a job the owner had cancelled 37 min earlier.
+    # 2026-09-27 18:42Z re-enqueued a job Penn had cancelled 37 min earlier.
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import plan_cancel
@@ -854,7 +854,7 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
 # queue's needs_opus lane. The watcher detects it (source D), a local review runs and
 # gives a verdict -- and then self-heal answered "skip:job is not a slice of any plan",
 # because every lever above is a SLICER lever (--retry-slice / --regate). Nothing
-# acted, the driver had already exited, and the bundle parked "needs the owner"
+# acted, the driver had already exited, and the bundle parked "needs Penn"
 # (95234578bc40, verdict b: a fixture/harness defect). A human then enqueued exactly
 # the obvious remedy -- one more continuation authoring round on the SAME worktree
 # with --continues -- and it converged (3f75be3df79a, VERIFY_OK).
@@ -1609,7 +1609,7 @@ def _park_final(job, key, why, notifier, decisions, ledger_path, now, job_cap=Fa
         if notifier is None:
             import importlib.util as _ilu
             _s = _ilu.spec_from_file_location(
-                "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+                "notify_penn", Path(__file__).resolve().parent / "notify-penn.py")
             _m = _ilu.module_from_spec(_s)
             _s.loader.exec_module(_m)
             notifier = _m.notify
@@ -1784,7 +1784,7 @@ def resume_auto_driver(job, cid, ledger_path=None, runs_dir=None, launch=None, n
             if notifier is None:
                 import importlib.util as _ilu
                 _s = _ilu.spec_from_file_location(
-                    "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+                    "notify_penn", Path(__file__).resolve().parent / "notify-penn.py")
                 _m = _ilu.module_from_spec(_s)
                 _s.loader.exec_module(_m)
                 notifier = _m.notify
@@ -1895,7 +1895,7 @@ def job_heal_sweep(jobs=None, ledger_path=None, slice_runs=None, resolve=None, h
 # Only the queue's own verbs: `cancel <id> --automated` (job-scoped) for a PENDING
 # review that never launched, `resolve <id>` for a finished row. Capped per day,
 # logged to decisions.jsonl, one deduped alert per action batch.
-HYGIENE_MAX_PER_DAY = 12
+HYGIENE_MAX_PER_DAY = 30
 _ESC_REVIEW_RE = re.compile(r"^esc-review-(\d{8}T\d{6}Z)-job-([0-9a-f]{8,})$")
 _STUCK = ("needs_opus", "escalated", "failed", "blocked")
 
@@ -1922,7 +1922,7 @@ def _sibling_version(subject, rows):
     return best
 
 
-def superseded_review_actions(jobs, ledger=None, sidecars=None):
+def superseded_review_actions(jobs, ledger=None, sidecars=None, runs=None):
     """PURE. [(verb, id, why)] with verb 'cancel' (a pending, never-launched review)
     or 'resolve' (a finished row). Never touches running rows, gate jobs, rows
     awaiting sign-off, or anything that is not an esc-review -- except a needs_opus
@@ -1978,6 +1978,126 @@ def superseded_review_actions(jobs, ledger=None, sidecars=None):
         vo, vid = _sibling_version(j, jobs + sc)
         if vo == "passed":
             add("resolve", j["id"], "re-run as sibling %s, which passed" % vid)
+    if runs is not None:
+        for verb, jid, why in passed_lineage_actions(jobs, runs, sc):
+            add(verb, jid, why)
+    return out
+
+
+_LINEAGE_FAIL = ("failed", "needs_opus", "blocked", "done_unconverged")
+
+
+def auto_run_passes(runs_dir=None):
+    """[(label, bundle, ended_epoch)] for every ended auto-run record whose outcome is
+    a clean `exit 0` (the chain PASSED). Reads ~/.ollama-dispatch/auto-runs/*.json
+    (per-label `runs` map + the top-level latest record). Best-effort: unreadable -> []."""
+    seen, out = set(), []
+    try:
+        files = sorted(Path(runs_dir or AUTO_RUNS).glob("*.json"))
+    except OSError:
+        return out
+    for f in files:
+        d = _load(f)
+        if not isinstance(d, dict):
+            continue
+        for r in list((d.get("runs") or {}).values()) + [d]:
+            if not isinstance(r, dict) or not r.get("label"):
+                continue
+            if r.get("phase") != "ended" or str(r.get("outcome") or "").strip() != "exit 0":
+                continue
+            t = _parse_ts(r.get("updated_at")) or _parse_ts(r.get("phase_since"))
+            bundle = r.get("bundle") or r.get("key")
+            k = (r["label"], bundle, t)
+            if t and k not in seen:
+                seen.add(k)
+                out.append(k)
+    return out
+
+
+def _lineage_matches(label, chain_label):
+    """PURE. True when queue `label` is a round of auto-run chain `chain_label`: the same
+    label after stripping stage/round decoration, or a `-sN` sub-slice of it."""
+    stem = label_base(label)
+    return stem == chain_label or re.fullmatch(re.escape(chain_label) + r"-s\d+", stem) is not None
+
+
+def _row_epoch(r):
+    ts = [_parse_ts(r.get(k)) for k in ("enqueued_at", "launched_at", "finished_at",
+                                        "ended_at", "persisted_at", "superseded_at")]
+    ts = [t for t in ts if t]
+    return max(ts) if ts else 0
+
+
+def passed_lineage_actions(jobs, runs, sidecars=None):
+    """PURE. [('resolve', id, why)] for failed/needs_opus/blocked queue rows (and the
+    job-form esc-review rows about them) whose lineage PROVABLY passed later, so a
+    superseded retry attempt no longer sits in Needs attention (Penn 2026-10-09,
+    rt-bg-commitments-guard: 5 failed rows of a chain whose later round exited 0).
+    Two proofs, nothing weaker:
+      (1) an ended auto-run `exit 0` for chain L (same bundle) finished AFTER the row, and
+          the row's label is L or an `L-sN` round of it;
+      (2) the row's superseded_by/continued_by chain reaches a done exit-0 job.
+    Never when the lineage still has a live row or a stuck row newer than the pass."""
+    jobs = list(jobs or [])
+    by_id = {j.get("id"): j for j in jobs}
+    for r in sidecars or []:
+        by_id.setdefault(r.get("id"), r)
+    out, resolved = [], set()
+
+    def reach_pass(row):
+        seen, todo = {row.get("id")}, [row]
+        while todo and len(seen) < 40:
+            cur = todo.pop()
+            nxt = [x for x in [cur.get("superseded_by")] + list(cur.get("continued_by") or []) if x]
+            for n in nxt:
+                if n in seen:
+                    continue
+                seen.add(n)
+                nr = by_id.get(n)
+                if nr is None:
+                    continue
+                if _passed(nr):
+                    return n
+                todo.append(nr)
+        return None
+    for j in jobs:
+        if j.get("status") not in _LINEAGE_FAIL or j.get("awaiting_signoff"):
+            continue
+        lab = str(j.get("label") or "")
+        if _ESC_REVIEW_RE.match(lab) or lab.startswith(("esc-review-", "gate-", "regate-", "secondop-")):
+            continue
+        t = _row_epoch(j)
+        why = None
+        cid = reach_pass(j)
+        if cid:
+            why = "superseded chain reached passing job %s" % cid
+        for (L, bundle, end) in runs or []:
+            if why:
+                break
+            if not _lineage_matches(lab, L) or t >= end:
+                continue
+            if j.get("bundle") and bundle and j.get("bundle") != bundle:
+                continue
+            mates = [x for x in jobs if x is not j and _lineage_matches(x.get("label"), L)
+                     and (not x.get("bundle") or not bundle or x.get("bundle") == bundle)]
+            if any((x.get("status") in _LIVE or x.get("status") in _LINEAGE_FAIL)
+                   and _row_epoch(x) >= end for x in mates):
+                continue
+            if any(x.get("status") in _LIVE for x in mates):
+                continue
+            why = "chain %s ended exit 0 after this attempt" % L
+        if why:
+            out.append(("resolve", j["id"], why))
+            resolved.add(j["id"])
+    for j in jobs:
+        m = _ESC_REVIEW_RE.match(str(j.get("label") or ""))
+        if not m or j.get("awaiting_signoff") or j.get("status") not in _LINEAGE_FAIL:
+            continue
+        sid = m.group(2)
+        if sid in resolved:
+            out.append(("resolve", j["id"], "review of %s, whose lineage passed" % sid))
+        elif sid not in {x.get("id") for x in jobs} and sid in by_id and _passed(by_id[sid]):
+            out.append(("resolve", j["id"], "review of %s, which passed" % sid))
     return out
 
 
@@ -1989,7 +2109,7 @@ def hygiene_sweep(jobs=None, ledger_path=None, sidecars=None, act=None, notifier
     jobs = jobs if jobs is not None else _queue_jobs()
     led = _load(Path(ledger_path or HEAL_LEDGER)) or {}
     sc = sidecars if sidecars is not None else _all_sidecars()
-    acts = superseded_review_actions(jobs, led, sc)
+    acts = superseded_review_actions(jobs, led, sc, runs=auto_run_passes())
     if dry_run or not acts:
         return [(v, i, "would: " + w) for v, i, w in acts] if dry_run else []
     day = _utc_day(now)
@@ -2039,7 +2159,7 @@ def hygiene_sweep(jobs=None, ledger_path=None, sidecars=None, act=None, notifier
             if notifier is None:
                 import importlib.util as _ilu
                 _s = _ilu.spec_from_file_location(
-                    "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+                    "notify_penn", Path(__file__).resolve().parent / "notify-penn.py")
                 _m = _ilu.module_from_spec(_s)
                 _s.loader.exec_module(_m)
                 notifier = _m.notify
@@ -2292,7 +2412,7 @@ def self_test():
         ctx.write_text("# ctx\n")
         calls, alerts = [], []
         launch = lambda pp, args, lp: calls.append(args)
-        # never alert the owner / write the live decisions log from a self-test
+        # never alert Penn / write the live decisions log from a self-test
         heal._notifier = lambda t, m, **k: alerts.append((m, k.get("dedupe_key")))
         global DECISIONS, ESC_DIR
         _saved = (DECISIONS, ESC_DIR)
@@ -2369,7 +2489,7 @@ def self_test():
         # a HUMAN cancel is terminal: no lever is pulled for a cancelled plan
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import plan_cancel
-        plan_cancel.mark_cancelled("p", "the owner cancelled", runs_dir=runs)
+        plan_cancel.mark_cancelled("p", "Penn cancelled", runs_dir=runs)
         base["slices"]["s2"]["status"] = "escalated"
         (runs / "p.json").write_text(json.dumps(base))
         calls.clear()
@@ -2433,7 +2553,7 @@ def main():
             try:
                 import importlib.util as _ilu
                 _s = _ilu.spec_from_file_location(
-                    "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+                    "notify_penn", Path(__file__).resolve().parent / "notify-penn.py")
                 _m = _ilu.module_from_spec(_s)
                 _s.loader.exec_module(_m)
                 _m.notify("stale dispatch drivers", "; ".join(
