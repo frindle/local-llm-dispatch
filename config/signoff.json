@@ -15,6 +15,14 @@
   "ts": "2026-09-17T19:29:02Z",
   "verdict": null
  },
+ "00bc57098fcf": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T10:19:42Z",
+  "verdict": null
+ },
  "00cfc217c310": {
   "conditions": [
    "merged 176225d (reconcile-on-push)"
@@ -111,6 +119,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-03T02:26:13Z",
+  "verdict": null
+ },
+ "04bb27063aac": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T16:07:22Z",
   "verdict": null
  },
  "050c5a6c1f41": {
@@ -210,6 +226,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-03T22:48:16Z",
+  "verdict": null
+ },
+ "06ccb7a15046": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T10:01:24Z",
   "verdict": null
  },
  "06e50bcbd76d": {
@@ -1367,6 +1391,14 @@
   "ts": "2026-09-07T23:31:31Z",
   "verdict": null
  },
+ "216dadf03537": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T08:06:15Z",
+  "verdict": null
+ },
  "2184ebe8952d": {
   "conditions": [
    "merged ec967ab (reconcile-on-push)"
@@ -1957,6 +1989,14 @@
   "reviewer": "",
   "ts": "2026-10-02T20:09:32Z",
   "verdict": "approve"
+ },
+ "34df9c7cd147": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T15:51:04Z",
+  "verdict": null
  },
  "35101fd4b3c5": {
   "conditions": [],
@@ -3306,6 +3346,14 @@
   "ts": "2026-09-14T21:51:31Z",
   "verdict": null
  },
+ "5861cfa26bf3": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T13:37:15Z",
+  "verdict": null
+ },
  "58bb4908e5a3": {
   "conditions": [],
   "reason": "",
@@ -4009,6 +4057,25 @@
   "ts": "2026-10-04T16:13:41Z",
   "verdict": "approve"
  },
+ "6b86ecf5e352": {
+  "conditions": [],
+  "reason": "File 'schema.prisma' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "1 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "scope-check flagged 2 finding(s): files the task never named",
+   "the job's own verify exit was 1, not 0",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 1); nothing to mutate against; no preflight ledger entry for /Users/user/.ollama-dispatch/worktrees/wt-smoke-egift-s4-api-route-rs1. ABSENT IS UNMEASURED, not relevant.",
+   "change class is not auto-approvable: 4 files changed; a single-site change touches at most 1; creates new file(s): prisma/migrations/20991231235959_add_egiftlink_table_7b0efa113f/migration.sql -- new code is not a bounded edit; 8 hunks; a single-site change has at most 3; 87 changed lines; cap for the safe class is 80; security-adjacent: line \"-import { encryptSetting } from '@/lib/secrets.ts';\" ~ /crypt/; line \"-import { encryptSetting } from '@/lib/secrets.ts';\" ~ /secret/; path 'prisma/migrations/20991231235959_add_egiftlink_table_7b0efa113f/migration.sql' ~ /migrat/; path 'prisma/migrations/20991231235959_add_egiftlink_table_7b0efa113f/migration.sql' ~ /prisma/"
+  ],
+  "shadow_ts": "2026-10-09T12:20:02Z",
+  "ts": "2026-10-09T12:18:10Z",
+  "verdict": null
+ },
  "6b8d1a102488": {
   "conditions": [],
   "reason": "",
@@ -4145,6 +4212,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-25T10:32:12Z",
+  "verdict": null
+ },
+ "6fe8c8c8b36b": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T14:13:03Z",
   "verdict": null
  },
  "7012f219ac37": {
@@ -4588,6 +4663,14 @@
   "ts": "2026-09-24T03:45:37Z",
   "verdict": null
  },
+ "7c203d43d44c": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T09:55:07Z",
+  "verdict": null
+ },
  "7c3574b5c18e": {
   "conditions": [
    "merged a3e935e (reconcile-on-push)"
@@ -4914,6 +4997,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-06T06:46:54Z",
+  "verdict": null
+ },
+ "849434f21ca4": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T11:05:14Z",
   "verdict": null
  },
  "849f2521c0d7": {
@@ -5243,6 +5334,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-07T03:15:09Z",
+  "verdict": null
+ },
+ "8f897757b3ff": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T10:44:22Z",
   "verdict": null
  },
  "8fa72a0f4f36": {
@@ -5583,6 +5682,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-14T15:47:44Z",
+  "verdict": null
+ },
+ "98da531c61bc": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T07:25:50Z",
   "verdict": null
  },
  "994fcee5701f": {
@@ -6281,6 +6388,14 @@
   "ts": "2026-09-14T01:00:50Z",
   "verdict": "approve"
  },
+ "aaded5b41312": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T14:44:38Z",
+  "verdict": null
+ },
  "aaf4dc13de08": {
   "conditions": [
    "merged 8c1fa37 (reconcile-on-push)"
@@ -6305,6 +6420,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-05T23:28:16Z",
+  "verdict": null
+ },
+ "abc2bbfdd5ff": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T14:56:21Z",
   "verdict": null
  },
  "abf93b841f2c": {
@@ -6475,6 +6598,14 @@
   "ts": "2026-10-02T01:15:06Z",
   "verdict": null
  },
+ "b12be10d20b5": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T07:46:12Z",
+  "verdict": null
+ },
  "b185e7bb718d": {
   "conditions": [],
   "reason": "",
@@ -6549,6 +6680,14 @@
   "ts": "2026-09-06T17:59:53Z",
   "verdict": null
  },
+ "b2926b196964": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T07:09:19Z",
+  "verdict": null
+ },
  "b2d99d680ac0": {
   "conditions": [],
   "reason": "",
@@ -6556,6 +6695,22 @@
   "reviewer": "",
   "ts": "2026-09-21T18:15:41Z",
   "verdict": "approve"
+ },
+ "b31d141f41de": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T09:57:58Z",
+  "verdict": null
+ },
+ "b335c783fbcc": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T02:45:44Z",
+  "verdict": null
  },
  "b3571f8e32b7": {
   "conditions": [],
@@ -6574,6 +6729,25 @@
   "reviewer": "",
   "ts": "2026-09-18T15:27:09Z",
   "verdict": "approve"
+ },
+ "b37436ae69a3": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "1 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "scope-check flagged 1 finding(s): files the task never named",
+   "the job's own verify exit was 1, not 0",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 1); nothing to mutate against; no preflight ledger entry for /Users/user/.ollama-dispatch/worktrees/wt-aw-codec-floor-incoming-name. ABSENT IS UNMEASURED, not relevant.",
+   "change class is not auto-approvable: 2 files changed; a single-site change touches at most 1; creates new file(s): dispatch_env.py -- new code is not a bounded edit; 5 hunks; a single-site change has at most 3; 221 changed lines; cap for the safe class is 80; security-adjacent: line '+    lacks codec/PROPER tokens because Radarr/Sonarr rename ' ~ /token/; line '+  memory_db(*sql, migrations_dir=None)   in-memory sqlite3 ' ~ /migrat/"
+  ],
+  "shadow_ts": "2026-10-09T12:43:27Z",
+  "ts": "2026-10-09T12:42:20Z",
+  "verdict": null
  },
  "b380e07a4d16": {
   "conditions": [
@@ -7206,6 +7380,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-14T11:57:29Z",
+  "verdict": null
+ },
+ "c2d6a594ce03": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T13:57:23Z",
   "verdict": null
  },
  "c35ed065ae84": {
@@ -8008,6 +8190,14 @@
   "ts": "2026-09-14T02:18:11Z",
   "verdict": "approve"
  },
+ "d96a0fe7e1df": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T15:52:30Z",
+  "verdict": null
+ },
  "d9753390c041": {
   "conditions": [
    "merged 8c6c229 (reconcile-on-push)"
@@ -8198,6 +8388,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-03T13:45:50Z",
+  "verdict": null
+ },
+ "dfa38f0cfba3": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T13:17:00Z",
   "verdict": null
  },
  "dfa6a67ee96f": {
@@ -9038,6 +9236,14 @@
   "ts": "2026-09-24T08:05:17Z",
   "verdict": null
  },
+ "f69977d3b5ea": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T16:00:09Z",
+  "verdict": null
+ },
  "f6c528c3dba9": {
   "conditions": [],
   "reason": "",
@@ -9124,6 +9330,14 @@
   "ts": "2026-09-21T03:39:16Z",
   "verdict": null
  },
+ "f9f83e7f8b1c": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T16:39:37Z",
+  "verdict": null
+ },
  "fa1e8ff137e8": {
   "conditions": [],
   "reason": "",
@@ -9183,6 +9397,14 @@
   "ts": "2026-09-22T07:23:32Z",
   "verdict": null
  },
+ "fc4d6fa16ce6": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T13:06:16Z",
+  "verdict": null
+ },
  "fc6eec003057": {
   "conditions": [],
   "reason": "",
@@ -9197,6 +9419,25 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-19T23:58:05Z",
+  "verdict": null
+ },
+ "fca00fce882b": {
+  "conditions": [],
+  "reason": "File 'schema.prisma' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "1 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "scope-check flagged 1 finding(s): files the task never named",
+   "the job's own verify exit was 1, not 0",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 1); nothing to mutate against; no preflight ledger entry for /Users/user/.ollama-dispatch/worktrees/wt-smoke-egift-s4-api-route. ABSENT IS UNMEASURED, not relevant.",
+   "change class is not auto-approvable: 4 files changed; a single-site change touches at most 1; creates new file(s): lib/egiftLinkStore.ts -- new code is not a bounded edit; 5 hunks; a single-site change has at most 3; 269 changed lines; cap for the safe class is 80; security-adjacent: line \"+import { encryptSetting, decryptSetting } from '@/lib/secre\" ~ /crypt/; line \"+import { encryptSetting, decryptSetting } from '@/lib/secre\" ~ /secret/; line \"+import { getSessionUserId } from '@/lib/auth';\" ~ /auth/; line \"+import { getSessionUserId } from '@/lib/auth';\" ~ /session/"
+  ],
+  "shadow_ts": "2026-10-09T03:00:14Z",
+  "ts": "2026-10-09T02:59:30Z",
   "verdict": null
  },
  "fcf3cd7c10a1": {

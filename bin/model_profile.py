@@ -125,6 +125,19 @@ def get_profile(model, role="author", lane=None, data=None):
     vals = dict(modes.get(mode) or modes.get("thinking_coding") or {})
     out = {k: vals.get(k) for k in MODE_KEYS}
     out["stop"] = list(vals.get("stop") or [])
+    # Per-role thinking policy (2026-10-09): a mode may carry `thinking: off|low|on` (or a bool).
+    # off/on pin enable_thinking; low keeps the mode's enable_thinking (reasoning_effort is NOT
+    # visibly honored by Darkbloom) and is only surfaced as out["thinking"]. Absent = unchanged.
+    _th = vals.get("thinking")
+    _tn = str(_th).strip().lower() if _th is not None else None
+    if _tn in ("off", "false", "no", "none", "0"):
+        out["enable_thinking"], out["thinking"] = False, "off"
+    elif _tn in ("on", "true", "yes", "1"):
+        out["enable_thinking"], out["thinking"] = True, "on"
+    elif _tn in ("low", "medium", "high"):
+        out["thinking"] = _tn
+    else:
+        out["thinking"] = None
     out.update({
         "model": resolved, "requested_model": model, "aliased_from": aliased_from,
         "profile_key": key, "role": role, "mode": mode,
@@ -143,7 +156,8 @@ def get_profile(model, role="author", lane=None, data=None):
     return out
 
 
-def build_request_fields(model, role, api, overrides=None, think=None, lane=None):
+def build_request_fields(model, role, api, overrides=None, think=None, lane=None,
+                         turn_kind=None, arm=None):
     """What to put in the request body for `api` ("openai" | "ollama").
     `overrides`: {temperature, top_p, top_k, min_p, presence_penalty,
     repetition_penalty, max_tokens, num_ctx, stop}; None values are ignored.
@@ -155,6 +169,10 @@ def build_request_fields(model, role, api, overrides=None, think=None, lane=None
     stop = ov.get("stop", p["stop"])
     ctx = ov.get("num_ctx", ov.get("ctx", p["ctx"]))
     thinking = think if think is not None else p["enable_thinking"]
+    if think is None and turn_kind is not None:
+        _pol = thinking_policy(role, turn_kind, arm)      # None = keep the profile's value
+        if _pol is not None:
+            thinking = _pol
     if api == "openai":
         f = {k: val for k, val in v.items() if val is not None}
         if "repetition_penalty" in f:
@@ -194,6 +212,83 @@ def build_request_fields(model, role, api, overrides=None, think=None, lane=None
 
 def role_wants_reasoning_kept(model, role, lane=None):
     return bool(get_profile(model, role, lane)["preserve_reasoning"])
+
+
+# ---------------------------------------------------------------- thinking policy / escalation
+# THINKING_POLICY_MARK (2026-10-09). Settings live in model_profiles.yaml, never in code.
+#   thinking_policy.roles[role]   -> "profile" (use the role's mode enable_thinking; the default,
+#                                    i.e. NO behaviour change) or the name of an arm
+#   thinking_policy.arms[arm]     -> {turn_kind: on|off|profile}, turn kinds TURN_KINDS
+#   thinking_policy.ab_roles      -> roles the experiment arm (arg or env MODEL_THINKING_ARM)
+#                                    may override; every other role keeps its pinned policy
+#   escalation.roles[role]        -> {models: [...], claude: bool}: the ordered models a bigger-model
+#                                    step may use (any Darkbloom-hostable model with a profile)
+# Known probe facts (2026-10-09, Darkbloom): Qwen thinking arrives INSIDE content; chat_template_kwargs.
+# enable_thinking=false is honored; reasoning_effort is NOT visibly honored (never sent); tool_choice
+# required/named gives 400.
+TURN_KINDS = ("oneshot", "tool_first", "tool_after_failure", "tool_mechanical")
+_ONOFF = {"on": True, "true": True, "off": False, "false": False}
+
+
+def thinking_policy(role, turn_kind, arm=None, data=None):
+    """True / False = force enable_thinking for this (role, turn kind); None = defer to the
+    role's profile mode. `arm` (or env MODEL_THINKING_ARM) overrides only roles listed in
+    thinking_policy.ab_roles."""
+    data = data or load_profiles()
+    tp = data.get("thinking_policy") or {}
+    arms = tp.get("arms") or {}
+    pol = (tp.get("roles") or {}).get(str(role or "author"), "profile")
+    arm = arm or os.environ.get("MODEL_THINKING_ARM") or None
+    if arm and str(role or "author") in (tp.get("ab_roles") or []):
+        pol = arm
+    if pol in (None, "profile"):
+        return None
+    table = arms.get(pol)
+    if not isinstance(table, dict):
+        _warn(("arm", pol), f"thinking_policy: unknown arm {pol!r} for role {role!r}; using the profile")
+        return None
+    v = str(table.get(turn_kind, "profile")).strip().lower()
+    return _ONOFF.get(v)
+
+
+def escalation_models(role, data=None):
+    """Ordered list of model names a bigger-model/escalation step may use for `role` (from the
+    YAML `escalation:` section; [] when none is configured)."""
+    data = data or load_profiles()
+    e = ((data.get("escalation") or {}).get("roles") or {}).get(str(role or "author")) or {}
+    return [str(m) for m in (e.get("models") or []) if m]
+
+
+def escalation_allows_claude(role, data=None):
+    data = data or load_profiles()
+    e = ((data.get("escalation") or {}).get("roles") or {}).get(str(role or "author")) or {}
+    return bool(e.get("claude"))
+
+
+def check_policy(data):
+    """Problems in thinking_policy / escalation (used by check_profiles)."""
+    out = []
+    tp = data.get("thinking_policy") or {}
+    arms = tp.get("arms") or {}
+    for arm, table in arms.items():
+        for k, v in (table or {}).items():
+            if k not in TURN_KINDS:
+                out.append(f"thinking_policy.arms.{arm}: unknown turn kind {k!r}")
+            if str(v).strip().lower() not in ("on", "off", "true", "false", "profile"):
+                out.append(f"thinking_policy.arms.{arm}.{k}: bad value {v!r}")
+    for role, pol in (tp.get("roles") or {}).items():
+        if pol not in ("profile", None) and pol not in arms:
+            out.append(f"thinking_policy.roles.{role}: unknown arm {pol!r}")
+    for ab in tp.get("ab_roles") or []:
+        if ab not in (data.get("roles") or {}):
+            out.append(f"thinking_policy.ab_roles: unknown role {ab!r}")
+    for role, e in ((data.get("escalation") or {}).get("roles") or {}).items():
+        if role not in (data.get("roles") or {}):
+            out.append(f"escalation.roles.{role}: unknown role")
+        for m in (e or {}).get("models") or []:
+            if _find_entry(data, m)[1] is None:
+                out.append(f"escalation.roles.{role}: model {m!r} has no profile entry (add one citing its card)")
+    return out
 
 
 # ---------------------------------------------------------------- drift/citations
@@ -275,6 +370,7 @@ def check_profiles(path=None):
             problems.append(f"{name}.thinking_coding: max_tokens < 32768")
         if not e.get("tool_call_format"):
             problems.append(f"{name}: missing tool_call_format")
+    problems += check_policy(data)
     for src, a in (data.get("aliases") or {}).items():
         if _find_entry(data, a.get("to"))[1] is None:
             problems.append(f"alias {src}: target {a.get('to')} has no profile")

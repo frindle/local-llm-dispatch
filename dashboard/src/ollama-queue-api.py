@@ -723,7 +723,7 @@ def _slice_resolved_ok(s, verdict_of=_durable_verdict_tag, log_dir=None):
 
 
 def _needs_attention_ids(rows, state_of=None, log_dir=None,
-                         verdict_of=_durable_verdict_tag, superseded=()):
+                         verdict_of=_durable_verdict_tag, superseded=(), superseded_map=None):
     """PURE apart from the injected lookups. The ids of non-success rows that a bundle
     header should actually RAISE AN ALARM about -- as opposed to merely report.
 
@@ -747,12 +747,29 @@ def _needs_attention_ids(rows, state_of=None, log_dir=None,
     belongs to; rows that function already declared superseded are skipped outright.
     Returns a set of row ids. Nothing is dropped, reordered or restyled by this."""
     out, states = set(), {}
+    # a bundle `qctl supersede`d with nothing pending/running is retired: its leftover
+    # failed rows raise no alarm (2026-10-08; see _retired_bundle_keys)
+    try:
+        _sup_map = _bundle_view_lib()[0].load_superseded() if superseded_map is None else superseded_map
+        # A row's bundle is its group_key, else its explicit `bundle` tag (a tagged row the
+        # grouping did not key -- qctl retire stamps the TAG): either must hit the marker.
+        _bk = lambda j: j.get("group_key") or (j.get("bundle") if isinstance(j.get("bundle"), str)
+                                                and j.get("bundle").strip() else None)
+        _retired = _retired_bundle_keys(
+            {_bk(r) for r in rows or [] if _bk(r)}, rows or [], _bk, _sup_map, None)
+    except Exception:
+        _retired = set()
     for r in rows or []:
         if str(r.get("status") or "") not in PLAN_ALERT_STATUSES:
             continue
         if not r.get("id") or r.get("id") in (superseded or ()):
             continue
         gk = r.get("group_key") or None
+        if gk and gk in _retired:
+            continue
+        _tag = r.get("bundle") if isinstance(r.get("bundle"), str) else None
+        if _tag and _tag.strip() in _retired:
+            continue
         if gk:   # a human-cancelled plan is terminal: its rows raise no alarm
             try:
                 import plan_cancel as _pc
@@ -1093,11 +1110,25 @@ def _annotate_plan_rollup(rows, runs_dir=None, log_dir=None):
     # onto the dashboard forever -- a much larger change than the row-history bug
     # being fixed here. Only `k in live_keys` is gone, which is the asymmetry itself.
     stranded = []
+    # RETIRED plans (human-cancelled / `qctl supersede`d, nothing pending or running) are
+    # not "stranded": their leftover terminal rows must not rebuild a bundle that reads
+    # "pending X/Y slices, 0 jobs" in the Queue panel (replay-endorse, cancelled
+    # 2026-10-05, sat there with 21 done rows -- 2026-10-08). See _retired_bundle_keys.
+    try:
+        import plan_cancel as _pc
+        _retired = _retired_bundle_keys(
+            {r.get("group_key") for r in rows if r.get("group_key")}, rows,
+            lambda j: j.get("group_key"), _bundle_view_lib()[0].load_superseded(),
+            lambda k: _pc.cancelled(k, runs_dir=runs_dir))
+    except Exception:
+        _retired = set()
     for r in rows:
         k = r.get("group_key")
         if not k or r.get("status") not in _QUEUE_TERMINAL_STATUSES:
             continue
         if r in live:                     # already grouped; never double-count
+            continue
+        if k in _retired:
             continue
         prog = _load_plan_progress(k, runs_dir)
         if prog and prog[0] < prog[1]:
@@ -1467,6 +1498,13 @@ FRONTEND_HTML = r"""<!doctype html>
   .now-meta { display: flex; flex-wrap: wrap; gap: 3px 14px; color: var(--muted); font-size: .83rem;
               font-variant-numeric: tabular-nums; margin-top: 4px; overflow-wrap: anywhere; }
   .now-meta b { color: var(--fg); font-weight: 600; }
+  .lane-now { margin-top: 8px; display: grid; gap: 4px; }
+  .lane-card { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; padding: 5px 8px; border: 1px solid var(--line);
+               border-radius: 6px; font-size: .83rem; min-width: 0; overflow-wrap: anywhere; }
+  .lane-card.idle { color: var(--muted); }
+  .lane-card.run { border-left: 3px solid var(--run); }
+  .lane-name { font-weight: 650; text-transform: uppercase; font-size: .72rem; letter-spacing: .05em; color: var(--muted); }
+  .lane-meta, .lane-line { color: var(--muted); font-variant-numeric: tabular-nums; }
   .now-more { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); font-size: .82rem; color: var(--muted); }
   .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--run);
            margin-right: 6px; vertical-align: 1px; animation: slicepulse 1.6s ease-in-out infinite; }
@@ -2227,6 +2265,56 @@ function idleWaitText(w, jobs, activeKey) {
   return 'Waiting on: queued work (reason shows after the next daemon restart)';
 }
 
+
+// PER-LANE "RUNNING NOW" (the owner 2026-10-09): one equal row per lane -- studio-db, unraid, CPU
+// lane -- each with label, model, host, elapsed, bundle and a short live status line; an
+// idle lane says so explicitly ("unraid: idle"). A gpu-exclusive job shows its PHASE.
+const NOW_LANES = [['studio-db', 'studio-db'], ['unraid', 'unraid'], ['cpu', 'CPU lane']];
+function laneOfJob(j) {
+  const l = String(j.lane || j.host_pref || '').toLowerCase();
+  if (l.includes('unraid')) return 'unraid';
+  if (l === 'cpu' || l.startsWith('cpu')) return 'cpu';
+  return 'studio-db';
+}
+function laneStatusLine(j) {
+  if (j.job_kind === 'gpu_exclusive') {
+    if (j.gpu_wait) return 'waiting for VRAM: ' + j.gpu_wait;
+    if (j.phase === 'warming') return 'loading';
+    return 'serving' + (j.gpu_summary ? ' - ' + j.gpu_summary : '');
+  }
+  if (j.phase === 'warming') return 'loading model';
+  const bits = [];
+  if (j.iteration != null && j.max_iters != null) bits.push('iter ' + j.iteration + '/' + j.max_iters);
+  if (j.tok_s != null) bits.push(j.tok_s.toFixed(1) + ' tok/s');
+  return bits.length ? bits.join(' - ') : 'running';
+}
+function laneNowRows(jobs, acts, cpuRunning) {
+  const by = {};
+  for (const [k] of NOW_LANES) by[k] = [];
+  const actOf = id => (acts || []).find(a => a.kind === 'gpu' && a.id === id) || {};
+  for (const j of (jobs || [])) {
+    if (j.status !== 'running') continue;
+    const a = actOf(j.id);
+    by[laneOfJob(j)].push({label: a.display || j.label || j.id, model: a.model || j.model || '?',
+      host: a.host || j.lane || j.host_pref || '?', elapsed_s: a.elapsed_s != null ? a.elapsed_s : j.elapsed_s,
+      bundle: a.group_key || null, line: laneStatusLine(j), id: j.id});
+  }
+  for (const c of (cpuRunning || [])) {
+    by.cpu.push({label: c.label || String(c.id || '').slice(0, 8), model: c.stage || 'cpu', host: c.runner || 'cpu',
+      elapsed_s: c.running_s, bundle: c.bundle || null, line: c.stage ? 'stage ' + c.stage : 'running', id: c.id});
+  }
+  return NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k]}));
+}
+function laneNowHtml(rows) {
+  return '<div class="lane-now">' + rows.map(r => {
+    if (r.idle) return `<div class="lane-card idle" data-lane="${r.lane}"><span class="lane-name">${escapeHtml(r.name)}</span>: idle</div>`;
+    return r.jobs.map(x => `<div class="lane-card run" data-lane="${r.lane}"><span class="lane-name">${escapeHtml(r.name)}</span>`
+      + ` <b>${escapeHtml(x.label)}</b> <span class="lane-meta">model ${escapeHtml(x.model)} &middot; host ${escapeHtml(x.host)}`
+      + ` &middot; ${formatElapsed(x.elapsed_s)}${x.bundle ? ' &middot; bundle ' + escapeHtml(x.bundle) : ''}</span>`
+      + ` <span class="lane-line">${escapeHtml(x.line)}</span></div>`).join('');
+  }).join('') + '</div>';
+}
+
 function renderSummary(jobs, acts, attnStats, q) {
   const gpu = (acts || []).filter(a => a.kind === 'gpu');
   const other = (acts || []).filter(a => a.kind !== 'gpu');
@@ -2251,7 +2339,8 @@ function renderSummary(jobs, acts, attnStats, q) {
     now.innerHTML = `<div class="k"><span class="pulse"></span>Running now</div>
       <div class="now-job">${escapeHtml(first.display || first.label || first.id)}</div>
       <div class="now-meta">${meta}</div>
-      ${rest.length ? `<div class="now-more">Also live now: ${rest.map(fmtAct).join(' &middot; ')}</div>` : ''}`;
+      ${rest.length ? `<div class="now-more">Also live now: ${rest.map(fmtAct).join(' &middot; ')}</div>` : ''}
+      ${laneNowHtml(laneNowRows(jobs, acts, window.cpuLaneRunning))}`;
     now.style.cursor = 'pointer';
     now.onclick = () => openLivelog(first.id, first.label || first.id);
     now.title = 'Open the live log';
@@ -2259,7 +2348,8 @@ function renderSummary(jobs, acts, attnStats, q) {
     now.innerHTML = `<div class="k"><span class="idle-dot"></span>Running now</div>
       <div class="now-job" style="color:var(--muted);font-weight:500">Nothing on the GPU</div>
       <div class="now-more" id="idleWait">${escapeHtml(idleWaitText(queueWait, jobs, bundleViews.active))}</div>
-      ${other.length ? `<div class="now-more">Off-GPU, live now: ${other.map(fmtAct).join(' &middot; ')}</div>` : ''}`;
+      ${other.length ? `<div class="now-more">Off-GPU, live now: ${other.map(fmtAct).join(' &middot; ')}</div>` : ''}
+      ${laneNowHtml(laneNowRows(jobs, acts, window.cpuLaneRunning))}`;
     now.style.cursor = ''; now.onclick = null; now.title = '';
   }
   const cnt = st => jobs.filter(j => j.status === st).length;
@@ -3959,7 +4049,7 @@ async function refreshCpuLane() {
   try {
     const d = await (await fetch('/api/cpu-lane')).json();
     const panel = document.getElementById('cpuLanePanel');
-    if (!d.enabled) { panel.hidden = true; return; }
+    if (!d.enabled) { panel.hidden = true; window.cpuLaneRunning = []; return; }
     panel.hidden = false;
     const c = d.counts || {};
     const rn = (d.runners || []).filter(r => r.seen_s_ago < 120).length;
@@ -3974,6 +4064,7 @@ async function refreshCpuLane() {
         const td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
       tb.appendChild(tr);
     };
+    window.cpuLaneRunning = d.running || [];
     (d.running || []).forEach(j => add('running', j, Math.round(j.running_s) + 's'));
     (d.pending || []).forEach(j => add('pending', j, 'waiting ' + Math.round(j.waiting_s) + 's'));
     (d.recent || []).forEach(j => add(j.status + (j.exit_code ? ' (exit ' + j.exit_code + ')' : ''), j,
@@ -5954,6 +6045,47 @@ def _bundle_view_lib():
     return _bv, _dp
 
 
+LIVE_BUNDLE_STATUSES = ("pending", "running")
+
+
+def _retired_bundle_keys(keys, jobs, gkey, superseded=None, cancelled=None):
+    """PURE. Which of `keys` are RETIRED: marked superseded (`qctl supersede`:
+    bundle-superseded.json, whole-bundle key) or human-cancelled (`cancelled(key)`:
+    plan_cancel's `.cancelled` marker, own or an ancestor plan's) AND with no LIVE job
+    (pending/running) left. Such a bundle is finished business: it must not show in the
+    live Queue panel or raise Needs attention -- it belongs to the finished/stalled
+    history. ROOT CAUSE (2026-10-08): replay-endorse, cancelled 2026-10-05, sat in the
+    Queue as "pending 5/9 slices, 0 jobs" because 21 DONE rows were still in
+    queue-state; only the history path consulted the markers. A bundle with a live
+    job is never retired here (a marker must not hide running work). `gkey(job)` is the
+    queue's grouping authority; a job's `bundle` tag also counts as its bundle."""
+    sup = superseded or {}
+    live = set()
+    for j in jobs or []:
+        if str(j.get("status") or "") not in LIVE_BUNDLE_STATUSES:
+            continue
+        try:
+            k = gkey(j)
+        except Exception:
+            k = None
+        if k:
+            live.add(k)
+        t = j.get("bundle")
+        if isinstance(t, str) and t.strip():
+            live.add(t.strip())
+    out = set()
+    for k in keys:
+        if k in live:
+            continue
+        try:
+            canc = cancelled(k) if cancelled else None
+        except Exception:
+            canc = None
+        if k in sup or canc:
+            out.add(k)
+    return out
+
+
 def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
                   heal_path=None, preflight_dir=None, progress=None, alive=None,
                   now=None, history=None, live_dir=None):
@@ -6050,6 +6182,20 @@ def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
             v = bv.build_job_view(t, tj + kids, now=now, result_of=_lab)
             if v:
                 views[t] = v
+    except Exception:
+        pass
+    # RETIRED bundles (superseded / human-cancelled, nothing pending or running) leave
+    # the live panel -- see _retired_bundle_keys. Best-effort: never raise into a poll.
+    try:
+        def _gk_live(j):
+            return q.job_group_key(j, reverse)
+
+        def _canc(k):
+            import plan_cancel as _pc
+            return _pc.cancelled(k, runs_dir=runs_dir)
+        for k in _retired_bundle_keys(list(views), jobs, _gk_live,
+                                      bv.load_superseded(), _canc):
+            views.pop(k, None)
     except Exception:
         pass
     activity = []

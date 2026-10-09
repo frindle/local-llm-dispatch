@@ -34,7 +34,22 @@ REASON_FORMAT = "repeated_format_error"
 REASON_LOOP = "loop_detected"
 REASON_STOPGATE = "stop_gate_failed"
 REASON_REASONING = "reasoning_runaway"
-NEW_EXIT_REASONS = (REASON_FORMAT, REASON_LOOP, REASON_STOPGATE, REASON_REASONING)
+# loop-detector sub-kinds that end the run under their OWN named reason (2026-10-09; stolen from
+# OpenHands' stuck detector / SWE-agent navigation limits). The legacy kinds (repeat_read,
+# repeat_write, write_thrash, verify_spin, no_progress) still end as REASON_LOOP.
+REASON_ERROR_LOOP = "error_loop"            # same action + same error, 4th time
+REASON_MONOLOGUE = "monologue_loop"         # 3 consecutive assistant turns with no tool call
+REASON_ALTERNATION = "alternation_loop"     # A,B,A,B,... alternation
+REASON_NAV_LOOP = "nav_loop"                # endless grep/find/ls/view/read_file navigation
+LOOP_KIND_REASONS = {"error_streak": REASON_ERROR_LOOP, "monologue": REASON_MONOLOGUE,
+                     "alternation": REASON_ALTERNATION, "nav_streak": REASON_NAV_LOOP}
+NEW_EXIT_REASONS = (REASON_FORMAT, REASON_LOOP, REASON_STOPGATE, REASON_REASONING,
+                    REASON_ERROR_LOOP, REASON_MONOLOGUE, REASON_ALTERNATION, REASON_NAV_LOOP)
+
+
+def loop_exit_reason(kind):
+    """The named exit reason a loop-detector `kind` ends the run with."""
+    return LOOP_KIND_REASONS.get(kind, REASON_LOOP)
 
 # ---------------------------------------------------------------------------------------
 # 0. think-tag handling
@@ -410,11 +425,19 @@ def looks_like_call_attempt(visible, valid_names=()):
     return False
 
 
+# Parameters the schema marks REQUIRED (so the model is asked to always supply them -- optional
+# params make Qwen3.5-35B / Qwen3-Coder loop at long contexts, llama.cpp #20164) but whose OMISSION
+# is still honoured with this default, so old transcripts / weaker models are not format-errored.
+DEFAULTED_PARAMS = {"read_file": {"offset": 1, "length": 0}, "request_diagnostics": {"why": ""}}
+
+
 def required_params(tool_schemas):
     out = {}
     for t in tool_schemas or []:
         fn = t.get("function", t)
-        out[fn.get("name")] = list((fn.get("parameters") or {}).get("required") or [])
+        name = fn.get("name")
+        out[name] = [k for k in ((fn.get("parameters") or {}).get("required") or [])
+                     if k not in DEFAULTED_PARAMS.get(name, {})]
     return out
 
 
@@ -543,6 +566,14 @@ LOOP_DEFAULTS = {
     "no_progress_iters": 8,  # consecutive iterations with nothing novel (no new call sig, no new bytes)
     "verify_spin": 0,       # OFF by default (poor precision, see calibration); the job's own verify re-run this many times in a row with NO edit between
     "min_iter": 4,          # never fire before this iteration
+    # --- 2026-10-09 additions (each 0 = off) ---
+    "error_streak_warn": 3,   # same call + same error this many times in a row: ONE nudge ...
+    "error_streak_stop": 4,   # ... and stop on this one (error_loop)
+    "monologue": 3,           # consecutive assistant turns with no tool call (monologue_loop)
+    "alternation": 6,         # A,B,A,B,... over this many calls: warn; stop after `alternation_stop`
+    "alternation_stop": 8,
+    "nav_warn": 15,           # consecutive navigation calls (grep/find/ls/view/read_file as ONE class)
+    "nav_stop_after": 8,      # ... stop this many navigation calls after the warning (nav_loop)
 }
 _READ_TOOLS = frozenset({"read_file", "list_files", "web_fetch", "web_search"})
 _RO_BASH_RE = re.compile(
@@ -582,6 +613,33 @@ def _h(s):
     return hashlib.sha1(str(s).encode("utf-8", "replace")).hexdigest()[:12]
 
 
+_NAV_CMD_RE = re.compile(
+    r"^\s*(?:cd\s+\S+\s*&&\s*)?(?:grep|egrep|fgrep|rg|ag|ack|find|fd|ls|tree|cat|cd|head|tail|less|more|"
+    r"view|bat|wc|stat|file|pwd|git\s+(?:grep|ls-files|log|show|diff|status))\b")
+_NAV_TOOLS = frozenset({"read_file", "list_files", "view", "grep", "find", "ls", "search_files"})
+
+
+def is_navigation_call(name, args):
+    """grep/find/ls/view/read_file/list_files and read-only shell lookups are ONE class: a
+    streak of them with no edit is exploration that never ends."""
+    if name in _NAV_TOOLS:
+        return True
+    if name == "run_bash":
+        cmd = str((args or {}).get("command") or "")
+        parts = [p for p in re.split(r"\s*(?:&&|\|\||;|\|)\s*", cmd.strip()) if p]
+        return bool(parts) and not re.search(r"(?<![<2&])>|>>|\btee\b|<<", cmd) and \
+            all(_NAV_CMD_RE.match(p) for p in parts)
+    return False
+
+
+def normalise_error(text):
+    """Collapse an error to a comparable key (first line, digits/hex squashed)."""
+    t = str(text or "").strip()
+    line = t.splitlines()[0] if t else ""
+    line = re.sub(r"0x[0-9a-fA-F]+|\b\d+\b", "N", line)
+    return line[:160]
+
+
 class LoopDetector:
     """Feed it every tool call (observe) and tell it when an iteration ends (end_iteration).
     end_iteration returns None, or (action, kind, message) with action "warn" (first detection,
@@ -606,15 +664,26 @@ class LoopDetector:
         self.warned = False
         self.detections = []
         self._calls_this_iter = 0
+        # 2026-10-09 detectors (own state; per-kind one-time warning)
+        self.err_sig = None        # (call sig, normalised error) of the last failing call
+        self.err_streak = 0
+        self.sig_hist = []         # recent call sigs (non-exempt), for A,B,A,B alternation
+        self.nav_streak = 0
+        self.nav_warn_at = None
+        self.no_tool_streak = 0
+        self.kind_warned = set()
 
     # -- input ----------------------------------------------------------------------------
-    def observe(self, name, args, exempt=False, content_hash=None):
-        """exempt: the job's own verify command (re-running it after an edit is progress)."""
+    def observe(self, name, args, exempt=False, content_hash=None, error=None):
+        """exempt: the job's own verify command (re-running it after an edit is progress).
+        error: the tool's error text when the call failed (drives the same-error streak)."""
         if not self.cfg.get("enabled"):
             return
         args = args if isinstance(args, dict) else {}
         self._calls_this_iter += 1
         sig = name + ":" + _h(json.dumps(args, sort_keys=True, default=str))
+        if not exempt:
+            self._observe_extra(name, args, sig, error)
         if sig not in self.seen_sigs:
             self.seen_sigs.add(sig)
             if not exempt:
@@ -653,6 +722,87 @@ class LoopDetector:
         elif name in _READ_TOOLS or name == "run_bash":
             self.read_counts[sig] = self.read_counts.get(sig, 0) + 1
 
+
+    # -- 2026-10-09 detectors -------------------------------------------------------------
+    def _observe_extra(self, name, args, sig, error):
+        c = self.cfg
+        # same action + same ERROR: consecutive; a success or any different call breaks it
+        if error:
+            # the worker's repeated-failure hard block answers the Nth identical failing call with a
+            # "REFUSED: ..." instead of the original error -- same call, so it continues the streak
+            refused = str(error).startswith("REFUSED")
+            key = (sig, normalise_error(error))
+            same = key == self.err_sig or (refused and self.err_sig is not None and self.err_sig[0] == sig)
+            self.err_streak = self.err_streak + 1 if same else 1
+            self.err_sig = self.err_sig if (same and refused) else key
+        else:
+            self.err_sig, self.err_streak = None, 0
+        # A,B,A,B alternation over the last N non-exempt calls
+        self.sig_hist.append(sig)
+        keep = max(int(c.get("alternation_stop") or 0), int(c.get("alternation") or 0), 2)
+        if len(self.sig_hist) > keep:
+            del self.sig_hist[:-keep]
+        # navigation class: grep/find/ls/view/read_file/list_files are one thing; anything else resets
+        if is_navigation_call(name, args):
+            self.nav_streak += 1
+        else:
+            self.nav_streak = 0
+            self.nav_warn_at = None
+
+    def observe_turn(self, has_tool_call):
+        """Feed one assistant turn: consecutive turns with NO tool call are a monologue."""
+        if not self.cfg.get("enabled"):
+            return
+        self.no_tool_streak = 0 if has_tool_call else self.no_tool_streak + 1
+
+    def monologue_verdict(self):
+        """Call at the top of each iteration (a turn that ended the run never gets here).
+        -> None | ("stop", "monologue", msg)."""
+        n = int(self.cfg.get("monologue") or 0)
+        if self.cfg.get("enabled") and n and self.no_tool_streak >= n:
+            self.detections.append("monologue")
+            return ("stop", "monologue", f"loop detected: {self.no_tool_streak} consecutive assistant "
+                    f"turns made no tool call (the run kept being nudged and kept talking)")
+        return None
+
+    def _alternating(self, n):
+        h = self.sig_hist
+        if n < 4 or len(h) < n:
+            return False
+        w = h[-n:]
+        a, b = w[0], w[1]
+        return a != b and all(w[k] == (a if k % 2 == 0 else b) for k in range(n))
+
+    def _detect_extra(self):
+        """-> None | (action, kind, what). Per-kind ONE-time warning, then stop."""
+        c = self.cfg
+        sw, ss = int(c.get("error_streak_warn") or 0), int(c.get("error_streak_stop") or 0)
+        if self.err_sig and ss and self.err_streak >= ss:
+            return ("stop", "error_streak", f"the same call has failed with the same error "
+                    f"{self.err_streak} times in a row")
+        if self.err_sig and sw and self.err_streak >= sw and "error_streak" not in self.kind_warned:
+            self.kind_warned.add("error_streak")
+            return ("warn", "error_streak", f"you have made the same call {self.err_streak} times in a "
+                    f"row and gotten the same error each time")
+        na, ns = int(c.get("alternation") or 0), int(c.get("alternation_stop") or 0)
+        if ns and self._alternating(ns):
+            return ("stop", "alternation", f"the last {ns} calls alternate between the same two calls "
+                    f"(A,B,A,B,...) and neither moves the task")
+        if na and self._alternating(na) and "alternation" not in self.kind_warned:
+            self.kind_warned.add("alternation")
+            return ("warn", "alternation", f"the last {na} calls alternate between the same two calls "
+                    f"(A,B,A,B,...)")
+        nw, nst = int(c.get("nav_warn") or 0), int(c.get("nav_stop_after") or 0)
+        if nw and self.nav_streak >= nw:
+            if self.nav_warn_at is None:
+                self.nav_warn_at = self.nav_streak
+                return ("warn", "nav_streak", f"the last {self.nav_streak} calls were all navigation "
+                        f"(grep/find/ls/view/read_file) with no edit")
+            if nst and self.nav_streak >= self.nav_warn_at + nst:
+                return ("stop", "nav_streak", f"{self.nav_streak} navigation calls in a row "
+                        f"(grep/find/ls/view/read_file) and still no edit")
+        return None
+
     # -- verdict --------------------------------------------------------------------------
     def _detect(self, i):
         c = self.cfg
@@ -687,6 +837,13 @@ class LoopDetector:
             self.stale_iters += 1
         self.iter_novel = False
         self._calls_this_iter = 0
+        x = self._detect_extra()
+        if x:
+            action, kind, what = x
+            self.detections.append(kind)
+            if action == "warn":
+                return ("warn", kind, loop_message(kind, what))
+            return ("stop", kind, f"loop detected: {what}")
         d = self._detect(i)
         if not d:
             return None
@@ -731,8 +888,129 @@ def loop_message(kind, what):
                        "addresses the first failing check, and only then run it again.",
         "no_progress": "Nothing has changed for several turns. Either make a concrete edit toward "
                        "the failing check, or, if everything is already done, call task_complete.",
+        "error_streak": "Repeating the exact same call again will not work. Read the error message and "
+                        "either correct the arguments or try a different approach.",
+        "alternation": "Going back and forth between the same two calls changes nothing. Pick the "
+                       "next DIFFERENT step: make the edit, or run something new.",
+        "nav_streak": "You have enough context. Stop exploring: make the edit the task asks for now, "
+                      "or run the verify to see the actual failure.",
+        "monologue": "Respond with a tool call.",
     }[kind]
     return (f"[loop detected] {what}. {todo} If this repeats once more the run will be stopped.")
+
+
+# ---------------------------------------------------------------------------------------
+# 3b. post-edit syntax guard (SWE-agent edit-linter / Agentless lint-delta, 2026-10-09)
+# ---------------------------------------------------------------------------------------
+SYNTAX_GUARD_TIMEOUT_S = 10
+SYNTAX_GUARD_MAX_BYTES = 2_000_000
+_NODE_TS_CHECK = (
+    "const m=require('module'),fs=require('fs');"
+    "try{m.stripTypeScriptTypes(fs.readFileSync(process.argv[1],'utf8'),{mode:'strip'});process.exit(0)}"
+    "catch(e){if(e&&e.code==='ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX'){process.exit(3)}"
+    "console.error(String(e&&e.message||e).split('\\n')[0]);process.exit(1)}")
+_ESM_HINT_RE = re.compile(r"^\s*(?:import\s|export\s)", re.M)
+
+
+def syntax_guard_enabled(profile_robust=None, env=None):
+    """Kill switches: env WORKER_SYNTAX_GUARD=0, or profile `robust.syntax_guard: false`."""
+    env = os.environ if env is None else env
+    ev = str(env.get("WORKER_SYNTAX_GUARD", "")).strip().lower()
+    if ev in ("0", "false", "off", "no"):
+        return False
+    if (profile_robust or {}).get("syntax_guard") is False:
+        return False
+    return True
+
+
+def _node_check(argv_tail, timeout):
+    import subprocess
+    import shutil
+    node = shutil.which("node")
+    if not node:
+        return None
+    try:
+        r = subprocess.run([node, "--disable-warning=ExperimentalWarning"] + argv_tail,
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    if r.returncode == 0 or r.returncode == 3:
+        return None
+    msg = (r.stderr or "").strip().splitlines()
+    # node --check prints "file:LINE\n<src>\n   ^\n\nSyntaxError: msg"
+    for ln in msg:
+        if "Error" in ln:
+            return ln.strip()[:300]
+    return (msg[0] if msg else "syntax error")[:300]
+
+
+def syntax_error_for(path, text, timeout=SYNTAX_GUARD_TIMEOUT_S):
+    """-> the parser error string, or None when the text parses OR the type is unknown/unchecked.
+    Never raises. python: ast.parse; json: json.loads; yaml: safe_load_all; .js/.mjs/.cjs: node
+    --check; .ts/.mts/.cts: node's stripTypeScriptTypes (offline parser, erasable syntax only --
+    enums/namespaces are skipped, not flagged). .tsx/.jsx are skipped (no JSX-safe fast parser)."""
+    try:
+        if text is None or len(text) > SYNTAX_GUARD_MAX_BYTES:
+            return None
+        ext = os.path.splitext(str(path))[1].lower()
+        if ext in (".py", ".pyi"):
+            import ast
+            try:
+                ast.parse(text)
+            except SyntaxError as e:
+                return f"SyntaxError: {e.msg} (line {e.lineno})"
+            except ValueError as e:
+                return f"ValueError: {e}"
+            return None
+        if ext == ".json":
+            try:
+                json.loads(text)
+            except ValueError as e:
+                return f"JSONDecodeError: {e}"
+            return None
+        if ext in (".yaml", ".yml"):
+            try:
+                import yaml
+            except Exception:
+                return None
+            try:
+                list(yaml.safe_load_all(text))
+            except yaml.YAMLError as e:
+                return "YAMLError: " + " ".join(str(e).split())[:250]
+            except Exception:
+                return None
+            return None
+        if ext in (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"):
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="wsyn-") as td:
+                is_ts = ext in (".ts", ".mts", ".cts")
+                # check a COPY: the text under test, never the live worktree file
+                if is_ts:
+                    f = os.path.join(td, "x" + ext)
+                    open(f, "w").write(text)
+                    return _node_check(["-e", _NODE_TS_CHECK, f], timeout)
+                esm = ext == ".mjs" or (ext == ".js" and _ESM_HINT_RE.search(text))
+                f = os.path.join(td, "x.mjs" if esm else ("x.cjs" if ext == ".cjs" else "x.js"))
+                open(f, "w").write(text)
+                return _node_check(["--check", f], timeout)
+    except Exception:
+        return None
+    return None
+
+
+def syntax_delta(path, before, after, timeout=SYNTAX_GUARD_TIMEOUT_S):
+    """-> an error string ONLY when `after` has a syntax error and `before` did not (a file that
+    was already broken never blocks an edit -- a parser reports just the first error, so fixing it
+    legitimately reveals the next). Never raises."""
+    try:
+        err = syntax_error_for(path, after, timeout)
+        if not err:
+            return None
+        if before is not None and syntax_error_for(path, before, timeout):
+            return None
+        return err
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------------------
@@ -923,3 +1201,167 @@ def bash_mode_error(kind, n=None):
     if kind == "multiple":
         return (f"Format error: you sent {n} bash blocks. Send EXACTLY ONE ```bash block per turn.")
     return "Format error: no ```bash block found. Send EXACTLY ONE ```bash block with the next command."
+
+
+# ---------------------------------------------------------------------------------------
+# Observation masking (2026-10-09). Old bulky TOOL OUTPUTS are replaced, in the copy of the
+# transcript SENT to the model, by a short deterministic placeholder (tool call kept, one-line
+# summary, how to get it back). The model's reasoning and actions stay in full, the saved
+# transcript is never touched, and the most recent verify output is never masked. No LLM
+# summariser. Prefix stability: masking only advances in strides (`obs_mask_stride` turns), so
+# between advances the sent prefix is byte-identical turn to turn (prompt-cache friendly).
+OBS_MASK_DEFAULTS = {"keep_turns": 8, "min_chars": 2000, "stride": 4}
+_TOOL_USER_RE = re.compile(r"^\[tool result for ([A-Za-z0-9_.:-]+)\]: ", re.S)
+_VERIFY_CMD_RE = re.compile(
+    r"pytest|unittest|node\s+--test|npm\s+(run\s+)?test|\btest[-_][\w.-]+\.(py|sh|js)|auto-harness-check"
+    r"|make\s+test|cargo\s+test|go\s+test|\bjest\b|\bvitest\b|\btsc\b", re.I)
+
+
+def obs_mask_enabled(profile_robust=None, env=None):
+    """Kill switches: env WORKER_OBS_MASK=0, or profile `robust.obs_mask: false`."""
+    env = os.environ if env is None else env
+    if str(env.get("WORKER_OBS_MASK", "")).strip().lower() in ("0", "false", "off", "no"):
+        return False
+    return (profile_robust or {}).get("obs_mask") is not False
+
+
+def obs_mask_config(profile_robust=None):
+    rb = profile_robust or {}
+    cfg = dict(OBS_MASK_DEFAULTS)
+    for k, rk in (("keep_turns", "obs_mask_keep_turns"), ("min_chars", "obs_mask_min_chars"),
+                  ("stride", "obs_mask_stride")):
+        try:
+            if rb.get(rk) is not None:
+                cfg[k] = max(0, int(rb[rk]))
+        except (TypeError, ValueError):
+            pass
+    cfg["stride"] = max(1, cfg["stride"])
+    return cfg
+
+
+def _call_args(tc):
+    fn = (tc or {}).get("function") or {}
+    raw = fn.get("arguments", {})
+    if isinstance(raw, dict):
+        return fn.get("name") or "", raw
+    try:
+        v = json.loads(raw or "{}")
+        return fn.get("name") or "", v if isinstance(v, dict) else {}
+    except Exception:
+        return fn.get("name") or "", {}
+
+
+def _tool_result_slots(messages):
+    """-> {msg_index: (name, args, text)} for every tool output message. Native/openai tool
+    messages are matched to their call by tool_call_id, else positionally within the preceding
+    assistant turn; manual-tools results ("[tool result for NAME]: ...") carry the name."""
+    out = {}
+    calls, pos = [], 0
+    for idx, m in enumerate(messages):
+        role = m.get("role")
+        if role == "assistant":
+            calls = [_call_args(tc) + (tc.get("id"),) for tc in (m.get("tool_calls") or [])]
+            pos = 0
+            continue
+        text = m.get("content")
+        if not isinstance(text, str):
+            continue
+        if role == "tool":
+            hit = None
+            tcid = m.get("tool_call_id")
+            if tcid:
+                hit = next((c for c in calls if c[2] == tcid), None)
+            elif pos < len(calls):
+                hit = calls[pos]
+            pos += 1
+            name, args = (hit[0], hit[1]) if hit else ("tool", {})
+            out[idx] = (name, args, text)
+        elif role == "user":
+            mm = _TOOL_USER_RE.match(text)
+            if mm:
+                out[idx] = (mm.group(1), {}, text[mm.end():])
+    return out
+
+
+def _is_verify_output(name, args, text, verify):
+    if name != "run_bash":
+        return False
+    cmd = str(args.get("command") or "")
+    if verify and verify.strip() and verify.strip() in cmd:
+        return True
+    if cmd and _VERIFY_CMD_RE.search(cmd):
+        return True
+    return False
+
+
+def _first_line(text, n=100):
+    for ln in str(text).splitlines():
+        ln = ln.strip()
+        if ln and ln not in ("{", "}"):
+            return ln[:n]
+    return ""
+
+
+def obs_placeholder(name, args, text):
+    """Deterministic one-line stand-in for a bulky tool output. Pure."""
+    n = len(text)
+    lines = text.count("\n") + 1
+    if name == "read_file":
+        path = args.get("path", "?")
+        off = args.get("offset")
+        again = f"read_file path={path}" + (f" offset={off}" if off is not None else "")
+        what = f"read_file {path}" + (f" (offset {off})" if off is not None else "")
+        return (f"[old output elided to save context: {what}, {n} chars / {lines} lines; first line: "
+                f"{_first_line(text)!r}. Re-read with {again} if you need it again.]")
+    if name == "run_bash":
+        cmd = str(args.get("command") or "?").replace("\n", " ")[:160]
+        rc = re.search(r'"exit_code":\s*(-?\d+)', text)
+        rcs = f" exit_code={rc.group(1)}" if rc else ""
+        return (f"[old output elided to save context: run_bash `{cmd}`{rcs}, {n} chars. "
+                f"Re-run the command if you need the output again.]")
+    desc = ", ".join(f"{k}={str(v)[:60]!r}" for k, v in list(args.items())[:3])
+    return (f"[old output elided to save context: {name}({desc}), {n} chars / {lines} lines; first line: "
+            f"{_first_line(text)!r}. Call the tool again if you need it.]")
+
+
+def mask_observations(messages, cfg=None, state=None, verify=None):
+    """-> (view, stats). `view` is `messages` with old bulky tool outputs replaced by placeholders
+    (shallow copies only; `messages` is never mutated). An output is masked when it is older
+    than the last `keep_turns` assistant turns (advanced in `stride` steps via `state`, a dict the
+    caller keeps for the run), at least `min_chars` long, and not the most recent verify output.
+    ERROR results are kept (they are short and instructive)."""
+    cfg = cfg or dict(OBS_MASK_DEFAULTS)
+    state = state if state is not None else {}
+    keep, min_chars, stride = cfg["keep_turns"], cfg["min_chars"], cfg["stride"]
+    asst = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+    keep = max(1, keep)
+    cand = asst[-keep] if len(asst) >= keep else 0
+    rank = sum(1 for a in asst if a < cand)          # assistant turns before the candidate boundary
+    if rank - state.get("rank", 0) >= stride:
+        state["rank"], state["boundary"] = rank, cand
+    boundary = state.get("boundary", 0)
+    stats = {"masked": 0, "chars_saved": 0, "boundary": boundary}
+    if boundary <= 0:
+        return messages, stats
+    slots = _tool_result_slots(messages)
+    last_verify = None
+    for idx in sorted(slots):
+        name, args, text = slots[idx]
+        if _is_verify_output(name, args, text, verify):
+            last_verify = idx
+    view = list(messages)
+    for idx, (name, args, text) in slots.items():
+        if idx >= boundary or idx == last_verify or len(text) < min_chars:
+            continue
+        if text.lstrip().startswith("ERROR"):
+            continue
+        ph = obs_placeholder(name, args, text)
+        if len(ph) >= len(text):
+            continue
+        m = dict(messages[idx])
+        m["content"] = (messages[idx]["content"][:_TOOL_USER_RE.match(messages[idx]["content"]).end()] + ph
+                        if messages[idx].get("role") == "user" else ph)
+        view[idx] = m
+        stats["masked"] += 1
+        stats["chars_saved"] += len(text) - len(ph)
+    return view, stats

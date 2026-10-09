@@ -150,6 +150,71 @@ def main():
           q.main(["runs-clear", "--apply", "h1", "deliv"]), 2)
     q._api = lambda m, p, body=None, timeout=10: (None, "down")
     check("runs-clear: API down refuses", q.main(["runs-clear"]), 2)
+    # --- retire: supersede + plan --cancel + resolve rows, with refusals ------------
+    os.environ["OLLAMA_SUPERSEDED_FILE"] = str(root / "superseded.json")
+    sp = importlib.util.spec_from_file_location("pc_t", str(HERE / "plan_cancel.py"))
+    pcm = importlib.util.module_from_spec(sp); sp.loader.exec_module(pcm)
+    rp_plan = root / "rp-plan.json"; rp_plan.write_text("{}")
+    (disp / "slice-runs" / "rp.json").write_text(json.dumps({
+        "label": "rp", "plan_path": str(rp_plan), "order": ["s1", "s2"],
+        "slices": {"s1": {"status": "done"}, "s2": {"status": "pending"}}}))
+    def qrows(*rows): qstate.write_text(json.dumps({"jobs": list(rows)}))
+    R1 = {"id": "r1", "label": "auto-author-rp-s1", "status": "failed"}
+    R2 = {"id": "r2", "label": "auto-refine-rp-s1-r1", "status": "done"}
+    R3 = {"id": "r3", "label": "auto-author-rp-s2", "status": "paused"}
+    OTHER = {"id": "o1", "label": "auto-author-other-s1", "status": "failed"}
+    calls = []
+    def rrun(cmd, dry, timeout=600):
+        calls.append((list(map(str, cmd)), dry))
+        if dry:
+            return 0, ""
+        if "--cancel" in cmd:
+            pcm.mark_cancelled("rp", "t", "t", runs_dir=disp / "slice-runs")
+        if "resolve" in cmd:
+            qrows(*[j for j in json.loads(qstate.read_text())["jobs"] if j["id"] != cmd[-1]])
+        return 0, ""
+    q._run = rrun
+    q._api = lambda m, p, body=None, timeout=10: (200, [])
+    qrows(R1, R2, R3, OTHER)
+    supf = lambda: json.loads((root / "superseded.json").read_text()) if (root / "superseded.json").exists() else {}
+    before_q = qstate.read_text()
+    check("retire without --reason refused", q.main(["retire", "rp"]), 2)
+    check("retire with a blank --reason refused", q.main(["retire", "rp", "--reason", "   "]), 2)
+    check("...and nothing was touched", (calls, supf(), qstate.read_text()), ([], {}, before_q))
+    qrows(R1, {"id": "pj", "label": "auto-author-rp-s2", "status": "pending"})
+    check("retire refuses while a job is PENDING", q.main(["retire", "rp", "--reason", "r"]), 2)
+    qrows(R1, {"id": "rj", "label": "auto-author-rp-s2", "status": "running"})
+    check("retire refuses while a job is RUNNING", q.main(["retire", "rp", "--reason", "r"]), 2)
+    qrows(R1, R2)
+    q._api = lambda m, p, body=None, timeout=10: (200, [{"id": "r2", "awaiting_signoff": True}])
+    check("retire refuses a row awaiting_signoff", q.main(["retire", "rp", "--reason", "r"]), 2)
+    q._api = lambda m, p, body=None, timeout=10: (None, "down")
+    check("retire refuses when the API is down (cannot prove no sign-off)", q.main(["retire", "rp", "--reason", "r"]), 2)
+    check("refusals changed nothing", (calls, supf(), (disp / "slice-runs" / "rp.cancelled").exists()), ([], {}, False))
+    q._api = lambda m, p, body=None, timeout=10: (200, [])
+    qrows(R1, R2, R3, OTHER)
+    check("retire --dry-run exits 0", q.main(["retire", "rp", "--reason", "r", "--dry-run"]), 0)
+    check("--dry-run: every tool call is a dry call, no marker written",
+          (all(d for _c, d in calls), supf(), (disp / "slice-runs" / "rp.cancelled").exists()), (True, {}, False))
+    calls.clear()
+    check("retire exits 0", q.main(["retire", "rp", "--reason", "shipped in abc123"]), 0)
+    m = supf().get("rp") or {}
+    check("supersede marker recorded WITH the reason", "shipped in abc123" in str(m.get("reason")), True)
+    cc = [c for c, _d in calls if "--cancel" in c]
+    check("plan --cancel called once, with the plan path and the reason",
+          (len(cc), cc and cc[0][1] == str(rp_plan), cc and "shipped in abc123" in " ".join(cc[0])), (1, True, True))
+    check("finished rows resolved (failed + done); paused row and other bundle kept",
+          sorted(c[-1] for c, _d in calls if "resolve" in c), ["r1", "r2"])
+    check("queue still holds the paused row and the OTHER bundle's row",
+          sorted(j["id"] for j in json.loads(qstate.read_text())["jobs"]), ["o1", "r3"])
+    calls.clear()
+    check("retire is idempotent (rc 0)", q.main(["retire", "rp", "--reason", "a DIFFERENT reason"]), 0)
+    check("...no second cancel, no resolve, first reason kept",
+          (calls, "shipped in abc123" in str(supf()["rp"]["reason"])), ([], True))
+    dec = [json.loads(l) for l in (disp / "decisions.jsonl").read_text().splitlines()]
+    check("retire actions and refusals are logged",
+          [d["outcome"] for d in dec if d["action"] == "retire"].count("refused") >= 5
+          and [d["outcome"] for d in dec if d["action"] == "retire"].count("done") == 2, True)
     print("\nALL PASS" if not FAILS else f"\n{len(FAILS)} FAILED: {FAILS}")
     return 0 if not FAILS else 1
 
@@ -166,6 +231,17 @@ MUTATIONS = [
     ("runs-clear preview posts", "    if not a.apply or a.dry_run:", "    if not a.apply:"),
     ("runs-clear swallows refusals", "    if bad:\n        raise Refused", "    if False:\n        raise Refused"),
     ("runs-clear widens scope", '{"ids": a.apply}', '{"ids": a.apply + ["extra"]}'),
+    ("retire ignores live jobs", '    live = [j for j in rows if j.get("status") in RETIRE_LIVE]', '    live = []'),
+    ("retire ignores sign-off", '    held = [j["id"] for j in rows if j.get("id") in set(signoff_ids)]', '    held = []'),
+    ("retire reason optional", '    if not (reason or "").strip():\n        return "--reason is required', '    if False:\n        return "--reason is required'),
+    ("retire never cancels", '"--cancel", "--reason", f"retired via', '"--status", "--reason", f"retired via'),
+    ("retire resolves paused rows", 'RETIRE_RESOLVABLE = ("done",', 'RETIRE_RESOLVABLE = ("paused", "done",'),
+    ("retire re-cancels (not idempotent)", '    if own:\n        print("  cancel: plan already', '    if False:\n        print("  cancel: plan already'),
+    ("retire overwrites the first reason", '    if a.bundle in bv.load_superseded():', '    if False:'),
+    ("retire dry-run writes the marker", '    elif a.dry_run:\n        print(f"  [dry-run] would mark', '    elif False:\n        print(f"  [dry-run] would mark'),
+    ("retire dry-run really resolves", '"resolve", j["id"]], a.dry_run, 120)', '"resolve", j["id"]], False, 120)'),
+    ("retire tolerates API down", '    if not api_ok:\n        raise Refused', '    if False:\n        raise Refused'),
+    ("retire resolves the other bundle", 'return [j for j in jobs if j.get("bundle") == bundle', 'return [j for j in jobs if j.get("bundle") == bundle or "other" in str(j.get("label"))'),
 ]
 
 

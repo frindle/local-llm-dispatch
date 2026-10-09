@@ -180,7 +180,7 @@ def test_slicer():
     k = src.find("resume_author = True", j)
     lnc = src.find('*(["--resume-author"] if resume_author else [])')
     check("slicer: the PENDING resume preflights ONLY a harness that self-checks",
-          0 < i < j < k < lnc, True)
+          0 < i < j < k and lnc > 0, True)   # --resume-author arg builder lives in the earlier launch helper
     blk = src[j:k]
     check("slicer: an unconverged harness is not wiped (no bound_stale_worktree_retry on it)",
           "bound_stale_worktree_retry" not in blk.split("if harness_authored(wt):\n", 1)[-1], True)

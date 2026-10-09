@@ -50,8 +50,20 @@ THE CHECKS, and the specific failure each one is scar tissue from
   target-parses     the file the model is told to edit parses right now
   verify-shape      verify.sh uses the counting idiom and can report a FAIL
                     (not `set -e`, which aborts before printing anything)
+  spec-defect       PRE-DISPATCH CONTRADICTION GATE (2026-10-09, smoke-order-mismatch): the
+                    spec contradicts the BASE commit -- a task that CREATES a file which
+                    already exists at base (as a real implementation), or a refimpl OLD
+                    anchor that matches nothing in the base files. Structured
+                    `SPEC_DEFECT: <reason>: <path>`; nothing is executed or enqueued.
+  already-satisfied (only added when it fires) every `## Must contain` literal is already
+                    present at base AND the verify is already green: SPEC_DEFECT
+                    'already satisfied at base' (the property holds; nothing to build).
   baseline-fails    BOTH-WAYS, half 1: verify MUST fail on the untouched tree,
-                    else it certifies a run that changed nothing
+                    else it certifies a run that changed nothing. The red must be an
+                    ASSERTION failure: a crash / import / syntax error alone is red for the
+                    wrong reason and does NOT count (creation tasks and spec-named symbols
+                    may fail on a missing module/export -- see
+                    dispatch_harness_gates.classify_baseline_red)
   refimpl-passes    BOTH-WAYS, half 2: a reference impl MUST make it print
                     VERIFY_OK, else the task is unsatisfiable as specified
   refimpl-satisfies with the refimpl applied, every "Must contain" literal is in
@@ -586,6 +598,30 @@ class Result:
 
 
 class Preflight:
+    def _task_class_info(self):
+        """The task class recorded in .dispatch-harness.json by ollama-dispatch-auto (read-only
+        here: preflight never writes the manifest), else a fresh classification from TASK.md
+        and the base tree, marked source="derived". None when ~/bin/task_class.py is unavailable."""
+        try:
+            import importlib.util as _ilu
+            _sp = _ilu.spec_from_file_location(
+                "task_class", Path(__file__).resolve().parent / "task_class.py")
+            m = _ilu.module_from_spec(_sp)
+            _sp.loader.exec_module(m)
+            rec = m.read_task_class(self.wt)
+            if rec:
+                return dict(rec, source="manifest")
+            try:
+                man = json.loads((self.wt / ".dispatch-harness.json").read_text())
+            except (OSError, ValueError):
+                man = {}
+            tgt = man.get("target") or ""
+            r = m.classify_task(self.task_text or "", "", tgt, (), man.get("lang") or "python",
+                                m.base_facts(self.wt, tgt))
+            return dict(r, source="derived")
+        except Exception:
+            return None
+
     def __init__(self, args):
         self.a = args
         self.wt = Path(args.worktree).expanduser().resolve()
@@ -1378,6 +1414,42 @@ class Preflight:
                 "literal, and make refimpl.py's anchor match the target. Nothing is enqueued "
                 "on a placeholder harness.")
 
+    def _creation_flag(self):
+        try:
+            d = json.loads((self.wt / ".dispatch-harness.json").read_text())
+            return bool(isinstance(d, dict) and d.get("creation_task"))
+        except (OSError, ValueError):
+            return False
+
+    def check_spec_defect(self):
+        """PRE-DISPATCH CONTRADICTION GATE, static half (2026-10-09). The spec is checked
+        against the BASE commit (git cat-file/show of HEAD, never the working copy): a
+        creation target that already exists as a real implementation, or a creation-task
+        refimpl whose OLD anchor matches nothing at base, can never be satisfied -- the
+        smoke-order-mismatch task burned ~3 authoring jobs on exactly that. Fail-closed when
+        the shared module cannot be loaded."""
+        hg = _hg()
+        if hg is None:
+            return self.add("spec-defect", FAIL,
+                            "dispatch_harness_gates.py could not be loaded (fail-closed)",
+                            fix="restore ~/bin/dispatch_harness_gates.py")
+        try:
+            tf = self.target_files()
+            tgt = self._rel_to_wt(tf[0]) if tf else None
+        except Exception:
+            tgt = None
+        fs = hg.spec_defects(self.wt, target=tgt, creation=self._creation_flag(),
+                             task_text=self.task_text or None)
+        self.spec_defect_findings = fs
+        if not fs:
+            return self.add("spec-defect", PASS,
+                            "the spec does not contradict the base commit")
+        return self.add(
+            "spec-defect", FAIL, hg.SPEC_DEFECT_PREFIX + fs[0]["reason"] + ": " + fs[0]["path"],
+            detail=hg.format_spec_defects(fs)[:900],
+            fix="re-spec (the slicer's re-spec path) or park: no authoring/coding job can "
+                "satisfy a spec that contradicts the base. Nothing is enqueued.")
+
     def check_contract(self):
         """FAIL-BEFORE / PASS-AFTER (Agentless): the contract every dispatch rests on.
         The verify must FAIL on the untouched baseline and PASS with the refimpl applied.
@@ -2116,15 +2188,52 @@ class Preflight:
             return self.add("baseline-fails", FAIL,
                             f"verify timed out after {VERIFY_TIMEOUT_S}s")
         if rc == 0 or "VERIFY_OK" in out:
+            # (b) ALREADY SATISFIED at base: every Must-contain literal is already in the
+            # base files AND the verify is green -> a structured SPEC_DEFECT, not just a
+            # leaky-looking verify (the slicer's already-satisfied decision reads it).
+            hg = _hg()
+            if hg is not None:
+                try:
+                    fs = hg.already_satisfied_findings(
+                        self.wt, self.task_text or "",
+                        (self._rel_to_wt(self.target_files()[0]) if self.target_files() else None),
+                        True)
+                except Exception:
+                    fs = []
+                if fs:
+                    self.add("already-satisfied", FAIL,
+                             hg.SPEC_DEFECT_PREFIX + fs[0]["reason"] + ": " + fs[0]["path"],
+                             detail=fs[0]["message"],
+                             fix="skip the task (the property already holds) or restate it")
             return self.add(
                 "baseline-fails", FAIL,
                 f"verify PASSES on the untouched baseline (exit {rc})",
                 detail="It cannot tell a completed task from an untouched one. "
                        "A run that changes nothing would be certified done.",
                 fix="make the verify assert the PROPERTY the fix introduces")
+        # RED FOR THE RIGHT REASON (review steal #2): an assertion failure counts; a bare
+        # crash / import / syntax error does not (creation targets and spec-named symbols
+        # may fail on the missing module/export).
+        hg = _hg()
+        kind = "unclassified"
+        if hg is not None:
+            cls = hg.classify_baseline_red(out, creating=(self._creation_flag() or self._task_is_creation()),
+                                           spec_text=self.task_text or "")
+            kind = cls["kind"]
+            self.baseline_red_kind = kind
+            if not cls["ok"]:
+                return self.add(
+                    "baseline-fails", FAIL,
+                    f"verify is red at baseline for the WRONG reason (exit {rc}): "
+                    f"crash/import/syntax error, no assertion failure",
+                    detail="; ".join(cls["signals"]),
+                    fix="a crash is not 'fails before': fix the fixture so the baseline run "
+                        "reaches an assertion (import the module, define the doubles) and fails "
+                        "THERE. A creation/new-symbol task may fail on the missing module/export "
+                        "only when that name is the one the spec asks for.")
         return self.add("baseline-fails", PASS,
                         f"fails at baseline as it must (exit {rc}, "
-                        f"{self.verify_secs:.1f}s)")
+                        f"{self.verify_secs:.1f}s, red = {kind})")
 
     def check_draft_confirmed(self):
         """Drafted cases must be read by a human before they gate a dispatch.
@@ -3015,6 +3124,125 @@ class Preflight:
         return self.add("refimpl-reverted", PASS,
                         "tree restored to baseline; the model starts clean")
 
+    AUDIT_VERIFY_MAX_S = 30      # the repeat-run / trivial battery only when one verify is this fast
+
+    def _audit_mod(self):
+        """~/bin/harness_audit_gates.py (wave 3 spec/harness defect gates), or None (fail-open:
+        these are WARN-grade audits, never blockers, until their fire rate is measured)."""
+        try:
+            import importlib.util as _ilu
+            _sp = _ilu.spec_from_file_location(
+                "harness_audit_gates", Path(__file__).resolve().parent / "harness_audit_gates.py")
+            m = _ilu.module_from_spec(_sp)
+            _sp.loader.exec_module(m)
+            return m
+        except Exception:
+            return None
+
+    def check_spec_audit(self):
+        """Never lets an audit bug (or an unreadable file) take the gate down."""
+        try:
+            return self._check_spec_audit()
+        except Exception as e:
+            self._audit = {"error": f"{type(e).__name__}: {e}"[:200]}
+
+    def _check_spec_audit(self):
+        """Wave-3 research gates (2026-10-09-spec-defect-research.md), WARN-ONLY and silent when
+        clean: A traceability, B prose-vs-fixture constants, C flake lint + 3x determinism,
+        D trivial-solution battery.  Findings are recorded in the state file under `audit` and in
+        the auto-decision log (for the fire-rate replay) -- they never turn a GO into a NO-GO.
+        PREFLIGHT_AUDIT=0 / --no-audit disables."""
+        if os.environ.get("PREFLIGHT_AUDIT", "1") in ("0", "off") or getattr(self.a, "no_audit", False):
+            return
+        gm = self._audit_mod()
+        if gm is None:
+            return
+        audit = {}
+        try:
+            tf = self.target_files()
+            tgt = self._rel_to_wt(tf[0]) if tf else None
+        except Exception:
+            tgt = None
+        try:
+            man = json.loads((self.wt / ".dispatch-harness.json").read_text())
+        except (OSError, ValueError):
+            man = {}
+        lang = man.get("lang") or ("python" if (tgt or "").endswith(".py") else "ts")
+        fx_name = next((n for n in ("test_fixture.py", "verify.test.ts", "verify.test.mts")
+                        if (self.wt / n).is_file()), None)
+        try:
+            fx = (self.wt / fx_name).read_text(errors="replace") if fx_name else ""
+        except OSError:                              # unreadable fixture: check_draft_confirmed owns that verdict
+            fx = ""
+        base_text = ""
+        if tgt:
+            r = subprocess.run(["git", "-C", str(self.wt), "show", f"HEAD:{tgt}"],
+                               capture_output=True, text=True)
+            base_text = r.stdout if r.returncode == 0 else ""
+        creation = self._creation_flag() or self._task_is_creation()
+        lits = []
+        hg = _hg()
+        if hg is not None:
+            try:
+                lits = [(l[1] if isinstance(l, (tuple, list)) else l) for l in hg.must_contain_literals(self.task_text or "")]
+            except Exception:
+                lits = []
+
+        def warn(cid, fs, fix):
+            if not fs:
+                return
+            audit[cid] = fs[:8]
+            self.add(cid, WARN, f"{len(fs)} finding(s): {fs[0]['detail'][:140]}",
+                     detail="; ".join(f["detail"][:120] for f in fs[:5]), fix=fix)
+            try:
+                if hg is not None:
+                    hg.log_auto_decision("audit-" + cid, self.wt.name, "WARN", fs[0]["detail"][:200],
+                                         count=len(fs))
+            except Exception:
+                pass
+        try:
+            if fx and tgt and not self._is_test_file_target(tgt):
+                warn("spec-traceability", gm.untraceable_assertions(fx, self.task_text or "", base_text, tgt, lang),
+                     "name/assert only what TASK.md or the base file defines, or add `spec-ok` on the line")
+            if fx and self.task_text:
+                warn("prose-constants", gm.constant_conflicts(self.task_text, fx),
+                     "make the fixture constant agree with TASK.md (or fix the prose)")
+            flk = (gm.flake_lint(fx, fx_name or "fixture") if fx else []) + \
+                (gm.flake_lint((self.wt / "refimpl.py").read_text(errors="replace"), "refimpl.py")
+                 if (self.wt / "refimpl.py").is_file() else [])
+            warn("flake-lint", flk, "remove wall-clock/random/unordered/network sources or mark `flake-ok`")
+            if self.verify_secs is not None and self.verify_secs <= self.AUDIT_VERIFY_MAX_S \
+                    and self.baseline_rc not in (None, 124):
+                runs = [(self.baseline_rc, self.baseline_out)]
+                for _ in range(2):
+                    runs.append(self.sh(self.a.verify))
+                warn("determinism", gm.determinism_findings(runs),
+                     "the verify must give the same verdict on the same tree: remove the flake source")
+                if tgt and lits:
+                    variants = gm.trivial_variants(base_text, tgt, lits, lang, creation)
+                    tracked = subprocess.run(["git", "-C", str(self.wt), "ls-files", "--error-unmatch", tgt],
+                                             capture_output=True, text=True).returncode == 0
+                    if variants and tracked:
+                        # the battery rewrites the TARGET: journal it so a SIGKILL (auto's group timeout)
+                        # mid-battery is recovered by the next preflight, like the refimpl itself
+                        self._journal_open()
+                        try:
+                            warn("trivial-solution", gm.run_trivial_battery(
+                                self.wt, tgt, variants, lambda: self.sh(self.a.verify)),
+                                "the verify must be RED for a literals-only / no-op / return-None target")
+                        finally:
+                            self._journal_close()
+        except Exception as e:                      # an audit must never break the gate
+            audit["error"] = f"{type(e).__name__}: {e}"[:200]
+        self._audit = audit
+        try:
+            self._state.setdefault("audit", audit) if hasattr(self, "_state") else None
+        except Exception:
+            pass
+
+    def _is_test_file_target(self, tgt):
+        return bool(re.search(r"(^|/)(test_[^/]*\.py|[^/]*_test\.py|[^/]*\.(test|spec)\.[cm]?[jt]sx?)$", tgt or ""))
+
     def check_verify_quality(self):
         """Delegated. This tool does not judge verify quality itself."""
         vq = BIN / "verify-quality.py"
@@ -3349,6 +3577,7 @@ class Preflight:
         self.check_toolchain()
         self.recover_interrupted_refimpl()
         hc_ok = self.check_harness_complete()
+        sd_ok = self.check_spec_defect()
         base_ok = self.check_baseline_clean()
         # Fold `--seal-baseline` into the GO decision (gap #2) -- needs the
         # untracked set baseline-clean just populated.
@@ -3363,7 +3592,7 @@ class Preflight:
         self.check_target_parses()
         self.check_verify_shape()
 
-        if base_ok == FAIL or hc_ok == FAIL:
+        if base_ok == FAIL or hc_ok == FAIL or sd_ok == FAIL:
             for cid in ("baseline-fails", "env-parity", "verify-speed",
                         "verify-quality", "refimpl-passes",
                         "refimpl-satisfies", "verify-relevance",
@@ -3371,6 +3600,9 @@ class Preflight:
                 self.unproven(cid, "not run: the tree is not at baseline, so a "
                                    "run here would prove nothing"
                                    if base_ok == FAIL else
+                                   "not run: the spec contradicts the base commit "
+                                   "(SPEC_DEFECT), so executing it would prove nothing"
+                                   if sd_ok == FAIL and hc_ok != FAIL else
                                    "not run: the harness is incomplete (placeholders / no "
                                    "real literal / dead refimpl anchor), so executing it "
                                    "would prove nothing")
@@ -3383,6 +3615,7 @@ class Preflight:
         self.check_env_parity()
         self.check_verify_speed()
         self.check_verify_quality()
+        self.check_spec_audit()
         self.check_refimpl()
         self.check_contract()
         return self.report()
@@ -3439,6 +3672,17 @@ class Preflight:
         try:
             st = getattr(self, "_state", {})
             st["verdict"] = verdict
+            if verdict == "GO" and not review:
+                try:       # gate E: what this GO was measured against (see --revalidate)
+                    _gm = self._audit_mod()
+                    _tf = self.target_files()
+                    if _gm is not None:
+                        st["freshness"] = _gm.freshness_snapshot(
+                            self.wt, self._rel_to_wt(_tf[0]) if _tf else None)
+                    if getattr(self, "_audit", None) is not None:
+                        st["audit"] = self._audit
+                except Exception:
+                    pass
             st["blockers"] = [r.id for r in blockers]
             st["unproven"] = [r.id for r in unproven]
             # The authoritative both-ways reading, taken here BEFORE any model
@@ -3506,6 +3750,7 @@ class Preflight:
                 "unproven": [r.as_dict() for r in unproven],
                 "checks": [r.as_dict() for r in self.results],
                 "verify_seconds": self.verify_secs,
+                "task_class": self._task_class_info(),
                 # ONE ctx formula (ollama-queue.estimate_task_tokens ->
                 # required_num_ctx): ollama-dispatch-auto adopts this so its own
                 # target-bytes guess can never under-provision the coding job.
@@ -4020,6 +4265,17 @@ def main():
     # `worktree` positional. Runs the in-process guard tests and exits.
     if "--self-test" in sys.argv[1:]:
         return _self_test()
+    if "--revalidate" in sys.argv[1:]:
+        # Queue-pop freshness re-check (wave 3, gate E): see harness_audit_gates.revalidate.
+        i = sys.argv.index("--revalidate")
+        if i + 1 >= len(sys.argv):
+            print("usage: ollama-dispatch-preflight --revalidate WORKTREE", file=sys.stderr)
+            return 2
+        import importlib.util as _ilu
+        _sp = _ilu.spec_from_file_location("harness_audit_gates", BIN / "harness_audit_gates.py")
+        _gm = _ilu.module_from_spec(_sp)
+        _sp.loader.exec_module(_gm)
+        return _gm.main(["revalidate", sys.argv[i + 1]] + [a for a in sys.argv[i + 2:]])
     ap = argparse.ArgumentParser(
         description="GO/NO-GO gate for an ollama dispatch worktree.",
         epilog="exit 0 = GO, 1 = NO-GO, 2 = usage error")
@@ -4084,6 +4340,13 @@ def main():
                          "local model, or a test stub). Omit to emit the "
                          "requirements with an empty proposal for a later pass.")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-audit", action="store_true",
+                    help="skip the wave-3 WARN-only spec/harness audits (traceability, constants, "
+                         "flake/determinism, trivial-solution battery); env PREFLIGHT_AUDIT=0 too")
+    ap.add_argument("--revalidate", metavar="WORKTREE", default=None,
+                    help="queue-pop freshness re-check of a GO'd worktree: if its blob SHAs/HEAD "
+                         "drifted since preflight, re-run creation-exists/anchor/NOP and print JSON; "
+                         "exit 3 = SPEC_DEFECT (park, 0 GPU), 4 = verify now green on the untouched tree")
     args = ap.parse_args()
 
     # --review audits a FINISHED run; there is no both-ways proof to do and

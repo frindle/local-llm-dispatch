@@ -253,7 +253,16 @@ def plan_cases(pl, sl):
     check("planner and slicer detectors agree on every pre-fix slice", agree)
     fixed = json.loads((Path.home() / ".ollama-dispatch/slice-plans/rt-egift-link-s1.slices.json.fixed").read_text())
     fcodes = [c for c, _ in pl.gate_plan(fixed)]
-    check("planner: fixed egift plan gates CLEAN", fcodes == [], fcodes)
+    # ROOT CAUSE of the old failure (2026-10-09): this test pins a FROZEN snapshot of the plan
+    # (`.slices.json.fixed`, 2026-10-05) as "the fixed plan". plan_lint's HEADER_PAIR_LITERAL
+    # gate landed LATER (5c4dab4) and, correctly, flags that snapshot's s4 `Cache-Control:
+    # no-store` must_contain (the live plan was fixed for it on 10-06, `.bak-...s4hdr`). The test
+    # is about SCOPE (--edit-file coverage), so it asserts exactly that: no scope-family code, and
+    # nothing but the later-added header-pair lint remains.
+    scope_codes = [c for c in fcodes if "SCOPE" in c or c.startswith("UNSCOPED")]
+    check("planner: fixed egift plan has no scope defects", scope_codes == [], fcodes)
+    check("planner: the only code left on the frozen snapshot is the later HEADER_PAIR_LITERAL lint",
+          set(fcodes) <= {"HEADER_PAIR_LITERAL"}, fcodes)
     check("slicer: fixed plan has no uncovered edit files",
           all(sl.uncovered_edit_files(fixed, s) == [] for s in fixed["slices"]))
 

@@ -62,5 +62,8 @@ No secrets are tracked. Code reads credentials at runtime from the Keychain or `
 ## Test status at snapshot (2026-10-08)
 `./run-tests.sh`: 199 of 207 sandboxed tests pass. The 8 failures are the known non-hermetic ones listed in the header of `run-tests.sh` (they read live `~/.ollama-dispatch` plans/logs or `.bak` files, or are too slow for the 90s default). Skipped by design (run by hand): heavier/side-effecting tests and `test-selfcheck-hang.py` (~20 min).
 
+## Added in the 2026-10-09 update
+CPU lane fixes (relevance stage now eligible and correct on the runner: shipped args file, the git-excluded `.dispatch-harness.json` restored there; a CPU-only chain stage such as preflight no longer holds the GPU lanes, `cpu_wait` park with a yield-back to the returning bundle), escalation-review bundling (a `needs-opus-auto-X` placeholder is born with its real bundle, `ollama-queue.py retag-bundles [--apply]` janitor, esc-review rows never own the lanes; test `test-esc-review-bundle.py`), and the agent-budget policies (`worker_budget.py`, `budget-policy-ab*`, `docs/budget-policies.md`).
+
 ## Added in the 2026-10-08 update
 Worker robustness (`worker_robust.py`, `model_profile.py` + `model_profiles.yaml`), harness gates (`dispatch_harness_gates.py`), BloomGauge/Darkbloom queue hooks (`bloom_control.py`), the CPU lane (`cpu_lane.py`, `cpu_dispatch.py`, `cpu_job.py`, `cpu_stage.py`, `cpu_vr_measure.py`), `handoff-triage.py`, and their tests and docs (`docs/`). The CPU runner container is its own public repo: https://github.com/frindle/dispatch-cpu-runner (image `ghcr.io/frindle/dispatch-cpu-runner`).

@@ -22,7 +22,7 @@ OUT="$BAKEOFF/model-buildoff-2026-08-22/strata-h2h-runs"
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 RUN="$OUT/$TS-$CELL"; RRUN="strata-h2h/$TS-$CELL"     # remote dir is relative to sandbox $HOME
 PORT_L=18180
-BUDGET="${STRATA_REASONING_BUDGET:-4096}"
+BUDGET="${STRATA_REASONING_BUDGET:-12288}"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 claude-sandbox)
 umask 077
 mkdir -p "$RUN"
@@ -50,7 +50,7 @@ chmod 600 "$KEYF"
 
 # 2. server (its guard writes preflight-guard.txt = what was resident on the card)
 mkdir -p "$RUN/remote"
-if ! "${SSH[@]}" "mkdir -p \$HOME/$RRUN && STRATA_RUN_DIR=\$HOME/$RRUN STRATA_REASONING_BUDGET=$BUDGET STRATA_MAX_S=${STRATA_MAX_S:-14400} ~/strata/strata-serve.sh start" >> "$RUN/arm.txt" 2>&1; then
+if ! "${SSH[@]}" "mkdir -p \$HOME/$RRUN && STRATA_RUN_DIR=\$HOME/$RRUN STRATA_REASONING_BUDGET=$BUDGET STRATA_WATCHDOG_S=${STRATA_WATCHDOG_S:-600} STRATA_PLE_IO=${STRATA_PLE_IO:-ram} STRATA_MAX_S=${STRATA_MAX_S:-14400} ~/strata/strata-serve.sh start" >> "$RUN/arm.txt" 2>&1; then
   say "ABORT: strata-serve.sh start failed (guard or load) -- see arm.txt / remote/preflight-guard.txt"
   exit 1
 fi
@@ -62,10 +62,17 @@ TPID=$!
 for _ in $(seq 30); do curl -fs -m 5 "http://127.0.0.1:$PORT_L/health" >/dev/null 2>&1 && break; sleep 1; done
 curl -fs -m 5 "http://127.0.0.1:$PORT_L/health" >/dev/null 2>&1 || { say "ABORT: tunnel to Strata not healthy"; exit 1; }
 say "tunnel up 127.0.0.1:$PORT_L -> sandbox:18080"
+# warm-up: the first request after load is cold (prefix prefill + expert paging) and outlasts the
+# worker's 30 s tool-calling preflight; absorb it here so it never becomes a model result.
+say "warm-up request (max 600 s)"
+printf 'Authorization: Bearer %s\n' "$(cat "$KEYF")" > "$RUN/.hdr"; chmod 600 "$RUN/.hdr"
+curl -s -m 600 -o /dev/null -H @"$RUN/.hdr" -H "Content-Type: application/json" \
+  -d '{"model":"strata","messages":[{"role":"user","content":"Reply with the single word ready."}],"max_tokens":16}' \
+  "http://127.0.0.1:$PORT_L/v1/chat/completions" >/dev/null 2>&1; WRC=$?; rm -f "$RUN/.hdr"; say "warm-up done rc=$WRC"
 
 # 4. driver
 H2H_ARM=strata H2H_CELLS="$CELL" H2H_ARM_URL="http://127.0.0.1:$PORT_L" H2H_KEY_FILE="$KEYF" \
-  STRATA_REASONING_BUDGET="$BUDGET" bash "$DRIVER" < /dev/null >> "$RUN/arm.txt" 2>&1
+  WORKER_PREFLIGHT_TIMEOUT_S="${WORKER_PREFLIGHT_TIMEOUT_S:-900}" STRATA_REASONING_BUDGET="$BUDGET" bash "$DRIVER" < /dev/null >> "$RUN/arm.txt" 2>&1
 RC=$?
 say "driver exit $RC"
 exit "$RC"

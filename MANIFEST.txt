@@ -469,3 +469,9 @@ tests|~/bin/test-plan-lint-rootcause.py
 tests|~/bin/test-queue-gate-priority.py
 tests|~/bin/test-slice-orphan-enqueue.py
 tests|~/bin/test-zombie-driver-lock.py
+bin|~/bin/worker_budget.py
+bin|~/bin/budget-policy-ab-select.py
+bin|~/bin/budget-policy-ab.md
+tests|~/bin/test-worker-budget-policy.py
+tests|~/bin/test-esc-review-bundle.py
+docs|~/Desktop/GitHub Projects/machine-config/docs/budget-policies.md

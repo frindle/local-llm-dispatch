@@ -104,6 +104,8 @@ def _log(stage, bundle, path, why, snap, exit_code, wall, job_id=None):
         sys.stderr.flush()
     except Exception:
         pass
+    if os.environ.get("CPU_LANE_LOG_OFF") == "1":      # canary/tests must not pollute the real lane log
+        return
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         with open(LOG_FILE, "a") as f:
@@ -236,8 +238,12 @@ def tsx_bundle():
         return None
 
 
-def eligibility(wt, cmd, cwd_rel=None):
-    """(ok, why). Conservative: anything the runner cannot reproduce faithfully stays local."""
+def eligibility(wt, cmd, cwd_rel=None, shipped_extra=()):
+    """(ok, why). Conservative: anything the runner cannot reproduce faithfully stays local.
+    shipped_extra: tool names ('bin/vr-args.json') the caller ships beside host_tools(); a cmd naming
+    $HOME/bin/<that> is fine (2026-10-09: the relevance stage named its own shipped args file and was
+    declared host-only -> ran 17 min locally)."""
+    extra = {HOST_BIN + "/" + n[4:] for n in (shipped_extra or ()) if n.startswith("bin/")}
     wt = Path(wt)
     pkg = _find_pkg_dir(wt, cwd_rel)
     if pkg is None:
@@ -259,9 +265,10 @@ def eligibility(wt, cmd, cwd_rel=None):
         if m:
             return False, "%s needs network/secrets/host services (%s)" % (n, m.group(0).strip())
         for hp in _HOSTPATH_RE.findall(t):
-            if hp in _shipped_host_paths() or (
-                    hp.startswith(("~/bin/", "$HOME/bin/")) and
-                    HOST_BIN + "/" + hp.split("/bin/", 1)[1] in _shipped_host_paths()):
+            ship = _shipped_host_paths() | extra
+            if hp in ship or (
+                    hp.startswith(("~/bin/", "$HOME/bin/", "${HOME}/bin/")) and
+                    HOST_BIN + "/" + hp.split("/bin/", 1)[1] in ship):
                 continue
             return False, "%s names a host-only path (%s)" % (n, hp[:80])
     # `npx --yes X` fallbacks: the runner has no network, so X must come from the lockfile install
@@ -319,10 +326,16 @@ def host_tools(extra=None):
     return t
 
 
-def remote_cmd(cmd, rewrite=True, group=False):
+def remote_cmd(cmd, rewrite=True, group=False, harness=False):
     """Wrap `cmd` for the runner: $HOME/bin -> the shipped tools; host /Users/<u>/bin/ paths in the
     harness files of the (shipped copy only) rewritten to the same place. Plain POSIX sh/bash."""
     pre = ('mkdir -p "$HOME" && ln -sfn "$JOB_TOOLS/bin" "$HOME/bin"; ')
+    if harness:
+        # .dispatch-harness.json is git-excluded (info/exclude) so the snapshot never carries it, yet
+        # verify-relevance --applied reads it (creation_task target) -> on the runner it saw "no tracked
+        # diff" (rc=3) for every creation task. Restore the shipped copy at the checkout root.
+        pre += ('_r=$(git rev-parse --show-toplevel 2>/dev/null); [ -n "$_r" ] && [ ! -e "$_r/.dispatch-harness.json" ] '
+                '&& cp "$JOB_TOOLS/bin/dispatch-harness.json" "$_r/.dispatch-harness.json"; ')
     if rewrite:
         hb = shlex.quote(HOST_BIN + "/")
         pre += ('for _f in $(grep -lIsF %s ./* 2>/dev/null); do '
@@ -398,7 +411,7 @@ def run_stage(wt, cmd, timeout_s, stage, bundle_id, local_fn, *, tools=None, env
     snap0 = None
     job_id = None
     try:
-        ok, why_e = eligibility(wt, cmd, cwd_rel)
+        ok, why_e = eligibility(wt, cmd, cwd_rel, shipped_extra=tuple((tools or {}).keys()))
         if not ok:
             why = "ineligible: " + why_e
         else:
@@ -418,7 +431,13 @@ def run_stage(wt, cmd, timeout_s, stage, bundle_id, local_fn, *, tools=None, env
                 pre = ('mkdir -p "$JOB_TOOLS/tsx" && tar xzf "$JOB_TOOLS/bin/tsx-linux-x64.tgz" -C "$JOB_TOOLS/tsx" '
                        '&& mkdir -p node_modules/.bin && { [ -e node_modules/.bin/tsx ] || '
                        'ln -s "$JOB_TOOLS/tsx/node_modules/.bin/tsx" node_modules/.bin/tsx; }; ')
-            full = pre + remote_cmd(cmd, group=gzb64) + (GZB64_SUFFIX if gzb64 else "")
+            hf = Path(wt) / ".dispatch-harness.json"
+            if hf.is_file() and "bin/dispatch-harness.json" not in xt:
+                try:
+                    xt["bin/dispatch-harness.json"] = hf.read_bytes()
+                except OSError:
+                    pass
+            full = pre + remote_cmd(cmd, group=gzb64, harness="bin/dispatch-harness.json" in xt) + (GZB64_SUFFIX if gzb64 else "")
             if gzb64:
                 full = "set -o pipefail; " + full
             res = _submit(cj, api, str(wt), full, timeout_s, stage, bundle_id, host_tools(xt),
@@ -441,7 +460,8 @@ def run_stage(wt, cmd, timeout_s, stage, bundle_id, local_fn, *, tools=None, env
                 if why is None and check is not None:
                     veto = check(r)
                     if veto:
-                        why = "remote result vetoed: " + str(veto)
+                        why = "remote result vetoed after %.0fs of runner work (re-running locally): %s" % (
+                            time.time() - t0, veto)
                 if why is None:
                     _log(stage, bundle_id, "runner", "", snap0, r.exit_code, r.wall, job_id)
                     return r

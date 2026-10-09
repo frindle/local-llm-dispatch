@@ -31,8 +31,18 @@ if [ -n "${CLAUDE_HEADLESS_DIAGNOSIS:-}" ]; then exit 0; fi
 
 IDX="$HOME/.ollama-dispatch/escalations/ESCALATIONS.md"
 READY="$HOME/.ollama-dispatch/escalations/READY-TO-LAND.md"
-[ -f "$IDX" ] || [ -f "$READY" ] || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
+
+# LAND QUEUE (2026-10-09, ollama-land): finished chains that already have a computed landing
+# packet and wait for FINAL REVIEW by the main session. Read-only (the tool never merges from
+# here); silent when nothing waits or when the tool is not installed.
+land="$(python3 "$HOME/bin/ollama-land" summary 2>/dev/null || true)"
+
+if [ ! -f "$IDX" ] && [ ! -f "$READY" ]; then
+  [ -n "$land" ] || exit 0
+  jq -n --arg m "$land" '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $m}}'
+  exit 0
+fi
 
 msg="$(python3 - "$IDX" "$READY" <<'PY' 2>/dev/null || true
 import sys, pathlib
@@ -67,6 +77,11 @@ print("\n".join(out))
 PY
 )"
 
+if [ -n "$land" ]; then
+  msg="${land}${msg:+
+
+}${msg}"
+fi
 [ -n "$msg" ] || exit 0
 
 jq -n --arg m "$msg" '{

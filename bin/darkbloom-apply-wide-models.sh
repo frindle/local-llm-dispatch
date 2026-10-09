@@ -67,7 +67,10 @@ def toml_enabled():
 def base_key():
     try:
         j = json.loads(LOCAL.read_text())
-        return str(j.get("base_url") or "http://127.0.0.1:8000").rstrip("/"), str(j.get("api_key") or j.get("key") or "")
+        base = str(j.get("base_url") or "http://127.0.0.1:8000").rstrip("/")
+        if base.endswith("/v1"):    # real local.json carries ".../v1"; every caller appends "/v1/..." itself
+            base = base[:-3]
+        return base, str(j.get("api_key") or j.get("key") or "")
     except (OSError, ValueError):
         return "http://127.0.0.1:8000", ""
 

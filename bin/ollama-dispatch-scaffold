@@ -43,6 +43,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -168,7 +169,7 @@ def sh(cmd, cwd=None):
     return p.returncode, p.stdout, p.stderr
 
 
-def _fresh_base_ref(repo, fetch_timeout=90):
+def _fresh_base_ref(repo, fetch_timeout=90, lock_timeout=240):
     """The ref a new dispatch worktree should start from: the repo's HEAD, UNLESS
     HEAD is strictly BEHIND origin's default branch -- then that branch.
 
@@ -178,7 +179,39 @@ def _fresh_base_ref(repo, fetch_timeout=90):
     conflicted with what was already on main. HEAD is kept when it is AHEAD of or
     DIVERGED from origin (local work never silently dropped), and on any failure
     (no origin, offline, fetch timeout) -- i.e. never worse than before.
+    The fetch is taken under the SAME per-repo flock as dispatch_harness_gates.resolve_base_sha
+    (<git-common-dir>/ods-base-fetch.lock), so concurrent scaffolds/autos cannot interleave a
+    fetch with another's base read (smoke defect 2, 2026-10-09). A lock that stays busy is NOT
+    silently ignored: the fetch is skipped and the note says so.
     Returns (ref, note)."""
+    import fcntl
+    _gd = sh(["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    _lockdir = Path(_gd[1].strip()) if _gd[0] == 0 and _gd[1].strip() else Path(repo)
+    _fh = None
+    try:
+        _fh = open(_lockdir / "ods-base-fetch.lock", "a+")
+        _deadline = time.time() + lock_timeout
+        while True:
+            try:
+                fcntl.flock(_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() > _deadline:
+                    return "HEAD", f"base-fetch lock busy > {lock_timeout}s -- fetch skipped, cutting from HEAD"
+                time.sleep(0.2)
+    except OSError:
+        _fh = None          # lock file unusable: proceed unlocked (old behaviour)
+    try:
+        return _fresh_base_ref_locked(repo, fetch_timeout)
+    finally:
+        if _fh is not None:
+            try:
+                _fh.close()
+            except OSError:
+                pass
+
+
+def _fresh_base_ref_locked(repo, fetch_timeout=90):
     try:
         rc, _, err = (lambda p: (p.returncode, p.stdout, p.stderr))(subprocess.run(
             ["git", "-C", str(repo), "fetch", "--quiet", "origin"],
@@ -2550,6 +2583,26 @@ def _ensure_gitignore(root: Path, a, entries):
     a._gitignore_touched = True
 
 
+def _drop_env_fixtures(root: Path, a):
+    """Drop the sealed environment fixture(s) for this harness's language into `root`.
+    Returns the file names written (fail-open: [] when the helper module/templates are absent)."""
+    try:
+        from importlib.machinery import SourceFileLoader as _SFL
+        import importlib.util as _ilu
+        _here = Path(__file__).resolve().parent
+        _sl = _SFL("dispatch_env_fixture", str(_here / "dispatch_env_fixture.py"))
+        _sm = _ilu.module_from_spec(_ilu.spec_from_loader("dispatch_env_fixture", _sl))
+        _sl.exec_module(_sm)
+        out = []
+        for n in _sm.fixture_names(getattr(a, "lang", "") or "python"):
+            if _sm.drop(root, n, bin_dir=_here) in ("created", "restored", "ok"):
+                out.append(n)
+        return out
+    except Exception as e:  # pragma: no cover - never block a scaffold on the optional fixture
+        print(f"  (environment fixture not dropped: {e})", file=sys.stderr)
+        return []
+
+
 def build_python(root: Path, a):
     # Only seed requirements.txt for a fresh project. In --repo mode an empty
     # requirements.txt is an untracked leak into the diff, and for a pyproject-
@@ -4074,6 +4127,7 @@ def main():
     _wt_cleanup = None
     branch = None
     creating_target = False
+    _recorded_base = (None, "")
     if a.repo:
         repo = Path(a.repo).expanduser().resolve()
         if not (repo / ".git").exists():
@@ -4085,7 +4139,24 @@ def main():
         # dispatch against a bogus file with a green "parses" check. A genuine
         # creation task uses --new-project.
         creating_target = False
-        if not (repo / a.target).exists():
+        # BASE RESOLVED ONCE, UP FRONT (smoke defect 2): the worktree is cut from this exact
+        # commit, the creation decision reads THIS tree (not the source checkout's working
+        # copy, which can differ from the base), and the sha is recorded in the manifest.
+        base_ref = a.baseline_ref
+        if base_ref:
+            _base_note = f"explicit --baseline-ref {base_ref} (no fetch)"
+        else:
+            base_ref, _base_note = _fresh_base_ref(repo)
+        _rc, _o, _ = sh(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", base_ref])
+        _base_obj = _o.strip() if _rc == 0 and _o.strip() else None
+        _bt = sh(["git", "-C", str(repo), "cat-file", "-t", _base_obj])[1].strip() if _base_obj else ""
+        base_sha = _base_obj if _bt == "commit" else None
+        print(f"  base: {_base_note}")
+        if _base_obj:
+            _in_base = sh(["git", "-C", str(repo), "cat-file", "-e", f"{_base_obj}:{a.target}"])[0] == 0
+        else:
+            _in_base = (repo / a.target).exists()
+        if not _in_base:
             _ext = Path(a.target).suffix.lower()
             if _ext in CREATION_CODE_EXTS:
                 # CREATION task: a real-code-extension target that does not yet
@@ -4159,12 +4230,8 @@ def main():
         # handled gracefully; -b otherwise so an existing branch errors loudly.
         # --baseline-ref: start the worktree/branch from a caller-supplied treeish
         # (e.g. a pre-materialised conflicted merge tree) instead of the repo HEAD.
-        base_ref = a.baseline_ref
-        if not base_ref:
-            base_ref, _note = _fresh_base_ref(repo)
-            print(f"  base: {_note}")
         addcmd = ["git", "-C", str(repo), "worktree", "add",
-                  ("-B" if a.force else "-b"), branch, str(dest), base_ref]
+                  ("-B" if a.force else "-b"), branch, str(dest), _base_obj or base_ref]
         _ensure_git_materialized(repo)
         rc, out, err = sh(addcmd)
         if rc != 0 and _MMAP_FAIL in err:
@@ -4193,6 +4260,7 @@ def main():
                   file=sys.stderr)
             return 2
         _wt_cleanup = (repo, dest, branch)
+        _recorded_base = (base_sha, _base_note)
         root, mode = dest, f"worktree of {repo.name} on {branch}"
     else:
         # FIX 2a (2026-09-13): a repo EDIT mis-invoked as --new-project. If the
@@ -4250,6 +4318,13 @@ def main():
         if not is_diag:
             (root / "check_literals.py").write_text(
                 CHECK_LITERALS.format(target=a.target))
+            # SEALED ENVIRONMENT FIXTURE (2026-10-09): a vetted, tested DOM/page/chrome/fetch/sqlite
+            # double (JS/TS) or memory_db/clock/http helpers (python), dropped READ-ONLY at the
+            # worktree root and sealed with the rest of the harness (the manifest `authored` list
+            # below). The author IMPORTS it instead of hand-writing a fake page (smoke bbafd0efed38
+            # burned 24/24 iterations on one); auto-harness-check restores it if edited and bounces
+            # a fixture that defines its own.
+            a._env_fixtures = _drop_env_fixtures(root, a)
         if a.mirror_from:
             msrc = Path(a.mirror_from).expanduser().resolve()
             if not msrc.is_dir():
@@ -4318,6 +4393,7 @@ def main():
         if a.lang == "rust" and (root / "Cargo.toml").is_file():
             authored.append("Cargo.toml")
         authored += list(getattr(a, "_cs_harness", []))
+        authored += list(getattr(a, "_env_fixtures", []))
         # .gitignore is part of the authored harness for the compiled flavours:
         # without it the toolchain's build dir (.build/, target/, out/) is
         # untracked noise and the gate FAILs baseline-clean on artefacts. Only
@@ -4354,7 +4430,11 @@ def main():
                         # node-test run verify.test.ts, swift
                         # Sources/<M>Tests/main.swift, bash verify_cases.sh).
                         "fixture": getattr(a, "fixture_rel", None),
-                        "creation_task": bool(getattr(a, "_creating_target", False))},
+                        "creation_task": bool(getattr(a, "_creating_target", False)),
+                        # the commit the worktree was cut from (preflight's spec-defect
+                        # check compares it with HEAD); only in --repo mode
+                        **({"base_sha": _recorded_base[0], "base_note": _recorded_base[1]}
+                           if _recorded_base[0] else {})},
                        indent=2))
 
         # A fresh project needs a baseline commit, or there is nothing for

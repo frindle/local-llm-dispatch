@@ -103,6 +103,36 @@ def log(cfg, msg, level="INFO"):
         pass
 
 
+# Drift-guard WARN de-noising (2026-10-09 smoke): the queue re-verifies the hold every ~67s,
+# and a DEGRADED hold (BloomGauge closed) re-logged the same WARN each time for hours. The
+# guard's BEHAVIOUR is untouched; only the LOGGING of an unchanged condition is limited: log
+# when the condition (key, signature) changes, plus a heartbeat at most every
+# WARN_HEARTBEAT_S while it persists. `_LOG_SEEN` is per process (the queue daemon holds one).
+WARN_HEARTBEAT_S = 600.0
+_LOG_SEEN = {}
+
+
+def log_on_change(cfg, key, sig, msg, level="WARN", now=None, heartbeat_s=None):
+    """log() once per state change of `key` (signature `sig`) and at most every
+    `heartbeat_s` while the same signature persists. -> True if a line was written."""
+    now = time.time() if now is None else now
+    hb = WARN_HEARTBEAT_S if heartbeat_s is None else heartbeat_s
+    last = _LOG_SEEN.get(key)
+    if last is not None and last[0] == sig and now - last[1] < hb:
+        return False
+    _LOG_SEEN[key] = (sig, now)
+    log(cfg, msg + (" [still: heartbeat]" if last is not None and last[0] == sig else ""), level)
+    return True
+
+
+def clear_log_seen(key=None):
+    """Forget a condition (it cleared) so its next occurrence logs immediately."""
+    if key is None:
+        _LOG_SEEN.clear()
+    else:
+        _LOG_SEEN.pop(key, None)
+
+
 # ------------------------------------------------------------------ state file
 def read_state(cfg):
     try:
@@ -406,7 +436,10 @@ def _hold_locked(cfg):
     except (BloomDown, BloomShape) as e:
         degraded = True
         notes.append("bloom %s" % e)
-        log(cfg, "BloomGauge unusable (%s): DEGRADED -- darkbloom start only" % e, "WARN")
+        log_on_change(cfg, "bloom-unusable", str(e),
+                      "BloomGauge unusable (%s): DEGRADED -- darkbloom start only" % e)
+    else:
+        clear_log_seen("bloom-unusable")
     ready, why = pair_ready(cfg)
     manual = view is not None and view["mode"] == "manual"
     plan_edits = desired_toml(toml_text(cfg), cfg["pair"])[1]
@@ -428,11 +461,13 @@ def _hold_locked(cfg):
             if not ok:
                 degraded = True
                 notes.append("set-automatic false refused: %s" % w)
-                log(cfg, "set-automatic enabled:false failed (%s): continuing, DEGRADED" % w, "WARN")
+                log_on_change(cfg, "set-automatic-refused", str(w),
+                              "set-automatic enabled:false failed (%s): continuing, DEGRADED" % w)
         except (BloomDown, BloomShape) as e:
             degraded = True
             notes.append("manual: %s" % e)
-            log(cfg, "set-automatic enabled:false: %s: continuing, DEGRADED" % e, "WARN")
+            log_on_change(cfg, "set-automatic-down", str(e),
+                          "set-automatic enabled:false: %s: continuing, DEGRADED" % e)
 
     # 2) Darkbloom auto-update off for the busy period (remember it was on)
     if au_on:

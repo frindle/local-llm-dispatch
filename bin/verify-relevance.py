@@ -799,6 +799,7 @@ class Mutant:
         self.func = None           # innermost enclosing def (Python), for reports
         self.io_adapter = None     # declared+validated real-I/O adapter -> excluded
         self.io_adapter_candidate = None   # UNDECLARED adapter-shaped fn (hint only)
+        self.bank = None           # wrong-solution-bank category (wrong_solution_bank)
 
     def as_dict(self):
         return {"id": self.id, "file": self.path, "class": self.klass,
@@ -808,7 +809,8 @@ class Mutant:
                 "seconds": self.seconds, "snippet": self.snippet,
                 "original": self.original, "func": self.func,
                 "io_adapter": self.io_adapter,
-                "io_adapter_candidate": self.io_adapter_candidate}
+                "io_adapter_candidate": self.io_adapter_candidate,
+                "bank": self.bank}
 
 
 # --------------------------------------------------------------------------
@@ -1228,7 +1230,8 @@ def csharp_mutants(rel: str, fixed_text: str, added: set[int]) -> list[Mutant]:
 # language-agnostic hunk reverts
 # --------------------------------------------------------------------------
 def hunk_revert_mutants(rel: str, fixed_text: str, hunks: list[dict],
-                        code_lines: set[int] | None = None) -> list[Mutant]:
+                        code_lines: set[int] | None = None,
+                        report: list | None = None) -> list[Mutant]:
     """Revert ONE hunk of the refimpl while keeping the others: the partial
     revert. Needs >= 2 material hunks, otherwise it is the full revert (already
     proven by baseline-fails) and says nothing new."""
@@ -1242,6 +1245,20 @@ def hunk_revert_mutants(rel: str, fixed_text: str, hunks: list[dict],
         return (not _is_comment_only(h["new_lines"])
                 or not _is_comment_only(h["old_lines"]))
     material = [h for h in hunks if material_hunk(h)]
+    if report is not None:
+        # PER-HUNK NECESSITY (necessity_pass): every hunk that is NOT subject to
+        # the gate is recorded with its reason -- the exemptions are explicit.
+        for h in hunks:
+            if h not in material:
+                report.append({"file": rel, "hunk": h["new_start"],
+                               "reason": "non-material hunk (comment-only / "
+                                         "type-only / no executable line): erases "
+                                         "at runtime, reverting it is equivalent"})
+        if len(material) < 2 and material:
+            report.append({"file": rel, "hunk": material[0]["new_start"],
+                           "reason": "single material hunk (whole-file creation "
+                                     "or one-hunk fix): its full revert is the "
+                                     "baseline-fails proof"})
     if len(material) < 2:
         return []
     out = []
@@ -1488,10 +1505,20 @@ def generate(worktree: Path, diff_text: str, literals,
         # dedupe identical sources
         seen = set()
         uniq = []
+        dead = python_unreachable_lines(fixed) if rel.endswith(".py") else set()
         for m in ms:
             if m.source in seen:
                 continue
             seen.add(m.source)
+            # EQUIVALENT-MUTANT FILTER, deterministic (equivalent_reason): an
+            # identical / AST-equal / comment-or-whitespace-only / dead-branch
+            # mutant cannot be killed by ANY test, so it is not evidence.
+            why = equivalent_reason(m, fixed, dead)
+            if why:
+                notes.setdefault("equivalent_filtered", []).append(
+                    {"file": rel, "line": m.lineno, "class": m.klass,
+                     "mutation": m.desc, "reason": why})
+                continue
             uniq.append(m)
         notes["files"][rel] = {"added_lines": len(info["added"]),
                                "hunks": len(info["hunks"]),
@@ -1597,7 +1624,27 @@ def measure_applied(worktree: Path, verify_cmd: str, diff_text: str, **kw) -> di
                          "line kills its mutants by textual coincidence), so it was "
                          "not measured. FIX: " + str(sth.get("fix") or "")),
         }
+    kw = dict(kw)
+    post_bs = kw.pop("post_budget_s", None)
+    do_nec = kw.pop("necessity", True)
+    do_bank = kw.pop("wrong_bank", True)
+    llm_equiv_cmd = kw.pop("llm_equivalence_cmd", None)
+    llm_wrong_cmd = kw.pop("llm_wrong_solutions_cmd", None)
     rec = _measure_applied_core(worktree, verify_cmd, diff_text, **kw)
+    objs = rec.pop("_objs", None)
+    if objs is not None:
+        try:
+            if post_bs is not None:
+                kw["post_budget_s"] = post_bs
+            apply_post_gates(worktree, verify_cmd, diff_text, rec, objs, kw,
+                             necessity=do_nec, bank=do_bank,
+                             llm_equiv_cmd=llm_equiv_cmd, llm_wrong_cmd=llm_wrong_cmd)
+        except Exception as e:     # fail CLOSED: an unrunnable gate is UNPROVEN, never a pass
+            rec["post_gate_error"] = f"{type(e).__name__}: {e}"
+            if rec.get("verdict") == "relevant":
+                rec["verdict"] = "unproven"
+                rec["reason"] = ("necessity / wrong-solution post-gate crashed ("
+                                 + rec["post_gate_error"] + ") -- relevance not proven")
     # BEHAVIOURAL OPT-OUTS (optout_lines): never honoured, always reported -- on
     # a PASS too, so the coordinator sees the author tried to exempt a decision.
     _rej = (rec.get("generation") or {}).get("optout_rejected") or []
@@ -1682,6 +1729,8 @@ def _measure_applied_core(worktree: Path, verify_cmd: str, diff_text: str, *,
     notes["literals_from_verify_grep"] = grep_lits
     rec["generation"] = notes
     rec["generated"] = len(mutants)
+    rec["_green_secs"] = green_secs
+    rec["_objs"] = mutants          # popped by measure_applied (post-gates reuse them)
     # Declared + validated real-I/O adapter mutants: generated, reported, NOT
     # evidence (a hermetic verify cannot reach them by design) -- see the
     # REAL-I/O ADAPTERS block at the top of this file.
@@ -1860,6 +1909,477 @@ def _measure_applied_core(worktree: Path, verify_cmd: str, diff_text: str, *,
                          f"breaking mutants of the reference impl pass -- it is "
                          f"testing a proxy, or a benign slice, of the property")
     return rec
+
+
+# --------------------------------------------------------------------------
+# DETERMINISTIC EQUIVALENT-MUTANT FILTER (2026-10-09)
+# --------------------------------------------------------------------------
+# A mutant no test CAN kill is not evidence and must not be fed back to the
+# fixture author as a "hole" (research: equivalent-mutant noise is what makes
+# survivor-feedback loops burn rounds). Filtered DETERMINISTICALLY, before any
+# LLM is consulted: identical text, identical AST (Python: comment / whitespace /
+# formatting only), comment-or-whitespace-only text change (other languages), and
+# DEAD code (Python: statements after return/raise/continue/break, bodies of
+# `if False` / `while 0`, the `else` of `if True`). Every drop is recorded in
+# generation.equivalent_filtered -- never silent.
+def python_unreachable_lines(text: str) -> set[int]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+    dead: set[int] = set()
+
+    def mark(stmts):
+        for st in stmts:
+            for n in range(st.lineno, (getattr(st, "end_lineno", None) or st.lineno) + 1):
+                dead.add(n)
+
+    def truth(t):
+        if isinstance(t, ast.Constant) and not isinstance(t.value, (str, bytes)):
+            return bool(t.value)
+        return None
+    for node in ast.walk(tree):
+        for f in ("body", "orelse", "finalbody"):
+            lst = getattr(node, f, None)
+            if isinstance(lst, list) and lst and isinstance(lst[0], ast.stmt):
+                for i, st in enumerate(lst):
+                    if isinstance(st, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
+                        mark(lst[i + 1:])
+                        break
+        if isinstance(node, ast.If):
+            t = truth(node.test)
+            if t is False:
+                mark(node.body)
+            elif t is True:
+                mark(node.orelse)
+        elif isinstance(node, ast.While) and truth(node.test) is False:
+            mark(node.body)
+    return dead
+
+
+def _strip_line_comment(line: str, py: bool) -> str:
+    """Drop a trailing `//` (or `#` for Python) comment, string-aware."""
+    q = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = None
+        elif c in "'\"`":
+            q = c
+        elif py and c == "#":
+            return line[:i]
+        elif not py and line.startswith("//", i):
+            return line[:i]
+        i += 1
+    return line
+
+
+def _normalised_code_lines(text: str, py: bool) -> list[str]:
+    out = []
+    for l in text.split("\n"):
+        s = l.strip()
+        if not s or s.startswith(("//", "/*", "*", "*/")) or (py and s.startswith("#")):
+            continue
+        out.append(" ".join(_strip_line_comment(s, py).split()))
+    return [l for l in out if l]
+
+
+def equivalent_reason(m: Mutant, fixed: str, dead: set | None = None) -> str | None:
+    """PURE. Why `m` is provably equivalent to the fixed file, or None."""
+    if m.source == fixed:
+        return "identical text"
+    py = m.path.endswith(".py")
+    if py:
+        try:
+            if ast.dump(ast.parse(m.source)) == ast.dump(ast.parse(fixed)):
+                return "AST-identical (comment / whitespace / formatting only)"
+        except SyntaxError:
+            pass
+        if dead and all(n in dead for n in range(m.lineno, (m.end_lineno or m.lineno) + 1)):
+            return "dead code (unreachable statement / constant-false branch)"
+    elif _normalised_code_lines(m.source, False) == _normalised_code_lines(fixed, False):
+        return "comment / whitespace-only change"
+    return None
+
+
+# --------------------------------------------------------------------------
+# POST-GATES on the measured record (2026-10-09): per-hunk NECESSITY and the
+# WRONG-SOLUTION BANK. Both reuse the mutants the core already ran (a result is
+# never re-measured), run only what is missing, and are CHEAP: hunk-reverts are
+# one verify run per hunk, the bank is capped at BANK_PER_CATEGORY x categories.
+# Both FAIL CLOSED: a surviving variant is LOW (a hard NO-GO at preflight); a
+# variant the budget did not reach turns a would-be RELEVANT into UNPROVEN.
+# --------------------------------------------------------------------------
+NECESSITY_DOC_EXTS = (".md", ".rst", ".txt", ".adoc", ".markdown")
+BANK_PER_CATEGORY = 3
+BANK_CATEGORIES = ("boundary", "swapped-compare", "dropped-guard",
+                   "wrong-default", "early-return")
+_BOUNDARY_PAIRS = {(">=", ">"), (">", ">="), ("<=", "<"), ("<", "<=")}
+_GUARDISH = re.compile(r"\bnot\b|\bNone\b|\bnull\b|\bundefined\b|!|\blen\(|\.length\b"
+                       r"|==\s*0\b|\bempty\b|\bis_empty\b")
+_COMPAREISH = re.compile(r"<|>|==|!=|\brange\(|\blen\(|\[|\bslice\(|\.length\b")
+
+
+def bank_category(m: Mutant) -> str | None:
+    """PURE. The wrong-solution category of an existing mutant, or None."""
+    k, d = m.klass, m.desc or ""
+    orig = m.original or ""
+    if k in ("compare-flip", "cmp-bound"):
+        mt = re.match(r"^(.+?) -> (.+?)$", d.strip())
+        if mt and (mt.group(1).strip(), mt.group(2).strip()) in _BOUNDARY_PAIRS:
+            return "boundary"
+        return "swapped-compare"
+    if k == "const-int" and _COMPAREISH.search(orig):
+        return "boundary"
+    if k == "const-default":
+        return "wrong-default"
+    if k == "early-return":
+        return "early-return"
+    if k in ("stmt-delete", "cond-force-false") and orig.strip().startswith("if") \
+            and _GUARDISH.search(orig):
+        return "dropped-guard"
+    return None
+
+
+def wrong_solution_extras(rel: str, fixed: str, added: set) -> list[Mutant]:
+    """Python-only plausible-wrong variants the generic mutator has no class for:
+    an EARLY `return None` at the top of an added function, and a WRONG parameter
+    DEFAULT. (TS/JS get the categories its sidecar mutator already emits.)"""
+    if not rel.endswith(".py"):
+        return []
+    try:
+        tree = ast.parse(fixed)
+    except SyntaxError:
+        return []
+    annotated, _ = optout_lines(fixed)
+    src = Src(fixed)
+    lines = fixed.split("\n")
+    out: list[Mutant] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        fn_end = getattr(fn, "end_lineno", None) or fn.lineno
+        if not any(n in added for n in range(fn.lineno, fn_end + 1)):
+            continue            # the refimpl did not touch this function
+        body = list(fn.body)
+        if body and isinstance(body[0], ast.Expr) and isinstance(
+                getattr(body[0], "value", None), ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body = body[1:]
+        has_yield = any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(fn))
+        if len(body) >= 2 and not has_yield and body[0].lineno > fn.lineno \
+                and body[0].lineno not in annotated:
+            first = body[0]
+            ind = " " * first.col_offset
+            text = "\n".join(lines[:first.lineno - 1] + [ind + "return None"]
+                             + lines[first.lineno - 1:])
+            try:
+                compile(text, rel, "exec")
+            except SyntaxError:
+                text = None
+            if text:
+                m = Mutant(rel, "early-return",
+                           f"early `return None` at the top of `{fn.name}`", text, first.lineno)
+                m.snippet = "return None"
+                m.original = _line_of(fixed, first.lineno)
+                out.append(m)
+        a = fn.args
+        for d in list(a.defaults) + [x for x in a.kw_defaults if x is not None]:
+            if not isinstance(d, ast.Constant) or d.lineno in annotated or d.lineno not in added:
+                continue
+            v = d.value
+            if isinstance(v, bool):
+                nv = str(not v)
+            elif isinstance(v, int):
+                nv = str(v + 1000003)
+            else:
+                continue
+            x, y = src.span(d)
+            text = src.replace(x, y, nv)
+            try:
+                compile(text, rel, "exec")
+            except SyntaxError:
+                continue
+            m = Mutant(rel, "const-default", f"parameter default {v!r} -> {nv}", text, d.lineno)
+            m.snippet = (text.split("\n")[d.lineno - 1].strip()[:120])
+            m.original = _line_of(fixed, d.lineno)
+            out.append(m)
+    return out
+
+
+def _run_missing(worktree: Path, verify_cmd: str, ms: list, green_secs, verify_timeout,
+                 deadline: float) -> None:
+    """Run every mutant in `ms` whose .killed is None; restore the tree after each."""
+    originals: dict[str, str] = {}
+    try:
+        for m in ms:
+            if m.killed is not None:
+                continue
+            if time.time() > deadline:
+                break
+            p = worktree / m.path
+            if m.path not in originals:
+                originals[m.path] = p.read_text()
+            p.write_text(m.source)
+            _clear_pycache(p.parent)
+            rc, out, secs = _run_verify(verify_cmd, worktree,
+                                        mutant_timeout(green_secs, verify_timeout))
+            p.write_text(originals[m.path])
+            _clear_pycache(p.parent)
+            m.killed = not _green(rc, out)
+            m.crash = m.killed and ("Traceback (most recent call last)" in out)
+            if m.killed and m.path.endswith(".cs") and "FAIL: dotnet build" in out:
+                m.killed = None      # uncompilable: not behavioural evidence
+                m.uncompilable = True
+            m.seconds = round(secs, 2)
+    finally:
+        for rel, text in originals.items():
+            try:
+                (worktree / rel).write_text(text)
+            except Exception:
+                pass
+        _clear_pycache(worktree)
+
+
+def _lit_ok(m: Mutant, file_lits: list) -> bool:
+    return all(l in m.source for l in file_lits)
+
+
+def _llm_json(cmd: str, payload: dict, cwd: Path, timeout: int = 300):
+    cp = subprocess.run(cmd, shell=True, cwd=str(cwd), input=json.dumps(payload),
+                        capture_output=True, text=True, timeout=timeout)
+    txt = cp.stdout.strip()
+    a, b = txt.find("["), txt.rfind("]")
+    if a < 0 or b < a:
+        return None
+    return json.loads(txt[a:b + 1])
+
+
+def apply_post_gates(worktree: Path, verify_cmd: str, diff_text: str, rec: dict,
+                     objs: list, kw: dict, *, necessity=True, bank=True,
+                     llm_equiv_cmd=None, llm_wrong_cmd=None) -> None:
+    """Mutates `rec` in place. See the section header above."""
+    t0 = time.time()
+    green_secs = rec.pop("_green_secs", None)
+    verify_timeout = kw.get("verify_timeout", VERIFY_TIMEOUT_S)
+    budget = kw.get("budget_s", DEFAULT_BUDGET_S)
+    deadline = t0 + kw.get("post_budget_s", max(60, budget // 2))        # its own allowance on top of the core's
+    io_adapters = kw.get("io_adapters") or ()
+    gen = rec.get("generation") or {}
+    all_lits = list(dict.fromkeys(list(gen.get("literals_from_task") or [])
+                                  + list(gen.get("literals_from_verify_grep") or [])))
+    files = parse_unified_diff(diff_text)
+    by_id = {m.id: m for m in objs}
+    new_surv: list[dict] = []
+    reasons: list[str] = []
+    untested_msgs: list[str] = []
+    extra_tried = 0
+
+    # ---------------- 1. PER-HUNK NECESSITY ----------------
+    nec = {"enabled": bool(necessity), "checked": 0, "necessary": 0,
+           "unnecessary": [], "exempt": [], "untested": []}
+    if necessity:
+        cands: list[Mutant] = []
+        for rel, info in files.items():
+            if rel.endswith(NECESSITY_DOC_EXTS):
+                nec["exempt"].append({"file": rel, "hunk": None,
+                                      "reason": "doc-only file: prose has no behaviour to revert"})
+                continue
+            p = worktree / rel
+            if not p.is_file():
+                continue
+            try:
+                fixed = p.read_text()
+            except Exception:
+                continue
+            code_lines = python_code_lines(fixed) if rel.endswith(".py") else None
+            rep: list = []
+            hms = hunk_revert_mutants(rel, fixed, info["hunks"], code_lines, rep)
+            nec["exempt"].extend(rep)
+            annotated, _ = optout_lines(fixed)
+            dead = python_unreachable_lines(fixed) if rel.endswith(".py") else set()
+            file_lits = [l for l in all_lits if l in fixed]
+            for hm in hms:
+                m = by_id.get(hm.id) or hm
+                label = {"file": rel, "hunk": m.lineno}
+                why = equivalent_reason(m, fixed, dead)
+                if why:
+                    nec["exempt"].append(dict(label, reason="equivalent revert: " + why))
+                    continue
+                if not _lit_ok(m, file_lits):
+                    nec["exempt"].append(dict(label, reason="reverting it removes a `## Must contain` "
+                                              "literal: the spec itself requires this hunk"))
+                    continue
+                if rel.endswith(".py"):
+                    tag_io_adapters(rel, fixed, [m], io_adapters, {})
+                    if m.io_adapter:
+                        nec["exempt"].append(dict(label, reason=f"declared real-I/O adapter `{m.io_adapter}`"))
+                        continue
+                span = range(m.lineno, (m.end_lineno or m.lineno) + 1)
+                body = [n for n in span if code_lines is None or n in code_lines]
+                if body and all(n in annotated for n in body):
+                    nec["exempt"].append(dict(label, reason="every code line carries a (honoured, "
+                                              "non-behavioural) `relevance: unobservable` opt-out"))
+                    continue
+                cands.append(m)
+        _run_missing(worktree, verify_cmd, cands, green_secs, verify_timeout, deadline)
+        for m in cands:
+            if m.killed is None:
+                nec["untested"].append({"file": m.path, "hunk": m.lineno})
+                untested_msgs.append(f"hunk {m.path}@{m.lineno}")
+                continue
+            nec["checked"] += 1
+            if m.killed:
+                nec["necessary"] += 1
+            else:
+                end = m.end_lineno or m.lineno
+                n_lines = end - m.lineno + 1
+                msg = (f"UNNECESSARY HUNK {m.path}:{m.lineno}-{end} ({n_lines} line(s)): reverting "
+                       f"it leaves the verify GREEN, so nothing tests it -- `{(m.snippet or '')[:90]}`")
+                d = m.as_dict()
+                d["mutation"] = msg
+                d["gate"] = "necessity"
+                d["unnecessary_hunk"] = True
+                nec["unnecessary"].append({"file": m.path, "start": m.lineno, "end": end,
+                                           "message": msg})
+                new_surv.append(d)
+        if nec["unnecessary"]:
+            reasons.append("; ".join(u["message"] for u in nec["unnecessary"][:3])
+                           + " -- DELETE the hunk from the reference solution if the spec does "
+                             "not need it, or add a case that fails without it")
+    rec["necessity"] = nec
+
+    # ---------------- 2. WRONG-SOLUTION BANK ----------------
+    bk = {"enabled": bool(bank), "variants": [], "survivors": [],
+          "unavailable": [], "llm": bool(llm_wrong_cmd)}
+    if bank:
+        pool = [m for m in objs if m.literal_preserving and not m.io_adapter
+                and m.klass != "hunk-revert"]
+        for rel, info in files.items():
+            p = worktree / rel
+            if not p.is_file() or not rel.endswith(".py"):
+                continue
+            try:
+                fixed = p.read_text()
+            except Exception:
+                continue
+            file_lits = [l for l in all_lits if l in fixed]
+            dead = python_unreachable_lines(fixed)
+            ex = [m for m in wrong_solution_extras(rel, fixed, info["added"])
+                  if not equivalent_reason(m, fixed, dead) and _lit_ok(m, file_lits)]
+            tag_io_adapters(rel, fixed, ex, io_adapters, {})   # declared adapters are exempt
+            pool.extend(m for m in ex if not m.io_adapter)
+        picked: list[Mutant] = []
+        have = set()
+        for cat in BANK_CATEGORIES:
+            # the operator-level variants first (compare-flip IS the off-by-one /
+            # swapped comparison; a +/-1 constant is the weaker form of it)
+            cand = sorted((m for m in pool if bank_category(m) == cat),
+                          key=lambda m: (m.klass not in ("compare-flip", "cmp-bound"),
+                                         m.path, m.lineno, m.klass, m.id))
+            n, sites = 0, set()
+            for m in cand:
+                if n >= BANK_PER_CATEGORY:
+                    break
+                if (m.path, m.lineno, m.klass) in sites or m.id in have:
+                    continue
+                sites.add((m.path, m.lineno, m.klass))
+                have.add(m.id)
+                m.bank = cat
+                picked.append(m)
+                n += 1
+            if n == 0:
+                bk["unavailable"].append(cat)
+        if llm_wrong_cmd:
+            try:
+                texts = {rel: (worktree / rel).read_text() for rel in files
+                         if (worktree / rel).is_file()}
+                tfile = worktree / "TASK.md"
+                props = _llm_json(llm_wrong_cmd, {"files": texts,
+                                                  "task": tfile.read_text() if tfile.is_file() else ""},
+                                  worktree) or []
+                for pr in props[:4]:
+                    rel, srcx = pr.get("file"), pr.get("source")
+                    if rel not in texts or not isinstance(srcx, str) or srcx == texts[rel]:
+                        continue
+                    if rel.endswith(".py"):
+                        try:
+                            compile(srcx, rel, "exec")
+                        except SyntaxError:
+                            continue
+                    m = Mutant(rel, "llm-wrong-solution", str(pr.get("why") or "LLM wrong solution")[:160],
+                               srcx, int(pr.get("line") or 1))
+                    m.literal_preserving = _lit_ok(m, [l for l in all_lits if l in texts[rel]])
+                    if (not m.literal_preserving
+                            or equivalent_reason(m, texts[rel], python_unreachable_lines(texts[rel])
+                                                 if rel.endswith(".py") else set())):
+                        continue
+                    m.bank = "llm"
+                    picked.append(m)
+            except Exception as e:
+                bk["llm_error"] = f"{type(e).__name__}: {e}"
+        _run_missing(worktree, verify_cmd, picked, green_secs, verify_timeout, deadline)
+        for m in picked:
+            row = {"category": m.bank, "file": m.path, "line": m.lineno, "mutation": m.desc,
+                   "killed": m.killed}
+            bk["variants"].append(row)
+            if m.killed is None:
+                untested_msgs.append(f"bank variant {m.bank} {m.path}:{m.lineno}")
+            elif not m.killed:
+                msg = (f"WRONG-SOLUTION [{m.bank}] survived at {m.path}:{m.lineno}: {m.desc} "
+                       f"(`{(m.original or '').strip()[:70]}` ==> `{(m.snippet or '').strip()[:70]}`) "
+                       f"-- a plausible wrong implementation passes the fixture")
+                d = m.as_dict()
+                d["mutation"] = msg
+                d["gate"] = "wrong-solution-bank"
+                bk["survivors"].append(msg)
+                if not any(s.get("id") == d["id"] for s in new_surv):
+                    new_surv.append(d)
+        if bk["survivors"]:
+            reasons.append("; ".join(bk["survivors"][:3]))
+    rec["wrong_bank"] = bk
+
+    # ---------------- fold into the record ----------------
+    if new_surv:
+        ids = {d["id"] for d in new_surv}
+        old = [s for s in rec.get("survivors") or [] if s.get("id") not in ids]
+        counted = {s.get("id") for s in rec.get("survivors") or []} | \
+                  {m["id"] for m in rec.get("mutants") or [] if m.get("killed") is not None}
+        fresh = [d for d in new_surv if d["id"] not in counted]
+        rec["survivors"] = new_surv + old
+        rec["survived"] = rec.get("survived", 0) + len(fresh)
+        rec["evidence_mutants"] = rec.get("evidence_mutants", 0) + len(fresh)
+    if reasons:
+        rec["verdict"] = "low"
+        rec["reason"] = " | ".join(reasons) + ((" || " + rec["reason"]) if rec.get("reason") else "")
+    elif untested_msgs and rec.get("verdict") == "relevant":
+        rec["verdict"] = "unproven"
+        rec["reason"] = ("could not finish the necessity / wrong-solution checks within the "
+                         "time budget (" + ", ".join(untested_msgs[:4]) + ") -- raise --budget-s")
+
+    # ---------------- optional LLM equivalence classifier (default OFF) ----------------
+    if llm_equiv_cmd and rec.get("survivors"):
+        try:
+            rows = [{k: s.get(k) for k in ("id", "file", "line", "mutation", "original", "snippet")}
+                    for s in rec["survivors"]]
+            ids = _llm_json(llm_equiv_cmd, {"survivors": rows}, worktree) or []
+            ids = {str(i) for i in ids}
+            n = 0
+            for s in rec["survivors"]:
+                # ADVISORY ONLY: flags the survivor so the refine loop does not spend a
+                # round on it. The verdict and score still COUNT it (fail-closed).
+                if s.get("id") in ids and not s.get("unnecessary_hunk"):
+                    s["llm_equivalent"] = True
+                    n += 1
+            rec["llm_equivalent"] = n
+        except Exception as e:
+            rec["llm_equivalent_error"] = f"{type(e).__name__}: {e}"
+    rec["post_gate_seconds"] = round(time.time() - t0, 2)
 
 
 # --------------------------------------------------------------------------
@@ -2199,6 +2719,18 @@ def main() -> int:
                          "(gate: an auto-fix round's chain root, whose HEAD is a "
                          "round seal holding the previous attempt)")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-necessity", action="store_true",
+                    help="skip the per-hunk NECESSITY hard gate (diagnostics only)")
+    ap.add_argument("--no-wrong-bank", action="store_true",
+                    help="skip the WRONG-SOLUTION BANK hard gate (diagnostics only)")
+    ap.add_argument("--llm-equivalence-cmd", default="",
+                    help="OPT-IN (default off): command reading {survivors:[...]} JSON on "
+                         "stdin, printing a JSON list of survivor ids it judges equivalent; "
+                         "advisory flag only, the verdict still counts them")
+    ap.add_argument("--llm-wrong-solutions-cmd", default="",
+                    help="OPT-IN (default off): command reading {files, task} JSON on stdin, "
+                         "printing [{file, source, why, line}] plausible-wrong full-file "
+                         "variants to add to the bank (validated, equivalent-filtered)")
     ap.add_argument("-v", action="store_true", help="print each mutant as it runs")
     ap.add_argument("--signoff", action="store_true",
                     help="after measuring, emit a relevance SIGN-OFF artifact "
@@ -2310,7 +2842,11 @@ def main() -> int:
         rec = measure_applied(wt, a.verify, diff_text, literals=literals,
                               threshold=a.threshold, min_mutants=a.min_mutants,
                               max_mutants=a.max_mutants, budget_s=a.budget_s,
-                              progress=prog, io_adapters=io_adapters)
+                              progress=prog, io_adapters=io_adapters,
+                              necessity=not a.no_necessity,
+                              wrong_bank=not a.no_wrong_bank,
+                              llm_equivalence_cmd=a.llm_equivalence_cmd or None,
+                              llm_wrong_solutions_cmd=a.llm_wrong_solutions_cmd or None)
         if a.signoff:
             # Build requirements while the FIX is still applied -- the finally
             # below reverts the tree, and behavioral_added_lines reads the fixed

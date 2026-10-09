@@ -396,11 +396,11 @@ def slice_job_labels(plan, sid):
 def label_base(label):
     """PURE. Strip auto-author-/auto-refine-/gate-/regate-/secondop- and trailing
     -rN/-cN/-esc decorations."""
-    b = re.sub(r"^(?:auto-(?:author|refine)-|gate-|regate-|secondop-)", "", str(label or ""))
+    b = re.sub(r"^(?:needs-opus-auto-|auto-(?:author|refine)-|gate-|regate-|secondop-)", "", str(label or ""))
     prev = None
     while prev != b:
         prev = b
-        b = re.sub(r"-(?:r\d+|c\d+|esc)$", "", b)
+        b = re.sub(r"-(?:r\d+|c\d+|esc|rs\d+)$", "", b)
     return b
 
 
@@ -575,7 +575,15 @@ _VERDICT_RE = re.compile(r"^\W*VERDICT\W*\(?\s*([abcd])\b", re.I)
 
 
 def review_verdict(review):
-    """PURE. 'a'|'b'|'c'|'d' from the review's VERDICT line, else None."""
+    """PURE. 'a'|'b'|'c'|'d' from the review (VERDICT line, ESC_RESULT json, or an inferred
+    classification), else None. The ladder itself uses escalation_verdict.resolve, which
+    never returns None."""
+    try:
+        v, _src = _ev().parse_review(review)
+        if v:
+            return v
+    except Exception:
+        pass
     for line in (review or "").splitlines():
         m = _VERDICT_RE.match(line.strip())
         if m:
@@ -705,22 +713,75 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
                              jobs=getattr(heal, "_jobs", None))
     reason = s.get("escalation_reason") or ""
     kind = classify(reason)
-    verdict = review_verdict(review_text)
-    rung = rung_for(kind, verdict, reason)
+    # A verdict is NEVER None (2026-10-09): structured/line/inferred review, else the
+    # escalation reason's keywords, else (b) re-spec. Cached by input hash, never re-asked.
+    _ev_ = _ev()
+    _vd = _ev_.resolve(review_text, None, reason, cache_path=getattr(heal, "_verdict_cache", None),
+                       key_parts=(plan, sid))
+    verdict = _vd["verdict"]
+    # a verdict that is only the DEFAULT (no evidence either way) must not turn a plain
+    # authoring-class retry into a notes retry; but it also never leaves a
+    # non-authoring escalation without an action.
+    rung = rung_for(kind, None if _vd["source"] == "default" else verdict, reason)
+    if rung == "final" and _vd["source"] == "default" and "PIPELINE BUG SUSPECTED" not in (reason or ""):
+        rung = "retry-notes"
     notifier = getattr(heal, "_notifier", None)
     if rung == "final":
         return final_rung(plan, sid, "no automatic action applies (verdict %s): %s"
                           % (verdict or "none", reason[:200]), ctx, ledger_path, notifier)
-    used = attempts_used(_load(Path(ledger_path or HEAL_LEDGER)), plan, sid)
-    if used >= MAX_ATTEMPTS:
-        return final_rung(plan, sid, "%d self-heal attempts already spent (last verdict %s): %s"
-                          % (used, verdict or "none", reason[:200]), ctx, ledger_path, notifier)
+    _led = _load(Path(ledger_path or HEAL_LEDGER)) or {}
+    used = attempts_used(_led, plan, sid)
     plan_path = st.get("plan_path")
     if not plan_path or not Path(plan_path).is_file():
         record(plan, sid, {"action": "none", "detail": "plan file missing (%r)" % plan_path},
                ctx, ledger_path=ledger_path)
         return "skip:no plan file"
     log_path = Path(slice_runs or SLICE_RUNS) / f"{plan}.advance.log"
+    # ABANDON-AFTER-N (research 2026-10-09): the SAME mechanical failure signature N times
+    # (default 2), or the attempt budget spent, means another identical retry is pointless:
+    # go to RE-SPEC (one per slice) instead of parking for a human.
+    _cfg = _ev_.load_config()
+    _sig = _ev_.failure_signature("slice", reason)
+    _rec_s = _led.get(heal_key(plan, sid)) or {}
+    _n_same = _ev_.same_signature_count(list(_rec_s.get("sigs") or []) + [_sig], _sig)
+    if (_n_same >= int(_cfg["abandon_same_signature_n"]) or used >= MAX_ATTEMPTS):
+        why_ = ("same failure signature %d times" % _n_same
+                if _n_same >= int(_cfg["abandon_same_signature_n"])
+                else "%d attempts spent" % used)
+        if _ev_.actions_killed() or int(_rec_s.get("respecs") or 0) >= int(_cfg["slice_respec_max"]):
+            return final_rung(plan, sid, "%s and the re-spec is %s (last verdict %s): %s"
+                              % (why_, "disabled" if _ev_.actions_killed() else "spent", verdict,
+                                 reason[:200]), ctx, ledger_path, notifier)
+        _lp = Path(ledger_path or HEAL_LEDGER)
+        _l2 = _load(_lp) or {}
+        _r2 = _l2.setdefault(heal_key(plan, sid), {"attempts": 0, "log": []})
+        _r2["respecs"] = int(_r2.get("respecs") or 0) + 1
+        _r2.setdefault("sigs", []).append(_sig)
+        try:
+            _lp.parent.mkdir(parents=True, exist_ok=True)
+            _tmp = _lp.with_suffix(".tmp")
+            _tmp.write_text(json.dumps(_l2, indent=1))
+            _tmp.replace(_lp)
+        except OSError:
+            pass
+        _notes = ("RE-SPEC (automated): %s. Do NOT repeat the previous approach. The slice's "
+                  "intent/must_contain/verify_shape are the suspect: author a harness whose "
+                  "fixture FAILS at baseline and passes only with the reference implementation, "
+                  "narrowed to the ONE property named in the intent.\n\n%s"
+                  % (why_, (review_text or "").strip()[-1800:]))
+        return _retry_with_notes(plan, sid, plan_path, _notes,
+                                 "RE-SPEC: %s (verdict %s)" % (why_, verdict),
+                                 launch, log_path, ctx, ledger_path)
+    try:
+        _lp = Path(ledger_path or HEAL_LEDGER)
+        _l2 = _load(_lp) or {}
+        _l2.setdefault(heal_key(plan, sid), {"attempts": 0, "log": []}).setdefault(
+            "sigs", []).append(_sig)
+        _tmp = _lp.with_suffix(".tmp")
+        _tmp.write_text(json.dumps(_l2, indent=1))
+        _tmp.replace(_lp)
+    except OSError:
+        pass
 
     def _fallback(why):
         # (c) harness defect with no usable patch: RESET the harness and re-author
@@ -818,7 +879,8 @@ JOB_HEAL_MAX_PER_CHAIN = 2
 JOB_HEAL_MAX_PER_BUNDLE_DAY = 3
 JOB_HEAL_MAX_PER_DAY = 6
 JOB_HEAL_WINDOW_S = 30 * 60      # the queue treats a fresh eligible row as heal-pending this long
-JOB_HEAL_VERDICTS = ("b", "c")
+JOB_HEAL_VERDICTS = ("a", "b", "c", "d")   # every verdict drives an action (2026-10-09)
+AUTHOR_LABEL_PREFIXES = ("auto-author-", "needs-opus-auto-")
 QUEUE_PY = Path(__file__).resolve().parent / "ollama-queue.py"
 QUEUE_LOG_DIR = Path.home() / "bin" / "ollama-queue-logs"
 _LIVE = ("pending", "running", "queued", "scheduled", "held", "paused", "planned")
@@ -873,7 +935,7 @@ def job_heal_eligible(job, slice_runs=None):
     lbl = str(job.get("label") or "")
     if job.get("status") != "needs_opus":
         return False, "status %r, not needs_opus" % job.get("status")
-    if not lbl.startswith("auto-author-"):
+    if not lbl.startswith(AUTHOR_LABEL_PREFIXES):
         return False, "not an auto-author (harness authoring) job"
     if plan_slice_for_label(lbl, slice_runs)[0]:
         return False, "a slice job (the slice ladder owns it)"
@@ -1053,57 +1115,380 @@ def _queue_resolve(jid):
     return r.returncode == 0
 
 
-def heal_job(job, review_text, jobs=None, ledger_path=None, slice_runs=None, now=None,
-             enqueue=None, notifier=None, decisions=None, log_dir=None, ctx=None):
-    """Act on ONE needs_opus non-slice authoring job. Returns one word:
-    'heal-continuation:<id>' | 'retired:<id>' | 'wait:<why>' | 'skip:<why>' |
-    'park:final-rung'. All side effects are injectable (enqueue/notifier/paths)."""
+def _ev():
+    """The verdict/config module (escalation_verdict.py, beside this file)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import escalation_verdict as ev
+    return ev
+
+
+_CHAIN_PREFIX_RE = re.compile(r"^(?:needs-opus-)?(?:auto-(?:author|refine)-)?")
+
+
+def run_label_candidates(label):
+    """PURE. Names an auto-run argv record may be filed under for a queue label:
+    the label minus its job decorations (kept -rN first, then fully stripped)."""
+    s = _CHAIN_PREFIX_RE.sub("", str(label or ""))
+    out = [s]
+    for rx in (r"-(?:c\d+|esc)$",):
+        s2 = re.sub(rx, "", s)
+        if s2 not in out:
+            out.append(s2)
+    b = label_base(label)
+    if b not in out:
+        out.append(b)
+    return [x for x in out if x]
+
+
+def job_failure_sig(row):
+    ev = _ev()
+    return ev.failure_signature(row.get("failure_class"), row.get("failure_detail"),
+                                row.get("terminal_reason"))
+
+
+def chain_signatures(job, jobs=None, log_dir=None, limit=12):
+    """MECHANICAL signature history of the authoring chain ending at `job`, oldest
+    first, ending with `job`'s own: walks `continues` back through live rows and the
+    done.json sidecars (failure_class / failure_detail / terminal_reason)."""
+    jobs = jobs or []
+    by_id = {j.get("id"): j for j in jobs}
+    sigs, seen, cur = [], set(), job
+    while cur and cur.get("id") not in seen and len(sigs) < limit:
+        seen.add(cur.get("id"))
+        row = cur
+        if not row.get("failure_class"):
+            row = dict(_sidecar(cur.get("id"), log_dir) or {}, **{k: v for k, v in cur.items() if v})
+        sigs.append(job_failure_sig(row))
+        nxt = cur.get("continues")
+        cur = by_id.get(nxt) or (_sidecar(nxt, log_dir) if nxt else None)
+    return list(reversed(sigs))
+
+
+def plan_job_action(job, verdict, signatures, cfg, rec=None, source=None):
+    """PURE. The action for one stuck authoring row.
+      verdict   : 'a'|'b'|'c'|'d'    signatures: chain history, oldest->newest (current last)
+      returns   : {"kind": resume|close|continue|bigger|respec|reslice|park, "why": str}
+    The research rule: the SAME mechanical failure signature N times (default 2) means
+    retrying is pointless -> re-spec. A capped re-spec that is spent parks (digest)."""
+    rec = rec or {}
+    cur = signatures[-1] if signatures else None
+    n_same = _ev().same_signature_count(signatures, cur)
+    n_abandon = int(cfg.get("abandon_same_signature_n") or 2)
+    respecs = len(rec.get("respecs") or [])
+    can_respec = respecs < int(cfg.get("respec_max_per_chain") or 1)
+    has_model = bool(job.get("model")) and bool(job.get("task_file") or job.get("cwd"))
+    repeat = n_same >= n_abandon
+    attempts = len(signatures)
+
+    def respec_or_park(why):
+        if can_respec:
+            return {"kind": "respec", "why": why}
+        return {"kind": "park", "why": why + "; the re-spec budget is spent (%d)" % respecs}
+
+    if repeat:
+        return respec_or_park("same failure signature %d times (>= %d): not retrying, re-spec"
+                              % (n_same, n_abandon))
+    if attempts > int(cfg.get("max_attempts_per_task") or 3):
+        return respec_or_park("%d attempts on this task (cap %s): re-spec"
+                              % (attempts, cfg.get("max_attempts_per_task")))
+    if verdict == "a":
+        if source == "mechanical":
+            return {"kind": "resume" if has_model else "respec",
+                    "why": "not a real failure (operator stop/pause): resume the authoring"}
+        return {"kind": "close", "why": "reviewer says already satisfied: verify, then close"}
+    if verdict == "d":
+        bm = cfg.get("bigger_model")
+        tried = any(r.get("kind") == "bigger" for r in rec.get("rounds") or [])
+        if bm and has_model and job.get("model") != bm and not tried:
+            return {"kind": "bigger", "why": "model incapable: one attempt on %s" % bm}
+        return respec_or_park("model incapable and no bigger model configured: re-slice")
+    # b / c
+    if not has_model:
+        return respec_or_park("no runnable job to continue (placeholder row): re-spec")
+    return {"kind": "continue",
+            "why": "verdict %s: one %s round with the findings attached"
+                   % (verdict, "harness-repair" if verdict == "c" else "re-author")}
+
+
+def _launch_detached(cmd, cwd, log):
+    log.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(log, "a")
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=fh, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, start_new_session=True,
+                         env=dict(os.environ, PYTHONUNBUFFERED="1"))
+    return p.pid
+
+
+REWRITE_CACHE = ESC_DIR / "intent-rewrite-cache.json"
+
+
+def _claude_sonnet(prompt, timeout=420):
+    env = dict(os.environ, CLAUDE_HEADLESS_DIAGNOSIS="1")
+    r = subprocess.run(["claude", "-p", "--model", "sonnet", "--tools", "", "--no-session-persistence"],
+                       input=prompt, capture_output=True, text=True, timeout=timeout, env=env)
+    return r.stdout or ""
+
+
+def rewrite_intent_argv(argv, reason, notes, rewriter=None, cache_path=None):
+    """The argv with its --intent rewritten by ONE Sonnet call that sees the old intent and
+    the mechanical diagnosis. Cached by input hash (never re-asked). Returns argv unchanged
+    when anything is off (no --intent, empty/short answer, no claude)."""
+    ev = _ev()
+    if ev.actions_killed() or "--intent" not in argv:
+        return argv
+    i = argv.index("--intent")
+    old = argv[i + 1]
+    key = ev.input_hash("intent-v1", old, reason, notes)
+    cp = Path(cache_path or REWRITE_CACHE)
+    cache = _load(cp) or {}
+    new = cache.get(key)
+    if not new:
+        prompt = ("A dispatch-auto run failed. Rewrite its INTENT so the next run can succeed. "
+                  "Keep every symptom fact, MUST HOLD clause and literal identifier; change only "
+                  "what the diagnosis says is wrong (e.g. if a file to CREATE already exists, say "
+                  "MODIFY/EXTEND it explicitly). Output ONLY the new intent text, no preface.\n\n"
+                  "DIAGNOSIS:\n%s\n\nOLD INTENT:\n%s\n" % ((reason or notes)[:1500], old))
+        new = ((rewriter or _claude_sonnet)(prompt) or "").strip()
+        if len(new) < max(80, len(old) // 3) or new.lower().startswith(("i can't", "i cannot", "sorry")):
+            return argv
+        cache[key] = new
+        try:
+            _save_json(cp, cache)
+        except OSError:
+            pass
+    out = list(argv)
+    out[i + 1] = new
+    return out
+
+
+def _save_json(p, obj):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1))
+    os.replace(tmp, p)
+
+
+def respec_argv(argv, new_label, notes, reslice=False):
+    """PURE. The recorded dispatch-auto argv re-labelled, with the diagnosis appended to
+    --interface (added when absent) and --auto-slice when re-slicing. Nothing else moves."""
+    out, i, seen_iface = [], 0, False
+    argv = list(argv)
+    while i < len(argv):
+        a = argv[i]
+        if a == "--label" and i + 1 < len(argv):
+            out += ["--label", new_label]
+            i += 2
+            continue
+        if a == "--interface" and i + 1 < len(argv):
+            out += ["--interface", argv[i + 1].rstrip() + "\n\n" + notes]
+            seen_iface = True
+            i += 2
+            continue
+        if a in ("--resume-harness", "--resume-author", "--auto-slice", "--no-auto-slice"):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    if not seen_iface:
+        out += ["--interface", notes]
+    if "--label" not in out:
+        out += ["--label", new_label]
+    out.append("--auto-slice" if reslice else "--no-auto-slice")
+    return out
+
+
+def respec_notes(job, review_text, why):
+    ev = _ev()
+    v = ev.parse_structured(review_text) or {}
+    body = (v.get("why") or "").strip()
+    if not body:
+        t = str(review_text or "")
+        if "</think>" in t:
+            t = t.rsplit("</think>", 1)[1]
+        body = t.strip()[-900:]
+    return ("RE-SPEC NOTES (automated, %s): the previous authoring attempt(s) failed with the "
+            "same mechanical signature (class=%s detail=%s). Do NOT repeat that approach. %s\n"
+            "Diagnosis: %s\nAuthor a harness whose fixture FAILS at baseline and passes only "
+            "with the reference implementation; fill every TODO and freeze the literals."
+            % (time.strftime("%Y-%m-%d", time.gmtime()), job.get("failure_class") or "?",
+               str(job.get("failure_detail") or "?")[:120], why, body[:1200]))
+
+
+def respec_job(job, review_text, why, reslice=False, ledger_path=None, runs_dir=None,
+               launch=None, now=None, decisions=None, resolve=None, ctx=None, alive=None,
+               intent_rewriter=None):
+    """Re-spec a stuck authoring row: relaunch dispatch-auto from the recorded argv under
+    a NEW label (`<run>-rsN`, same bundle) with the diagnosis in --interface, then resolve
+    the old needs_opus row (superseded). Capped per chain and per day (config). Returns
+    'respec:<label> pid N' | 'skip:<why>' | 'park:<why>'."""
+    ev = _ev()
+    cfg = ev.load_config()
+    lbl = str(job.get("label") or "")
+    led = _load(Path(ledger_path or HEAL_LEDGER)) or {}
+    jl = led.get("jobs") or {}
+    key = job_chain_key(job)
+    rec = (jl.get("chains") or {}).get(key) or {}
+    root = label_base(lbl)
+    n_root = len([r for r in jl.get("respec_log") or [] if r.get("root") == root])
+    if n_root >= int(cfg["respec_max_per_chain"]):
+        return "park:re-spec budget spent for %s (%d/%s)" % (root, n_root, cfg["respec_max_per_chain"])
+    day = _utc_day(now)
+    if len([r for r in jl.get("respec_log") or [] if r.get("day") == day]) >= int(cfg["respec_max_per_day"]):
+        return "park:re-spec daily cap %s" % cfg["respec_max_per_day"]
+    argrec, run_label = None, None
+    for cand in run_label_candidates(lbl):
+        r = _load(Path(runs_dir or AUTO_RUNS) / "argv" / ("%s.json" % cand))
+        if isinstance(r, dict) and r.get("argv"):
+            argrec, run_label = r, cand
+            break
+    if not argrec:
+        return "park:no recorded dispatch-auto argv for %s (cannot re-spec mechanically)" % lbl
+    if auto_driver_live(run_label, job.get("bundle"), runs_dir, alive):
+        return "skip:driver for %s is alive" % run_label
+    _m = re.search(r"-rs(\d+)$", run_label)
+    n = max(n_root, int(_m.group(1)) if _m else 0) + 1     # never reuse a label (= worktree)
+    new_label = "%s-rs%d" % (re.sub(r"-rs\d+$", "", run_label), n)
+    notes = respec_notes(job, review_text, why)
+    argv2 = list(argrec["argv"])
+    # The diagnosis often says the INTENT itself is wrong (e.g. SPEC_DEFECT: creation target
+    # exists at base). Re-launching the same intent just fails the same way, so ONE Sonnet
+    # call (headless, no tools, cached by input hash) rewrites the --intent. Never under
+    # the verify sandbox / kill switch; a refusal or junk answer keeps the old intent.
+    if intent_rewriter is not False and os.environ.get("DISPATCH_VERIFY_SANDBOX") != "1":
+        try:
+            argv2 = rewrite_intent_argv(argv2, (job.get("escalation") or {}).get("reason") or "",
+                                        notes, intent_rewriter)
+        except Exception:
+            pass
+    cmd = [sys.executable, str(AUTO_TOOL)] + respec_argv(argv2, new_label, notes, reslice)
+    if launch is None:
+        if os.environ.get("DISPATCH_VERIFY_SANDBOX") == "1":
+            return "skip:DISPATCH_VERIFY_SANDBOX=1 (no launch)"
+        if ledger_path is not None and Path(ledger_path).resolve() != Path(HEAL_LEDGER).resolve():
+            return "skip:non-production ledger %s (no launch)" % ledger_path
+        launch = _launch_detached
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now) if now else time.gmtime())
+    log = Path(runs_dir or AUTO_RUNS) / "logs" / ("%s-%s.log" % (new_label, ts))
+    cwd = argrec.get("cwd") if argrec.get("cwd") and Path(str(argrec["cwd"])).is_dir() else str(Path.home())
+    pid = launch(cmd, cwd, log)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now) if now else time.gmtime())
+
+    def _rec(j):
+        c = j["chains"].setdefault(key, {"rounds": []})
+        c.setdefault("respecs", []).append({"label": new_label, "for": job.get("id"), "at": stamp,
+                                            "why": why[:200], "pid": pid, "reslice": bool(reslice)})
+        j.setdefault("respec_log", []).append({"day": day, "at": stamp, "chain": key,
+                                               "label": new_label, "root": root})
+        j["respec_log"] = j["respec_log"][-200:]
+    _job_ledger_update(_rec, ledger_path)
+    log_decision(job.get("bundle") or "job", lbl, "respec", "launched",
+                 "%s -> %s (pid %s, log %s)" % (why, new_label, pid, log), path=decisions)
+    if ctx:
+        try:
+            with open(ctx, "a") as fh:
+                fh.write("\n- self-heal %s: RE-SPEC (%s) -> dispatch-auto relaunched as %s (pid %s)\n"
+                         % (stamp, why, new_label, pid))
+        except OSError:
+            pass
+    if job.get("id"):
+        try:
+            (resolve or _queue_resolve)(job["id"])
+        except Exception:
+            pass
+    return "respec:%s pid %s" % (new_label, pid)
+
+
+def verified_close(job, runner=None):
+    """(ok, detail) -- a verdict (a) on a JOB is trusted only if the job's own harness
+    self-check passes in its worktree (auto-harness-check.py exits 0)."""
+    cwd = job.get("cwd")
+    if not cwd or not Path(cwd, "auto-harness-check.py").is_file():
+        return False, "no auto-harness-check.py in %s" % cwd
+    run = runner or (lambda: subprocess.run([sys.executable, "auto-harness-check.py"], cwd=cwd,
+                                            capture_output=True, text=True, timeout=900))
+    try:
+        r = run()
+        return r.returncode == 0, "auto-harness-check rc=%s" % r.returncode
+    except Exception as exc:
+        return False, "auto-harness-check error %s" % type(exc).__name__
+
+
+def _heal_job(job, review_text, jobs=None, ledger_path=None, slice_runs=None, now=None,
+             enqueue=None, notifier=None, decisions=None, log_dir=None, ctx=None,
+             respec=None, closer=None, verdict_cache=None, config=None, runs_dir=None,
+             resolve=None, intent_rewriter=None):
+    """Act on ONE needs_opus authoring job. Returns one word:
+    'heal-continuation:<id>' | 'respec:<label> ...' | 'closed:<why>' | 'retired:<id>' |
+    'wait:<why>' | 'skip:<why>' | 'park:final-rung'. The verdict ALWAYS drives an action
+    (escalation_verdict.resolve never returns None); all side effects are injectable.
+      a not a real failure  -> resume (operator stop) or verified close
+      b spec wrong          -> continuation with findings; the same signature again -> re-spec
+      c harness defect      -> harness-repair continuation; the same signature again -> re-spec
+      d model incapable     -> ONE round on the configured bigger model, else re-slice"""
+    ev = _ev()
     enqueue = enqueue or _queue_enqueue
     jobs = jobs if jobs is not None else _queue_jobs()
     ok, why = job_heal_eligible(job, slice_runs)
     if not ok:
         return "skip:" + why
+    if ev.actions_killed():
+        return "skip:ACTIONS-OFF kill switch set"
     led = _load(Path(ledger_path or HEAL_LEDGER)) or {}
     outcome, cid = continuation_outcome(job, jobs, led, log_dir)
     if outcome == "live":
         return "wait:continuation %s is live" % cid
     if outcome == "passed":
         return "skip:continuation %s already passed (the sweep retires it)" % cid
-    verdict = review_verdict(review_text)
+    cfg = config or ev.load_config()
+    vd = ev.resolve(review_text, job.get("failure_class"),
+                    (job.get("escalation") or {}).get("reason"),
+                    cache_path=verdict_cache, key_parts=(job.get("id"),))
+    verdict = vd["verdict"]
     key = job_chain_key(job)
-    if verdict not in JOB_HEAL_VERDICTS:
-        def _decl(jl):
-            c = jl["chains"].setdefault(key, {"rounds": []})
-            c.update(declined_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                     declined_job=job.get("id"), declined_why="verdict %s" % verdict)
-        _job_ledger_update(_decl, ledger_path)
-        return "skip:verdict %s is not a fixture/harness defect (b/c)" % (verdict or "none")
+    rec = ((led.get("jobs") or {}).get("chains") or {}).get(key) or {}
+    _root = label_base(job.get("label"))
+    rec = dict(rec, respecs=[r for r in (led.get("jobs") or {}).get("respec_log") or []
+                             if r.get("root") == _root])   # the cap is per ROOT task, not per worktree
+    sigs = chain_signatures(job, jobs, log_dir)
+    plan = plan_job_action(job, verdict, sigs, cfg, rec, source=vd["source"])
+    kind = plan["kind"]
+    if kind == "close":
+        okc, det = verified_close(job, closer)
+        if okc:
+            try:
+                (resolve or _queue_resolve)(job["id"])
+            except Exception:
+                pass
+            log_decision(job.get("bundle") or "job", job.get("label"), "job-close", "closed", det,
+                         path=decisions)
+            return "closed:%s" % det
+        kind, plan = "continue", {"kind": "continue", "why": "(a) not verified (%s): treated as (b)" % det}
+        verdict = "b"
+        if not (job.get("model") and job.get("cwd")):
+            kind = "respec"
+    if kind in ("respec", "reslice"):
+        act = (respec or respec_job)(job, review_text, plan["why"], reslice=(verdict == "d"),
+                                     ledger_path=ledger_path, now=now, decisions=decisions,
+                                     ctx=ctx, runs_dir=runs_dir, intent_rewriter=intent_rewriter)
+        if act.startswith("park:"):
+            return _park_final(job, key, act[5:], notifier, decisions, ledger_path, now)
+        return act
+    if kind == "park":
+        return _park_final(job, key, plan["why"], notifier, decisions, ledger_path, now)
     if any(j.get("status") in _LIVE and j.get("cwd") == job.get("cwd") for j in jobs):
         return "wait:another job is live on %s" % job.get("cwd")
     ok, why = job_heal_budget(led, job, now)
     if not ok:
-        def _fin(jl):
-            jl["chains"].setdefault(key, {"rounds": []})["final_at"] = time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        _job_ledger_update(_fin, ledger_path)
-        log_decision(job.get("bundle") or "job", job.get("label"), "job-heal-cap",
-                     "parked-for-human", why, path=decisions)
-        msg = ("%s (%s) needs a human: %s. Inspect: python3 ~/bin/ollama-queue.py needs-opus; "
-               "then resolve/cancel %s." % (job.get("label"), job.get("id"), why, job.get("id")))
-        try:
-            if notifier is None:
-                import importlib.util as _ilu
-                _s = _ilu.spec_from_file_location(
-                    "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
-                _m = _ilu.module_from_spec(_s)
-                _s.loader.exec_module(_m)
-                notifier = _m.notify
-            dk = ("job-heal-daily-cap:" + _utc_day(now)) if "daily cap" in why else (
-                "job-heal-cap:" + key)
-            notifier("dispatch needs you", msg, dedupe_key=dk, dedupe_s=24 * 3600)
-        except Exception:
-            pass
-        return "park:final-rung"
+        # the continuation budget is spent: that is itself "retrying does not help" -> re-spec
+        if (respec or respec_job) and len(rec.get("respecs") or []) < int(cfg["respec_max_per_chain"]):
+            act = (respec or respec_job)(job, review_text, "continuation budget spent (%s)" % why,
+                                         reslice=(verdict == "d"), ledger_path=ledger_path, now=now,
+                                         decisions=decisions, ctx=ctx, runs_dir=runs_dir,
+                                         intent_rewriter=intent_rewriter)
+            if not act.startswith("park:"):
+                return act
+            why = act[5:]
+        return _park_final(job, key, why, notifier, decisions, ledger_path, now, job_cap=True)
     tf = Path(str(job.get("task_file") or Path(job["cwd"]) / "AUTO-TASK.md"))
     try:
         prev = tf.read_text()
@@ -1112,13 +1497,19 @@ def heal_job(job, review_text, jobs=None, ledger_path=None, slice_runs=None, now
     label = _next_c_label(job, jobs, log_dir)
     pf = Path(job["cwd"]) / "AUTO-TASK.md"
     pf.write_text(heal_prompt(prev, review_text))
-    argv = ["--model", str(job.get("model")), "--host", str(job.get("host_pref") or "studio"),
+    model = str(job.get("model"))
+    host = str(job.get("host_pref") or "studio")
+    if kind == "bigger":
+        model = str(cfg["bigger_model"])
+        host = str(cfg.get("bigger_host") or host)
+    argv = ["--model", model, "--host", host,
             "--cwd", str(job["cwd"]), "--task-file", str(pf), "--task-kind", "coding",
             "--verify", str(job.get("verify") or "python3 auto-harness-check.py"),
             "--max-iters", str(job.get("max_iters") or 24), "--label", label,
             "--continues", str(job.get("id"))]
-    if job.get("num_ctx"):
-        argv += ["--num-ctx", str(job["num_ctx"])]
+    ncx = cfg.get("bigger_num_ctx") if kind == "bigger" else job.get("num_ctx")
+    if ncx:
+        argv += ["--num-ctx", str(ncx)]
     if job.get("bundle"):
         argv += ["--bundle", str(job["bundle"])]
     new_id, out = enqueue(argv)
@@ -1131,22 +1522,96 @@ def heal_job(job, review_text, jobs=None, ledger_path=None, slice_runs=None, now
     def _rec(jl):
         c = jl["chains"].setdefault(key, {"rounds": []})
         c["rounds"].append({"job": new_id, "for": job.get("id"), "at": stamp,
-                            "verdict": verdict, "label": label})
+                            "verdict": verdict, "label": label, "kind": kind,
+                            "model": model, "sig": sigs[-1] if sigs else None})
         c["last_at"] = stamp
         jl["log"].append({"day": _utc_day(now), "at": stamp, "bundle": job.get("bundle"),
                           "chain": key, "job": new_id})
     _job_ledger_update(_rec, ledger_path)
     log_decision(job.get("bundle") or "job", job.get("label"), "job-heal",
-                 "launched", "verdict %s -> continuation %s (%s) --continues %s"
-                 % (verdict, new_id, label, job.get("id")), path=decisions)
+                 "launched", "verdict %s (%s) %s -> continuation %s (%s, model %s) --continues %s"
+                 % (verdict, vd["source"], kind, new_id, label, model, job.get("id")),
+                 path=decisions)
     if ctx:
         try:
             with open(ctx, "a") as fh:
-                fh.write("\n- self-heal %s: verdict %s -> continuation authoring round %s "
-                         "(%s) --continues %s\n" % (stamp, verdict, new_id, label, job.get("id")))
+                fh.write("\n- self-heal %s: verdict %s (%s) -> %s: continuation authoring round "
+                         "%s (%s, model %s) --continues %s\n"
+                         % (stamp, verdict, vd["source"], plan["why"], new_id, label, model,
+                            job.get("id")))
         except OSError:
             pass
     return "heal-continuation:%s" % new_id
+
+
+ACTED_PREFIXES = ("heal-continuation:", "respec:", "closed:", "retired:", "resumed:")
+
+
+def close_index_rows(jid, action, index=None, log_path=None):
+    """The ACTION handled this escalation: tick every OPEN index row that names job `jid`
+    (its D row and the bundle's PARKED row) with the same-length in-place flip, and record
+    the action taken in ESCALATIONS-AUTOCLOSE.jsonl (row, rule, evidence). Never raises."""
+    closed = []
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import escalation_index_janitor as eij
+        p = Path(index or (ESC_DIR / "ESCALATIONS.md"))
+        data = p.read_bytes()
+        off = 0
+        for raw in data.split(b"\n"):
+            line = raw.decode("utf-8", "replace")
+            if line.startswith("- [ ] ") and jid in line:
+                if eij._flip(p, off, line):
+                    closed.append(line)
+            off += len(raw) + 1
+        lp = Path(log_path or (p.parent / "ESCALATIONS-AUTOCLOSE.jsonl"))
+        with lp.open("a") as fh:
+            for line in closed:
+                fh.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                     "file": str(p), "row": line,
+                                     "rule": "action taken: %s" % action}) + "\n")
+    except Exception:
+        pass
+    return closed
+
+
+def heal_job(job, review_text, *a, close_rows=True, index=None, **kw):
+    """_heal_job + auto-close: an ACTED outcome ticks the escalation's index rows and
+    records the action (nobody has to read ESCALATIONS.md)."""
+    out = _heal_job(job, review_text, *a, **kw)
+    lp = kw.get("ledger_path")
+    prod = lp is None or Path(lp).resolve() == Path(HEAL_LEDGER).resolve()
+    if close_rows and prod and index is None and os.environ.get("DISPATCH_VERIFY_SANDBOX") == "1":
+        prod = False                      # never touch the real index from a sandboxed test
+    if close_rows and (prod or index is not None) and str(out).startswith(ACTED_PREFIXES) and job.get("id"):
+        close_index_rows(job["id"], out, index=index)
+    return out
+
+
+def _park_final(job, key, why, notifier, decisions, ledger_path, now, job_cap=False):
+    """The only rung that parks for a human: ONE deduped alert + a ledger final_at."""
+    def _fin(jl):
+        jl["chains"].setdefault(key, {"rounds": []})["final_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _job_ledger_update(_fin, ledger_path)
+    log_decision(job.get("bundle") or "job", job.get("label"), "job-heal-cap",
+                 "parked-for-human", why, path=decisions)
+    msg = ("%s (%s) needs a human: %s. Inspect: python3 ~/bin/ollama-queue.py needs-opus; "
+           "then resolve/cancel %s." % (job.get("label"), job.get("id"), why, job.get("id")))
+    try:
+        if notifier is None:
+            import importlib.util as _ilu
+            _s = _ilu.spec_from_file_location(
+                "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
+            _m = _ilu.module_from_spec(_s)
+            _s.loader.exec_module(_m)
+            notifier = _m.notify
+        dk = ("job-heal-daily-cap:" + _utc_day(now)) if "daily cap" in why else (
+            "job-heal-cap:" + key)
+        notifier("dispatch needs you", msg, dedupe_key=dk, dedupe_s=24 * 3600)
+    except Exception:
+        pass
+    return "park:final-rung"
 
 
 def job_row_state(job, jobs, ledger=None, now=None, log_dir=None, slice_runs=None):

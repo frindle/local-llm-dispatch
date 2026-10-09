@@ -60,3 +60,29 @@ manual-tools plumbing; no native tools are sent.
 `loop-detected`, `stop-gate-failed`, `reasoning-runaway`) with repeat-failure prompt hints. The queue's
 `classify_failure` (`ollama-queue.py` `_FAILURE_CONTEXT_REASONS`) must list them so they classify as
 `context` (not `model`).
+
+## Tool-calling preflight timeout (`WORKER_PREFLIGHT_TIMEOUT_S`)
+`_tool_calling_preflight` sends one minimal tools-bearing request before the loop. Its timeout is
+30s by default; `WORKER_PREFLIGHT_TIMEOUT_S` (positive integer seconds) overrides it for slow-prefill
+servers (the Strata expert-offload arm needs minutes; `strata-h2h-arm.sh` exports 900). Invalid,
+zero or negative values fall back to 30. The Darkbloom lane keeps `WARMUP_TIMEOUT_S`. Test:
+`test-worker-preflight-timeout.py`; canary seam `preflighttimeout` (3 revert proofs). The Strata arm
+also warms the server before the driver runs and passes `STRATA_REASONING_BUDGET` (default 12288).
+
+## Darkbloom 422 "Inference generation failed" recovery ladder (2026-10-09)
+Darkbloom 0.9.19 (MTP + tool-call generation) deterministically answers HTTP 422
+`invalid_request_error` "Inference generation failed" (streaming: `finish_reason:"error"`, "Response
+generation failed", which `call_openai_streaming` now raises as the same 422) for some contexts when
+tools are present: the model emits `</think>` and dies at the first tool-call token. Identical retries
+cannot help, and the old worker paused for review (exit 3), blocking the whole cell. After the normal
+retries are exhausted, `run_task` runs `_recover_422` (openai lane, native tools only), one attempt per step,
+on a COPY of the messages (the transcript keeps the real tool output):
+1. same body with `tool_choice:"none"` + an appended user nudge asking for the text-embedded
+   `<tool_call><function=..>` form, which the visible-text fallback parser / `repair_tool_calls` consumes;
+2. tools kept, the last tool result cut to its first 40 lines + `[truncated N lines]` (JSON tool results
+   are cut per string field; a long few-line blob is cut at 4000 chars).
+Each step logs `422 recovery: step N (...) ok|failed`; `_dispatch_metrics["recovery_422"]` records
+`{attempts, ok, events[]}`. Cap: `RECOVERY_422_MAX_ATTEMPTS` = 6 per run, so a truly dead server still
+ends `PAUSED FOR REVIEW` (`chat_request_failed`). `call_ollama` gained `tool_choice=` and `max_attempts=`.
+Test: `test-worker-422-recovery.py` (stub HTTP server; red on the old worker); canary seam `worker422`
+(4 revert proofs).

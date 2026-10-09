@@ -272,6 +272,14 @@ def classify(rec, fp, scrape):
         tags.append("stop-gate-failed")
     if reason == "reasoning_runaway":
         tags.append("reasoning-runaway")
+    if reason in ("error_loop", "monologue_loop", "alternation_loop", "nav_loop"):
+        tags.append(reason.replace("_", "-"))     # worker_robust named loop exits (2026-10-09)
+    if reason == "fixed_lane_exhausted":
+        tags.append("fixed-lane-exhausted")
+    if reason == "fixed_lane_apply_failed":
+        tags.append("fixed-lane-apply-failed")
+    if reason == "fixed_lane_transport_error":
+        tags.append("fixed-lane-transport-error")   # infra: retry-safe, not a model verdict
     if reason == "write_thrash":
         top = max(rewrites.items(), key=lambda kv: kv[1])[0] if rewrites else None
         tags.append("write-thrash" + (":" + top if top else ""))

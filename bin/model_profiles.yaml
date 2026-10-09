@@ -54,15 +54,74 @@ aliases:
 #   bash_only          mini-swe-agent action mode: one ```bash block per turn instead of tool calls. OFF.
 #   format_requery_max consecutive unparseable tool calls re-prompted free before repeated_format_error
 #   reasoning_budget_chars  thinking chars with no content/tool call before a turn is cut (0 = off)
+#   prose_budget_tokens  coding turns only: a turn that has streamed this many tokens (x4 chars) of
+#                      content with NO tool call is aborted mid-stream and handled as a cut-off turn
+#                      (nudge + prose_loop accounting); a degenerate repeated line/block aborts it
+#                      earlier. 0 = off. 12000 (~48K chars): every successful turn in the 2026-10
+#                      logs is 6-4300 chars, while the smoke 6cf6fb3afca4 runaways were 110-122K
+#                      chars (~32K tokens, ~400s each); 12000 leaves >10x headroom over any legit
+#                      prose and cuts a runaway at ~37% of the max_tokens cost. A turn with a real
+#                      tool call (or <tool_call>/<function= markup) is never aborted by it.
 #   stop_gate_max      task_complete refusals (files/must-contain criteria) before stop_gate_failed
 #   loop_detector      thresholds (see worker_robust.LOOP_DEFAULTS); WORKER_LOOP_<KEY> env overrides
+#   obs_mask           (default true; false or env WORKER_OBS_MASK=0 disables) observation masking: tool
+#                      outputs older than the last obs_mask_keep_turns assistant turns and at least
+#                      obs_mask_min_chars long are replaced in the SENT prompt by a one-line placeholder
+#                      (tool call + first line + how to re-read). Advances in obs_mask_stride-turn steps so
+#                      the prompt prefix stays byte-stable in between (prompt-cache friendly). The saved
+#                      transcript is untouched; the most recent verify output is never masked.
+#   syntax_guard       (default true; false or env WORKER_SYNTAX_GUARD=0 disables) edit_file/write_file reject a
+#                      change that introduces a NEW syntax error (py/json/yaml/js/ts; lint delta, 10s bound)
 robust_defaults:
   tool_extractor: false
   bash_only: false
   format_requery_max: 3
   reasoning_budget_chars: 24000
+  prose_budget_tokens: 12000
   stop_gate_max: 3
+  obs_mask: true
+  obs_mask_keep_turns: 8
+  obs_mask_min_chars: 2000
+  obs_mask_stride: 4
   loop_detector: {enabled: true}
+
+# THINKING_POLICY_MARK -- per-role / per-turn-kind thinking control (model_profile.thinking_policy).
+# DEFAULT = "profile": every role keeps the enable_thinking of its mode above, i.e. NO behaviour
+# change until a role is pointed at an arm. Arms exist for the thinking A/B
+# (~/.ollama-dispatch/merge-queue/2026-10-09-thinking-ab-plan.md); `ab_roles` are the roles the
+# experiment arm (env MODEL_THINKING_ARM=always_on|always_off|hybrid, or arm=) may override.
+# Turn kinds: oneshot (a single no-tool authoring/fixed-lane turn), tool_first (first turn of a tool
+# loop), tool_after_failure (turn right after a failing tool/verify result), tool_mechanical (other).
+# The hybrid arm is a HYPOTHESIS from the model-behavior research, not a measured result.
+# Qwen3.6 has no effort dial: reasoning_effort is not sent; the thinking cut is client-side
+# (robust_defaults.reasoning_budget_chars / prose_budget_tokens).
+thinking_policy:
+  ab_roles: [author, coding, thinking_coding]
+  roles:
+    author: profile
+    coding: profile
+    thinking_coding: profile
+    gate: always_off
+    review: always_off
+    non_thinking: always_off
+  arms:
+    always_on:  {oneshot: on,  tool_first: on, tool_after_failure: on, tool_mechanical: on}
+    always_off: {oneshot: off, tool_first: off, tool_after_failure: off, tool_mechanical: off}
+    hybrid:     {oneshot: on,  tool_first: on, tool_after_failure: on, tool_mechanical: off}
+
+# Escalation (bigger-model) steps: ordered models per role. NOT hardcoded anywhere else (the queue's
+# N-sample escalation reads this via model_profile.escalation_models). The owner 2026-10-09: any model he
+# can host on Darkbloom is allowed. A model must have a `models:` entry (card + sha) to be listed.
+# The model that just failed is skipped. While bloom_control holds the queue's PAIR only
+# (Qwen3.5-9B + qwen3.6-35b-a3b), an escalation model outside the pair needs the pair widened first:
+# see darkbloom-apply-wide-models.sh / BLOOMCTL_PAIR. Candidates with a vendored card but no profile
+# yet (add an entry before listing): Qwen3.5-35B-A3B, Nemotron-3.5-Lightning-30B-A3B,
+# Nemotron-Cascade-2-30B-A3B, gemma-4-12b.
+escalation:
+  roles:
+    author:   {models: [qwen3.6-35b-a3b-vl-mtp-mxfp8, gemma-4-26b-qat-4bit], claude: false}
+    coding:   {models: [qwen3.6-35b-a3b-vl-mtp-mxfp8, gemma-4-26b-qat-4bit], claude: false}
+    thinking_coding: {models: [qwen3.6-35b-a3b-vl-mtp-mxfp8, gemma-4-26b-qat-4bit], claude: false}
 
 # Used for a model with no entry. LOUD warning on first use per process.
 # These are the pre-profile legacy values, kept only so unknown models keep working.

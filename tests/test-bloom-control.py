@@ -294,6 +294,39 @@ def t_drift(bc, q):
         w.close()
 
 
+@scenario("warn-once")
+def t_warn_once(bc, q):
+    """Drift-guard WARN de-noising (smoke 2026-10-09): a persistent DEGRADED condition logs ONCE
+    per state change plus a heartbeat at most every 10 min; the guard's behaviour (noop verify,
+    degraded flag) is unchanged."""
+    bc.clear_log_seen()
+    w = World(bc.__file__, bloom_up=False)
+    try:
+        def n_warn():
+            t = (w.home / "bloom-control.log").read_text() if (w.home / "bloom-control.log").exists() else ""
+            return t.count("BloomGauge unusable")
+        r1 = bc.hold_for_queue()
+        r2 = bc.hold_for_queue()      # the ~67s verify: already held, still degraded
+        r3 = bc.hold_for_queue()
+        r4 = bc.hold_for_queue()
+        check("verify path behaviour unchanged (noop, degraded, ok)",
+              r1["ok"] and r2["ok"] and r2.get("noop") and r2.get("degraded") and r4.get("noop"), (r1, r2, r4))
+        check("4 degraded checks in a row log the WARN ONCE", n_warn() == 1, n_warn())
+        cfg = bc.load_cfg()
+        t0 = time.time()
+        bc.clear_log_seen("hb")
+        check("log_on_change: first occurrence logs", bc.log_on_change(cfg, "hb", "a", "x", now=t0) is True)
+        check("...same signature inside the heartbeat window is silent",
+              bc.log_on_change(cfg, "hb", "a", "x", now=t0 + 540) is False)
+        check("...heartbeat after 10 min", bc.log_on_change(cfg, "hb", "a", "x", now=t0 + 601) is True)
+        check("...a CHANGED signature logs immediately",
+              bc.log_on_change(cfg, "hb", "b", "x2", now=t0 + 602) is True)
+        bc.clear_log_seen("hb")
+        check("...a cleared condition logs again", bc.log_on_change(cfg, "hb", "b", "x2", now=t0 + 603) is True)
+    finally:
+        w.close()
+
+
 @scenario("concurrent")
 def t_conc(bc, q):
     w = World(bc.__file__)

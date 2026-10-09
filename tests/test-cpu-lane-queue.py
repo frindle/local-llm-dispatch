@@ -94,14 +94,17 @@ def main():
     k, ev = tick(20.0, running="bB", cands=[], cpu={"bA": ["cpu1"]})
     check("2 B running, A's CPU job still out -> B keeps the lanes, A stays parked", (k, "bA" in state["_bundle_parked"]),
           ("bB", True))
-    # the cpu result lands and A's next row appears while B still runs: not preempted
+    # the cpu result lands and A's next row appears while B still runs: B's RUNNING job is not preempted
+    # (2026-10-09: the commitment goes back to A at once -- B is parked 'yielded', its later jobs wait --
+    # so A's next model job waits only for B's running job, not B's whole bundle; was: B kept it to completion)
     a2 = {"id": "a2", "label": "bA-s2", "bundle": "bA", "status": "pending"}
     state["jobs"] = [a2, b1]
     k, ev = tick(30.0, running="bB", cands=["bA"], cpu={})
-    check("3 result landed + A has a row again, B running -> B is NOT preempted", k, "bB")
+    check("3 result landed + A has a row again, B running -> commitment returns to A; B's running job is not preempted, B parked 'yielded'",
+          (k, ev[:1], (state["_bundle_parked"].get("bB") or {}).get("kind")), ("bA", ["yield"], "yielded"))
     state["jobs"] = [a2, {"id": "c1", "label": "bC-s1", "bundle": "bC", "status": "pending"}]   # B finished
     k, ev = tick(40.0, cands=["bC", "bA"], cpu={})
-    check("3 B done -> parked A RESUMES first, before the brand-new bundle C", (k, "resume" in ev), ("bA", True))
+    check("3 B done -> A (already committed) still owns the lanes, ahead of the brand-new bundle C", k, "bA")
     check("3 ...never alerted along the way", alerts, [])
 
     # ---- 4. gate hook: alone it still holds its bundle (nobounce); with a CPU stage inside it, it yields
@@ -146,6 +149,56 @@ def main():
     check("5 queue: cpu_outstanding_by_bundle() reads the store", q.cpu_outstanding_by_bundle(), {"bZ": [r]})
     check("5 queue: a missing/broken store -> {} (queue behaves as before)",
           (os.environ.__setitem__("CPU_LANE_DIR", "/nonexistent/x"), cpu_lane.outstanding_by_bundle("/nonexistent/x"))[1], {})
+
+    # ---- 6. a CPU-ONLY CHAIN STAGE (preflight) does not pin the GPU lanes (2026-10-09, rt-card-bonus) ----
+    import json as _json
+    import time as _time
+    now0 = _time.time()
+    iso = lambda t_: _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(t_))   # noqa: E731
+
+    def chain_file(key, step):
+        (rd / f"{key}.json").write_text(_json.dumps({"key": key, "pid": os.getpid(), "phase": "advancing",
+                                                      "phase_since": iso(now0 - 30), "updated_at": iso(now0 - 30),
+                                                      "step": step, "job": None, "outcome": None}))
+    check("6 step classifier: preflight/self-check/harness-check/relevance are CPU-only; enqueue/author/start are not",
+          [q.chain_step_cpu_only(x) for x in ("preflight r2", "author continuation c1 self-check", "harness-check",
+                                              "relevance", "enqueue x", "author stage t try 1", "start", None)],
+          [True, True, True, True, False, False, False, False])
+    chain_file("bP", "preflight r2")
+    cp = q.chain_run_progress("bP", runs_dir=rd)
+    check("6 chain_run_progress: live driver on a preflight step -> driver_live AND cpu_only",
+          (cp["driver_live"], cp["cpu_only"]), (True, True))
+    check("6 status: nothing running/live, only the preflight stage -> 'waiting', not moving",
+          q.bundle_commit_status("bP", [], pk, {}, cp)[0::2], ("waiting", False))
+    chain_file("bE", "enqueue auto-refine-x-r2")
+    ce = q.chain_run_progress("bE", runs_dir=rd)
+    check("6 status: control -- the same driver on an 'enqueue' step still holds the lane (working, moving)",
+          q.bundle_commit_status("bE", [], pk, {}, ce)[0::2], ("working", True))
+    check("6 status: control -- a RUNNING model row keeps it working during a preflight step",
+          q.bundle_commit_status("bP", [{"bundle": "bP", "status": "running"}], pk, {}, cp)[0], "working")
+    # full tick: bP committed, only preflighting; bQ has runnable work -> bQ gets the lanes (the 17-min idle Studio lane)
+    alerts.clear()
+    state = {"jobs": [{"id": "q1", "label": "bQ-s1", "bundle": "bQ", "status": "pending"}],
+             "_bundle_commit": {"key": "bP", "since": now0 - 100, "empty_since": None, "idle_since": None}}
+    k, ev = tick(now0, cands=["bQ"])
+    check("6 tick: committed bundle in a CPU-only stage releases the lanes; the other bundle commits",
+          (k, ev, (state["_bundle_parked"].get("bP") or {}).get("kind"), alerts), ("bQ", ["cpu_wait", "commit"], "cpu_wait", []))
+    check("6 tick: ...and the launch loop would launch bQ's job",
+          q.focus_skips_job(state["jobs"][0], "bQ", "bQ", True, k, set(), None, None), False)
+    state["jobs"][0]["status"] = "running"
+    k, ev = tick(now0 + 5, running="bQ", cands=[])
+    check("6 tick: bQ's job running while bP still preflights -> bQ keeps the commitment", (k, ev), ("bQ", []))
+    # preflight done: bP's next model row exists while bQ's job is still running
+    (rd / "bP.json").unlink()
+    state["jobs"].append({"id": "p3", "label": "bP-r3", "bundle": "bP", "status": "pending"})
+    k, ev = tick(now0 + 10, running="bQ", cands=["bP"])
+    check("6 tick: bP's next model job is ready -> bP takes the commitment back at once (bQ's running job is not "
+          "preempted, bQ is parked 'yielded' and resumes after)",
+          (k, ev[:1], (state["_bundle_parked"].get("bQ") or {}).get("kind"), "bP" in state["_bundle_parked"]),
+          ("bP", ["yield"], "yielded", False))
+    check("6 tick: ...bQ's later jobs are held again (never interleave once the committed bundle has model work)",
+          q.focus_skips_job({"id": "q2", "label": "bQ-s2", "bundle": "bQ", "status": "pending"}, "bQ", "bP", True, k,
+                            set(), None, None), True)
 
     bad = RESULTS.count(False)
     print("CPU_LANE_QUEUE_TEST_OK" if not bad else f"{bad} FAILED")

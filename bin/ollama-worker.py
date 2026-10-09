@@ -67,6 +67,10 @@ _HERE_DIR = os.path.dirname(os.path.realpath(__file__))
 if _HERE_DIR not in sys.path:
     sys.path.insert(0, _HERE_DIR)
 import model_profile as _mp
+try:
+    import worker_budget as _bb   # switchable budget policies (2026-10-09); every use is gated on a non-empty policy set
+except Exception:                 # a missing/broken module must never break a default run
+    _bb = None
 import worker_robust as _wr   # Phase 3 (2026-10-08): layered tool-call repair, format requery, loop detector, stop-gate
 
 try:
@@ -165,6 +169,9 @@ WEB_TIMEOUT_S = 20
 # (num_ctx * 4 // 8 chars) so a small-ctx dispatch cannot spend an eighth of its
 # window on a single read -- the cap that matters is whichever is SMALLER.
 READ_FILE_MAX_CHARS = 16000
+# budget policy `read_window`: when [0] > 0, read_file pages show AT LEAST this many lines (default
+# when `length` is omitted/0, floor when it is smaller). 0 = off = historical behaviour.
+_READ_WINDOW = [0]
 
 # Pre-send ceiling, as a fraction of num_ctx. Deliberately ABOVE
 # CONTEXT_REVIEW_THRESHOLD: this is the last-resort "this request will not fit"
@@ -675,7 +682,8 @@ TOOLS = [
             # is what stops the prompt teaching the old behaviour.
             "description": (
                 "Read a file. Large files come back in PAGES, not in full. "
-                "Call with just `path` to get the first page; if the file is "
+                "Always pass all three parameters: `path`, `offset` (1 = first line) and "
+                "`length` (0 = to the end of the file, still one page); if the file is "
                 "bigger than one page the result ends with a notice giving the "
                 "total line count and the exact next call to make. Pass "
                 "`offset` (1-based line number to start at) and `length` "
@@ -687,11 +695,15 @@ TOOLS = [
                 "properties": {
                     "path": {"type": "string", "description": "Path relative to the working directory."},
                     "offset": {"type": "integer",
-                               "description": "1-based line number to start reading at. Omit to start at line 1."},
+                               "description": "1-based line number to start reading at. ALWAYS pass it: use 1 to start at the first line."},
                     "length": {"type": "integer",
-                               "description": "How many lines to read. Omit to read to the end of the file (still capped to one page)."},
+                               "description": "How many lines to read. ALWAYS pass it: use 0 to read to the end of the file (still capped to one page)."},
                 },
-                "required": ["path"],
+                # Every parameter is REQUIRED (2026-10-09, llama.cpp #20164: optional parameters make
+                # Qwen3.5-35B / Qwen3-Coder loop on tool calls at long contexts). The defaults live in
+                # the descriptions; a call that omits offset/length is still honoured (old transcripts,
+                # weaker models) -- see worker_robust.DEFAULTED_PARAMS.
+                "required": ["path", "offset", "length"],
             },
         },
     },
@@ -794,9 +806,9 @@ TOOLS = [
                         "description": "Request objects, each {kind: ..., ...that kind's fields}.",
                         "items": {"type": "object"},
                     },
-                    "why": {"type": "string", "description": "One line: what this evidence will settle."},
+                    "why": {"type": "string", "description": "One line: what this evidence will settle (pass an empty string if there is nothing to add)."},
                 },
-                "required": ["requests"],
+                "required": ["requests", "why"],
             },
         },
     },
@@ -1414,6 +1426,8 @@ def _paginate_read(text: str, args: dict, shown_path: str,
     off = _int(args.get("offset"))
     ln = _int(args.get("length"))
     start = max(1, off) if off else 1
+    if _READ_WINDOW[0] and (ln is None or ln < _READ_WINDOW[0]):
+        ln = _READ_WINDOW[0]
     if total_lines and start > total_lines:
         return (f"ERROR: offset {start} is past the end of {shown_path} -- the file has "
                 f"{total_lines} lines. Call read_file with "
@@ -1467,16 +1481,100 @@ def _fix_literal_escapes(content: str) -> str:
     return content
 
 
+_SYNTAX_GUARD_ON = [True]    # run_task sets this from the profile (robust.syntax_guard); env WORKER_SYNTAX_GUARD=0 also kills it
+
+
+def _syntax_guard_reject(rel_path, before, after):
+    """Post-edit syntax LINT-DELTA guard (SWE-agent edit linter / Agentless lint delta, 2026-10-09).
+    -> an ERROR string when applying `after` over `before` would introduce a syntax error the file
+    did not already have (nothing is written -- the edit is REJECTED), else None. Pre-existing
+    errors never block; unknown file types, a missing parser, a timeout, or any internal failure
+    all mean None (the guard can only ever reject, never break a dispatch)."""
+    try:
+        if not _SYNTAX_GUARD_ON[0] or not _wr.syntax_guard_enabled():
+            return None
+        err = _wr.syntax_delta(rel_path, before, after)
+        if not err:
+            return None
+        shown = ""
+        m = re.search(r"line (\d+)", err)
+        if m:
+            ln = int(m.group(1))
+            lines = after.splitlines()
+            if 1 <= ln <= len(lines):
+                shown = f"\nOffending line {ln} of the result: {lines[ln - 1].strip()[:200]}"
+        return (f"ERROR: your change to {rel_path} was REJECTED and NOT applied -- it would introduce a "
+                f"syntax error that the file did not have before. Parser said: {err}{shown}\n"
+                f"The file is unchanged. Fix the new text (balanced brackets/quotes, correct indentation, "
+                f"no half-finished statement) and send the edit again.")
+    except Exception:
+        return None
+
+
 def tool_write_file(cwd: Path, args: dict) -> str:
     if "path" not in args:
         return 'ERROR: write_file requires a "path" argument.'
     if "content" not in args:
         return 'ERROR: write_file requires a "content" argument.'
     p = resolve_path(cwd, args["path"])
-    p.parent.mkdir(parents=True, exist_ok=True)
     content = _fix_literal_escapes(args["content"])
+    before = None
+    try:
+        if p.is_file():
+            before = p.read_text()
+    except Exception:
+        before = None
+    rejected = _syntax_guard_reject(args["path"], before, content)
+    if rejected:
+        return rejected
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
+    _drop_stale_pyc(p)
     return f"OK: wrote {len(content)} bytes to {args['path']}"
+
+
+def _edit_miss_hints(content: str, old_string: str, new_string: str) -> str:
+    """Aider-style failure hints for an edit_file whose old_string was not found: 'this change looks
+    already applied' when new_string is already in the file, and a 'did you mean' with the closest
+    real lines (with line numbers). Pure, bounded, never raises."""
+    try:
+        out = []
+        if new_string and new_string.strip() and new_string in content:
+            n = content[:content.index(new_string)].count("\n") + 1
+            out.append(f"NOTE: this change looks ALREADY APPLIED -- your new_string is already present in the "
+                       f"file (starting at line {n}). Do not repeat the edit: re-read around that line, then "
+                       f"run the verify or call task_complete if the task is done.")
+        flines = content.splitlines()
+        if 0 < len(flines) <= 40000:
+            stripped = [l.strip() for l in flines]
+            seen, picks = set(), []
+            for ol in [l.strip() for l in old_string.splitlines() if l.strip()][:6]:
+                if ol in seen:
+                    continue
+                seen.add(ol)
+                best, best_r = None, 0.0
+                for idx, fl in enumerate(stripped):
+                    if not fl or abs(len(fl) - len(ol)) > max(8, len(ol)):
+                        continue
+                    sm = difflib.SequenceMatcher(None, ol, fl)
+                    if sm.real_quick_ratio() < 0.6 or sm.quick_ratio() < 0.6:
+                        continue
+                    r = sm.ratio()
+                    if r > best_r:
+                        best, best_r = idx, r
+                if best is not None and best_r >= 0.6:
+                    picks.append((best + 1, best_r))
+            if picks:
+                lines_out = []
+                for ln, _r in sorted(set(picks))[:5]:
+                    lines_out.append(f"  line {ln}: {flines[ln - 1].rstrip()[:160]}")
+                out.append("Did you mean? The closest lines actually in the file (exact text, check "
+                           "whitespace/indentation):\n" + "\n".join(lines_out)
+                           + f"\nRe-read with read_file offset={max(1, picks[0][0] - 3)} length=20 and copy "
+                             f"old_string from there.")
+        return "\n".join(out)
+    except Exception:
+        return ""
 
 
 def tool_edit_file(cwd: Path, args: dict) -> str:
@@ -1520,19 +1618,29 @@ def tool_edit_file(cwd: Path, args: dict) -> str:
         if len(ws_matches) == 1:
             m = ws_matches[0]
             new_content = content[:m.start()] + new_string + content[m.end():]
+            rejected = _syntax_guard_reject(args["path"], content, new_content)
+            if rejected:
+                return rejected
             p.write_text(new_content)
+            _drop_stale_pyc(p)
             return (f"OK: replaced 1 occurrence in {args['path']} ({len(new_content)} bytes total) "
                     f"[whitespace-tolerant match: your old_string matched except for interior whitespace]")
+        _hints = _edit_miss_hints(content, old_string, new_string)
         return (f"ERROR: old_string not found in {args['path']} -- it must match the file's "
                 f"current exact content, including whitespace/indentation. To check, re-read "
                 f"AROUND the region you are editing: call read_file with an `offset` near it "
                 f"(and a small `length`), not a bare re-read -- on a large file a bare read "
-                f"returns only the first page, which may not contain your region at all.")
+                f"returns only the first page, which may not contain your region at all."
+                + ("\n" + _hints if _hints else ""))
     if count > 1:
         return (f"ERROR: old_string matches {count} locations in {args['path']} -- it must be "
                 f"unique. Include more surrounding context (a line or two before/after) to disambiguate.")
     new_content = content.replace(old_string, new_string, 1)
+    rejected = _syntax_guard_reject(args["path"], content, new_content)
+    if rejected:
+        return rejected
     p.write_text(new_content)
+    _drop_stale_pyc(p)
     return f"OK: replaced 1 occurrence in {args['path']} ({len(new_content)} bytes total)"
 
 
@@ -1640,7 +1748,30 @@ def _shell_env() -> dict:
     # VERIFY-SANDBOX (2026-10-05): the model's shells and its verify are code under
     # test -- ollama-queue.py refuses to enqueue/mutate real jobs from them.
     env["DISPATCH_VERIFY_SANDBOX"] = "1"
+    # STALE-BYTECODE HAZARD (2026-10-09, found by the fixed-lane agent): a .pyc is valid while
+    # (int mtime, size) of its source match, so an edit that keeps the size within the same
+    # second verified against the OLD bytecode. Our shells and verifies never write bytecode,
+    # so none can be left behind to go stale; _drop_stale_pyc() removes any pre-existing one
+    # for each file the worker writes.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
+
+
+def _drop_stale_pyc(p) -> None:
+    """Remove the cached bytecode of a .py file the worker just (re)wrote. Never raises."""
+    try:
+        p = Path(p)
+        if p.suffix != ".py":
+            return
+        pc = p.parent / "__pycache__"
+        if pc.is_dir():
+            for f in pc.glob(p.stem + ".*.pyc"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+    except Exception:
+        pass
 
 
 class _GroupTimeout(Exception):
@@ -2919,7 +3050,8 @@ def call_ollama(host: str, model: str, messages: list, temperature: float, num_c
                  top_p: float = None, top_k: int = None, api_style: str = "ollama",
                  max_tokens: int = None,
                  repeat_penalty: float = None, think=None,
-                 preserve_reasoning: bool = False, role: str = "author") -> dict:
+                 preserve_reasoning: bool = False, role: str = "author",
+                 tool_choice: str = None, max_attempts: int = None) -> dict:
     """api_style="openai" targets llama-server (or any OpenAI-compatible
     /v1/chat/completions endpoint) instead of Ollama's native /api/chat.
     Added 2026-08-22: confirmed live that Ollama's own chat-template
@@ -2940,6 +3072,8 @@ def call_ollama(host: str, model: str, messages: list, temperature: float, num_c
         payload.update(_f)
         if tools:
             payload["tools"] = TOOLS
+            if tool_choice:       # 422-recovery ladder only (see _recover_422)
+                payload["tool_choice"] = tool_choice
         url = f"{host}/v1/chat/completions"
     else:
         payload = {"model": model, "messages": messages, "stream": False,
@@ -2960,7 +3094,7 @@ def call_ollama(host: str, model: str, messages: list, temperature: float, num_c
     last_err_detail = None
     _lane_state = {}
     attempt = 0
-    _budget = CHAT_RETRIES + 1
+    _budget = (CHAT_RETRIES + 1) if max_attempts is None else max(1, int(max_attempts))
     while attempt < _budget:
         attempt += 1
         # Built per attempt: Darkbloom rotates its key on every provider restart,
@@ -3084,6 +3218,114 @@ def call_ollama(host: str, model: str, messages: list, temperature: float, num_c
         except Exception as e:
             log(f"[worker] CUDA OOM recovery retry also failed: {e}")
     raise RuntimeError(f"Chat request failed after retries: {last_err_detail}") from last_err
+
+
+# ---------------------------------------------------------------------------
+# 422 "Inference generation failed" recovery (2026-10-09). Darkbloom 0.9.19 (MTP +
+# tool-call generation) answers HTTP 422 invalid_request_error "Inference generation
+# failed" (stream: finish_reason "error") DETERMINISTICALLY for some contexts when tools
+# are present: the model emits </think> and the server dies at the first tool-call token.
+# Identical-body retries can never help. Proven to flip to 200: tool_choice "none" for
+# that turn, no tools for that turn, or a shortened prior tool result. After the normal
+# retries are exhausted run a bounded ladder, one attempt per step, on a COPY of the
+# messages (the real transcript is never altered).
+# ---------------------------------------------------------------------------
+RECOVERY_422_MAX_ATTEMPTS = 6        # per run; a truly dead server still pauses for review
+RECOVERY_422_TRUNC_LINES = 40
+RECOVERY_422_NUDGE = ("Continue. Respond with your next tool call now, as text in exactly this format "
+                      "(no tool-calling API is available this turn):\n"
+                      "<tool_call>\n<function=TOOL_NAME>\n<parameter=PARAM_NAME>\nVALUE\n"
+                      "</parameter>\n</function>\n</tool_call>")
+
+
+def _is_422_gen_failed(err) -> bool:
+    s = str(err)
+    return ("422" in s) and ("Inference generation failed" in s or "Response generation failed" in s)
+
+
+def _cut_text(text: str):
+    """(shorter text, changed). >40 lines -> first 40 + '[truncated N lines]'; else a very
+    long few-line blob -> first 4000 chars + '[truncated N chars]'."""
+    lines = text.split("\n")
+    if len(lines) > RECOVERY_422_TRUNC_LINES:
+        return ("\n".join(lines[:RECOVERY_422_TRUNC_LINES])
+                + f"\n[truncated {len(lines) - RECOVERY_422_TRUNC_LINES} lines]"), True
+    if len(text) > 4000:
+        return text[:4000] + f"\n[truncated {len(text) - 4000} chars]", True
+    return text, False
+
+
+def _truncate_last_tool_result(messages: list):
+    """Copy of `messages` whose LAST tool-role message is shortened (first
+    RECOVERY_422_TRUNC_LINES lines + a '[truncated N lines]' marker). The worker's tool
+    results are usually JSON ({"exit_code":..,"stdout":"a\\nb.."}), i.e. ONE physical line, so
+    long string fields inside a JSON object are cut individually and re-dumped. None when
+    there is nothing to cut."""
+    for idx in range(len(messages) - 1, -1, -1):
+        m = messages[idx]
+        if m.get("role") != "tool":
+            continue
+        raw = str(m.get("content") or "")
+        new, changed = raw, False
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            for k, v in list(obj.items()):
+                if isinstance(v, str):
+                    nv, ch = _cut_text(v)
+                    if ch:
+                        obj[k], changed = nv, True
+            if changed:
+                new = json.dumps(obj)
+        if not changed:
+            new, changed = _cut_text(raw)
+        if not changed:
+            return None
+        out = list(messages)
+        out[idx] = {**m, "content": new}
+        return out
+    return None
+
+
+def _recover_422(call, messages: list, metrics: dict, iteration=None):
+    """Run the ladder; `call(msgs, **kw)` is a single-attempt non-streaming request. Returns
+    the normalized response of the first step that worked, else None (caller pauses)."""
+    def _useful(r):
+        m = (r or {}).get("message") or {}
+        return bool((m.get("content") or "").strip() or m.get("tool_calls"))
+    steps = [
+        (1, "tool_choice=none + nudge", lambda: (
+            [*messages, {"role": "user", "content": RECOVERY_422_NUDGE}], {"tool_choice": "none"})),
+        (2, f"last tool result truncated to {RECOVERY_422_TRUNC_LINES} lines", lambda: (
+            _truncate_last_tool_result(messages), {})),
+    ]
+    rec = metrics.setdefault("recovery_422", {"attempts": 0, "ok": 0, "events": []})
+    for n, label, build in steps:
+        if rec["attempts"] >= RECOVERY_422_MAX_ATTEMPTS:
+            log(f"[worker] 422 recovery: cap of {RECOVERY_422_MAX_ATTEMPTS} attempts reached -- not trying step {n}.")
+            return None
+        msgs, kw = build()
+        if msgs is None:
+            log(f"[worker] 422 recovery: step {n} ({label}) skipped -- nothing to truncate.")
+            continue
+        rec["attempts"] += 1
+        try:
+            r = call(msgs, **kw)
+            ok = _useful(r)
+            why = "" if ok else "empty reply"
+        except Exception as e:
+            r, ok, why = None, False, str(e)[:160]
+        rec["events"].append({"iteration": iteration, "step": n, "ok": ok})
+        if ok:
+            rec["ok"] += 1
+        log(f"[worker] 422 recovery: step {n} ({label}) {'ok' if ok else 'failed'}"
+            + (f" -- {why}" if why else "") + f" [attempt {rec['attempts']}/{RECOVERY_422_MAX_ATTEMPTS}]")
+        if ok:
+            r["_recovery_422"] = n
+            return r
+    return None
 
 # ---------------------------------------------------------------------------
 # Opt-in live streaming log (--live-log). Ported from qwen-dispatch.sh's
@@ -3265,6 +3507,28 @@ class ChatAbortedForReasoningRunaway(Exception):
     just unbounded deliberation, so the retry turns thinking OFF (profile non-thinking mode)."""
 
 
+# No-tool-call PROSE budget for coding turns, in CHARS (0 = off). Armed per run by run_task
+# from the profile's robust.prose_budget_tokens (x4 chars/token, the file-wide estimate) for
+# coding tasks only. One-element list for the same reason as _REASONING_BUDGET.
+_PROSE_BUDGET = [0]
+PROSE_GUARD_STRIDE = 1500        # re-check the streamed text every this many new content chars
+PROSE_LINE_REPEAT_MIN_LEN = 20   # a line shorter than this ("}", "  ],") may repeat legitimately
+PROSE_LINE_REPEAT_MAX = 25       # same >=20-char line this many times in one tool-call-free turn
+PROSE_BLOCK_CHARS = 500          # the last 500 chars occurring ...
+PROSE_BLOCK_REPEATS = 3          # ... this many times in the turn = a repeated block
+
+
+class ChatAbortedForProseRunaway(Exception):
+    """A coding turn streamed more than the no-tool-call prose budget (or degenerated into a
+    repeated line/block) without starting a tool call (smoke job 6cf6fb3afca4, 2026-10-08: four
+    turns of ~115K chars / ~400s each, no tool call, until prose_loop fired after ~28 min).
+    Carries the partial turn so run_task can treat it as a cut-off turn (existing nudge +
+    prose_loop accounting) after persisting the raw text for diagnosis."""
+    def __init__(self, reason, content, thinking="", streamed=True):
+        super().__init__(reason)
+        self.reason, self.content, self.thinking, self.streamed = reason, content, thinking, streamed
+
+
 class ChatAbortedForReasoningLoop(Exception):
     """Raised by call_ollama_streaming when a SINGLE generation is stuck
     re-deriving the same reasoning inside one turn (the owner 2026-09-20: three
@@ -3376,6 +3640,8 @@ def call_ollama_streaming(host: str, model: str, messages: list, temperature: fl
     content_parts = []
     tool_calls_acc = []
     _intra_checked_len = 0
+    _pc_len = 0         # content chars streamed so far / at the last prose-runaway check
+    _pc_checked = 0
     phase = None  # None -> 'thinking' -> 'writing'
     seen_checkpoints = set()
     prompt_tokens = 0
@@ -3463,6 +3729,19 @@ def call_ollama_streaming(host: str, model: str, messages: list, temperature: fl
                     phase = 'writing'
                 content_parts.append(content)
                 token_count += max(1, len(content) // 4)
+                _pc_len += len(content)
+                if _PROSE_BUDGET[0] and not tool_calls_acc and _pc_len - _pc_checked >= PROSE_GUARD_STRIDE:
+                    _pc_checked = _pc_len
+                    _pc_why = prose_runaway_check(''.join(content_parts), _PROSE_BUDGET[0])
+                    if _pc_why:
+                        emit(f'[{model}] PROSE RUNAWAY ({_pc_why}, {_pc_len} chars, no tool call) '
+                             f'-- aborting turn', LIVE_YELLOW)
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        raise ChatAbortedForProseRunaway(
+                            _pc_why, ''.join(content_parts), think_buf, streamed=True)
 
             now = time.time()
             if phase == 'thinking' and now - last_status_write > 8:
@@ -3508,6 +3787,7 @@ def call_ollama_streaming(host: str, model: str, messages: list, temperature: fl
     if tool_calls_acc:
         message["tool_calls"] = tool_calls_acc
     return {
+        "streamed": True,
         "message": message,
         "done_reason": done_reason,
         "usage": {"prompt_tokens": prompt_tokens,
@@ -3647,6 +3927,8 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
     tc_slots = {}       # index -> OpenAI tool_call dict being assembled
     tc_order = []       # first-seen order of those indices
     _intra_checked_len = 0
+    _pc_len = 0         # content chars streamed so far / at the last prose-runaway check
+    _pc_checked = 0
     phase = None        # None -> 'thinking' -> 'writing'
     seen_checkpoints = set()
     prompt_tokens = 0
@@ -3788,6 +4070,19 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
                         phase = 'writing'
                     content_parts.append(content)
                     token_count += max(1, len(content) // 4)
+                    _pc_len += len(content)
+                    if _PROSE_BUDGET[0] and not tc_slots and _pc_len - _pc_checked >= PROSE_GUARD_STRIDE:
+                        _pc_checked = _pc_len
+                        _pc_why = prose_runaway_check(''.join(content_parts), _PROSE_BUDGET[0])
+                        if _pc_why:
+                            emit(f'[{model}] PROSE RUNAWAY ({_pc_why}, {_pc_len} chars, no tool call) '
+                                 f'-- aborting turn', LIVE_YELLOW)
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                            raise ChatAbortedForProseRunaway(
+                                _pc_why, ''.join(content_parts), think_buf, streamed=True)
 
                 now = time.time()
                 if phase == 'thinking' and now - last_status_write > 8:
@@ -3804,7 +4099,8 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
                     if live is not None:
                         live.write_rate(f'{model}: {rate:.1f} tok/s (est)')
                     last_rate_write = now
-    except (ChatAbortedForPause, ChatAbortedForReasoningLoop, ChatAbortedForReasoningRunaway):
+    except (ChatAbortedForPause, ChatAbortedForReasoningLoop, ChatAbortedForReasoningRunaway,
+            ChatAbortedForProseRunaway):
         raise
     except (urllib.error.URLError, TimeoutError, http.client.HTTPException, OSError,
             ValueError) as e:
@@ -3813,6 +4109,15 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
         # silently return a half-generation -- partial tool-call arguments would be
         # invalid JSON and a partial answer could be mistaken for a final one.
         _fail(str(e), e)
+
+    if done_reason == "error" and not tc_slots:
+        # Darkbloom (MTP + tool-call generation) reports a server-side generation
+        # failure as finish_reason:"error" ("Response generation failed") -- the same
+        # deterministic failure the non-streaming path reports as HTTP 422 "Inference
+        # generation failed". Surface it as that error so run_task's 422 recovery
+        # ladder (_recover_422) handles both lanes identically.
+        raise RuntimeError("Chat request failed after retries: HTTP Error 422: Unprocessable "
+                           "Entity -- body: Response generation failed (stream finish_reason=error)")
 
     if not saw_terminator:
         # The body ended without `data: [DONE]` and without a finish_reason. A
@@ -3875,6 +4180,7 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
         except Exception:
             prompt_tokens = 0
     return {
+        "streamed": True,
         "message": message,
         "done_reason": done_reason,
         "usage": {"prompt_tokens": prompt_tokens,
@@ -3990,6 +4296,16 @@ def _usable_prime(msgs) -> bool:
 PREFLIGHT_MAX_TOKENS = 256   # the tool-calling probe only needs the server to accept TOOLS
 
 
+def _preflight_timeout_default():
+    """30s unless WORKER_PREFLIGHT_TIMEOUT_S is set (a slow-prefill server such as the Strata
+    expert-offload engine needs minutes for the tools-bearing first request)."""
+    try:
+        v = int(os.environ.get("WORKER_PREFLIGHT_TIMEOUT_S", "") or 30)
+    except ValueError:
+        return 30
+    return v if v > 0 else 30
+
+
 def _tool_calling_preflight(host, model, urlopen=None, sleep=time.sleep):
     """One minimal real request carrying TOOLS, so a server that cannot tool-call
     fails HERE, in seconds, before run_task's loop spends context.
@@ -4004,7 +4320,7 @@ def _tool_calling_preflight(host, model, urlopen=None, sleep=time.sleep):
     the original 30s / any-500-means-no-jinja behaviour byte for byte."""
     urlopen = urlopen or urllib.request.urlopen
     darkbloom = _is_darkbloom_lane(host)
-    timeout = WARMUP_TIMEOUT_S if darkbloom else 30
+    timeout = WARMUP_TIMEOUT_S if darkbloom else _preflight_timeout_default()
     if darkbloom:
         log(f"[worker] preflight on the Darkbloom lane: first request to {model} may "
             f"lazy-load it (cold start) -- allowing up to {WARMUP_TIMEOUT_S}s.")
@@ -4369,6 +4685,167 @@ BUDGET_GRANTING_PAUSE_REASONS = frozenset({
 })
 
 
+FIXED_LANE_TERMINAL_REASONS = ("fixed_lane_exhausted", "fixed_lane_apply_failed", "fixed_lane_transport_error")
+_FIXED_LANE_NONE = {"converged": False, "summary": None, "files_changed": 0, "reason": None, "status": None}
+
+
+def fixed_lane_handoff_text(handoff) -> str:
+    """PURE. The block appended to the FIRST user message when the fixed lane failed, so the open
+    loop starts from the lane's best attempt instead of from nothing."""
+    h = handoff or {}
+    parts = ["\n\n---\nHARNESS NOTE: a fixed one-shot repair lane already tried this task and did not "
+             f"get the verify green (reason: {h.get('reason') or 'unknown'})."]
+    if h.get("seed_applied"):
+        parts.append("Its best attempt is ALREADY APPLIED in the working tree (diff below). Build on it, "
+                     "or revert parts of it if it is wrong; do not start over blindly.")
+    elif h.get("seed_diff"):
+        parts.append("Its best attempt could not be applied automatically; the diff is below for reference.")
+    if h.get("seed_diff"):
+        parts.append("Seed diff:\n```diff\n" + str(h["seed_diff"])[:6000] + "\n```")
+    if h.get("last_verify_output"):
+        parts.append("Last verify output (what is still red):\n```\n" + str(h["last_verify_output"])[-3000:] + "\n```")
+    return "\n".join(parts)
+
+
+def _apply_fixed_lane_seed(cwd, handoff) -> bool:
+    """Apply the lane's seed diff (git apply, else write the seed files) so the open loop continues
+    from it. Never raises; False when nothing was applied."""
+    try:
+        diff = (handoff or {}).get("seed_diff") or ""
+        if not diff.strip():
+            return False
+        r = subprocess.run(["git", "apply", "--whitespace=nowarn", "-"], cwd=str(cwd), input=diff,
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return True
+        n = 0
+        for rel, text in ((handoff or {}).get("seed_files") or {}).items():
+            if not isinstance(text, str):
+                continue
+            fp = resolve_path(Path(cwd), rel)
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(text)
+            _drop_stale_pyc(fp)
+            n += 1
+        return n > 0
+    except Exception:
+        return False
+
+
+def _run_fixed_lane_seam(*, mode, model, host, cwd, task, verify, task_kind, api_style, resume_from,
+                         bash_only, manual_tools, targets, rb, messages, lane_module=None):
+    """--mode auto|fixed: try the one-shot repair lane (fixed_lane.py) before the open loop.
+    -> dict(converged, summary, files_changed, reason, status). converged=True on passed /
+    already_green (the caller then runs the normal verify + gate path). Any other lane outcome
+    leaves the worktree as the lane's best attempt (seed) and INJECTS result['handoff'] (seed diff +
+    last verify output) into messages[1], then returns converged=False so the open loop runs.
+    reason is one of FIXED_LANE_TERMINAL_REASONS when the lane ran and failed, else None."""
+    out = dict(_FIXED_LANE_NONE)
+    skip = None
+    if resume_from:
+        skip = "resumed run"
+    elif task_kind != "coding":
+        skip = "not a coding task"
+    elif not (verify or "").strip():
+        skip = "no verify command"
+    elif api_style != "openai":
+        skip = f"lane needs the OpenAI-style lane (api={api_style})"
+    elif bash_only or manual_tools:
+        skip = "bash-only/manual-tools action mode"
+    if skip:
+        log(f"[worker] FIXED LANE ({mode}): skipped -- {skip}; open loop.")
+        return out
+    try:
+        fl = lane_module
+        if fl is None:
+            import fixed_lane as fl
+        ltask = {"cwd": str(cwd), "targets": list(targets or []), "verify": verify,
+                 "spec": task, "title": (task or "").strip().splitlines()[0][:200] if (task or "").strip() else ""}
+        ok, why = fl.lane_eligible(ltask, model=model)
+        if not ok:
+            log(f"[worker] FIXED LANE ({mode}): ineligible -- {'; '.join(why)}; open loop.")
+            return out
+        guard_fn = None
+        if not (_SYNTAX_GUARD_ON[0] and _wr.syntax_guard_enabled(rb)):
+            guard_fn = lambda path, before, after: (True, [])   # noqa: E731  (profile/env kill switch)
+        log(f"[worker] FIXED LANE ({mode}): running on {len(ltask['targets'])} target file(s).")
+        res = fl.run_lane(ltask, model=model, host=host, log=log, guard_fn=guard_fn)
+    except Exception as e:
+        log(f"[worker] FIXED LANE ({mode}): crashed ({type(e).__name__}: {str(e)[:200]}) -- open loop.")
+        _dispatch_metrics["fixed_lane"] = {"status": "crashed", "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        return out
+    status = res.get("status")
+    out["status"] = status
+    _dispatch_metrics["fixed_lane"] = {
+        "status": status, "reason": res.get("reason"), "tokens": res.get("tokens"),
+        "wall_s": res.get("wall_s"), "mode": mode}
+    _dispatch_metrics["sum_completion_tokens"] = (_dispatch_metrics.get("sum_completion_tokens") or 0) + int(res.get("tokens") or 0)
+    log(f"[worker] FIXED LANE RESULT: status={status} reason={res.get('reason')} tokens={res.get('tokens')} "
+        f"wall_s={res.get('wall_s')}")
+    if status in ("passed", "already_green"):
+        out["converged"] = True
+        out["summary"] = (f"fixed lane: {status} (verify green)"
+                          + (f", {res.get('tokens')} tokens, {res.get('wall_s')}s" if status == "passed" else ""))
+        try:
+            out["files_changed"] = len((res.get("best") or {}).get("files") or {}) if status == "passed" else 0
+        except Exception:
+            out["files_changed"] = 1 if status == "passed" else 0
+        return out
+    if status == "ineligible":
+        return out
+    reason = res.get("reason")
+    if reason in FIXED_LANE_TERMINAL_REASONS or (reason or "").startswith("fixed_lane_"):
+        out["reason"] = reason
+    handoff = dict(res.get("handoff") or {})
+    handoff.setdefault("reason", reason)
+    handoff["seed_applied"] = _apply_fixed_lane_seed(cwd, handoff)
+    try:
+        messages[1]["content"] = str(messages[1].get("content") or "") + fixed_lane_handoff_text(handoff)
+        log(f"[worker] FIXED LANE handoff injected into the first user message "
+            f"(seed applied={handoff['seed_applied']}); falling into the open loop.")
+    except Exception as e:
+        log(f"[worker] FIXED LANE handoff injection failed ({e!r}); open loop without it.")
+    return out
+
+
+EXTRA_ITERATIONS_MAX = 200
+TURN_LOG_MAX = 120
+
+
+def turn_log_record(i, resp, msg, thinking, usage, elapsed, turn_think) -> dict:
+    """PURE. One compact per-turn row for dispatch-metrics (`turn_log`): thinking chars (the
+    separate reasoning field PLUS Darkbloom's inline thinking that arrives inside content before
+    the first </think>), content chars, finish_reason, token counts, requested thinking mode and
+    (filled in by the loop) tool-call parse outcome. Needed for the thinking/sampling A/B."""
+    content = str((msg or {}).get("content") or "")
+    inline = content.split("</think>", 1)[0] if "</think>" in content else ""
+    usage = usage or {}
+    return {
+        "i": i,
+        "thinking_chars": len(thinking or "") + len(inline),
+        "content_chars": len(content),
+        "tool_calls": len((msg or {}).get("tool_calls") or []),
+        "parse": None,
+        "finish_reason": (resp or {}).get("done_reason"),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "elapsed_s": round(float(elapsed or 0), 1),
+        "think_requested": turn_think,
+    }
+
+
+def apply_extra_iterations(total_iters: int, extra) -> tuple:
+    """PURE. -> (new_total, applied). `extra` (--extra-iterations) raises the ceiling by that many
+    iterations; None/negative/garbage = 0, capped at EXTRA_ITERATIONS_MAX so a bad caller cannot
+    buy an unbounded run."""
+    try:
+        n = int(extra or 0)
+    except (TypeError, ValueError):
+        n = 0
+    n = max(0, min(n, EXTRA_ITERATIONS_MAX))
+    return total_iters + n, n
+
+
 def resume_total_iters(resumed_at_iteration: int, max_iters: int,
                        pause_reason: "str | None") -> int:
     """The iteration ceiling for this session.
@@ -4445,6 +4922,45 @@ def _changed_file_count(cwd) -> int | None:
         return len(paths)
     except Exception:
         return None
+
+
+SALVAGE_MAX_BYTES = 2_000_000
+
+
+def save_salvage_patch(cwd, dest) -> dict:
+    """SALVAGE ON EXIT (SWE-agent autosubmit-on-error, 2026-10-09). What the worker already did on a
+    loop_detected / stop_gate_failed / cap exit: left the worktree untouched, ran the end-of-run
+    verify, and (verify green) exited DONE-BUT-UNCONVERGED. What it did NOT do: keep a copy of the
+    diff outside the worktree, so a reaped/reset worktree discarded a near-complete patch. This
+    writes tracked changes (git diff-index -p HEAD, plumbing: never rewrites the index) plus
+    untracked files (as new-file diffs) to `dest`. Deterministic, bounded (2MB), never raises.
+    -> {"path", "bytes", "files"} or {} when there is nothing to save / not a git tree."""
+    try:
+        cwd = str(cwd)
+        if subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd, capture_output=True,
+                          text=True, timeout=10).stdout.strip() != "true":
+            return {}
+        parts = []
+        tracked = subprocess.run(["git", "diff-index", "-p", "HEAD", "--"], cwd=cwd, capture_output=True,
+                                 text=True, timeout=30)
+        if tracked.returncode == 0 and tracked.stdout:
+            parts.append(tracked.stdout)
+        unt = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=cwd,
+                             capture_output=True, text=True, timeout=15)
+        for f in [l for l in unt.stdout.splitlines() if l.strip()][:200]:
+            d = subprocess.run(["git", "diff", "--no-index", "--", "/dev/null", f], cwd=cwd,
+                               capture_output=True, text=True, timeout=15)
+            if d.stdout:
+                parts.append(d.stdout)
+        body = "".join(parts)
+        if not body.strip():
+            return {}
+        body = body[:SALVAGE_MAX_BYTES]
+        Path(dest).write_text(body)
+        files = len(re.findall(r"^diff --git ", body, re.M))
+        return {"path": str(dest), "bytes": len(body), "files": files}
+    except Exception:
+        return {}
 
 
 def _git_worktree_snapshot(cwd) -> str:
@@ -4773,6 +5289,108 @@ def compact_cut_off_prose(content, keep_chars=None):
         return text, 0
     return (kept + f"\n\n[worker: the rest of this turn ({dropped} chars, repeated/cut-off "
                    f"analysis) was dropped -- it hit the output cap without acting]"), dropped
+
+
+def degenerate_repetition(text):
+    """PURE. Reason string if a tool-call-free turn has degenerated into repetition, else None:
+    the same >= PROSE_LINE_REPEAT_MIN_LEN-char line PROSE_LINE_REPEAT_MAX+ times, or the
+    last PROSE_BLOCK_CHARS chars occurring PROSE_BLOCK_REPEATS+ times in the turn. Short
+    structural lines ("}", "],") are exempt: they legitimately repeat in code."""
+    if not text:
+        return None
+    counts = {}
+    for ln in text.split("\n"):
+        k = ln.strip()
+        if len(k) >= PROSE_LINE_REPEAT_MIN_LEN:
+            n = counts.get(k, 0) + 1
+            if n >= PROSE_LINE_REPEAT_MAX:
+                return f"line repeated x{n}: {k[:60]!r}"
+            counts[k] = n
+    if len(text) >= PROSE_BLOCK_CHARS * PROSE_BLOCK_REPEATS:
+        tail = text[-PROSE_BLOCK_CHARS:]
+        n = text.count(tail)
+        if n >= PROSE_BLOCK_REPEATS:
+            return f"block of {PROSE_BLOCK_CHARS} chars repeated x{n}"
+    return None
+
+
+def prose_runaway_check(text, budget_chars):
+    """PURE. Reason string if this tool-call-free streamed turn should be aborted, else None.
+    A turn that is (or is becoming) a tool call is never aborted: real tool_calls are tested by
+    the caller; markup-style calls (<tool_call>/<function=) in the text are exempt here, so a
+    large legit write_file is not cut by the budget."""
+    if "<tool_call>" in text or "<function=" in text:
+        return None
+    if budget_chars and len(text) >= budget_chars:
+        return f"no tool call after {len(text)} chars (budget {budget_chars})"
+    return degenerate_repetition(text)
+
+
+def turn_text_stats(text):
+    """PURE. Diagnostics for a cut-off turn: chars, lines, duplicate-line share (non-blank lines
+    that repeat an earlier line), and the longest repeated block measured in whole lines (the
+    largest n in 1,2,4,..,64 for which some n consecutive non-blank lines occur twice)."""
+    lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+    dup = (len(lines) - len(set(lines))) / len(lines) if lines else 0.0
+    longest = 0
+    for n in (1, 2, 4, 8, 16, 32, 64):
+        if len(lines) < 2 * n:
+            break
+        seen, hit = set(), False
+        for j in range(len(lines) - n + 1):
+            w = tuple(lines[j:j + n])
+            if w in seen:
+                hit = True
+                break
+            seen.add(w)
+        if not hit:
+            break
+        longest = n
+    return {"chars": len(text or ""), "lines": len(lines),
+            "dup_line_ratio": round(dup, 3), "longest_repeated_line_block": longest}
+
+
+CUTOFF_CAPTURE_MAX_BYTES = 400_000
+
+
+def _cap_head_tail(s, limit):
+    if len(s) <= limit:
+        return s
+    h = limit // 2
+    return (s[:h] + f"\n\n[... {len(s) - 2 * h} chars omitted by CUTOFF_CAPTURE cap ...]\n\n"
+            + s[-h:])
+
+
+def persist_cutoff_turn(path, *, iteration, content, thinking, finish_reason, usage, streamed,
+                        abort_reason, max_tokens):
+    """Write the raw cut-off / over-long no-tool-call turn (content AND reasoning) beside the
+    transcript BEFORE compaction destroys it. Capped at CUTOFF_CAPTURE_MAX_BYTES (head+tail with
+    a marker). Never raises. Returns the metrics dict for this turn."""
+    stats = turn_text_stats(content)
+    est_tokens = (usage or {}).get("completion_tokens") or max(1, (len(content or "") + len(thinking or "")) // 4)
+    rec = dict(stats, iteration=iteration, completion_tokens=est_tokens,
+               finish_reason=finish_reason, streamed=bool(streamed), abort_reason=abort_reason,
+               thinking_chars=len(thinking or ""), max_tokens=max_tokens,
+               head300=(content or "")[:300], tail300=(content or "")[-300:], file=None)
+    try:
+        header = (f"# cut-off turn, iteration {iteration}\n# finish_reason={finish_reason} "
+                  f"streamed={bool(streamed)} abort_reason={abort_reason!r} usage={usage!r} "
+                  f"max_tokens={max_tokens}\n# {stats}\n")
+        per = (CUTOFF_CAPTURE_MAX_BYTES - len(header) - 200) // 2
+        body = (header + "\n===== CONTENT =====\n" + _cap_head_tail(content or "", per)
+                + "\n\n===== REASONING =====\n" + _cap_head_tail(thinking or "", per) + "\n")
+        Path(path).write_text(body)
+        rec["file"] = str(path)
+    except Exception as e:
+        rec["capture_error"] = str(e)[:200]
+    return rec
+
+
+def prose_runaway_nudge(budget_tokens, reason) -> str:
+    return (f"Your last response was STOPPED after ~{budget_tokens} tokens of prose with no tool "
+            f"call ({reason}), so nothing was done. Do not write files, code or analysis as plain "
+            f"text -- put file contents inside a write_file tool call. Make your next tool call "
+            f"now, one file at a time, and keep any reasoning to a few sentences.")
 
 
 def output_cap_cut_nudge(max_tokens) -> str:
@@ -5618,9 +6236,21 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
              verify_failed_at_baseline=False, scored_arm=False, num_ctx_bumps=0,
              min_web_fetches=0,
              live_log=None, dispatch_tag=None, think=None, capture_final_as=None,
-             preserve_reasoning=False, role="author"):
+             preserve_reasoning=False, role="author", extra_iterations=0, mode="open",
+             fixed_targets=None, budget_policy=None, prefetch_specs=None):
     cwd = Path(cwd).resolve()
     cwd.mkdir(parents=True, exist_ok=True)
+    # BUDGET POLICIES (worker_budget.py): CLI > `Budget-policy:` line in the task > env
+    # WORKER_BUDGET_POLICY; empty (the default) leaves every code path below untouched.
+    _bp_names, _bp_unknown, _bp_source = (frozenset(), [], "default")
+    if _bb is not None:
+        _bp_names, _bp_unknown, _bp_source = _bb.resolve_policies(budget_policy, None, task)
+    if _bp_unknown:
+        log(f"[worker] budget policy: ignoring unknown name(s) {_bp_unknown} (known: {', '.join(_bb.POLICIES)})")
+    if _bp_names and task_kind != "coding":
+        log(f"[worker] budget policy {sorted(_bp_names)} ignored: task kind is {task_kind!r}, policies apply to coding runs only.")
+        _bp_names = frozenset()
+    _READ_WINDOW[0] = _bb.READ_WINDOW_LINES if "read_window" in _bp_names else 0
     # MODEL PROFILE (model_profiles.yaml): any sampling/budget value the caller left None
     # comes from the model card for (model, role); explicit CLI values win. Resolved to
     # concrete numbers here so every downstream use (budget math, recovery bumps, the
@@ -5759,6 +6389,22 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": task},
         ]
+        if "prefetch_excerpt" in _bp_names:
+            try:
+                _pf_specs = list(prefetch_specs or []) + _bb.prefetch_specs_from_text(task)
+                for _nm in ("AUTO-TASK.md", "TASK.md"):
+                    _tp = Path(cwd) / _nm
+                    if _tp.is_file():
+                        _pf_specs += _bb.prefetch_specs_from_text(_tp.read_text(errors="replace"))
+                if not _pf_specs:
+                    _pf_specs = list(_wr.parse_task_criteria(task)[0])
+                _pf_text = _bb.build_prefetch(cwd, _pf_specs)
+                if _pf_text:
+                    messages[1]["content"] = task + _pf_text
+                    log(f"[worker] budget policy prefetch_excerpt: injected {len(_pf_text)} chars from "
+                        f"{len(_pf_specs)} spec(s) into the first prompt.")
+            except Exception as _pf_err:      # an excerpt is a convenience, never a dispatch breaker
+                log(f"[worker] prefetch_excerpt error (ignored): {_pf_err!r}")
         resumed_at_iteration = 0
         resumed_pause_reason = None  # a fresh run was never paused
         _resume_full_messages = None  # no pre-pause history on a fresh run
@@ -6089,6 +6735,15 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
     # of the total count. On a fresh run resumed_at_iteration is 0 and this
     # is exactly the original range(1, max_iters + 1).
     total_iters = resume_total_iters(resumed_at_iteration, max_iters, resumed_pause_reason)
+    # CONTINUATION BUDGET (--extra-iterations): the queue marks an authoring job that is still making
+    # headway 'nonconvergence_progressing' with continuation_allowance.extra_iterations; the driver
+    # passes that number here for ONE round. Additive to whatever ceiling the resume rules above
+    # produced (a granting pause, a plain resume, or an involuntary pause restoring the original cap).
+    total_iters, _extra_applied = apply_extra_iterations(total_iters, extra_iterations)
+    if _extra_applied:
+        log(f"[worker] CONTINUATION BUDGET: --extra-iterations {_extra_applied} -> iteration ceiling "
+            f"{total_iters} (this round only).")
+        _dispatch_metrics["extra_iterations"] = _extra_applied
     # An involuntary-pause resume can hand back a ceiling <= resumed_at_iteration
     # (e.g. a resume-of-a-resume already at the cap) -- range() is then empty and
     # the loop body never runs, leaving `i` unbound at the final _save_transcript
@@ -6113,12 +6768,62 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
     _sg_entry = _wr.parse_entry_point(task)
     _next_turn_think = None   # one-turn override of `think` (runaway-reasoning / think-cap recovery)
     _REASONING_BUDGET[0] = _reasoning_budget_chars
-    while i < total_iters:
+    _SYNTAX_GUARD_ON[0] = _wr.syntax_guard_enabled(_rb)
+    _PROSE_BUDGET_TOKENS = int(_rb.get("prose_budget_tokens", 12000) or 0)
+    _PROSE_BUDGET[0] = _PROSE_BUDGET_TOKENS * 4 if task_kind == "coding" else 0
+    _mask_on = _wr.obs_mask_enabled(_rb)
+    _mask_cfg = _wr.obs_mask_config(_rb)
+    _mask_state = {}
+    _bp = None                    # worker_budget.BudgetState; None (the default) = every policy hook below is skipped
+    if _bp_names and _bb is not None:
+        _bp = _bb.BudgetState(
+            _bp_names, total_iters,
+            refine=("# REFINE TASK" in task or "refine" in str(dispatch_tag or cwd.name).lower()),
+            sig_fn=_verify_failure_signature)
+        _bp.set_cwd(cwd)
+        _dispatch_metrics.update(_bp.metrics())
+        log(f"[worker] BUDGET POLICY active ({_bp_source}): {', '.join(sorted(_bp_names))} "
+            f"(base cap {total_iters}; ceiling {int(total_iters * _bb.EXTEND_CEILING_FACTOR)}).")
+
+    def _bp_ext():
+        # loop-condition fallback: an iteration that ended via `continue` (silent-stop nudges) skips
+        # the end-of-iteration block, so the cap-time extension decision is also made here. Idempotent.
+        nonlocal total_iters
+        if _bp is None or paused_for_review or converged:
+            return False
+        try:
+            _x, _note = _bp.try_extend(i, total_iters)
+        except Exception as _e:
+            log(f"[worker] budget extension error (ignored): {_e!r}")
+            return False
+        if _x:
+            total_iters += _x
+            messages.append({"role": "user", "content": _note})
+            _dispatch_metrics.update(_bp.metrics())
+            log(f"[worker] BUDGET POLICY progress_extend: +{_x} iterations -> ceiling {total_iters}.")
+            return True
+        _dispatch_metrics.update(_bp.metrics())
+        return False
+    _fixed_lane_reason = None     # fixed_lane_{exhausted,apply_failed,transport_error} when the lane ran and failed
+    if mode in ("auto", "fixed"):
+        _fl = _run_fixed_lane_seam(
+            mode=mode, model=model, host=host, cwd=cwd, task=task, verify=verify, task_kind=task_kind,
+            api_style=api_style, resume_from=resume_from, bash_only=_bash_only_mode,
+            manual_tools=manual_tools, targets=(fixed_targets or _sg_files), rb=_rb, messages=messages)
+        if _fl["converged"]:
+            converged = True
+            final_summary = _fl["summary"]
+            _files_modified_count = max(_files_modified_count, _fl["files_changed"])
+            total_iters = i      # nothing left for the open loop; the normal verify/gate path runs below
+        _fixed_lane_reason = _fl["reason"]
+    while i < total_iters or _bp_ext():
         i += 1
         log(f"[worker] --- iteration {i}/{total_iters} ---")
         if live is not None:
             live.iteration(i, total_iters)
         _dispatch_metrics["iterations"] = i
+        if _bp is not None:
+            _bp.begin_turn(i)
 
         if _wall_budget and time.monotonic() - _wall_t0 > _wall_budget:
             log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: WALL BUDGET spent "
@@ -6127,6 +6832,22 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 f"re-plan instead of grinding for hours.")
             _dispatch_metrics["early_abort"] = "wall_budget"
             break
+
+        # MONOLOGUE (worker_robust.LoopDetector.monologue_verdict): 3 consecutive assistant turns with
+        # no tool call that the run nevertheless continued past (nudges, verify-gate) -- the model is
+        # talking, not working. Coding runs only: a research run is legitimately nudged for fetches.
+        if task_kind == "coding" and not paused_for_review:
+            try:
+                _mono = _loop_det.monologue_verdict()
+            except Exception as _ld_err:
+                _mono = None
+                log(f"[worker] loop-detector monologue error (ignored): {_ld_err!r}")
+            if _mono:
+                log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: {_mono[2]} -- "
+                    f"{_wr.REASON_MONOLOGUE}.")
+                _dispatch_metrics["loop_detector"] = {"kind": "monologue", "action": "stop", "iteration": i}
+                _dispatch_metrics["early_abort"] = _wr.REASON_MONOLOGUE
+                break
 
         # EARLY NON-CONVERGENCE ABORT (2026-09-10). A goalless run -- typically a
         # coding dispatch enqueued with no --verify (now gated at enqueue in
@@ -6206,8 +6927,27 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         # --num-ctx -- rather than sending a doomed request. Warn-and-pause,
         # never a hard refusal: the run is recoverable, and pausing keeps the
         # transcript intact for the resume.
+        _send_messages = messages
+        if _mask_on:
+            try:
+                _send_messages, _ms = _wr.mask_observations(messages, _mask_cfg, _mask_state, verify)
+                if _ms["masked"]:
+                    _dispatch_metrics["obs_masked"] = _ms["masked"]
+                    _dispatch_metrics["obs_chars_saved"] = _ms["chars_saved"]
+                    if _mask_state.get("logged") != _ms["boundary"]:
+                        _mask_state["logged"] = _ms["boundary"]
+                        log(f"[worker] observation masking: {_ms['masked']} old tool output(s) elided "
+                            f"({_ms['chars_saved']} chars) from the prompt (transcript unchanged).")
+            except Exception as _mk_err:      # a context optimisation must never break a dispatch
+                log(f"[worker] observation masking error (ignored): {_mk_err!r}")
+                _send_messages = messages
+        if _bp is not None:
+            try:
+                _send_messages = _bp.mask_view(_send_messages)
+            except Exception as _bm_err:
+                log(f"[worker] budget stale-read masking error (ignored): {_bm_err!r}")
         if num_ctx and not paused_for_review:
-            _projected = sum(len(str(_m.get("content") or "")) for _m in messages) // 4
+            _projected = sum(len(str(_m.get("content") or "")) for _m in _send_messages) // 4
             if _projected >= num_ctx * PRESEND_CONTEXT_LIMIT:
                 paused_for_review = (
                     f"projected prompt ~{_projected} tokens vs {num_ctx} context "
@@ -6236,6 +6976,21 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             log(f"[worker] output-cap recovery turn: temperature={_eff_temperature}, "
                 f"repeat_penalty={_turn_repeat_penalty} (this turn only).")
         _outer_break = False
+
+        def _view():
+            # the prompt actually sent: old bulky tool outputs masked (deterministic, see mask_observations)
+            base = messages
+            if _mask_on:
+                try:
+                    base = _wr.mask_observations(messages, _mask_cfg, _mask_state, verify)[0]
+                except Exception:
+                    base = messages
+            if _bp is not None:
+                try:
+                    base = _bp.mask_view(base)
+                except Exception:
+                    pass
+            return base
         _turn_think = think if _next_turn_think is None else _next_turn_think
         _next_turn_think = None
         while True:
@@ -6245,7 +7000,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                     # call_ollama_streaming's docstring for scope). Returns the same
                     # normalized {"message": {...}, "usage": {...}} shape as
                     # call_ollama, so nothing downstream changes.
-                    resp = call_ollama_streaming(host, model, messages, _eff_temperature, num_ctx,
+                    resp = call_ollama_streaming(host, model, _view(), _eff_temperature, num_ctx,
                                                  timeout=chat_timeout, tools=not manual_tools,
                                                  top_p=top_p, top_k=top_k, live=live,
                                                  max_tokens=_turn_max_tokens, repeat_penalty=_turn_repeat_penalty,
@@ -6257,7 +7012,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                     # blocking path below runs the identical turn -- --live-log must never
                     # be able to break a dispatch that would otherwise have worked.
                     try:
-                        resp = call_openai_streaming(host, model, messages, _eff_temperature, num_ctx,
+                        resp = call_openai_streaming(host, model, _view(), _eff_temperature, num_ctx,
                                                      timeout=chat_timeout, tools=not manual_tools,
                                                      top_p=top_p, top_k=top_k, live=live,
                                                      max_tokens=_turn_max_tokens,
@@ -6268,14 +7023,14 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                         log(f"[worker] live-log streaming unavailable on the OpenAI lane "
                             f"({_sse_err}) -- falling back to the non-streaming request for "
                             f"this turn.")
-                        resp = call_ollama(host, model, messages, _eff_temperature, num_ctx,
+                        resp = call_ollama(host, model, _view(), _eff_temperature, num_ctx,
                                            timeout=chat_timeout, tools=not manual_tools,
                                            top_p=top_p, top_k=top_k, api_style=api_style,
                                            max_tokens=_turn_max_tokens,
                                            repeat_penalty=_turn_repeat_penalty, think=_turn_think,
                                            preserve_reasoning=preserve_reasoning, role=role)
                 else:
-                    resp = call_ollama(host, model, messages, _eff_temperature, num_ctx, timeout=chat_timeout,
+                    resp = call_ollama(host, model, _view(), _eff_temperature, num_ctx, timeout=chat_timeout,
                                         tools=not manual_tools, top_p=top_p, top_k=top_k, api_style=api_style,
                                         max_tokens=_turn_max_tokens, repeat_penalty=_turn_repeat_penalty, think=_turn_think,
                                         preserve_reasoning=preserve_reasoning, role=role)
@@ -6303,6 +7058,18 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                     f"(runaway {_runaway_streak}).")
                 _call_started = time.monotonic()
                 continue
+            except ChatAbortedForProseRunaway as pr_abort:
+                # Stream guard (smoke 6cf6fb3afca4): a coding turn ran past the no-tool-call
+                # prose budget or degenerated into repetition. Hand it to the EXISTING
+                # cut-off handling below as a synthetic length-finished turn (persist ->
+                # compact -> nudge -> prose_loop accounting); the partial text is the turn.
+                _dispatch_metrics["prose_runaway_aborts"] = _dispatch_metrics.get("prose_runaway_aborts", 0) + 1
+                resp = {"message": {"role": "assistant", "content": pr_abort.content},
+                        "done_reason": "length", "streamed": pr_abort.streamed,
+                        "usage": {"prompt_tokens": 0, "total_tokens": 0,
+                                  "completion_tokens": max(1, (len(pr_abort.content) + len(pr_abort.thinking)) // 4)},
+                        "_prose_runaway": pr_abort.reason, "_raw_thinking": pr_abort.thinking}
+                break
             except ChatAbortedForReasoningLoop as loop_err:
                 # The owner 2026-09-20, 4 live occurrences in one night (bece829d8005,
                 # d08795db97ee, 0971afaccfa9, ...): a single turn stuck re-deriving the
@@ -6343,6 +7110,21 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 _outer_break = True
                 break
             except RuntimeError as chat_err:
+                if api_style == "openai" and not manual_tools and _is_422_gen_failed(chat_err):
+                    log(f"[worker] 422 recovery: server generation failure persists after the normal "
+                        f"retries at iteration {i}/{total_iters} -- running the recovery ladder.")
+                    _rec_resp = _recover_422(
+                        lambda _m, **_kw: call_ollama(
+                            host, model, _m, _eff_temperature, num_ctx, timeout=chat_timeout,
+                            tools=True, top_p=top_p, top_k=top_k, api_style=api_style,
+                            max_tokens=_turn_max_tokens, repeat_penalty=_turn_repeat_penalty,
+                            think=_turn_think, preserve_reasoning=preserve_reasoning, role=role,
+                            max_attempts=1, **_kw),
+                        _view(), _dispatch_metrics, iteration=i)
+                    if _rec_resp is not None:
+                        resp = _rec_resp
+                        _LANE_LAST_CAUSE[0] = None
+                        break
                 # A chat request that exhausted all its retries (a transient Ollama HTTP
                 # 500 / template-parse "XML syntax error" / network drop mid-run) used to
                 # propagate out of run_task and crash main() with exit 1 -- discarding a
@@ -6396,6 +7178,10 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         # reference, not a copy -- a copy here would desync that rewrite from
         # what's actually replayed on future turns.
         _msg_thinking = msg.get("thinking") or msg.get("reasoning") or msg.get("reasoning_content") or ""
+        _turn_rec = turn_log_record(i, resp, msg, _msg_thinking, usage, _call_elapsed, _turn_think)
+        _dispatch_metrics.setdefault("turn_log", [])
+        if len(_dispatch_metrics["turn_log"]) < TURN_LOG_MAX:
+            _dispatch_metrics["turn_log"].append(_turn_rec)
         if not preserve_reasoning:
             for _rk in ("thinking", "reasoning", "reasoning_content"):
                 msg.pop(_rk, None)
@@ -6512,6 +7298,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                         "the salvaged XML call, so the model doesn't imitate its own malformed "
                         "formatting on the next turn.")
 
+        _turn_rec["parse"] = "ok" if tool_calls else "no_tool_call"
         if tool_calls:
             _fmt_requery.on_ok()
             _runaway_streak = 0
@@ -6525,6 +7312,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                    else _wr.diagnose_format_error(content, _VALID_TOOL_NAMES, TOOLS, repair=_repair))
             if _fe:
                 _fe_kind, _fe_detail = _fe
+                _turn_rec["parse"] = f"fail:{_fe_kind}"
                 _fe_action, _fe_n = _fmt_requery.on_error(_fe_kind)
                 _dispatch_metrics["format_errors"] = _dispatch_metrics.get("format_errors", 0) + 1
                 if _fe_action == "stop":
@@ -6576,6 +7364,22 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             # each read as a "final answer". A cut-off turn did not choose to stop.
             _dispatch_metrics["output_cap_prose_cuts"] = _dispatch_metrics.get("output_cap_prose_cuts", 0) + 1
             _cap_cut_streak += 1
+            _pr_reason = resp.get("_prose_runaway")
+            # DIAGNOSTIC CAPTURE: persist the raw turn BEFORE compaction destroys it.
+            _co = persist_cutoff_turn(
+                log_path.with_name(f"{log_path.stem}.cutoff-{i}.txt"), iteration=i,
+                content=msg.get("content") or "", thinking=resp.get("_raw_thinking") or _msg_thinking,
+                finish_reason=resp.get("done_reason"), usage=usage, streamed=resp.get("streamed", False),
+                abort_reason=_pr_reason, max_tokens=_turn_max_tokens)
+            _dispatch_metrics.setdefault("cutoff_turns", [])
+            if len(_dispatch_metrics["cutoff_turns"]) < 8:
+                _dispatch_metrics["cutoff_turns"].append(_co)
+            log(f"[worker] cut-off turn {i}: {_co['chars']} chars, ~{_co['completion_tokens']} tokens, "
+                f"dup_line_ratio={_co['dup_line_ratio']}, longest_repeated_line_block="
+                f"{_co['longest_repeated_line_block']}, streamed={_co['streamed']}"
+                + (f", raw turn saved to {_co['file']}" if _co.get("file") else ", raw capture FAILED"))
+            for _rk in ("thinking", "reasoning", "reasoning_content"):
+                msg.pop(_rk, None)   # a cut turn's reasoning is not replayed either
             _compact, _dropped = compact_cut_off_prose(msg.get("content") or "")
             if _dropped:
                 # msg is the dict messages.append(msg) stored: rewriting it here
@@ -6599,15 +7403,30 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                     f"burning decode and context.")
                 _dispatch_metrics["early_abort"] = "prose_loop"
                 break
-            log(f"[worker] iteration {i}/{total_iters} was CUT OFF at the {_turn_max_tokens}-token "
-                f"output cap mid-prose with no tool call -- not a final answer; telling the model "
-                f"to act and continuing.")
-            messages.append({"role": "user", "content": output_cap_cut_nudge(_turn_max_tokens)})
+            if _pr_reason:
+                log(f"[worker] iteration {i}/{total_iters} was ABORTED by the prose-runaway guard "
+                    f"({_pr_reason}) with no tool call -- telling the model to act and continuing.")
+                messages.append({"role": "user", "content": prose_runaway_nudge(
+                    _PROSE_BUDGET_TOKENS, _pr_reason)})
+            else:
+                log(f"[worker] iteration {i}/{total_iters} was CUT OFF at the {_turn_max_tokens}-token "
+                    f"output cap mid-prose with no tool call -- not a final answer; telling the model "
+                    f"to act and continuing.")
+                messages.append({"role": "user", "content": output_cap_cut_nudge(_turn_max_tokens)})
             _cap_cut_recover = True
+            # Darkbloom returns Qwen thinking INSIDE content (no reasoning field), so a thinking-mode
+            # no-tool-call runaway is the chain of thought itself. Retry the next turn non-thinking
+            # (probe 2026-10-09: enable_thinking=false answers cleanly; default thinks in content).
+            if _prof.get("enable_thinking") is not None:
+                _next_turn_think = False
             continue
 
         if tool_calls:
             _cap_cut_streak = 0
+        try:
+            _loop_det.observe_turn(bool(tool_calls))
+        except Exception as _ld_err:
+            log(f"[worker] loop-detector observe_turn error (ignored): {_ld_err!r}")
         if not tool_calls:
             # Confirmed live 2026-08-21 (devstral:24b): a model can narrate
             # code in a fenced block instead of calling write_file, even
@@ -6877,6 +7696,11 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 # task_complete gate above -- see there for the conditions' full rationale.
                 v_ok, new_failures, preexisting, current_recognized, v_out = (
                     _verify_delta_feedback(verify, cwd, _baseline_verify_sig))
+                if _bp is not None:
+                    try:
+                        _bp.observe_verify(i, v_out, v_ok)
+                    except Exception:
+                        pass
                 _did_work = (_files_modified_count > 0 or _run_bash_success_count > 0)
                 _no_regression = (bool(_baseline_verify_sig) and current_recognized
                                    and not new_failures)
@@ -6894,6 +7718,9 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                     # no-regression reading -- a verify failing by design before the model
                     # started must PASS, "0 new failures" is what an untouched bug produces.
                     completion_verify_nudges += 1
+                    # the verify output is NEW information handed to the model, bounded by its own cap:
+                    # not a monologue streak (worker_robust.LoopDetector.monologue_verdict)
+                    _loop_det.no_tool_streak = 0
                     if _diff_new:
                         _fb = new_failure_feedback(_diff_new, v_out, _baseline_is_the_task)
                     elif _baseline_is_the_task:
@@ -7038,6 +7865,11 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             _thrash_cached, _thrash_nudge = _anti_thrash_intercept(
                 sig, _thrash_cacheable, _tool_result_cache, _thrash_repeats)
             impl = tool_impls.get(name)
+            if _bp is not None and isinstance(args, dict):
+                try:
+                    _bp.before_tool(name, args, cwd)
+                except Exception:
+                    pass
             # SILENT ARG-DROPPING IS WHAT MADE THE read_file BUG INVISIBLE. The
             # model asked for offset/length, the schema declared neither, and
             # the harness executed the call anyway as though the arguments had
@@ -7091,6 +7923,11 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                     # shouldn't fix (see _verify_failure_signature's docstring for the incident).
                     v_ok, new_failures, preexisting, current_recognized, v_out = (
                         _verify_delta_feedback(verify, cwd, _baseline_verify_sig))
+                    if _bp is not None:
+                        try:
+                            _bp.observe_verify(i, v_out, v_ok)
+                        except Exception:
+                            pass
                     # Evidence the model actually did work this session -- required before a
                     # BASELINE-BROKEN accept so a zero-edit claim on a broken baseline can't
                     # exit clean (Fable review 2026-08-30, condition 2: mirrors the end-of-run
@@ -7330,6 +8167,16 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                     _files_modified_count += 1
                 elif name == "run_bash" and result.startswith('{"exit_code"'):
                     _run_bash_success_count += 1
+            if _bp is not None:
+                try:
+                    _ro = (not _is_own_verify) and (
+                        name in ("read_file", "list_files", "web_search", "web_fetch")
+                        or (name == "run_bash" and isinstance(args, dict)
+                            and _command_is_local_read(str(args.get("command", "")))))
+                    _bp.observe_tool(i, name, args if isinstance(args, dict) else {}, result,
+                                     own_verify=_is_own_verify, readonly=_ro, msg_index=len(messages))
+                except Exception as _bo_err:
+                    log(f"[worker] budget observe error (ignored): {_bo_err!r}")
             # Anti-thrash cache invalidation: a successful write, or a run_bash that is
             # not a pure local read, may have changed the tree, so every cached read
             # result is now stale. Without this a `read_file X` re-issued after editing
@@ -7453,7 +8300,8 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             if failed:
                 repeated_calls.pop(sig, None)
             try:
-                _loop_det.observe(name, args if isinstance(args, dict) else {}, exempt=_is_own_verify)
+                _loop_det.observe(name, args if isinstance(args, dict) else {}, exempt=_is_own_verify,
+                                  error=(str(result) if failed else None))
             except Exception as _ld_err:     # telemetry/guard must never break a dispatch
                 log(f"[worker] loop-detector observe error (ignored): {_ld_err!r}")
             if manual_call_this_turn:
@@ -7522,13 +8370,31 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 log(f"[worker] loop-detector WARN ({_ld_kind}) at iteration {i}: {_ld_msg}")
                 loop_break_notes.append(_ld_msg)
             else:
+                _ld_reason = _wr.loop_exit_reason(_ld_kind)
                 log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: {_ld_msg} -- "
-                    f"{_wr.REASON_LOOP} ({_ld_kind}). Stopping instead of burning GPU time; the "
+                    f"{_ld_reason} ({_ld_kind}). Stopping instead of burning GPU time; the "
                     f"scheduler should re-spec this task.")
-                _dispatch_metrics["early_abort"] = _wr.REASON_LOOP
+                _dispatch_metrics["early_abort"] = _ld_reason
                 break
 
         if not paused_for_review:
+            if _bp is not None:
+                try:
+                    _bpr = _bp.end_turn(i, total_iters, cwd)
+                    if _bpr["extend"]:
+                        total_iters += _bpr["extend"]
+                        log(f"[worker] BUDGET POLICY progress_extend: +{_bpr['extend']} iterations -> "
+                            f"ceiling {total_iters}.")
+                    if _bpr.get("reverted"):
+                        _tool_result_cache.clear()
+                        log(f"[worker] BUDGET POLICY checkpoint_revert: restored {_bpr['reverted']} to the best verify state.")
+                    for _bn in _bpr["notes"]:
+                        messages.append({"role": "user", "content": _bn})
+                    if _bpr["budget_line"]:
+                        messages.append({"role": "user", "content": _bpr["budget_line"]})
+                    _dispatch_metrics.update(_bp.metrics())
+                except Exception as _be_err:
+                    log(f"[worker] budget end-of-turn error (ignored): {_be_err!r}")
             remaining = total_iters - i
             # Proportional, not a flat 3 (2026-09-22). With a 3-iteration floor the
             # warning arrived far too late to be actionable: request_more_iterations
@@ -7552,7 +8418,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                                f"complete, call task_complete now instead of calling another "
                                f"tool just to keep going.]",
                 })
-            elif remaining > 0 and i % 3 == 0:
+            elif remaining > 0 and i % 3 == 0 and not (_bp is not None and _bp.on("budget_visible")):
                 # Fable finding 2026-08-29: this note used to fire every single iteration,
                 # addressing the model directly right after every turn including ones where it
                 # had just given a would-be-final answer -- a real transcript showed a model
@@ -7671,7 +8537,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             # still FAILED, it just stopped failing empty-handed.
             _ea_harvest = _dispatch_metrics.get("early_abort")
             if (_ea_harvest in ("reasoning_freeze", "thrash_zero_diff", "write_thrash", "output_cap_loop",
-                                "prose_loop", "wall_budget")
+                                "prose_loop", "wall_budget") + tuple(_wr.LOOP_KIND_REASONS.values())
                     and run_ended_without_answer(messages)):
                 _harvested = harvest_reasoning(messages)
                 if _harvested:
@@ -8091,7 +8957,25 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             terminal_reason = "context_starved"
         else:
             terminal_reason = "nonconvergence"
+        # The fixed lane ran first and FAILED, and the open loop that followed ended with nothing more
+        # specific to say: report the lane's reason (queue tables classify fixed_lane_*).
+        if terminal_reason == "nonconvergence" and _fixed_lane_reason:
+            terminal_reason = _fixed_lane_reason
     _dispatch_metrics["terminal_reason"] = terminal_reason
+    # SALVAGE: a run that stopped without converging (loop_detected & friends, stop_gate_failed, the
+    # iteration cap) keeps its diff as a patch file next to the transcript, plus whether the end-of-run
+    # verify passed -- a near-complete diff is evidence, not garbage. Best-effort, never raises.
+    if terminal_reason and not paused_for_review:
+        try:
+            _salv = save_salvage_patch(cwd, Path(str(log_path)).with_suffix(".salvage.patch"))
+            if _salv:
+                _dispatch_metrics["salvage"] = dict(_salv, verify_passed=verify_passed,
+                                                    terminal_reason=terminal_reason)
+                log(f"[worker] SALVAGE: kept the non-converged diff ({_salv['files']} file(s), "
+                    f"{_salv['bytes']} bytes, verify_passed={verify_passed}) at {_salv['path']} "
+                    f"-- exit reason {terminal_reason}.")
+        except Exception as _se:
+            log(f"[worker] salvage error (ignored): {_se!r}")
     if terminal_reason:
         # Greppable marker the queue daemon parses out of the job log (same
         # channel as RESUMABLE TRANSCRIPT), so the terminal state carries WHY.
@@ -8379,7 +9263,35 @@ def main():
                           "comparable. Compute via claude-token-cursor.py: run it once before starting "
                           "prep, once again right before this dispatch, pass the delta here. Omit if "
                           "not tracking this for a given dispatch.")
+    ap.add_argument("--extra-iterations", type=int, default=0,
+                     help="Raise this process's iteration ceiling by N (capped at %d) for ONE round: the "
+                          "continuation allowance for a job the queue marked nonconvergence_progressing "
+                          "(continuation_allowance.extra_iterations). Additive to the ceiling the "
+                          "--resume/--max-iters rules produce; 0 = unchanged." % EXTRA_ITERATIONS_MAX)
+    ap.add_argument("--mode", choices=["auto", "open", "fixed"], default="open",
+                     help="open (default): the tool loop only. fixed / auto: first try the one-shot "
+                          "repair lane (fixed_lane.py) on small, localized, fast-verify tasks; on a pass "
+                          "finish via the normal verify/gate path, otherwise continue in the open loop "
+                          "seeded with the lane's best diff + last verify output. Ineligible tasks, "
+                          "resumes, research tasks and non-OpenAI lanes always run the open loop.")
+    ap.add_argument("--fixed-target", action="append", default=None,
+                     help="Target file for the fixed lane (repeatable). Default: the files the TASK "
+                          "declares (Entry point / Required files).")
+    ap.add_argument("--budget-policy", default=None, metavar="NAME[,NAME...]",
+                     help="Switchable agent-budget policies (worker_budget.py): progress_extend, "
+                          "budget_visible, read_window, mask_stale_reads, prefetch_excerpt, "
+                          "checkpoint_revert, read_streak_nudge, or `all` / `none`. Default (flag "
+                          "absent): a `Budget-policy:` line in the task, else env WORKER_BUDGET_POLICY, "
+                          "else none = unchanged behaviour. Coding runs only. See budget-policy-ab.md.")
+    ap.add_argument("--prefetch-excerpt", action="append", default=None, metavar="PATH[:A-B]",
+                     help="With the prefetch_excerpt policy: inject this file's head+outline (or lines "
+                          "A-B) into the first prompt (repeatable). Also read from `Prefetch:` lines in "
+                          "the task / TASK.md / AUTO-TASK.md.")
     args = ap.parse_args()
+    if args.budget_policy is not None and _bb is not None:
+        _bp_chk, _bp_bad = _bb.parse_policy_list(args.budget_policy)
+        if _bp_bad:
+            ap.error(f"--budget-policy: unknown name(s) {_bp_bad}; known: {', '.join(_bb.POLICIES)}, all, none")
 
     # Dispatch must go through ollama-queue.py. Enforced here rather than left
     # as a rule because the rule has failed repeatedly: a direct `nohup
@@ -8466,6 +9378,11 @@ def main():
             live_log=args.live_log,
             dispatch_tag=args.dispatch_tag or (Path(args.cwd).name or "dispatch"),
             think={"on": True, "off": False, "auto": None}[args.think],
+            extra_iterations=args.extra_iterations,
+            mode=args.mode,
+            fixed_targets=args.fixed_target,
+            budget_policy=args.budget_policy,
+            prefetch_specs=args.prefetch_excerpt,
         )
     except Exception as e:
         if _dispatch_metrics.get("status") == "running":

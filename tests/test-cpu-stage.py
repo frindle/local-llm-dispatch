@@ -301,6 +301,78 @@ check("5 remote stage in flight: bundle outstanding AND commit status 'waiting'"
 check("5 control: a RUNNING row of the bundle keeps it 'working' (the lane hold is unchanged for real work)",
       q.bundle_commit_status(BK, [{"bundle": BK, "status": "running"}], pk, {}, {}, cpu_wait=["j"])[0] == "working")
 
+# ---- 7. relevance-stage eligibility + runner parity (2026-10-09, rt-card-bonus) -----------------------
+import shutil, tarfile, io      # noqa: E402
+reset()
+wr = make_repo("relrepo")
+# the harness manifest is git-excluded, exactly as the real dispatch worktrees do (info/exclude)
+Path(wr, ".git", "info", "exclude").write_text(".dispatch-harness.json\n")
+Path(wr, ".dispatch-harness.json").write_text('{"creation_task": true, "target": "lib/new.ts"}\n')
+Path(wr, "lib").mkdir()
+Path(wr, "lib", "new.ts").write_text("export const x = 1;\n")      # untracked creation target
+
+
+def fake_runner(w):
+    """Emulate the runner: clone HEAD, apply the shipped patch, unpack tools, run the cmd verbatim."""
+    import cpu_job
+    d = Path(tempfile.mkdtemp(prefix="fakerunner-", dir=str(TMP)))
+    sh("git", "clone", "-q", w, str(d / "checkout"))
+    _p, patch, _k = cpu_job.make_payload(w)
+    if patch:
+        (d / "patch").write_bytes(patch)
+        sh("git", "apply", "--binary", str(d / "patch"), cwd=str(d / "checkout"))
+    (d / "tools").mkdir()
+    with tarfile.open(fileobj=io.BytesIO(cpu_job.make_tools_tgz(state["tools"])), mode="r:gz") as tf:
+        tf.extractall(d / "tools")
+    (d / "home").mkdir()
+    env = dict(os.environ, HOME=str(d / "home"), JOB_TOOLS=str(d / "tools"))
+    p = subprocess.run(["bash", "-c", state["cmd"]], cwd=str(d / "checkout"), env=env,
+                       capture_output=True, text=True)
+    return res(p.returncode, p.stdout, p.stderr)
+
+
+state["submit"] = fake_runner
+import tempfile      # noqa: E402
+r = cs.run_stage(wr, 'test -f .dispatch-harness.json && echo HARNESS_PRESENT', 60, "rel-harness", "b7", LOCAL)
+check("7 the git-excluded .dispatch-harness.json is shipped and restored on the runner "
+      "(verify-relevance --applied read it: missing => rc=3 'no tracked diff' for every creation task)",
+      r.ran_on == "runner" and "HARNESS_PRESENT" in r.stdout, (r, r.stdout))
+reset()
+state["submit"] = fake_runner
+r = cs.run_stage(wr, 'python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))))" "$HOME/bin/vr-args.json"',
+                 60, "rel-args", "b7", LOCAL, tools={"bin/vr-args.json": b'{"a": 1}'})
+check("7 a cmd naming its OWN shipped $HOME/bin/vr-args.json is eligible and runs on the runner "
+      "(was 'host-only path' -> a 17 min local mutation run)",
+      r.ran_on == "runner" and r.stdout.strip() == "1", (r.why, r.stdout, r.stderr))
+reset()
+state["submit"] = fake_runner
+r = cs.run_stage(wr, 'cat "$HOME/bin/not-shipped.json"', 60, "rel-args2", "b7", LOCAL,
+                 tools={"bin/vr-args.json": b'{}'})
+check("7 ...but a $HOME/bin path that is NOT shipped is still host-only (stays local)",
+      r.ran_on == "local" and "host-only path" in r.why, r.why)
+# a veto after real runner work names the wasted wall in the reason (no silent doubling)
+reset()
+state["submit"] = lambda w: res(3, "", "x")
+r = cs.run_stage(wr, "true", 60, "rel-veto", "b7", LOCAL, check=lambda rr: "bad record")
+check("7 a vetoed remote result is logged as remote work discarded + local re-run",
+      r.ran_on == "local" and "vetoed after" in r.why and "bad record" in r.why, r.why)
+# gate relevance: verify-relevance's clean abstain (rc=3 'nothing to mutate') is a verdict, not a veto
+import importlib.util   # noqa: E402
+_sp = importlib.util.spec_from_file_location("gate_on_complete_t", str(BIN / "gate-on-complete.py"))
+_g = importlib.util.module_from_spec(_sp)
+_sp.loader.exec_module(_g)
+_cap = {}
+_real_run_stage = cs.run_stage
+cs.run_stage = lambda *a, **k: (_cap.update(k), types.SimpleNamespace(exit_code=0, stdout="", stderr="", timed_out=False))[1]
+_g._relevance_run(["x"], str(wr), "bash verify.sh", None, "")
+cs.run_stage = _real_run_stage
+_chk = _cap["check"]
+R = lambda rc, so, se: types.SimpleNamespace(exit_code=rc, stdout=so, stderr=se, timed_out=False)   # noqa: E731
+check("7 gate check: rc=3 'nothing to mutate' (clean abstain) is accepted, not re-run locally",
+      _chk(R(3, "", "the reference impl produced no tracked diff; nothing to mutate\n")) is None)
+check("7 gate check: empty stdout with another rc, and non-JSON, are still vetoed",
+      bool(_chk(R(1, "", "boom"))) and bool(_chk(R(0, "garbage", ""))) and _chk(R(0, '{"verdict": "x"}', "")) is None)
+
 # ---- 6. call sites ------------------------------------------------------------------------------
 site = {
     "ollama-dispatch-auto": ["cpu_stage", "_cpu_lane_run(", "\"harness-check\""],
@@ -313,8 +385,12 @@ for f, needles in site.items():
     miss = [n for n in needles if n not in t]
     check(f"6 call site {f} routes its CPU stage through cpu_stage", not miss, miss)
 t = (BIN / "ollama-dispatch-preflight").read_text()
-check("6 preflight: raw self.sh(self.a.verify) no longer used for the whole-stage verifies",
-      "self.sh(self.a.verify)" not in t)
+# the two remaining raw calls are the harness-audit determinism re-runs and the trivial-solution
+# battery (WARN-only gate E/D, wave3): the battery rewrites the target in THIS worktree, so it must
+# stay local; the whole-stage verifies (baseline/final) all go through sh_lane.
+check("6 preflight: raw self.sh(self.a.verify) only in the two local audit sites (determinism, trivial battery)",
+      t.count("self.sh(self.a.verify)") <= 2 and "runs.append(self.sh(self.a.verify))" in t
+      and "lambda: self.sh(self.a.verify)" in t)
 t = (BIN / "gate-on-complete.py").read_text()
 check("6 gate: measure_relevance no longer runs verify-relevance with a bare subprocess.run",
       "r = subprocess.run(cmd, capture_output=True, text=True,\n                           timeout=RELEVANCE_BUDGET_S + 900)\n        rec = json.loads" not in t)

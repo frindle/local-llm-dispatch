@@ -1,0 +1,12 @@
+{
+  "authored": [
+    "TASK.md",
+    "check_literals.py",
+    "refimpl.py",
+    "verify.sh",
+    "verify.test.ts"
+  ],
+  "target": "lib/payoutMismatch.ts",
+  "fixture": "verify.test.ts",
+  "creation_task": true
+}

@@ -12,7 +12,7 @@
 #          bonsai ternary driver.
 # Identical for BOTH arms: prompt, tools (the worker's TOOLS), worker (current
 # ollama-worker.py, --api openai -- the production Darkbloom path), sampling (the lib's
-# qwen* case: both are Qwen-family), --max-iters 30, --max-tokens 16384, wall 3600s, grader.
+# qwen* case: both are Qwen-family), --max-iters 60, --max-tokens 16384, wall 3600s, grader.
 #
 # DIFFERS, DECLARED (measure behaviour, control error -- feedback_measure_behavior_control_error):
 #   num_ctx      strata 32768 (the most the 12 GB card holds; peak VRAM 11.6 GB in the
@@ -66,19 +66,20 @@ CELLS="${CELLS:-debug,bulk}"
 case "$ARM" in
   strata)
     MODEL="qwen3.8-flash-next-iq2_xs"; SLUG="strata-iq2-xs"; BACKEND="sandbox3080-strata"
-    ARM_URL="${H2H_ARM_URL:-http://127.0.0.1:18180}"; CTX=32768; NATIVE=262144
+    ARM_URL="${H2H_ARM_URL:-http://127.0.0.1:18180}"; CTX=65536; H2H_NATIVE=262144
     KEYFILE="${H2H_KEY_FILE:-}"
     if [ "$DRY" != "1" ] && { [ -z "$KEYFILE" ] || [ ! -s "$KEYFILE" ]; }; then
       echo "ABORT: strata arm needs H2H_KEY_FILE (0600 file with the Strata key)" >&2; exit 1
     fi
-    ARM_ARGS=(--api openai --max-tokens 16384 ${KEYFILE:+--api-key-file "$KEYFILE"}) ;;
+    ARM_ARGS=(--api openai --max-tokens 16384 --max-iters 60 --chat-timeout 3600 ${KEYFILE:+--api-key-file "$KEYFILE"})
+    SAMPLING=(--temperature 1.0 --top-p 0.95 --top-k 20 --repeat-penalty 1.0) ;;   # Strata/Qwen3.8-Flash-Next card
   qwen)
     MODEL="qwen3.6-35b-a3b-vl-mtp-mxfp8"; SLUG="qwen3.6-35b-a3b-darkbloom"; BACKEND="studio-darkbloom"
-    ARM_URL="${H2H_ARM_URL:-http://127.0.0.1:8000}"; CTX=65536; NATIVE=262144
-    ARM_ARGS=(--api openai --max-tokens 16384) ;;
+    ARM_URL="${H2H_ARM_URL:-http://127.0.0.1:8000}"; CTX=65536; H2H_NATIVE=262144
+    ARM_ARGS=(--api openai --max-tokens 16384 --max-iters 60)
+    SAMPLING=(--temperature 0.6 --top-p 0.95 --top-k 20 --repeat-penalty 1.0) ;;   # qwen3.6 thinking-coding card
   *) echo "ABORT: H2H_ARM must be strata|qwen (or ROSTER_ONLY=<arm>:<cells>), got '$ARM'" >&2; exit 1 ;;
 esac
-SAMPLING=(--temperature 0.2 --top-p 0.95 --top-k 20)   # the lib's qwen* case, both arms
 
 # Only through the queue (feedback_all_gpu_work_through_queue). The queue stamps this on
 # every process it launches (worker or runner); the GPU-exclusive runner inherits it too.
@@ -87,7 +88,7 @@ if [ "$DRY" != "1" ] && [ -z "${OLLAMA_DISPATCH_VIA_QUEUE:-}" ]; then
 fi
 
 # ---- lib overrides: these endpoints are OpenAI-style servers we do not manage --------
-native_ctx_for() { echo "$NATIVE"; }
+native_ctx_for() { echo "$H2H_NATIVE"; }
 ctx_for() { echo "$CTX"; }
 endpoint_up() { curl -fs -m 10 "$ARM_URL/health" >/dev/null 2>&1; }
 # The lib's version RESTARTS brew ollama for any 127.0.0.1 host -- wrong service, and on a
@@ -116,7 +117,7 @@ sha() { printf '%s' "$1" | shasum -a 256 | cut -c1-16; }
 {
   echo "# v12 strata h2h metadata (appended per launch)"
   echo "- $(date -u +%FT%TZ) arm=$ARM model=$MODEL backend=$BACKEND url=$ARM_URL cells=$CELLS reps=$REPS wall=${TMO}s"
-  echo "  num_ctx=$CTX native=$NATIVE worker=$WORKER sampling='${SAMPLING[*]}' args='${ARM_ARGS[*]}'"
+  echo "  num_ctx=$CTX native=$H2H_NATIVE worker=$WORKER sampling='${SAMPLING[*]}' args='${ARM_ARGS[*]}'"
   echo "  prompt sha256: debug=$(sha "$TASK_DEBUG") bulk=$(sha "$TASK_BULK") (must match across arms)"
   echo "  reasoning budget: ${STRATA_REASONING_BUDGET:-server default} (strata arm only; set server-side by strata-serve.sh)"
 } >> "$META"
@@ -126,8 +127,9 @@ if ! endpoint_up; then
   [ "$DRY" = "1" ] || exit 4
 fi
 
-infra_end() {  # rc timed_out -> 0 when the run was ended by infrastructure, not the model
-  { [ "$2" != "true" ] && [ "$1" -ge 128 ]; } || { [ "$1" -ne 0 ] && ! endpoint_up; }
+infra_end() {  # rc timed_out [iters] -> 0 when the run was ended by infrastructure, not the model
+  { [ "$2" != "true" ] && [ "$1" -ge 128 ]; } || { [ "$1" -ne 0 ] && ! endpoint_up; } \
+    || [ "${3:-1}" -eq 0 ] || [ "$1" -eq 3 ]   # no turn ever completed (preflight timeout/crash), or load_failed/HTTP 422
 }
 MISSING=0
 
@@ -192,8 +194,8 @@ run_debug() {
     RESULTS_CSV="$REAL"
     local ROW; ROW=$(tail -1 "$ROWF"); rm -f "$ROWF"
     [ -n "$ROW" ] || { echo "[$RUN_TAG] debug rep $REP produced no row" >> "$DRIVER_LOG"; MISSING=1; return; }
-    local RC TOUT; RC=$(cut -d, -f6 <<< "$ROW"); TOUT=$(cut -d, -f12 <<< "$ROW")
-    if [[ "$RC" =~ ^[0-9]+$ ]] && infra_end "$RC" "$TOUT"; then
+    local RC TOUT DIT; RC=$(cut -d, -f6 <<< "$ROW"); TOUT=$(cut -d, -f12 <<< "$ROW"); DIT=$(cut -d, -f14 <<< "$ROW")
+    if [[ "$RC" =~ ^[0-9]+$ ]] && infra_end "$RC" "$TOUT" "${DIT:-1}"; then
       echo "[$RUN_TAG] ABORT: debug rep $REP ended by infrastructure (rc=$RC) -- NO row; re-queue resumes" >> "$DRIVER_LOG"
       MISSING=1; return
     fi
@@ -212,7 +214,7 @@ run_bulk() {
   for REP in $(seq 1 "$REPS"); do
     if bulk_done "$REP"; then echo "[$RUN_TAG] SKIP bulk $MODEL rep $REP (recorded)" >> "$DRIVER_LOG"; continue; fi
     if ! python3 "$SCORER" --stage "$WT" >/dev/null; then
-      echo "$MODEL,$BACKEND,$REP,ABORT_STAGE,0,0,ABORT_STAGE,$CTX,$NATIVE,0,49,0,26,0,23,49,0,none" >> "$BULK_CSV"; MISSING=1; continue
+      echo "$MODEL,$BACKEND,$REP,ABORT_STAGE,0,0,ABORT_STAGE,$CTX,$H2H_NATIVE,0,49,0,26,0,23,49,0,none" >> "$BULK_CSV"; MISSING=1; continue
     fi
     if [ "$DRY" = "1" ]; then
       echo "DRY bulk: staged $WT ($(python3 "$SCORER" --score "$WT" 2>/dev/null | grep -oE 'sites [0-9]+/[0-9]+' | head -1) pristine); would run $MODEL rep $REP"
@@ -220,10 +222,10 @@ run_bulk() {
     fi
     endpoint_up || { echo "[$RUN_TAG] ABORT: endpoint down before bulk rep $REP -- no row" >> "$DRIVER_LOG"; MISSING=1; return; }
     local LOG="$OUTDIR/$SLUG-bulk-codemod-$RUN_TAG-$BACKEND-r${REP}.log" T0 RC DUR ITERS TIMED_OUT STOP S
-    echo "[$RUN_TAG] START: bulk $MODEL rep $REP ctx=$CTX/$NATIVE wall=${TMO}s" >> "$DRIVER_LOG"
+    echo "[$RUN_TAG] START: bulk $MODEL rep $REP ctx=$CTX/$H2H_NATIVE wall=${TMO}s" >> "$DRIVER_LOG"
     T0=$(date +%s)
     python3 "$WORKER" --model "$MODEL" --host "$ARM_URL" --cwd "$WT" --task "$TASK_BULK" \
-      --verify "python3 -m py_compile py/*.py" --max-iters 30 --num-ctx "$CTX" \
+      --verify "python3 -m py_compile py/*.py" --max-iters 60 --num-ctx "$CTX" \
       "${SAMPLING[@]}" "${ARM_ARGS[@]}" > "$LOG" 2>&1 &
     local WPID=$!
     ( sleep "$TMO" && kill -TERM "$WPID" 2>/dev/null ) & local WATCH=$!
@@ -232,13 +234,14 @@ run_bulk() {
     DUR=$(( $(date +%s) - T0 ))
     ITERS=$(grep -ac -- '--- iteration ' "$LOG" 2>/dev/null); ITERS=${ITERS:-0}
     TIMED_OUT=false; [ "$DUR" -ge "$TMO" ] && TIMED_OUT=true
-    if infra_end "$RC" "$TIMED_OUT"; then
+    if infra_end "$RC" "$TIMED_OUT" "$ITERS"; then
       echo "[$RUN_TAG] ABORT: bulk rep $REP ended by infrastructure (rc=$RC) -- NO row; re-queue resumes" >> "$DRIVER_LOG"
       MISSING=1; return
     fi
     if [ "$RC" -eq 3 ] || grep -aq "LOAD FAILED" "$LOG"; then STOP=load_failed
-    elif grep -aq "CONTEXT CEILING" "$LOG"; then [ "$CTX" -ge "$NATIVE" ] && STOP=native_ceiling || STOP=config_ceiling
+    elif grep -aq "CONTEXT CEILING" "$LOG"; then [ "$CTX" -ge "$H2H_NATIVE" ] && STOP=native_ceiling || STOP=config_ceiling
     elif [ "$TIMED_OUT" = true ]; then STOP=timeout
+    elif [ "$ITERS" -ge 60 ]; then STOP=iter_cap
     elif [ "$RC" -eq 0 ]; then STOP=converged
     elif [ "$RC" -eq 2 ]; then STOP=iter_cap
     else STOP=none; fi
@@ -249,7 +252,7 @@ run_bulk() {
     MC=$(echo "$S" | grep -oE "meta [0-9]+/[0-9]+" | head -1 | sed 's/meta //')
     MISS=$(echo "$S" | grep -oE "missed [0-9]+" | head -1 | sed 's/missed //')
     COLL=$(echo "$S" | grep -oE "collateral [0-9]+" | head -1 | sed 's/collateral //')
-    echo "$MODEL,$BACKEND,$REP,$RC,$DUR,$ITERS,$STOP,$CTX,$NATIVE,${SC%%/*},${SC##*/},${IC%%/*},${IC##*/},${MC%%/*},${MC##*/},${MISS:-0},${COLL:-0},$(basename "$LOG")" >> "$BULK_CSV"
+    echo "$MODEL,$BACKEND,$REP,$RC,$DUR,$ITERS,$STOP,$CTX,$H2H_NATIVE,${SC%%/*},${SC##*/},${IC%%/*},${IC##*/},${MC%%/*},${MC##*/},${MISS:-0},${COLL:-0},$(basename "$LOG")" >> "$BULK_CSV"
     echo "[$RUN_TAG] DONE: bulk $MODEL rep $REP $S dur=${DUR}s iters=$ITERS stop=$STOP" >> "$DRIVER_LOG"
     regrade bulk "$REP" "$WT" "$LOG" "python3 -m py_compile py/*.py"
   done

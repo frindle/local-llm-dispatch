@@ -203,7 +203,9 @@ def main():
         check("5 launch loop: gpu rows take the lane decision INSTEAD of the focus skip",
               0 < i_gx < i_fs, True)
         check("5 a gpu launch never consumes the backfill slot",
-              "and not _is_gpu_exclusive_job(job)):" in src, True)
+              bool(__import__("re").search(
+                  r"_backfill_ok and _commit_key is not None[^:]*?"
+                  r"and not _is_gpu_exclusive_job\(job\)[^:]*?\):", src)), True)
         # behavioural: the commitment step with the filtered candidate keys
         jobs = [gpu_row(status="running") | {"lane": "unraid", "pid": 1}]
         pk = lambda r: r.get("bundle")

@@ -109,6 +109,7 @@ pick_host() only knows the two native-Ollama endpoints, not an ad-hoc
 llama-server port), so auto-routing is refused for it here too.
 """
 import argparse
+import copy
 import errno
 import fcntl
 import importlib.util
@@ -117,6 +118,7 @@ import json
 from collections import Counter
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -204,6 +206,14 @@ GPU_JOB_RUNNER = str(Path.home() / "bin" / "gpu-exclusive-runner.py")
 GPU_JOB_DIR = Path.home() / ".ollama-dispatch" / "gpu-jobs"
 GPU_JOB_DEFAULT_TIMEOUT_S = 7200
 GPU_JOB_MAX_TIMEOUT_S = 6 * 3600
+
+
+def _is_esc_review_job(job):
+    """An escalation REVIEW row (esc-review-*): advisory, read-only. It runs AHEAD of its own bundle's
+    work (gate priority) but never OWNS the lanes: it must not make its bundle the running/committed
+    bundle, nor keep that bundle 'working' (2026-10-09: a review of a parked row, born in a minted
+    `job-<id>` bundle, was the 'running' bundle and held rt-walmart-cancel's lanes)."""
+    return isinstance(job, dict) and str(job.get("label") or "").startswith("esc-review-")
 
 
 def _is_gpu_exclusive_job(job):
@@ -744,14 +754,69 @@ def enqueue_bundle_key(job, jobs, reverse=None, log_dir=None):
     probe = job
     em = re.match(r"^esc-review-(?:\d{8}T\d{6}Z-|\d*Z?-)?(.+)$", lab)
     if em:
+        # esc-review-<ts>-job-<ID>: a review of a row with no slice/plan. It joins THAT ROW's
+        # bundle (live row's stamp, else its label's real bundle, else the pruned sidecar) --
+        # never a minted `job-<id>` bundle of one (2026-10-09, it stranded rt-walmart-cancel).
+        jm = re.match(r"^job-([0-9a-f]{12})$", em.group(1))
+        if jm:
+            rb = _row_real_bundle(jm.group(1), by_id, log_dir)
+            if rb:
+                return rb
         probe = dict(job, label=em.group(1))
     k = _launch_plan_key(probe, reverse, by_id)
     if k == _slice_feature_base(probe.get("label")) or k == probe.get("label"):
         # A group of one (no plan resolved it): strip the decorations that mark a
         # retry/continuation/slice of the SAME piece of work, so `x`, `x-r2`, `x-c1`
         # and `x-s3` land in one bundle. Empty -> the job id.
-        k = default_bundle_from_label(k) or (job or {}).get("id") or k
+        k = (chain_bundle_for_label(probe.get("label")) or default_bundle_from_label(k)
+             or (job or {}).get("id") or k)
     return k
+
+
+def _row_real_bundle(job_id, by_id, log_dir=None, runs_dir=None):
+    """PURE-ish. The real bundle of row `job_id`: its stamped bundle, else its label's chain
+    record / default bundle, else the pruned sidecar's stamp or label. None when unknown."""
+    row = (by_id or {}).get(job_id)
+    if row is not None:
+        b = row.get(BUNDLE_FIELD)
+        if isinstance(b, str) and b.strip() and not _is_minted_job_bundle(b):
+            return b.strip()
+        return chain_bundle_for_label(row.get("label"), runs_dir) or default_bundle_from_label(row.get("label")) or None
+    b = _pruned_job_bundle(job_id, log_dir)
+    if b and not _is_minted_job_bundle(b):
+        return b
+    lab = _pruned_job_label(job_id)
+    if lab:
+        return chain_bundle_for_label(lab, runs_dir) or default_bundle_from_label(lab) or None
+    return None
+
+
+def _is_minted_job_bundle(b):
+    """A `job-<12 hex>` bundle is the fallback slug minted for a row with no real bundle."""
+    return bool(re.match(r"^job-[0-9a-f]{12}$", str(b or "")))
+
+
+def retag_unbundled_rows(jobs, log_dir=None, runs_dir=None):
+    """PURE. [(job_id, old, new)] for needs_opus / esc-review rows whose bundle is missing or a minted
+    `job-<id>` slug but whose real bundle is resolvable. RUNNING rows are never touched (reported by
+    the caller as skipped)."""
+    by_id = {j.get("id"): j for j in (jobs or []) if j.get("id")}
+    out = []
+    for j in jobs or []:
+        lab = str(j.get("label") or "")
+        if not (j.get("status") == ESCALATION_STATUS or lab.startswith("esc-review-")):
+            continue
+        cur = j.get(BUNDLE_FIELD)
+        if cur and not _is_minted_job_bundle(cur):
+            continue
+        if lab.startswith("esc-review-"):
+            new = enqueue_bundle_key(dict(j, **{BUNDLE_FIELD: None}), [x for x in jobs if x is not j],
+                                     log_dir=log_dir)
+        else:
+            new = chain_bundle_for_label(lab, runs_dir) or default_bundle_from_label(lab)
+        if new and new != cur and not _is_minted_job_bundle(new) and new != j.get("id"):
+            out.append((j.get("id"), cur, new, j.get("status")))
+    return [(i, o, n) for i, o, n, st in out if st != "running"], [i for i, o, n, st in out if st == "running"]
 
 
 def default_bundle_from_label(label):
@@ -762,13 +827,41 @@ def default_bundle_from_label(label):
     belongs to the SAME feature as the slices it produces (which the slicer stamps
     `<label>`); deriving `plan-gen-<label>` made one feature two bundles."""
     s = re.sub(r"\s*\[[^\]]*\]\s*$", "", str(label or "")).strip()
-    s = re.sub(r"^(?:auto-(?:author|refine)-|gate-|regate-|secondop-|esc-review-|plan-gen-)+",
+    s = re.sub(r"^(?:auto-(?:author|refine)-|needs-opus-auto-|needs-opus-|gate-|regate-|secondop-|esc-review-|plan-gen-)+",
                "", s)
     prev = None
     while prev != s:
         prev = s
         s = re.sub(r"-(?:s|r|c)\d+$", "", s)
     return s.strip("-")
+
+
+def chain_bundle_for_label(label, runs_dir=None):
+    """PURE given `runs_dir`. The REAL bundle of a pipeline-stage label (`needs-opus-auto-X`,
+    `auto-author-X-s3-r1`, `X-r2` ...) from ollama-dispatch-auto's own chain record
+    (~/.ollama-dispatch/auto-runs/<key>.json -> {"runs": {<label>: {"bundle": ..}}}), or None.
+    2026-10-09: a needs_opus placeholder born with no bundle made its esc-review mint
+    `job-<id>` and strand an idle lane; the chain record knows the true bundle (rt-card-bonus)."""
+    base = default_bundle_from_label(label)
+    if not base:
+        return None
+    d = Path(runs_dir) if runs_dir else CHAIN_RUNS_DIR
+    try:
+        files = sorted(d.glob("*.json"))
+    except OSError:
+        return None
+    for f in files:
+        try:
+            runs = (json.loads(f.read_text()) or {}).get("runs")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(runs, dict):
+            rec = runs.get(base)
+            if isinstance(rec, dict):
+                b = rec.get("bundle") or rec.get("key")
+                if isinstance(b, str) and b.strip():
+                    return b.strip()
+    return None
 
 
 def _safe_group_index():
@@ -1167,6 +1260,17 @@ def slice_plan_progress(key, runs_dir=None, alive=None, now=None, lock_max_age_s
 CHAIN_RUNS_DIR = Path.home() / ".ollama-dispatch" / "auto-runs"
 CHAIN_ADVANCE_CEILING = 1800.0     # 30 min: 3x the preflight's default mutation budget
 CHAIN_WAIT_STALE_S = 24 * 3600     # a `waiting` record older than this is ignored outright
+# CPU-ONLY chain steps (2026-10-09, rt-card-bonus held the idle Studio lane ~17 min while its driver
+# ran the preflight's mutation stage): `advancing` on these steps is deterministic tooling, never a
+# model job, so it must not pin the GPU lanes -- the bundle reads "waiting" (cpu_wait park) and
+# other bundles run. Anything else `advancing` (author stage / enqueue / start / escalation) may be
+# about to submit a model row and keeps its hold.
+CHAIN_CPU_ONLY_STEP_RE = re.compile(r"^(preflight|relevance|harness-check)\b|\bself-check\b", re.I)
+
+
+def chain_step_cpu_only(step):
+    """PURE. Is this chain `advancing` step CPU-only tooling (no model job)?"""
+    return bool(step) and bool(CHAIN_CPU_ONLY_STEP_RE.search(str(step).strip()))
 
 
 def _parse_iso_ts(s):
@@ -1193,7 +1297,7 @@ def chain_run_progress(key, runs_dir=None, alive=None, now=None,
        "why": str}
     Best-effort: unreadable/odd files are unknown; never raises."""
     out = {"known": False, "phase": None, "step": None, "job": None,
-           "driver_live": False, "waiting": False, "why": "no chain run"}
+           "driver_live": False, "waiting": False, "cpu_only": False, "why": "no chain run"}
     if not key:
         return out
     alive = alive or _driver_pid_alive
@@ -1219,6 +1323,7 @@ def chain_run_progress(key, runs_dir=None, alive=None, now=None,
     if phase == "advancing":
         if age < advance_ceiling_s:
             out["driver_live"] = True
+            out["cpu_only"] = chain_step_cpu_only(d.get("step"))
             out["why"] = f"chain driver advancing ({d.get('step') or '?'}) for {age:.0f}s"
         else:
             out["why"] = (f"chain driver stuck advancing ({d.get('step') or '?'}) for "
@@ -1424,6 +1529,25 @@ def _gate_verdict_of(job):
     return None if (not v or v.endswith("pending-review")) else v
 
 
+_STREAK_EXEMPT_REASONS = frozenset({"force_stopped", "cancelled"})
+_WORKER_PAUSED_EXIT = 3     # ollama-worker.py EXIT_CODE_PAUSED (graceful SIGTERM pause)
+
+
+def _streak_exempt(j):
+    """True for a terminal row that is NOT a failed ATTEMPT: an operator/daemon stop or
+    cancel, or a worker that exited with its graceful-PAUSE code (3, e.g. SIGTERM from a
+    daemon restart/kill, pause reason external_sigterm). Smoke 2026-10-09: costco's c1 was
+    SIGTERM'd at iteration 9 (exit 3, recorded failed/force_stopped), counted as a second
+    consecutive non-PASS job, exhausted the bundle's focus and fed the persistent-nogo
+    escalation. The work was interrupted, not attempted-and-failed."""
+    if str(j.get("terminal_reason") or "") in _STREAK_EXEMPT_REASONS:
+        return True
+    try:
+        return int(j.get("exit_code")) == _WORKER_PAUSED_EXIT
+    except (TypeError, ValueError):
+        return False
+
+
 def update_bundle_fail_streaks(jobs, streaks, pk, verdict=None, now=None):
     """Fold newly-terminal WORK jobs into `streaks` ({bundle: consecutive non-PASS
     count}) per the rules above, stamping `_streak_counted` so a job counts once. A
@@ -1444,7 +1568,11 @@ def update_bundle_fail_streaks(jobs, streaks, pk, verdict=None, now=None):
             continue
         delta = 0
         if st in _NONPASS_TERMINAL:
-            delta = 1
+            # H6: ONE ledger decides what an attempt is. A SIGTERM pause / force-stop /
+            # restart / unreachable model is recorded but consumes no budget.
+            _kind = classify_attempt(j)
+            record_attempt(j, _kind)
+            delta = 1 if _kind in ATTEMPT_BUDGET_KINDS else 0
         elif not _is_authoring_round(j):
             v = verdict(j)
             if v is None:
@@ -1454,6 +1582,7 @@ def update_bundle_fail_streaks(jobs, streaks, pk, verdict=None, now=None):
             elif v.startswith("pass"):
                 delta = -1
             elif v.startswith("fail"):
+                record_attempt(j, "gate_reject")
                 delta = 1
         j["_streak_counted"] = True
         if delta == 0:
@@ -1581,10 +1710,236 @@ BUNDLE_IDLE_CEILING = 45 * 60.0     # working-but-nothing-moving -> parked as st
 BUNDLE_IDLE_SOFT = 10 * 60.0        # ...but only 10 min when ANOTHER bundle has runnable work
                                     # waiting (live 2026-10-06: a dead chain driver + a needs_opus
                                     # row held every lane 45 min while 17 jobs sat pending)
+BUNDLE_LEASE_S = float(os.environ.get("QUEUE_COMMIT_LEASE_S", "360") or 0)
+                                    # H4: a committed bundle that has not MOVED for this long while
+                                    # another bundle is waiting has lost its lease (0 = off; the idle
+                                    # ceilings stay as backstops)
+BUNDLE_DWELL_S = 60.0               # H5: a parked blocked/stalled bundle is not auto-resumed ahead of
+                                    # a fresh candidate sooner than this after it parked
+BUNDLE_FLAP_MAX = 8                 # H5: park/resume transitions of one bundle inside the window
+BUNDLE_FLAP_WINDOW_S = 30 * 60.0    # ...trip the breaker (parked `flapping`, ONE alert)
+BUNDLE_FLAP_COOLDOWN_S = 15 * 60.0  # ...and it may resume on its own only after this
 BUNDLE_KICK_AFTER_S = 60.0          # idle with due slicer work -> fire the slicer's advance
 BUNDLE_KICK_INTERVAL_S = 300.0      # ...at most this often per plan
 HEAL_WINDOW_S = 30 * 60.0           # an escalation self-heal may still act on (watcher: 5 min + review)
 _LIVE_ROW_STATES = frozenset({"pending", "running", "queued", "scheduled", "held", "paused"})
+# ============ ORCHESTRATION HARDENING (research 2026-10-09, backlog H1/H4/H5/H6/H7) ============
+# H7 -- DEGRADED-DECISION ACCOUNTING. A swallowed exception in a scheduling input used to read
+# as "no information" and the scheduler acted on it (park / unpark / complete). Every such swallow
+# now goes through soft()/_degraded_note(): a named counter, logged once per CHANGE, persisted to a
+# small stats file, and the tick is flagged degraded -> bundle_commit_step takes the conservative
+# action (changes nothing) instead of parking on missing data.
+DEGRADED_STATS_PATH = Path.home() / ".ollama-dispatch" / "queue-degraded.json"
+_DEGRADED_TICK = set()       # names degraded during the current commit tick
+_DEGRADED_TOTAL = {}         # name -> {"count", "last_error", "last_at"}
+_DEGRADED_LAST_WRITE = [0.0]
+
+
+def degraded_begin_tick():
+    _DEGRADED_TICK.clear()
+
+
+def degraded_this_tick():
+    return sorted(_DEGRADED_TICK)
+
+
+def _degraded_note(name, exc=None):
+    """Record one swallowed decision-input failure. Never raises."""
+    try:
+        err = f"{type(exc).__name__}: {exc}"[:300] if exc is not None else ""
+        rec = _DEGRADED_TOTAL.setdefault(name, {"count": 0, "last_error": "", "last_at": 0})
+        rec["count"] += 1
+        changed = rec["last_error"] != err
+        rec["last_error"], rec["last_at"] = err, round(time.time(), 1)
+        _DEGRADED_TICK.add(name)
+        if changed:
+            print(f"[queue] DEGRADED decision input {name!r}: {err or 'no value'} -- the tick takes the "
+                  f"conservative action (no park/unpark) until it recovers", file=sys.stderr)
+        if changed or time.time() - _DEGRADED_LAST_WRITE[0] > 30:
+            _DEGRADED_LAST_WRITE[0] = time.time()
+            DEGRADED_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = DEGRADED_STATS_PATH.with_name(DEGRADED_STATS_PATH.name + ".tmp")
+            tmp.write_text(json.dumps(_DEGRADED_TOTAL, indent=1, sort_keys=True))
+            os.replace(tmp, DEGRADED_STATS_PATH)
+    except Exception:
+        pass
+
+
+def soft(fn, name, default=None, *args, **kwargs):
+    """Call fn(*args, **kwargs); on an exception return `default` AND account for it as a
+    degraded decision input (see above)."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        _degraded_note(name, e)
+        return default
+
+
+# H1 -- WORKER IDENTITY (pid + start time) and the runner HEARTBEAT LEASE. A bare kill(pid,0)
+# adopts a recycled pid as "our worker" and lets it hold a lane until it exits.
+def _pid_start(pid):
+    """`ps -o lstart=` of a pid ('' when unknown). Never raises."""
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))],
+                           capture_output=True, text=True, timeout=5)
+        return " ".join(r.stdout.split())
+    except Exception:
+        return ""
+
+
+def proc_identity_alive(pid, pid_start=None, alive=None, start_of=None):
+    """True when `pid` is alive AND is still the process we launched. Unknown identity (no
+    recorded start, or ps fails) trusts kill(0), exactly as _driver_pid_alive does."""
+    if not (alive or _pid_alive)(pid):
+        return False
+    if not pid_start:
+        return True
+    cur = (start_of or _pid_start)(pid)
+    return (not cur) or cur == pid_start
+
+
+RUNNER_DRIVER_WRAPPERS = ("bakeoff-runner.py", "gpu-exclusive-runner.py")   # runners that exec a driver child
+RUNNER_NO_DRIVER_GRACE_S = 45.0       # wrapper alive, no live descendant for this long -> driver is gone
+RUNNER_FATAL_IDLE_S = 300.0           # driver printed a fatal shell error and logged nothing since
+RUNNER_KILL_ESCALATE_S = 15.0
+_BASH_FATAL_RE = re.compile(r"line \d+: [\w\[\]@*]+: unbound variable|: syntax error near|: bad substitution")
+
+
+def _proc_table():
+    """{pid: (ppid, stat)} from one `ps`. {} on failure."""
+    try:
+        r = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,stat="], capture_output=True, text=True, timeout=10)
+        out = {}
+        for ln in r.stdout.splitlines():
+            f = ln.split()
+            if len(f) >= 3:
+                out[int(f[0])] = (int(f[1]), f[2])
+        return out
+    except Exception:
+        return {}
+
+
+def _live_descendants(pid, table):
+    kids, seen, todo = [], set(), [pid]
+    while todo:
+        cur = todo.pop()
+        for c, (pp, st) in table.items():
+            if pp == cur and c not in seen:
+                seen.add(c)
+                todo.append(c)
+                if not st.startswith("Z"):
+                    kids.append(c)
+    return kids
+
+
+def runner_lease_verdict(job, n_desc, log_idle_s, log_tail, no_driver_since, now):
+    """PURE. Heartbeat lease of a wrapper-runner row (bakeoff-runner / gpu-exclusive-runner):
+    'the runner process is alive' is NOT 'the job is running' (job dfee823972cb: the driver
+    crashed with 'NATIVE: unbound variable', the runner row stayed running 47 min).
+    Returns (verdict 'ok'|'dead', why, no_driver_since')."""
+    rn = os.path.basename(str(job.get("runner") or ""))
+    if rn not in RUNNER_DRIVER_WRAPPERS:
+        return "ok", "", None
+    if n_desc > 0:
+        m = _BASH_FATAL_RE.search(log_tail or "")
+        if m and log_idle_s is not None and log_idle_s >= RUNNER_FATAL_IDLE_S:
+            return "dead", (f"driver reported a fatal shell error ({m.group(0)[:80]!r}) and the job "
+                            f"has logged nothing for {int(log_idle_s)}s"), None
+        return "ok", "", None
+    since = no_driver_since if no_driver_since else now
+    if now - since >= RUNNER_NO_DRIVER_GRACE_S:
+        return "dead", (f"runner pid alive but its driver process is gone for {int(now - since)}s"), since
+    return "ok", "", since
+
+
+def _enforce_runner_leases(state, active, now, table=None, killer=None, log_idle=None, log_tail=None):
+    """Effectful, once per daemon tick (state lock held). For each active wrapper-runner row
+    apply runner_lease_verdict; a dead lease SIGTERMs the runner tree (SIGKILL after
+    RUNNER_KILL_ESCALATE_S) and stamps job['driver_dead']; the normal reap then settles it
+    FAILED/driver_crashed. Returns ([(job_id, why)] newly declared dead, dirty) -- `dirty`
+    = something worth persisting changed (a heartbeat stamp is refreshed at most every 60 s)."""
+    out = []
+    dirty = False
+    killer = killer or _kill_tree
+    for pid, (_lane, proc, _logf) in list(active.items()):
+        job = next((j for j in state["jobs"] if j.get("pid") == pid), None)
+        if job is None or os.path.basename(str(job.get("runner") or "")) not in RUNNER_DRIVER_WRAPPERS:
+            continue
+        dd = job.get("driver_dead")
+        if isinstance(dd, dict):
+            if now - float(dd.get("ts") or now) >= RUNNER_KILL_ESCALATE_S and not dd.get("killed9"):
+                dd["killed9"] = True
+                killer(pid, signal.SIGKILL)
+                dirty = True
+            continue
+        if table is None:
+            table = _proc_table()
+        n_desc = len(_live_descendants(pid, table)) if table else 1     # unknown table -> assume alive
+        lp = job.get("live_log_path") or job.get("log_path")
+        try:
+            idle = (log_idle(lp) if log_idle else now - os.path.getmtime(lp))
+        except OSError:
+            idle = None
+        tail = (log_tail(lp) if log_tail else _log_tail(lp)) if lp else ""
+        verdict, why, since = runner_lease_verdict(job, n_desc, idle, tail, job.get("_no_driver_since"), now)
+        if n_desc > 0 and now - float(job.get("last_alive_at") or 0) >= 60:
+            job["last_alive_at"] = round(now, 1)
+            dirty = True
+        if job.get("_no_driver_since") != since:
+            job["_no_driver_since"] = since
+            dirty = True
+        if verdict == "dead":
+            dirty = True
+            job["driver_dead"] = {"ts": now, "why": why}
+            killer(pid, signal.SIGTERM)
+            print(f"[queue] LEASE LAPSED {job['id']} ({job.get('label')}): {why} -- terminating the runner; "
+                  f"it will settle FAILED (driver_crashed)", file=sys.stderr)
+            out.append((job["id"], why))
+    return out, dirty
+
+
+# H6 -- ATTEMPTS LEDGER. One list per job; only work_failed / gate_reject consume a retry or
+# focus-streak budget. A SIGTERM pause, a daemon restart, an unreachable model are not attempts.
+ATTEMPT_KINDS = ("work_failed", "external_pause", "restart", "model_unavailable", "gate_reject")
+ATTEMPT_BUDGET_KINDS = frozenset({"work_failed", "gate_reject"})
+_ATTEMPT_RESTART_REASONS = frozenset({"gpu_job_orphaned", "daemon_restart"})
+
+
+def classify_attempt(job, verdict=None):
+    """PURE. The attempt kind of a terminal row (see ATTEMPT_KINDS)."""
+    tr = str(job.get("terminal_reason") or "")
+    if tr in _STREAK_EXEMPT_REASONS:
+        return "external_pause"
+    try:
+        if int(job.get("exit_code")) == _WORKER_PAUSED_EXIT:
+            return "external_pause"
+    except (TypeError, ValueError):
+        pass
+    if tr in _ATTEMPT_RESTART_REASONS:
+        return "restart"
+    if tr in _FAILURE_INFRA_REASONS:
+        return "model_unavailable"
+    if str(verdict or "").startswith("fail"):
+        return "gate_reject"
+    return "work_failed"
+
+
+def record_attempt(job, kind, at=None):
+    """Append one entry to job['attempts'] (capped) and return it."""
+    assert kind in ATTEMPT_KINDS, kind
+    led = job.setdefault("attempts", [])
+    ent = {"kind": kind, "at": at or datetime.now(timezone.utc).isoformat(),
+           "exit": job.get("exit_code"), "reason": job.get("terminal_reason")}
+    led.append(ent)
+    del led[:-20]
+    return ent
+
+
+def attempts_used(job):
+    """Budget-consuming attempts recorded in the ledger."""
+    return sum(1 for a in (job.get("attempts") or []) if a.get("kind") in ATTEMPT_BUDGET_KINDS)
+
+
 _SELF_HEAL_MOD = []
 
 
@@ -1839,8 +2194,172 @@ def chain_final_nonpass(key, chain, accepted=None, since=None, log_dir=None):
         return None
 
 
+# NEXT-STEP DECLARATION (the owner 2026-10-09, smoke order-mismatch). When a job reaches a terminal
+# state the queue records, in the SAME state write, what happens NEXT for its bundle, instead of
+# inferring it from whether a row happens to exist yet. state["_bundle_next"][bundle] =
+#   {"kind": "continue"|"done"|"park"|"blocked", "actor": "ollama-dispatch-auto"|None, "job": id,
+#    "label": str, "at": epoch, "expires_at": epoch|None, "hard_until": epoch|None, "why": str}
+# "continue" = the actor WILL enqueue a continuation/retry/next-slice/gate row; until its row
+# exists (or the declaration expires) the bundle is "working" and keeps the lane. Without this,
+# the window between a terminal row and the driver's next enqueue read "nothing left / not
+# moving" and the lane went to another bundle (6cf6fb3afca4 -> costco, 2026-10-09).
+NEXT_STEP_EXPIRY_S = float(os.environ.get("OLLAMA_QUEUE_NEXT_STEP_EXPIRY_S") or 120.0)
+NEXT_STEP_HARD_S = CHAIN_ADVANCE_CEILING   # a LIVE actor may extend an expiring declaration up to this
+NEXT_STEP_ACTOR_AUTO = "ollama-dispatch-auto"
+
+
+def next_step_for_terminal(job, chain, now, expiry_s=None):
+    """PURE. The declaration for a job that just reached a terminal status, from what the
+    system already knows: a driver-managed row (auto-* label, not a gate) whose chain driver
+    is ALIVE (`chain` = chain_run_progress: driver_live or waiting) will be continued by that
+    driver (continuation / retry / next slice / gate / escalation) -> "continue". Otherwise
+    done -> "done", needs_opus/blocked -> "blocked", anything else -> "park"."""
+    expiry_s = NEXT_STEP_EXPIRY_S if expiry_s is None else expiry_s
+    st = str(job.get("status") or "")
+    label = str(job.get("label") or "")
+    chain = chain or {}
+    base = {"job": job.get("id"), "label": label, "at": now, "expires_at": None,
+            "hard_until": None, "actor": None}
+    driver_managed = label.startswith("auto-") and not label.startswith(("gate-", "regate-"))
+    if driver_managed and chain.get("known") and (chain.get("driver_live") or chain.get("waiting")):
+        base.update(kind="continue", actor=NEXT_STEP_ACTOR_AUTO,
+                    expires_at=now + expiry_s, hard_until=now + NEXT_STEP_HARD_S,
+                    why=f"{label} {st}; its chain driver is live and decides the next round")
+        return base
+    if st == "done":
+        base.update(kind="done", why=f"{label} done; no driver pending")
+    elif st in (ESCALATION_STATUS, "blocked"):
+        base.update(kind="blocked", why=f"{label} {st}")
+    else:
+        base.update(kind="park", why=f"{label} {st}; no live driver to continue it")
+    return base
+
+
+def next_step_holds(decl, now):
+    """PURE. ("hold"|"expired"|"blocked"|None, why) for one declaration: "hold" = a
+    non-expired continue (the bundle keeps the lane), "expired" = a continue past its
+    expiry, "blocked" = an explicit blocked declaration, None = no effect (done/park/none)."""
+    if not isinstance(decl, dict):
+        return None, ""
+    kind = decl.get("kind")
+    actor = decl.get("actor") or "?"
+    if kind == "continue":
+        exp = decl.get("expires_at")
+        if exp is not None and now >= float(exp):
+            return "expired", (f"NEXT-STEP DECLARATION EXPIRED: continuation by {actor} for "
+                               f"{decl.get('label')} never arrived within "
+                               f"{float(exp) - float(decl.get('at') or exp):.0f}s -- bundle blocked")
+        return "hold", f"holding lane: continuation pending ({actor})"
+    if kind == "blocked":
+        return "blocked", f"next-step declared blocked: {decl.get('why') or decl.get('label')}"
+    return None, ""
+
+
+def settle_next_steps(state, pk, now, chain_dir=None, alive=None):
+    """Effectful, once per tick under the state lock before the commitment is evaluated.
+    Drops declarations that are discharged (a live row of the bundle exists, or the actor's
+    chain ended / its driver died = it decided to stop), extends a LIVE actor's declaration
+    up to its hard cap, and turns an EXPIRED continue into a loud "blocked". Returns the
+    keys whose declaration expired this tick."""
+    nxt = state.get("_bundle_next")
+    if not isinstance(nxt, dict) or not nxt:
+        return []
+    jobs = state.get("jobs") or []
+    expired = []
+    for k in list(nxt):
+        d = nxt.get(k)
+        try:
+            if not isinstance(d, dict) or any(
+                    pk(j) == k and j.get("status") in _LIVE_ROW_STATES
+                    and not j.get("user_hold") and not j.get("fit_hold") for j in jobs):
+                nxt.pop(k, None)
+                continue
+            if d.get("kind") != "continue":
+                continue
+            # The declared job was PARKED (status needs_opus: the driver gave up and
+            # escalated it) -> there is no continuation coming. Without this the dead
+            # "continue" held the lane for its whole 120s expiry and the other bundles
+            # sat "waiting behind" a parked one (smoke 2026-10-09).
+            if any(j.get("id") == d.get("job") and j.get("status") == ESCALATION_STATUS for j in jobs):
+                nxt.pop(k, None)
+                continue
+            ch = chain_run_progress(k, runs_dir=chain_dir, now=now, alive=alive)
+            live = bool(ch.get("driver_live") or ch.get("waiting"))
+            if ch.get("known") and not live:
+                nxt.pop(k, None)   # chain ended / driver gone: it decided to stop
+                continue
+            if live and float(d.get("expires_at") or 0) <= now < float(d.get("hard_until") or 0):
+                d["expires_at"] = now + 30.0   # actor still live: not a miss yet
+            kind, why = next_step_holds(d, now)
+            if kind == "expired":
+                d.update(kind="blocked", why=why, expired_at=now)
+                expired.append(k)
+                print(f"[queue] bundle-commit: NEXT-STEP DECLARATION EXPIRED for bundle {k} "
+                      f"({why}); bundle marked BLOCKED, lane NOT silently passed")
+                print(f"[queue] NEXT-STEP DECLARATION EXPIRED for bundle {k}: {why}", file=sys.stderr)
+        except Exception as _e:
+            _degraded_note("settle_next_steps", _e)     # H7: counted + logged on change, tick flagged degraded
+            continue
+    return expired
+
+
+def _declare_terminal_next_step(state, job, now=None):
+    """Record the NEXT-STEP declaration for a job that just went terminal, in the caller's
+    state (persisted by the same save as the status change). Never raises."""
+    try:
+        now = time.time() if now is None else now
+        key = _plan_key_map(state.get("jobs") or [])(job)
+        if key is None:
+            return None
+        d = next_step_for_terminal(job, chain_run_progress(key, now=now), now)
+        state.setdefault("_bundle_next", {})[key] = d
+        print(f"[queue] next-step declared for bundle {key}: {d['kind']}"
+              + (f" by {d['actor']} (expires in {d['expires_at'] - now:.0f}s)"
+                 if d["kind"] == "continue" else "") + f" -- {d['why']}")
+        return d
+    except Exception as e:
+        print(f"[queue] next-step declaration failed for {job.get('id')}: {e}", file=sys.stderr)
+        return None
+
+
+def row_runnable_in_principle(j, by_id, _depth=0):
+    """PURE. Could this live row launch (now or once its upstream finishes)? False when a
+    human holds it or anything it waits on, or its upstream failed / is parked / is gone."""
+    if _depth > 50 or j.get("user_hold") or j.get("fit_hold"):
+        return False
+    st = j.get("status")
+    if st == PLANNED_STATUS:
+        return True                       # a promise of a dispatch (dependency_decision: 'wait')
+    if st == "paused":
+        return j.get("pause_reason") in (GATE_PREEMPT_REASON, PROMOTE_PREEMPT_REASON)
+    if st in ("running", "held", "queued", "scheduled"):
+        return True
+    if st != "pending":
+        return False
+    after = j.get("after")
+    if not after:
+        return True
+    d = by_id.get(after)
+    if d is None:
+        return bool(j.get("after_satisfied"))
+    if d.get("status") == "done":
+        return True
+    return row_runnable_in_principle(d, by_id, _depth + 1)
+
+
+def heal_continuation_live(j, by_id):
+    """PURE. A parked (needs_opus) row that already has a LIVE continuation / re-spec row
+    (named by superseded_by / continued_by, or a row whose `continues` is it): the bundle is
+    working on it, so it must not read 'needs the owner'."""
+    jid = j.get("id")
+    named = {x for x in [j.get("superseded_by")] + list(j.get("continued_by") or []) if x}
+    named |= {o.get("id") for o in by_id.values() if o.get("continues") == jid}
+    return any((by_id.get(n) or {}).get("status") in _LIVE_ROW_STATES
+               and not (by_id.get(n) or {}).get("user_hold") for n in named)
+
+
 def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
-                         final_verdict=None, esc_state=None, cpu_wait=None):
+                         final_verdict=None, esc_state=None, cpu_wait=None, next_step=None, now=None):
     """PURE given `plan` (slice_plan_runnability) / `chain` (chain_run_progress).
     ("working" | "blocked" | "complete", why, moving: bool). `moving` = something is
     running/launchable or a driver is live right now (the idle clock's reset).
@@ -1858,17 +2377,29 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
     activity is such a stage returns ("waiting", ...): it holds no GPU lane, so
     bundle_commit_step parks it (kind cpu_wait, no alert) and OTHER bundles launch; it
     resumes FIRST (parked bundles are re-committed before any new one) the moment the
-    stage's result lands and its next row exists. Without `cpu_wait` nothing changes."""
+    stage's result lands and its next row exists. Without `cpu_wait` nothing changes.
+    `next_step` (NEXT-STEP DECLARATION, 2026-10-09) = this bundle's _bundle_next record
+    (next_step_for_terminal): a non-expired "continue" holds the lane ("working", moving)
+    BEFORE the CPU-wait/idle logic because the system KNOWS a row is coming; an expired or
+    explicitly blocked one is "blocked". Absent -> unchanged."""
     if key is None:
         return "complete", "no bundle", False
     plan = plan or {}
     chain = chain or {}
-    rows = [j for j in (jobs or []) if pk(j) == key]
+    # GPU-EXCLUSIVE rows never drive focus/commitment (see GPU_JOB_KIND): the launch loop
+    # ignores them, so counting them here held a lane for a bundle with nothing launchable.
+    rows = [j for j in (jobs or []) if pk(j) == key and not _is_gpu_exclusive_job(j)
+            and not _is_esc_review_job(j)]
+    _by_id = {j.get("id"): j for j in (jobs or [])}
     running = [j for j in rows if j.get("status") == "running"]
     human_held = [j for j in rows if j.get("user_hold") or j.get("fit_hold")
                   or (j.get("status") == "paused" and j.get("pause_reason")
                       not in (GATE_PREEMPT_REASON, PROMOTE_PREEMPT_REASON))]
     live = [j for j in rows if j.get("status") in _LIVE_ROW_STATES and j not in human_held]
+    # A bundle must never hold lanes with no RUNNABLE member: a pending row whose upstream
+    # is human-held / failed / parked can never launch, so it is not "live work" (observed
+    # 2026-10-09: strata-h2h held every other job 'waiting behind bundle' with nothing to run).
+    live = [j for j in live if j.get("status") != "pending" or row_runnable_in_principle(j, _by_id)]
     # PLANNED placeholders mirror the slicer's own state for a sliced plan (whose
     # runnability is read from its run file above); they only count for chains
     # that live purely in queue rows.
@@ -1883,6 +2414,20 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
     if live:
         return "working", f"{len(live)} live row(s)", \
             any(j.get("status") == "pending" for j in live) or moving
+    # CPU-ONLY CHAIN STAGE (2026-10-09): nothing running, nothing live, and the only activity is the
+    # chain driver in a CPU-only step (preflight / self-check): the bundle holds no GPU lane -> "waiting"
+    # (parked cpu_wait, no alert); it resumes first when its next row appears (see bundle_commit_step).
+    _chain_cpu_only = bool(chain.get("driver_live") and chain.get("cpu_only")
+                           and not plan.get("driver_live") and not settling
+                           # a SLICED plan with runnable slices / a pending completion event is owned by the
+                           # slicer, not by this chain stage: it keeps its hold (canary: decoy must wait)
+                           and not plan.get("live") and not plan.get("marker"))
+    if next_step:
+        _nk, _nw = next_step_holds(next_step, time.time() if now is None else now)
+        if _nk == "hold" and not _chain_cpu_only:
+            return "working", _nw, True
+        if _nk in ("expired", "blocked"):
+            return "blocked", _nw, False
     if cpu_wait:
         return "waiting", (f"waiting on {len(cpu_wait)} CPU stage(s) "
                            f"({', '.join(str(x)[:12] for x in list(cpu_wait)[:3])}) -- holds no GPU lane"), False
@@ -1891,6 +2436,9 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
                            f"{', '.join(str(x) for x in list(settling)[:3])}"), True
     if plan.get("driver_live"):
         return "working", "slicer advance in flight", True
+    if _chain_cpu_only:
+        return "waiting", (f"{chain.get('why') or 'chain driver advancing'} -- CPU-only stage, "
+                           f"holds no GPU lane"), False
     if chain.get("driver_live"):
         return "working", chain.get("why") or "chain driver advancing", True
     if chain.get("waiting"):
@@ -1909,8 +2457,11 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
             continue
         try:
             _es = esc_state(j) if esc_state else None
-        except Exception:
+        except Exception as _e:
+            _degraded_note("esc_state", _e)        # H7: flagged degraded, never a silent "stuck"
             _es = None
+        if _es is None and heal_continuation_live(j, _by_id):
+            _es = "pending"        # a live continuation / re-spec of it exists: not stuck
         if _es == "cleared":
             continue
         (_esc_pending if _es == "pending" else _esc_rows).append(j)
@@ -1935,9 +2486,19 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
     return "complete", "nothing left", False
 
 
+def _flap_note(hist, key, now, window=BUNDLE_FLAP_WINDOW_S):
+    """Record one automatic park/resume transition of `key`; returns the ring length."""
+    if hist is None:
+        return 0
+    ring = [t for t in (hist.get(key) or []) if now - t < window] + [now]
+    hist[key] = ring[-(BUNDLE_FLAP_MAX * 2):]
+    return len(ring)
+
+
 def bundle_commit_step(commit, parked, running_key, cand_keys, status_of, now,
                        grace=BUNDLE_COMMIT_GRACE, idle_ceiling=BUNDLE_IDLE_CEILING,
-                       override_key=None, skip_grace=None):
+                       override_key=None, skip_grace=None, degraded=None, hist=None,
+                       lease_s=None, dwell_s=BUNDLE_DWELL_S):
     """PURE. One tick of the commitment. `skip_grace(key)` (optional) -> True when a
     completed bundle can never enqueue a late regate (no job in it is gated), so the
     grace window has nothing to wait for and the lane is released at once. `commit` None | {key, since, empty_since,
@@ -1945,8 +2506,16 @@ def bundle_commit_step(commit, parked, running_key, cand_keys, status_of, now,
     (status, why, moving); `cand_keys` = bundles with pending work in launch order
     (promote / pin decide this order). Returns (commit, events); events are
     ("park", key, why) | ("resume", key, why) | ("commit", key, why) |
-    ("complete", key, why) | ("unpark", key, why)."""
+    ("complete", key, why) | ("unpark", key, why) | ("flap", key, why).
+    `degraded()` (H7) -> True when a decision input failed this tick: the commitment is held
+    exactly as it is (no park / unpark / complete on missing data). `hist` (H5) = {key: [ts]}
+    persisted transition rings: a parked blocked/stalled bundle is not resumed ahead of a
+    fresh candidate inside `dwell_s`, and more than BUNDLE_FLAP_MAX automatic park/resume
+    transitions inside BUNDLE_FLAP_WINDOW_S parks it `flapping` (one alert, cooldown before
+    it may resume). None disables both. `lease_s` (H4) caps how long a non-moving committed
+    bundle may hold the lane while another bundle waits (default BUNDLE_LEASE_S)."""
     events = []
+    _ls = BUNDLE_LEASE_S if lease_s is None else float(lease_s)
     parked = parked if parked is not None else {}
     # HUMAN OVERRIDE (the owner 2026-09-27: "the commitment governs automatic scheduling,
     # but a human can always release or override"). A ↑↑ / `promote --take-focus` /
@@ -1964,34 +2533,82 @@ def bundle_commit_step(commit, parked, running_key, cand_keys, status_of, now,
                 parked[k] = {"since": now, "why": why, "kind": "yielded"}
                 events.append(("yield", k, why))
             parked.pop(override_key, None)
+            if hist is not None:
+                hist.pop(override_key, None)      # a human decision resets the flap ring
             events.append(("override", override_key, owhy))
             return ({"key": override_key, "since": now, "empty_since": None,
                      "idle_since": None, "by": "human"}, events)
+    _carry_idle = None      # the lane's idle clock survives a holder handoff (sim seed 84)
     if commit:
         k = commit["key"]
         st, why, moving = status_of(k)
+        if degraded and degraded():
+            return commit, events          # H7: never act on a degraded read
+        # CPU-WAIT RETURN (2026-10-09): a bundle parked `cpu_wait` whose next MODEL row now exists
+        # takes the commitment back at once. The visitor's running job is never preempted (it
+        # finishes on its lane); the visitor is parked `yielded` and resumes right after, so the
+        # returning bundle's next model job waits only for the running job, not the visitor's tail.
+        if st == "working":
+            for _cp in sorted(list(parked), key=lambda x: parked[x].get("since", 0)):
+                if _cp == k or parked[_cp].get("kind") != "cpu_wait":
+                    continue
+                _cst, _cwhy, _cmv = status_of(_cp)
+                if _cst == "working" and _cmv:
+                    _yw = f"YIELDED to {_cp}: its CPU stage finished and its next job is ready"
+                    parked[k] = {"since": now, "why": _yw, "kind": "yielded"}
+                    events.append(("yield", k, _yw))
+                    _carry_idle = commit.get("idle_since")
+                    commit = None
+                    st = "_yielded"
+                    break
         if st == "working":
             commit["empty_since"] = None
             if moving:
                 commit["idle_since"] = None
             elif commit.get("idle_since") is None:
                 commit["idle_since"] = now
+            # Another bundle WAITING for the lane: a fresh candidate, OR a parked bundle
+            # whose work is runnable again (a BLOCKED park that reads working; a STALLED
+            # one only once it moves -- exactly the resume rule below). Sim seed 3:
+            # ignoring the parked ones left a wedged committed bundle holding an idle lane
+            # for the 45 min ceiling instead of the 10 min soft one.
             _others = any(c_ is not None and c_ != k and c_ not in parked for c_ in (cand_keys or ()))
+            if not _others:
+                for _p in list(parked):
+                    if _p == k:
+                        continue
+                    _pst, _pw, _pmv = status_of(_p)
+                    if _pst == "working" and (_pmv or parked[_p].get("kind") != "stalled"):
+                        _others = True
+                        break
+            # H4 LEASE: a moving bundle renews it; a non-moving one holds the lane only for
+            # `lease_s` while somebody waits (holder = what last moved it).
+            if moving:
+                commit["lease_until"] = (now + _ls) if _ls > 0 else None
+                commit["holder"] = why
             _ceil = min(idle_ceiling, BUNDLE_IDLE_SOFT) if _others else idle_ceiling
+            _lease_cap = _ls > 0 and _others and _ls < _ceil
+            if _lease_cap:
+                _ceil = _ls
             if commit.get("idle_since") is not None and now - commit["idle_since"] >= _ceil:
-                why = (f"STALLED: nothing moved for {int((now - commit['idle_since']) // 60)} "
-                       f"min ({why}) -- no driver advanced it")
+                why = (f"{'LEASE LAPSED' if _lease_cap else 'STALLED'}: nothing moved for "
+                       f"{int((now - commit['idle_since']) // 60)} min ({why}) -- no driver advanced it")
                 parked[k] = {"since": now, "why": why, "kind": "stalled"}
                 events.append(("park", k, why))
+                _flap_note(hist, k, now)
+                _carry_idle = commit.get("idle_since")
                 commit = None
             else:
                 return commit, events
+        elif st == "_yielded":
+            pass
         elif st == "waiting":
             # CPU LANE: nothing of it can use a GPU lane while its CPU stage runs (remote or
             # local) -> release the commitment so other bundles run; it resumes first.
             parked[k] = {"since": now, "why": why, "kind": "cpu_wait",
                          "commit_since": commit.get("since")}
             events.append(("cpu_wait", k, why))
+            _carry_idle = commit.get("idle_since")
             commit = None
         elif st == "complete":
             commit["idle_since"] = None
@@ -2008,13 +2625,18 @@ def bundle_commit_step(commit, parked, running_key, cand_keys, status_of, now,
             parked[k] = {"since": now, "why": why, "kind": "blocked",
                          "commit_since": commit.get("since")}
             events.append(("park", k, why))
+            _flap_note(hist, k, now)
+            _carry_idle = commit.get("idle_since")
             commit = None
     # choose the next bundle: a parked bundle that can run again comes FIRST (it was
     # started before anything new), then a bundle already running (one launched
     # before the commitment existed, or a barrier gate), then launch order.
+    _deferred = None
     for pk_ in sorted(list(parked), key=lambda x: parked[x].get("since", 0)):
         st, why, moving = status_of(pk_)
         if st == "complete":
+            if degraded and degraded():
+                continue                   # H7: a degraded read must not drop a park
             parked.pop(pk_, None)
             events.append(("unpark", pk_, why))
             continue
@@ -2022,16 +2644,48 @@ def bundle_commit_step(commit, parked, running_key, cand_keys, status_of, now,
         # (it was already "working" and nothing moved) only once something actually
         # moves -- a job, a live driver -- or it would be re-committed straight away.
         if st == "working" and (moving or parked[pk_].get("kind") != "stalled"):
+            _kind = parked[pk_].get("kind")
+            if _kind == "flapping":
+                # FLAP BREAKER: stays parked until the cooldown, then gets a clean ring.
+                if now - float(parked[pk_].get("since") or 0) < BUNDLE_FLAP_COOLDOWN_S:
+                    continue
+                if hist is not None:
+                    hist.pop(pk_, None)
+            elif hist is not None and _kind in ("blocked", "stalled"):
+                if len([t for t in (hist.get(pk_) or []) if now - t < BUNDLE_FLAP_WINDOW_S]) >= BUNDLE_FLAP_MAX:
+                    _fw = (f"FLAPPING: {BUNDLE_FLAP_MAX}+ park/resume transitions in "
+                           f"{int(BUNDLE_FLAP_WINDOW_S // 60)} min -- held parked for "
+                           f"{int(BUNDLE_FLAP_COOLDOWN_S // 60)} min (last: {why})")
+                    parked[pk_] = {"since": now, "why": _fw, "kind": "flapping",
+                                   "commit_since": parked[pk_].get("commit_since")}
+                    events.append(("flap", pk_, _fw))
+                    continue
+                if (dwell_s and now - float(parked[pk_].get("since") or 0) < dwell_s
+                        and not moving):
+                    if _deferred is None:
+                        _deferred = (pk_, why, moving)
+                    continue
+                _flap_note(hist, pk_, now)
             parked.pop(pk_, None)
             events.append(("resume", pk_, why))
-            return {"key": pk_, "since": now, "empty_since": None, "idle_since": None}, events
+            return {"key": pk_, "since": now, "empty_since": None,
+                    "idle_since": None if moving else _carry_idle}, events
     for k in ([running_key] if running_key is not None else []) + list(cand_keys or []):
         if k is None or k in parked:
             continue
         st, why, _m = status_of(k)
         if st == "working":
             events.append(("commit", k, why))
-            return {"key": k, "since": now, "empty_since": None, "idle_since": None}, events
+            return {"key": k, "since": now, "empty_since": None,
+                    "idle_since": None if _m else _carry_idle}, events
+    if _deferred is not None:
+        # DWELL only prefers a fresh candidate; with nothing else to run the lane never idles.
+        pk_, why, moving = _deferred
+        parked.pop(pk_, None)
+        _flap_note(hist, pk_, now)
+        events.append(("resume", pk_, why))
+        return {"key": pk_, "since": now, "empty_since": None,
+                "idle_since": None if moving else _carry_idle}, events
     return None, events
 
 
@@ -2126,6 +2780,11 @@ def focus_skips_job(job, job_key, active, hold, commit_key, barrier_exempt_ids,
 # bundle's gate may also run, but only on an IDLE lane the committed bundle has no
 # job for, never preempting or pausing anything and never as a second slot. Every
 # non-gate job of another bundle stays held exactly as before.
+# POLICY (2026-10-09): an esc-review of bundle X runs AHEAD of X's own work (gate priority) but is
+# advisory and read-only, so it never OWNS the lanes: _is_esc_review_job rows are ignored by
+# bundle_commit_status and by the running-bundle pick (they cannot make X the running/committed
+# bundle or keep it 'working'), and for a foreign bundle it is confined to an idle, non-conflicting
+# lane exactly like any other foreign gate. It must not hold, strand or queue-block other bundles.
 _GATE_PRIO_PREFIXES = ("gate-", "regate-", "secondop-", "esc-review-")
 
 
@@ -2738,6 +3397,9 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
     cache = {}
     live_esc = set()
     prev = state.get("_bundle_commit") or None
+    degraded_begin_tick()
+    soft(settle_next_steps, "settle_next_steps", None, state, pk, now, chain_dir=chain_dir)
+    _nxt_all = state.get("_bundle_next") or {}
     # TRACKED SETTLEMENT (2026-10-05): a bundle is "working" while a gate-on-complete
     # hook of it is alive (it writes the verdict and enqueues any regate), instead of
     # guessing with a 90s timer after the last row went terminal.
@@ -2764,14 +3426,19 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
         _f = getattr(_heal_mod, "job_row_state", None) if _heal_mod is not None else None
         if _f is None:
             return None
-        return _f(j, jobs, _heal_ledger, now if now else None,
-                  log_dir=log_dir or LOG_DIR)
+        try:
+            return _f(j, jobs, _heal_ledger, now if now else None,
+                      log_dir=log_dir or LOG_DIR)
+        except Exception as _e:
+            _degraded_note("esc_state", _e)
+            return None
 
     def status_of(k):
         if k not in cache:
-            plan = slice_plan_runnability(k, runs_dir=runs_dir, now=now, esc_seen=esc_seen)
+            plan = soft(slice_plan_runnability, "slice_plan_runnability", {}, k,
+                        runs_dir=runs_dir, now=now, esc_seen=esc_seen)
             live_esc.update(plan.get("esc_keys") or ())
-            chain = chain_run_progress(k, runs_dir=chain_dir, now=now)
+            chain = soft(chain_run_progress, "chain_run_progress", {}, k, runs_dir=chain_dir, now=now)
             if prev and prev.get("key") == k:
                 since = prev.get("since")
             else:
@@ -2781,7 +3448,8 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
                                                    settling=settling_by.get(k),
                                                    final_verdict=fv,
                                                    esc_state=_esc_state,
-                                                   cpu_wait=cpu_by.get(k))
+                                                   cpu_wait=cpu_by.get(k),
+                                                   next_step=_nxt_all.get(k), now=now)
             cache[k] = (st, why, moving, plan)
         return cache[k][:3]
 
@@ -2789,7 +3457,8 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
     # there is nothing left for a timer to wait for.
     commit, events = bundle_commit_step(dict(prev) if prev else None, parked, running_key,
                                         cand_keys, status_of, now, override_key=override_key,
-                                        skip_grace=lambda _k: True)
+                                        skip_grace=lambda _k: True, degraded=degraded_this_tick,
+                                        hist=state.setdefault("_bundle_flaps", {}))
     # STALE-PARK SWEEP (2026-10-05). bundle_commit_step only re-reads parked bundles
     # when no commitment holds the lanes, so a parked bundle whose blocker was cleared
     # (rt-bg-commitments-fix: the needs_opus row it parked on was resolved after its
@@ -2802,15 +3471,19 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
     for _pk in [x for x in list(parked) if x != _ck]:
         try:
             _st, _why, _m = status_of(_pk)
-        except Exception:
+        except Exception as _e:
+            _degraded_note("status_of", _e)
             continue
-        if _st == "complete":
+        if _st == "complete" and not degraded_this_tick():
             parked.pop(_pk, None)
             events.append(("unpark", _pk, _why))
     for ev, k, why in events:
         if ev == "park":
             print(f"[queue] bundle-commit: PARKED bundle {k} -- nothing in it can run: {why}. "
                   f"ALERTED; moving to the next bundle, {k} resumes first once unblocked.")
+            alert(k, why, now)
+        elif ev == "flap":
+            print(f"[queue] bundle-commit: bundle {k} {why}. ALERTED once.")
             alert(k, why, now)
         elif ev == "cpu_wait":
             print(f"[queue] bundle-commit: bundle {k} {why}; released the lanes to the next bundle, "
@@ -3792,6 +4465,20 @@ def stamp_rerun(job, jobs, write=True):
 # is omitted -> the worker's constant actually governs.
 WORKER_DEFAULT_MAX_ITERS = 30
 
+_WORKER_FLAG_CACHE = {}
+
+
+def _worker_supports_flag(flag):
+    """True when ollama-worker.py declares `flag` (checked once per process from its source,
+    so the queue never passes an argparse-rejected flag to an older worker)."""
+    if flag not in _WORKER_FLAG_CACHE:
+        try:
+            _WORKER_FLAG_CACHE[flag] = f'"{flag}"' in Path(WORKER_PATH).read_text(errors="replace")
+        except Exception:
+            _WORKER_FLAG_CACHE[flag] = False
+    return _WORKER_FLAG_CACHE[flag]
+
+
 def iters_flag(job_max_iters):
     """Argv fragment for --max-iters. Empty when None so the worker default wins."""
     if job_max_iters is None:
@@ -4509,7 +5196,31 @@ DB_PROBE_DOWN_TTL = 30.0
 #   queue done (bloom_queue_work_remaining False) => release_to_bloom in a thread.
 # Kill switch: env BLOOM_CONTROL=0 or ~/.ollama-dispatch/bloom-control.disabled.
 _BLOOM_CTL_MOD = []
-_BLOOM_SYNC = {"thread": None, "kind": None, "last_fail": 0.0, "last_verify": 0.0}
+_BLOOM_SYNC = {"thread": None, "kind": None, "last_fail": 0.0, "last_verify": 0.0,
+               "last_why": None, "drain_s": None}
+# DRAIN ADAPTATION (2026-10-09): `darkbloom start --timeout <drain>` waits that long for
+# in-flight requests to finish before swapping models. bloom_control's default (60s) is
+# shorter than the drains seen live (up to ~600s: one long chat turn), so the hold FAILED
+# on every busy swap and retried with the same 60s forever. The queue now widens it: after
+# a failed hold whose reason is a timeout/drain, the next attempt doubles the drain up to
+# BLOOM_DRAIN_MAX_S (reset on success), and the switching state records `drain_s` so the
+# launch hold (bloom_control_hold) stays fresh for the whole drain instead of expiring
+# after BLOOM_IDLE_HB_MAX (300s) while `darkbloom start` is still legitimately waiting.
+# An operator-pinned BLOOMCTL_DRAIN_S is never overridden.
+BLOOM_DRAIN_MAX_S = 600
+BLOOM_DRAIN_HB_SLACK_S = 330
+
+
+def bloom_next_drain_s(base, last_why, prev=None, env=None):
+    """PURE. The drain timeout (s) to use for the next hold attempt, or None when the
+    operator pinned BLOOMCTL_DRAIN_S (leave cfg alone)."""
+    env = os.environ if env is None else env
+    if env.get("BLOOMCTL_DRAIN_S"):
+        return None
+    cur = int(prev or base)
+    if last_why and re.search(r"timed out|timeout|drain", str(last_why), re.I):
+        return int(min(BLOOM_DRAIN_MAX_S, max(cur * 2, base)))
+    return cur
 BLOOM_RETRY_S = 60.0           # after a failed hold/release: not before this (error backoff only)
 BLOOM_VERIFY_S = 60.0          # busy + held: re-check the pair is still served (drift guard)
 _BLOOM_LANE_PREFS = ("auto", "studio", "studio-db", "darkbloom")
@@ -4545,7 +5256,14 @@ def bloom_control_hold(now=None, state_path=None):
                     / "bloom-control-state.json")
         st = json.loads(path.read_text())
         now = time.time() if now is None else now
-        if now - float(st.get("heartbeat") or 0) > float(os.environ.get("BLOOM_IDLE_HB_MAX", "300")):
+        hb_max = float(os.environ.get("BLOOM_IDLE_HB_MAX", "300"))
+        if st.get("phase") == "switching":
+            # a long drain keeps the heartbeat quiet for its whole timeout: stay fresh that long
+            try:
+                hb_max = max(hb_max, float(st.get("drain_s") or 0) + BLOOM_DRAIN_HB_SLACK_S)
+            except (TypeError, ValueError):
+                pass
+        if now - float(st.get("heartbeat") or 0) > hb_max:
             return None
         if st.get("phase") == "switching":
             return "bloom-control switching Darkbloom onto the queue's pair"
@@ -4615,6 +5333,7 @@ def bloom_queue_work_remaining(state, pk, now=None, hooks=None, runs_dir=None, c
     keys = {pk(j) for j in jobs if j.get("status") in _LIVE_ROW_STATES
             and not j.get("user_hold") and not j.get("fit_hold")}
     keys |= set((state.get("_bundle_parked") or {}).keys())
+    keys |= set((state.get("_bundle_next") or {}).keys())
     for rec in (state.get("_bundle_commit"), state.get("_focus_wait")):
         if isinstance(rec, dict) and rec.get("key") is not None:
             keys.add(rec["key"])
@@ -4623,12 +5342,17 @@ def bloom_queue_work_remaining(state, pk, now=None, hooks=None, runs_dir=None, c
         try:
             plan = slice_plan_runnability(k, runs_dir=runs_dir, now=now)
             chain = chain_run_progress(k, runs_dir=chain_dir, now=now)
-            st, why, _m = bundle_commit_status(k, jobs, pk, plan, chain, settling=settling.get(k))
+            st, why, _m = bundle_commit_status(k, jobs, pk, plan, chain, settling=settling.get(k),
+                                                next_step=(state.get("_bundle_next") or {}).get(k), now=now)
         except Exception:
             return True, f"bundle {k}: status unreadable (fail toward busy)"
         if st == "working":
             return True, f"bundle {k}: {why}"
     return False, "queue done"
+
+
+_BLOOM_LOG_SEEN = {}
+_BLOOM_LOG_HEARTBEAT_S = 600.0
 
 
 def _bloom_run(kind, fn, cfg_note=""):
@@ -4639,13 +5363,25 @@ def _bloom_run(kind, fn, cfg_note=""):
         r = {"ok": False, "why": repr(e)}
     if not r.get("ok"):
         _BLOOM_SYNC["last_fail"] = time.time()
+        _BLOOM_SYNC["last_why"] = str(r.get("why") or "")
         print(f"[queue] !!! bloom-control {kind} FAILED: {r.get('why')} (retry in {BLOOM_RETRY_S:.0f}s; "
               f"queue falls back to plain /v1/models infra-wait)", file=sys.stderr)
     else:
-        if r.get("degraded"):
-            print("[queue] !!! bloom-control: DEGRADED -- BloomGauge control API unusable/changed; "
-                  "darkbloom start only (see ~/.ollama-dispatch/bloom-control.log)", file=sys.stderr)
-        print(f"[queue] bloom-control {kind}: {r.get('why')}")
+        _BLOOM_SYNC["last_why"] = None
+        if kind == "hold":
+            _BLOOM_SYNC["drain_s"] = None          # a successful hold resets the adaptation
+        # Log-noise (smoke 2026-10-09): the ~67s verify re-printed the DEGRADED alert and
+        # "already held" every time for hours. Print on a state change (degraded flag, kind,
+        # why) and as a heartbeat at most every 10 min; behaviour is identical.
+        _sig = (bool(r.get("degraded")), kind, str(r.get("why")), bool(r.get("noop")))
+        _now = time.time()
+        _last = _BLOOM_LOG_SEEN.get("run")
+        if _last is None or _last[0] != _sig or _now - _last[1] >= _BLOOM_LOG_HEARTBEAT_S:
+            _BLOOM_LOG_SEEN["run"] = (_sig, _now)
+            if r.get("degraded"):
+                print("[queue] !!! bloom-control: DEGRADED -- BloomGauge control API unusable/changed; "
+                      "darkbloom start only (see ~/.ollama-dispatch/bloom-control.log)", file=sys.stderr)
+            print(f"[queue] bloom-control {kind}: {r.get('why')}")
     return r
 
 
@@ -4676,8 +5412,17 @@ def bloom_queue_sync(state, pk, now=None, ctl=None, background=True):
                     return None
                 kind = "hold"
                 _BLOOM_SYNC["last_verify"] = now
+                _d = bloom_next_drain_s(cfg.get("drain_s") or 60, _BLOOM_SYNC.get("last_why"),
+                                        _BLOOM_SYNC.get("drain_s"))
+                if _d:
+                    if _d != cfg.get("drain_s"):
+                        print(f"[queue] bloom-control: drain timeout {cfg.get('drain_s')}s -> {_d}s "
+                              f"(previous hold: {str(_BLOOM_SYNC.get('last_why') or 'n/a')[:80]})")
+                    cfg["drain_s"] = _d
+                    _BLOOM_SYNC["drain_s"] = _d
                 # mark BEFORE this tick's launch loop so same-tick launches wait (infra-wait)
-                ctl.write_state(cfg, mode="queue", phase="switching", since=now)
+                ctl.write_state(cfg, mode="queue", phase="switching", since=now,
+                                drain_s=cfg.get("drain_s"))
             fn = lambda: ctl.hold_for_queue(cfg)
         else:
             if st.get("mode") != "queue" and not st.get("autoupdate_was_on"):
@@ -5072,7 +5817,16 @@ _FAILURE_SPEC_MARKERS = (
 _FAILURE_CONTEXT_REASONS = frozenset({"context_starved", "read_thrash", "write_thrash",
                                       "reasoning_freeze", "output_cap_loop", "prose_loop",
                                       "wall_budget", "repeated_format_error", "loop_detected",
-                                      "stop_gate_failed", "reasoning_runaway"})
+                                      "stop_gate_failed", "reasoning_runaway",
+                                      "error_loop", "monologue_loop", "alternation_loop", "nav_loop",
+                                      # fixed repair-and-validate lane (fixed_lane.py, 2026-10-09):
+                                      # the lane gave up (no verify pass in its samples) / its edit
+                                      # could not be applied -- scaffold outcomes, not model verdicts
+                                      "fixed_lane_exhausted", "fixed_lane_apply_failed"})
+# INFRA: the model host / transport broke under the lane; transient, retry-safe. There is no
+# separate retry class in the failure taxonomy, so it is the HARNESS class with an explicit
+# "infra" detail (the ledger tags it fixed-lane-transport-error).
+_FAILURE_INFRA_REASONS = frozenset({"fixed_lane_transport_error"})
 _FAILURE_OPERATOR_REASONS = frozenset({"cancelled", "force_stopped"})
 _FAILURE_ITER_RE = re.compile(r"--- iteration (\d+)/(\d+) ---")
 _FAILURE_VERIFY_RE = re.compile(r"^\[worker\] VERIFY (PASSED|FAILED[^\n]*)$", re.M)
@@ -5093,13 +5847,26 @@ def _log_tail(log_path, nbytes=_FAILURE_SCAN_BYTES):
         return ""
 
 
-def classify_failure(terminal_reason, log_tail, exit_code=None):
+_FAILURE_TOOL_LINE_RE = re.compile(r"^\[worker\] tool .*$", re.M)
+_TODO_MARKER_RE = re.compile(r"TASK\.md still has TODO placeholders")
+
+
+def classify_failure(terminal_reason, log_tail, exit_code=None, authoring=False):
     """PURE. (failure_class, failure_detail) for a FAILED job -- see the taxonomy
-    above. `log_tail` is the end of the job log (any length; '' when missing)."""
+    above. `log_tail` is the end of the job log (any length; '' when missing).
+
+    `authoring=True` marks a HARNESS-AUTHORING round (its verify is the
+    auto-harness-check self-check). There "TASK.md still has TODO placeholders" is the
+    unfinished DELIVERABLE the model was supposed to write (the scaffold's TODOs are its
+    job to fill), not a task that "was not runnable as written": it classifies as a
+    model nonconvergence, not `spec` (smoke 2026-10-09: order-mismatch c1 / egift s4 c1
+    were parked as spec defects though the harness check simply was not finished)."""
     tr = terminal_reason or ""
     tail = log_tail or ""
     if tr in _FAILURE_OPERATOR_REASONS:
         return "operator", tr.replace("_", " ")
+    if tr in _FAILURE_INFRA_REASONS:
+        return "harness", f"{tr.replace('_', ' ')} (infra: transient model-host/transport failure, safe to retry)"
     # Markers are looked for in the FINAL verify block when the worker got as far
     # as running one -- the model's earlier run_bash output can carry the same
     # phrases as things it went on to fix ("no frozen literals" before it froze
@@ -5115,8 +5882,15 @@ def classify_failure(terminal_reason, log_tail, exit_code=None):
         return "harness", "worker crashed (traceback in log)"
     if tr in _FAILURE_CONTEXT_REASONS:
         return "context", tr.replace("_", " ")
+    # Spec markers are END-STATE evidence too. With no end-of-run verify block the whole
+    # tail is scanned, which includes the model's own `[worker] tool run_bash(...)` echoes
+    # of EARLIER self-check runs (a TODO-placeholders FAIL it later fixed); those are not
+    # the final state, so they are dropped from the spec scan.
+    spec_scan = scan if _vs >= 0 else _FAILURE_TOOL_LINE_RE.sub("", scan)
     for rx, detail in _FAILURE_SPEC_MARKERS:
-        if rx.search(scan):
+        if authoring and rx.pattern == _TODO_MARKER_RE.pattern:
+            continue   # TODO placeholders in an authoring round = unfinished authoring (model)
+        if rx.search(spec_scan):
             return "spec", detail
     iters = _FAILURE_ITER_RE.findall(tail)
     verifies = _FAILURE_VERIFY_RE.findall(tail)
@@ -5138,6 +5912,8 @@ def classify_failure(terminal_reason, log_tail, exit_code=None):
             # "FAILED (exit 1) (2 new failure(s) ...). Do not trust this output as-is."
             # -> keep the fact, drop the boilerplate after it.
             detail.append(("VERIFY " + re.split(r"\. Do not trust| -- ", last)[0]).strip()[:80])
+    if authoring and _TODO_MARKER_RE.search(spec_scan):
+        detail.append("authoring unfinished: TASK.md TODO placeholders still unfilled at the final self-check")
     return "model", "; ".join(detail) or "did not converge"
 
 
@@ -5216,29 +5992,1003 @@ def stale_base_behind(cwd, baseline_head, run=None):
     return int(out), ref
 
 
+_SCOPE_EDIT_RE = re.compile(r"Only edit\s+(.+)", re.I)
+_BACKTICK_RE = re.compile(r"`([^`\n]+)`")
+
+
+def task_scope_files(cwd):
+    """The set of repo-relative files the task DECLARES it edits: the scaffold's
+    `.dispatch-harness.json` target plus every backticked path on TASK.md's
+    "Only edit `a`, `b`; do not edit ..." scope line (only the part before "do not").
+    Empty set when nothing is declared/readable. Never raises.
+
+    Used by the stale-base classifier: a moved default branch only makes a
+    nonconvergence a STALE BASE when the commits that landed touch these files."""
+    out = set()
+    try:
+        base = Path(str(cwd))
+        try:
+            hj = json.loads((base / ".dispatch-harness.json").read_text())
+            if isinstance(hj, dict):
+                for k in ("target", "targets"):
+                    v = hj.get(k)
+                    for t in ([v] if isinstance(v, str) else (v or [])):
+                        if isinstance(t, str) and t.strip():
+                            out.add(t.strip())
+        except (OSError, ValueError):
+            pass
+        try:
+            for ln in (base / "TASK.md").read_text(errors="replace").splitlines():
+                m = _SCOPE_EDIT_RE.search(ln)
+                if not m:
+                    continue
+                seg = re.split(r"\bdo not\b|\bdon't\b", m.group(1), maxsplit=1, flags=re.I)[0]
+                for t in _BACKTICK_RE.findall(seg):
+                    t = t.strip()
+                    if t and " " not in t:
+                        out.add(t)
+        except OSError:
+            pass
+    except Exception:
+        return set()
+    return out
+
+
+def stale_base_touched(cwd, baseline_head, ref, scope=None, run=None):
+    """Files in `scope` (default: task_scope_files(cwd)) that changed between the launch
+    baseline and `ref` -- the evidence that a moved default branch actually makes this job's
+    base STALE. [] when nothing in scope changed, scope is unknown, or git fails. `run` is
+    injectable for --self-test. A scope entry ending in '/' matches by prefix."""
+    scope = task_scope_files(cwd) if scope is None else set(scope)
+    if not scope or not cwd or not baseline_head or not ref:
+        return []
+    try:
+        cp = (run or subprocess.run)(["git", "-C", str(cwd), "diff", "--name-only",
+                                      f"{baseline_head}..{ref}"], capture_output=True, text=True)
+        if cp.returncode != 0:
+            return []
+        changed = [ln.strip() for ln in (cp.stdout or "").splitlines() if ln.strip()]
+    except Exception:
+        return []
+    return sorted({c for c in changed
+                   if c in scope or any(sc.endswith("/") and c.startswith(sc) for sc in scope)})
+
+
+# PROGRESSING NONCONVERGENCE (smoke 2026-10-09, defect D7). An authoring job (its verify
+# is the auto-harness-check self-check) that hits its iteration cap while its self-check
+# FAILURE keeps changing (or shrinking) is still making headway: costco's 24/24 round was
+# failing only on a fake-DOM detail after clearing everything else. The cap is a budget,
+# not a verdict, so the queue classifies that outcome apart from a flat-lined nonconvergence.
+#
+#   job["failure_class"]        = "nonconvergence_progressing"   (instead of "model")
+#   job["continuation_allowance"] = {                            # READ BY the auto driver /
+#       "extra_iterations": int,   # extra iterations the NEXT continuation round may be
+#                                  # granted on top of its normal budget (advisory ceiling:
+#                                  # max(6, max_iters // 2)); the queue never applies it
+#       "rounds": 1,               # how many continuation rounds the allowance covers
+#       "kind": "shrinking"|"changing",   # strictly fewer failing checks each time, or just
+#                                  # a different failure each time
+#       "window": N,               # self-check outputs compared (NONCONV_PROGRESS_WINDOW)
+#       "signatures": [[str,...],...]}   # the last N failing-check sets, oldest first
+# Recording only: how continuations are enqueued is unchanged. A job that repeats the SAME
+# failing set as its latest one (or flaps back to an earlier one) is NOT progressing and
+# keeps class "model".
+NONCONV_PROGRESS_WINDOW = 3
+_PROGRESS_SCAN_BYTES = 1_048_576
+_CHECK_FAIL_RE = re.compile(r"(?:FAIL|FAILED CASE):\s*([^\\\"\n]{3,110})")
+_SELFCHECK_TOOL_RE = re.compile(r"^\[worker\] tool run_bash\(.*auto-harness-check\.py.*$", re.M)
+_FINAL_VERIFY_BLOCK_RE = re.compile(r"\[worker\] verify stdout:\n(.*?)(?=^\[worker\] VERIFY|\Z)", re.M | re.S)
+
+
+def _check_signature(text):
+    """frozenset of the normalised failing-check names in one self-check output."""
+    sig = set()
+    for m in _CHECK_FAIL_RE.finditer(text or ""):
+        t = re.sub(r"\d+", "#", m.group(1)).strip().lower()
+        if t:
+            sig.add(t[:80])
+    return frozenset(sig)
+
+
+def selfcheck_failure_history(log_text):
+    """PURE. Chronological list of failing-check signatures (frozensets) for every
+    self-check output in an authoring job's log: each `run_bash ... auto-harness-check.py`
+    tool echo, then the end-of-run verify block. Outputs with no recognisable FAIL are
+    skipped (VERIFY_OK / truncated)."""
+    out = []
+    for m in _SELFCHECK_TOOL_RE.finditer(log_text or ""):
+        sig = _check_signature(m.group(0))
+        if sig:
+            out.append(sig)
+    fv = list(_FINAL_VERIFY_BLOCK_RE.finditer(log_text or ""))
+    if fv:
+        sig = _check_signature(fv[-1].group(1))
+        if sig:
+            out.append(sig)
+    return out
+
+
+def classify_progress(history, window=NONCONV_PROGRESS_WINDOW):
+    """PURE. (kind, window_sigs) when the last `window` self-check signatures show headway
+    -- the LATEST failing set is new in the window (not a repeat of, or a flap back to, an
+    earlier one): "shrinking" when the failing set gets strictly smaller each time, else
+    "changing" -- otherwise (None, []). Fewer than `window` outputs: not enough
+    evidence, so not progressing."""
+    h = list(history or [])
+    if window < 2 or len(h) < window:
+        return None, []
+    w = h[-window:]
+    if w[-1] in w[:-1]:
+        return None, []       # the latest failure is one already seen in the window: flat-lined/flapping
+    sizes = [len(x) for x in w]
+    kind = "shrinking" if all(b < a for a, b in zip(sizes, sizes[1:])) else "changing"
+    return kind, w
+
+
+def _is_authoring_job(job):
+    """A harness-authoring round: auto-author/refine label OR the auto-harness-check verify."""
+    try:
+        return bool(_is_harness_authoring_round(job)
+                    or "auto-harness-check" in str((job or {}).get("verify") or ""))
+    except Exception:
+        return False
+
+
+def _stamp_progress(job, cls, detail):
+    """-> (cls, detail) relabelled nonconvergence_progressing (+ job['continuation_allowance'])
+    when `job` is a nonconverged authoring round whose recent self-checks show headway."""
+    if cls != "model" or job.get("terminal_reason") != "nonconvergence" or not _is_authoring_job(job):
+        return cls, detail
+    if job.get("continuations"):
+        # the queue already spent its continuation round on this job: no second allowance
+        # is offered (to the queue or to the auto driver) -- it is a plain model failure now
+        return cls, f"{detail}; progress continuation round already used"
+    text = _log_tail(job.get("log_path"), _PROGRESS_SCAN_BYTES)
+    kind, w = classify_progress(selfcheck_failure_history(text))
+    if not kind:
+        return cls, detail
+    try:
+        mi = int(job.get("max_iters") or 24)
+    except (TypeError, ValueError):
+        mi = 24
+    job["continuation_allowance"] = {
+        "extra_iterations": max(6, mi // 2), "rounds": 1, "kind": kind,
+        "window": len(w), "signatures": [sorted(x) for x in w]}
+    return "nonconvergence_progressing", (
+        f"{detail}; self-check failure {kind} over its last {len(w)} runs -- still making "
+        f"headway, not a flat-lined model failure (continuation_allowance recorded)")
+
+
 def _stamp_failure_class(job):
     """Set job['failure_class'] / job['failure_detail'] from the job's own
     terminal_reason + log tail. Idempotent; never raises (a classification failure
     must not take the reap down with it)."""
     try:
+        authoring = _is_authoring_job(job)
         cls, detail = classify_failure(job.get("terminal_reason"),
                                        _log_tail(job.get("log_path")),
-                                       job.get("exit_code"))
+                                       job.get("exit_code"), authoring=authoring)
         # A convergence failure on a worktree whose default branch has since moved
         # is a STALE BASE until proven otherwise -- retrying it unchanged repeats
         # the run; the fix is to re-seed (or rebase) the worktree first.
         if cls == "model":
             lb = job.get("launch_baseline") or {}
             behind, ref = stale_base_behind(job.get("cwd"), lb.get("head") if isinstance(lb, dict) else None)
-            if behind:
+            # ...but ONLY when those commits touch the files this task declares it
+            # edits (smoke 2026-10-09: costco's 24/24 nonconvergence was relabelled
+            # stale-base because main moved 23 commits, none in its scope). Unrelated
+            # drift, or an undeclared scope, keeps the plain model nonconvergence.
+            touched = (stale_base_touched(job.get("cwd"), lb.get("head") if isinstance(lb, dict) else None, ref)
+                       if behind else [])
+            if behind and touched:
                 cls = "stale-base"
                 detail = (f"{detail}; {ref} moved {behind} commit(s) past the launch "
-                          f"baseline {str(lb.get('head'))[:8]} while this ran -- re-seed the "
+                          f"baseline {str(lb.get('head'))[:8]} while this ran, touching this task's "
+                          f"files ({', '.join(touched[:4])}) -- re-seed the "
                           f"worktree onto {ref} before any retry")
-                job["stale_base"] = {"behind": behind, "ref": ref}
+                job["stale_base"] = {"behind": behind, "ref": ref, "touched": touched[:20]}
+        cls, detail = _stamp_progress(job, cls, detail)
         job["failure_class"], job["failure_detail"] = cls, detail
     except Exception as e:  # pragma: no cover -- defensive
         job["failure_class"], job["failure_detail"] = None, f"unclassified: {e}"
+
+
+# ===================== PROGRESS CONTINUATION (2026-10-09) =====================
+# The classifier above marks a nonconverged AUTHORING round `nonconvergence_progressing`
+# and records an ADVISORY job["continuation_allowance"]. This is the queue ACTING on it:
+# ONE automatic continuation round, in place, from the job's own checkpoint transcript.
+#
+#   * the failed row flips failed -> pending (never reported as a failure, never gated:
+#     the gate sees the continuation's outcome), keeps its id/label/bundle/worktree;
+#   * the worker is relaunched with --resume <transcript> --max-iters <extra_iterations>.
+#     For a failed (not paused) transcript the worker's resume_total_iters() ceiling is
+#     resumed_at + max_iters, so --max-iters IS the extra budget; no new worker flag is
+#     needed (job["continuation_active"] makes _build_cmd send it instead of the row's
+#     own max_iters, which is left untouched);
+#   * CAPPED: min(QUEUE_CONTINUATION_MAX_ROUNDS (default 1, hard max 2), the allowance's
+#     own `rounds`), extra <= CONTINUATION_MAX_EXTRA_ITERS;
+#   * NEVER for a repeat/flapping signature: classify_progress already refuses a latest
+#     failing set that was seen in its window; here the latest set must also be new
+#     against every earlier continuation's recorded signatures;
+#   * AUDIT TRAIL on the row: job["continuations"] = [{n, at, extra_iterations, kind,
+#     window, signatures, transcript, prev: {log_path, log_copy, terminal_reason,
+#     failure_class, failure_detail, exit_code}}]. The prior round's log is copied to
+#     <log>.cont<N> because the relaunch truncates log_path.
+#   * once the queue has spent the allowance, a second progressing failure is class
+#     "model" (no second allowance is offered to the auto driver either).
+# Kill switch: ~/.ollama-dispatch/continuation.disabled or QUEUE_CONTINUATION_MAX_ROUNDS=0.
+# ---- TEST-TIME-COMPUTE POLICY SHELL (research 2026-10-09-test-time-compute-research.md) ----
+# Everything below ships in SHADOW mode: the decision is computed from the same inputs and
+# appended to the audit log, but NOT applied, until a human flips it:
+#     ollama-queue.py ttc set continuation|nsample live|shadow|off
+# Mode source (first hit wins): env QUEUE_TTC_<KIND>_MODE, ~/.ollama-dispatch/ttc-mode.json, "shadow".
+# Audit: append-only JSONL ~/.ollama-dispatch/ttc-decisions.jsonl, one row per decision
+# {ts, policy_version, rule, kind, action, mode, applied, job_id, label, class, inputs{...}}.
+# Decisions are deterministic functions of `inputs`, so any row can be re-derived.
+TTC_POLICY_VERSION = "ttc-v1"
+TTC_MODE_PATH = Path.home() / ".ollama-dispatch" / "ttc-mode.json"
+TTC_AUDIT_PATH = Path.home() / ".ollama-dispatch" / "ttc-decisions.jsonl"
+TTC_TASK_CAP_MULT = 3.0                  # R-caps: per-task cap = 3x median GPU-s of converged same-class tasks
+TTC_DEFAULT_TASK_CAP_S = 3600.0          # ...until >= TTC_MIN_CLASS_SAMPLES converged tasks exist
+TTC_MIN_CLASS_SAMPLES = 3
+TTC_MODES = ("off", "shadow", "live")
+
+
+def ttc_mode(kind, env=None, path=None):
+    env = os.environ if env is None else env
+    v = str(env.get(f"QUEUE_TTC_{kind.upper()}_MODE") or "").strip().lower()
+    if v not in TTC_MODES:
+        try:
+            v = str(json.loads(Path(path or TTC_MODE_PATH).read_text()).get(kind) or "").strip().lower()
+        except (OSError, ValueError, AttributeError):
+            v = ""
+    return v if v in TTC_MODES else "shadow"
+
+
+def ttc_audit(rec, path=None):
+    """Append one decision row (append-only JSONL). Never raises."""
+    try:
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "policy_version": TTC_POLICY_VERSION}
+        row.update(rec)
+        p = Path(path or TTC_AUDIT_PATH)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a") as f:
+            f.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def bundle_is_retired(key, superseded=None, cancelled=None):
+    """True when `key` was retired by `qctl retire` / `qctl supersede` (bundle-superseded.json)
+    or its plan is human-cancelled (plan_cancel marker). The queue never spends compute on
+    such a bundle (no continuation, no N-sample): the dashboard already lists it nowhere
+    (ollama-queue-api.py _retired_bundle_keys / _needs_attention_ids). Never raises."""
+    try:
+        if not key:
+            return False
+        if superseded is None:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import bundle_view as _bv
+            superseded = _bv.load_superseded()
+        if str(key) in (superseded or {}):
+            return True
+        if cancelled is None:
+            import plan_cancel as _pc
+            return bool(_pc.cancelled(str(key), runs_dir=SLICE_RUNS_DIR))
+        return bool(cancelled(str(key)))
+    except Exception:
+        return False
+
+
+def ttc_job_class(job):
+    """Task class for the GPU-seconds cap: authoring rounds vs everything else by task_kind."""
+    return "author" if _is_authoring_job(job) else str(job.get("task_kind") or "code")
+
+
+def ttc_task_cap_s(job, jobs, sidecar_dir=None):
+    """PURE-ish. 3x the median active GPU-seconds of CONVERGED (done) tasks of the same
+    class, from the live rows plus the never-pruned <id>.done.json sidecars; the default
+    until there are TTC_MIN_CLASS_SAMPLES of them. -> (cap_s, basis)."""
+    cls = ttc_job_class(job)
+    xs = [float(j.get("active_s")) for j in jobs
+          if j.get("status") == "done" and j.get("active_s") and ttc_job_class(j) == cls]
+    try:
+        for f in Path(sidecar_dir or LOG_DIR).glob("*.done.json"):
+            try:
+                d = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if d.get("status") == "done" and d.get("active_s") and ttc_job_class(d) == cls:
+                xs.append(float(d["active_s"]))
+    except OSError:
+        pass
+    if len(xs) >= TTC_MIN_CLASS_SAMPLES:
+        xs.sort()
+        med = xs[len(xs) // 2] if len(xs) % 2 else (xs[len(xs) // 2 - 1] + xs[len(xs) // 2]) / 2
+        return max(60.0, TTC_TASK_CAP_MULT * med), f"3x median of {len(xs)} converged {cls} tasks ({med:.0f}s)"
+    return TTC_DEFAULT_TASK_CAP_S, f"default (only {len(xs)} converged {cls} tasks on record)"
+
+
+CONTINUATION_HARD_MAX_ROUNDS = 2
+CONTINUATION_MAX_EXTRA_ITERS = 24
+CONTINUATION_DISABLE_FILE = Path.home() / ".ollama-dispatch" / "continuation.disabled"
+
+
+def continuation_max_rounds(env=None, disable_file=None):
+    """The configured number of queue-applied continuation rounds (0 = off)."""
+    env = os.environ if env is None else env
+    if (disable_file or CONTINUATION_DISABLE_FILE).exists():
+        return 0
+    try:
+        n = int(env.get("QUEUE_CONTINUATION_MAX_ROUNDS", "1"))
+    except (TypeError, ValueError):
+        n = 1
+    return max(0, min(n, CONTINUATION_HARD_MAX_ROUNDS))
+
+
+def continuation_decide(job, transcript_ok, max_rounds=None, task_cap_s=None):
+    """PURE. ("continue", extra_iterations, record) | ("skip", why) for a just-failed job.
+    Research R2 alignment: no grant for stuck/flapping/rising failure sets (classify_progress
+    + the repeat check below); the 2nd grant needs a strictly smaller failing set than the
+    1st grant started from; total extra <= the base budget (ceiling 2x); the per-task GPU cap
+    ends it (R6). DEVIATION: the grant is made when the run ENDS at its cap, not at 75% of it
+    mid-run (the queue cannot talk to a running worker; the transcript resume is equivalent
+    and costs nothing extra)."""
+    if job.get("failure_class") != "nonconvergence_progressing":
+        return ("skip", "not a progressing nonconvergence")
+    al = job.get("continuation_allowance")
+    if not isinstance(al, dict):
+        return ("skip", "no continuation_allowance recorded")
+    if job.get("force_stop") or job.get("terminal_reason") in _FAILURE_OPERATOR_REASONS:
+        return ("skip", "operator stop")
+    cap = continuation_max_rounds() if max_rounds is None else max_rounds
+    done = list(job.get("continuations") or [])
+    try:
+        allowed = min(cap, int(al.get("rounds") or 1))
+    except (TypeError, ValueError):
+        allowed = min(cap, 1)
+    if allowed <= 0:
+        return ("skip", "continuation disabled" if cap <= 0 else "allowance covers no rounds")
+    if len(done) >= allowed:
+        return ("skip", f"continuation cap reached ({len(done)}/{allowed})")
+    try:
+        extra = min(int(al.get("extra_iterations") or 0), CONTINUATION_MAX_EXTRA_ITERS)
+    except (TypeError, ValueError):
+        extra = 0
+    if extra <= 0:
+        return ("skip", "allowance grants no iterations")
+    sigs = [list(s) for s in (al.get("signatures") or [])]
+    if not sigs:
+        return ("skip", "allowance carries no failing-check signatures")
+    latest = sorted(sigs[-1])
+    for c in done:
+        if latest in [sorted(s) for s in (c.get("signatures") or [])]:
+            return ("skip", "latest failing set repeats an earlier continuation's (flapping)")
+    if done:
+        prev_n = min((len(s_) for s_ in (done[-1].get("signatures") or [[]])[-1:]), default=0)
+        if len(sigs[-1]) >= prev_n and prev_n:
+            return ("skip", "2nd grant needs a strictly smaller failing set than the 1st grant's")
+    try:
+        base = int(job.get("max_iters") or 24)
+    except (TypeError, ValueError):
+        base = 24
+    already = sum(int(c.get("extra_iterations") or 0) for c in done)
+    extra = min(extra, base - already)
+    if extra <= 0:
+        return ("skip", f"ceiling 2x base budget reached ({already} extra on {base})")
+    if task_cap_s is not None and float(job.get("active_s") or 0.0) >= task_cap_s:
+        return ("skip", f"per-task GPU cap reached ({float(job.get('active_s') or 0):.0f}s >= {task_cap_s:.0f}s)")
+    if not transcript_ok:
+        return ("skip", "no checkpoint transcript to resume from")
+    return ("continue", extra, {
+        "n": len(done) + 1, "extra_iterations": extra, "kind": al.get("kind"),
+        "window": al.get("window"), "signatures": sigs})
+
+
+def _apply_progress_continuation(job, now=None, jobs=None):
+    """Flip a just-failed, progressing authoring job into its ONE continuation round (in
+    place: status pending + resume_transcript). Returns the log line, or None when the
+    job is not continued (a refusal is recorded as job['continuation_refused'])."""
+    try:
+        if job.get("failure_class") != "nonconvergence_progressing":
+            return None
+        mode = ttc_mode("continuation")
+        if mode == "off":
+            return None
+        if bundle_is_retired(job_group_key(job)) or bundle_is_retired(job.get(BUNDLE_FIELD)):
+            job["continuation_refused"] = "bundle is retired"
+            return None
+        tp = _parse_checkpoint_transcript(job.get("log_path"))
+        tp_ok = bool(tp) and Path(tp).is_file()
+        cap_s, cap_basis = ttc_task_cap_s(job, jobs if jobs is not None else [])
+        dec = continuation_decide(job, tp_ok, task_cap_s=cap_s)
+        inputs = {"max_iters": job.get("max_iters"), "active_s": job.get("active_s"),
+                  "task_cap_s": cap_s, "cap_basis": cap_basis,
+                  "allowance": job.get("continuation_allowance"),
+                  "continuations_so_far": len(job.get("continuations") or []),
+                  "transcript": tp, "terminal_reason": job.get("terminal_reason")}
+        ttc_audit({"kind": "continuation", "rule": "R2" if dec[0] == "continue" else "R2-refuse",
+                   "action": dec[0], "why": dec[1] if dec[0] == "skip" else f"+{dec[1]} iterations",
+                   "mode": mode, "applied": dec[0] == "continue" and mode == "live",
+                   "job_id": job.get("id"), "label": job.get("label"), "class": ttc_job_class(job),
+                   "inputs": inputs})
+        if dec[0] != "continue":
+            job["continuation_refused"] = dec[1]
+            return None
+        if mode != "live":
+            job["continuation_shadow"] = {"would_extend_by": dec[1], "kind": dec[2].get("kind"),
+                                          "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            return None
+        extra, rec = dec[1], dec[2]
+        now = time.time() if now is None else now
+        lp = job.get("log_path")
+        copy = None
+        if lp and Path(lp).is_file():
+            copy = f"{lp}.cont{rec['n']}"
+            try:
+                shutil.copy2(lp, copy)
+            except OSError:
+                copy = None
+        rec.update({
+            "at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "transcript": tp,
+            "prev": {"log_path": lp, "log_copy": copy,
+                     "terminal_reason": job.get("terminal_reason"),
+                     "failure_class": job.get("failure_class"),
+                     "failure_detail": job.get("failure_detail"),
+                     "exit_code": job.get("exit_code")}})
+        job["continuations"] = list(job.get("continuations") or []) + [rec]
+        job["continuation_active"] = True
+        job["continuation_extra_iterations"] = extra
+        job["resume_transcript"] = tp
+        job["status"] = "pending"
+        for k in ("terminal_reason", "failure_class", "failure_detail", "error",
+                  "continuation_allowance", "continuation_refused"):
+            job[k] = None
+        job["pid"] = None
+        job["lane"] = None
+        return (f"[queue] PROGRESS CONTINUATION: {job['id']} ({job.get('label')}) hit its "
+                f"iteration cap while its self-check failure kept {rec['kind']} -- one "
+                f"continuation round, +{extra} iterations, resuming {tp} "
+                f"(round {rec['n']}; prior log kept at {copy or 'n/a'})")
+    except Exception as e:     # never take the reap down
+        job["continuation_refused"] = f"continuation error: {type(e).__name__}: {e}"
+        return None
+
+
+THINKING_ARMS = ("always_on", "always_off", "hybrid")
+
+
+def job_env_overrides(job):
+    """PURE. Extra worker env for a row: the thinking-policy A/B arm (model_profile reads
+    MODEL_THINKING_ARM, and only for roles listed in thinking_policy.ab_roles). Anything else
+    on the row never reaches the environment."""
+    arm = job.get("thinking_arm")
+    return {"MODEL_THINKING_ARM": arm} if arm in THINKING_ARMS else {}
+
+
+def effective_max_iters(job):
+    """The --max-iters a launch should carry: a continuation round gets exactly its
+    extra budget (see the block comment); everything else its own max_iters."""
+    if job.get("continuation_active") and job.get("continuation_extra_iterations"):
+        return int(job["continuation_extra_iterations"])
+    return job.get("max_iters")
+
+
+# ===================== N-SAMPLE, VERIFY-GATED SELECTION (2026-10-09) ===========
+# A per-BUNDLE opt-in (OFF by default; and SHADOW until `ttc set nsample live`): when a
+# slice job of an enabled bundle ends FAILED with a model-side class, the queue enqueues
+# fresh attempts as sibling jobs in the same bundle (same task/verify/worktree).
+# Aligned with the test-time-compute research policy (R3-R6):
+#   * each sample is FRESH: it never sees the failed transcript. Its task text is the
+#     original task + a <=15-line brief built ONLY from verifier facts (failing check
+#     names, first error line, files the failed attempt touched);
+#   * temperature >= 0.6 per sample (cfg temperatures; `--seed` rides along when the
+#     worker supports it), K capped at NSAMPLE_MAX_K = 4 fresh attempts total;
+#   * SIBLINGS RUN ONE AT A TIME in the shared worktree (they would collide otherwise):
+#     before each launch the previous attempt's dirt is stashed (evidence kept), so every
+#     sample starts from the same clean tree;
+#   * R4: while attempts end with DIFFERENT failing signatures, keep sampling (stop at the
+#     first green). R5: when the last two failed attempts end with the SAME signature the
+#     remaining unrun samples are cancelled and ONE escalation attempt is enqueued on the
+#     model(s) configured under model_profiles.yaml `escalation:` for the job's role (any
+#     Darkbloom-hostable model; not hardcoded). R6: the escalation also failing, the
+#     per-task GPU cap (3x median converged same-class GPU-seconds) or the bundle's
+#     gpu_cap_s => group closed, original failure stands, respec;
+#   * the first sibling whose verify passes (status done) WINS; unrun siblings are removed.
+#     If several are done, nsample_select picks: pass, then smallest diff, then earliest.
+#     No majority vote, no judge. The winner still goes through the normal gate-on-complete.
+#   DEVIATION from the research: it wants the anti-gaming scan inside the selection; here the
+#   winner is selected on verify exit 0 and the existing gate pipeline (relevance, mutation,
+#   completeness) is the anti-gaming layer; if the gate rejects the winner the group is
+#   already closed (no further samples).
+# Depth-first / bundle-to-completion: siblings carry the bundle tag and are ordinary
+# pending rows; the focus/commit logic keeps the lane on a bundle with live rows.
+# Config: ~/.ollama-dispatch/bundle-nsample.json, managed by `ollama-queue.py nsample`.
+NSAMPLE_PATH = Path.home() / ".ollama-dispatch" / "bundle-nsample.json"
+NSAMPLE_MAX_K = 4
+NSAMPLE_DEFAULT_K = 3
+NSAMPLE_DEFAULT_GPU_CAP_S = 3600
+NSAMPLE_DEFAULT_TEMPS = (0.6, 0.7, 0.8, 0.6)
+NSAMPLE_CLASSES = ("model", "nonconvergence_progressing")
+NSAMPLE_BRIEF_MAX_LINES = 15
+NSAMPLE_TASK_DIR = Path.home() / "bin" / "ollama-queue-logs" / "nsample-tasks"
+
+
+def nsample_load(path=None):
+    try:
+        d = json.loads(Path(path or NSAMPLE_PATH).read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def nsample_save(d, path=None):
+    p = Path(path or NSAMPLE_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(d, indent=2, sort_keys=True))
+    os.replace(tmp, p)
+
+
+def nsample_cfg(bundle, path=None, data=None):
+    """The ENABLED config for `bundle`, normalised (k clamped, caps defaulted), or None."""
+    c = (data if data is not None else nsample_load(path)).get(str(bundle or ""))
+    if not isinstance(c, dict) or not c.get("enabled"):
+        return None
+    try:
+        k = int(c.get("k") or NSAMPLE_DEFAULT_K)
+    except (TypeError, ValueError):
+        k = NSAMPLE_DEFAULT_K
+    try:
+        cap = float(c.get("gpu_cap_s") or NSAMPLE_DEFAULT_GPU_CAP_S)
+    except (TypeError, ValueError):
+        cap = float(NSAMPLE_DEFAULT_GPU_CAP_S)
+    temps = [float(t) for t in (c.get("temperatures") or []) if isinstance(t, (int, float))] \
+        or list(NSAMPLE_DEFAULT_TEMPS)
+    models = [m for m in (c.get("models") or []) if isinstance(m, str) and m] or []
+    return {"k": max(1, min(k, NSAMPLE_MAX_K)), "gpu_cap_s": max(0.0, cap),
+            "temperatures": temps, "models": models}
+
+
+def nsample_should_sample(job, cfg):
+    """PURE. Why NOT to sample `job` (a str), or None to proceed. R0: only model-side
+    failures are sampled -- harness/spec/context/operator failures cannot be fixed by
+    compute."""
+    if not cfg:
+        return "bundle not enabled"
+    if job.get("status") != "failed":
+        return "not failed"
+    if job.get("nsample_of") or job.get("nsample_group"):
+        return "already a sample / already sampled"
+    if job.get("failure_class") not in NSAMPLE_CLASSES:
+        return f"failure class {job.get('failure_class')!r} is not model-side (R0: compute cannot fix it)"
+    if not job.get("verify"):
+        return "no verify command (nothing to gate selection on)"
+    if _is_gate_job(job):
+        return "gate job"
+    return None
+
+
+# ---- verifier facts (the ONLY thing a retry is told about the failed attempt) ----
+_FIRST_ERROR_RE = re.compile(
+    r"^.*(?:Error|error:|Exception|FAIL|AssertionError|Traceback|not ok|Cannot find|undefined).*$", re.M)
+
+
+def job_failure_facts(job, tail_bytes=_PROGRESS_SCAN_BYTES, files=None):
+    """PURE-ish (reads the log). {checks: [failing check names], first_error: str,
+    files: [paths touched], sig: [sorted names]} from the failed job's final verify block
+    / last self-check -- verifier output only, never the model's reasoning."""
+    text = _log_tail(job.get("log_path"), tail_bytes)
+    fv = list(_FINAL_VERIFY_BLOCK_RE.finditer(text))
+    block = fv[-1].group(1) if fv else text[-8000:]
+    hist = selfcheck_failure_history(text)
+    sig = sorted(hist[-1]) if hist else sorted(_check_signature(block))
+    m = _FIRST_ERROR_RE.search(block)
+    first = (m.group(0).strip()[:200] if m else "")
+    return {"checks": sig[:8], "first_error": first, "files": list(files or [])[:10], "sig": sig}
+
+
+def build_retry_brief(facts, nth=1):
+    """PURE. The <=15-line fresh-retry brief: verifier facts only."""
+    lines = ["## Facts from a previous failed attempt (verifier output only)",
+             f"A previous attempt at this task did not make the verify command pass (fresh attempt #{nth}).",
+             "Do not assume its approach was right; start from the task as written."]
+    if facts.get("checks"):
+        lines.append("Failing checks it left behind:")
+        lines += [f"- {c}" for c in facts["checks"][:6]]
+    if facts.get("first_error"):
+        lines.append(f"First error line: {facts['first_error']}")
+    if facts.get("files"):
+        lines.append("Files it touched: " + ", ".join(facts["files"][:8]))
+    lines.append("Do not repeat the same kind of edit if it left the same checks failing.")
+    return "\n".join(lines[:NSAMPLE_BRIEF_MAX_LINES]) + "\n"
+
+
+def _nsample_touched_files(job):
+    try:
+        r = subprocess.run(["git", "-C", str(job.get("cwd")), "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=15)
+        return [ln[3:].strip() for ln in r.stdout.splitlines() if len(ln) > 3][:10]
+    except Exception:
+        return []
+
+
+def _nsample_write_task(job, sid, brief, task_dir=None):
+    """Original task text + the brief -> a new task file (the original is never modified).
+    -> path, or the original path when it cannot be read/written (fail-open)."""
+    try:
+        base = Path(job["task_file"]).read_text()
+        d = Path(task_dir or NSAMPLE_TASK_DIR)
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{sid}-retry.md"
+        p.write_text(base.rstrip("\n") + "\n\n" + brief)
+        return str(p)
+    except Exception:
+        return job.get("task_file")
+
+
+def nsample_escalation_model(job, mp=None):
+    """The model for the ONE escalation attempt: the first model under model_profiles.yaml
+    `escalation:` for the job's role that is not the model that just failed, else None.
+    Read through model_profile (config, not hardcoded)."""
+    try:
+        if mp is None:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import model_profile as mp
+        role = job.get("role") or ("author" if _is_authoring_job(job) else "coding")
+        failed = str(job.get("model") or "").lower()
+        for m in mp.escalation_models(role):
+            if str(m).lower() != failed:
+                return m
+    except Exception:
+        pass
+    return None
+
+
+def nsample_make_siblings(job, cfg, spent_s=0.0, seeds=None, facts=None, task_dir=None):
+    """The sibling job dicts for failed `job`, trimmed so the estimated spend stays under the
+    bundle cap (each sample estimated at the original's active_s, min 60s). Each gets a
+    fresh task file = task + verifier-facts brief, temperature from cfg, a seed."""
+    per = max(60.0, float(job.get("active_s") or 0.0))
+    room = max(0.0, cfg["gpu_cap_s"] - spent_s)
+    n = min(cfg["k"], int(room // per))
+    group = "ns-" + str(job["id"])
+    out = []
+    for i in range(n):
+        s = copy.deepcopy(job)
+        sid = uuid.uuid4().hex[:12]
+        for k in ("pid", "lane", "log_path", "exit_code", "terminal_reason", "failure_class",
+                  "failure_detail", "error", "resume_transcript", "pause_reason", "pause_meta",
+                  "launched_at", "active_s", "continuation_allowance", "continuations",
+                  "continuation_active", "continuation_extra_iterations", "continuation_refused",
+                  "continuation_shadow", "stale_base", "rerun", "continued_by", "superseded",
+                  "superseded_by", "gated", "launch_baseline", "baseline_at", "nsample",
+                  "after", "after_satisfied", "next_step"):
+            s.pop(k, None)
+        t = cfg["temperatures"][i % len(cfg["temperatures"])]
+        s.update({
+            "id": sid, "label": f"{_retry_base(job.get('label'))}-retry{i + 1}", "status": "pending",
+            "nsample_of": job["id"], "nsample_group": group, "nsample_index": i + 1,
+            "temperature": t, "temperature_explicit": True,
+            "seed": (seeds[i] if seeds else int(uuid.uuid4().int % 2_000_000_000)),
+            "enqueued_at": datetime.now(timezone.utc).isoformat(),
+            "live_log_path": None, "pid": None, "lane": None, "log_path": None,
+            "exit_code": None})
+        if facts is not None:
+            s["task_file"] = _nsample_write_task(job, sid, build_retry_brief(facts, i + 1), task_dir)
+        if cfg["models"]:
+            s["model"] = cfg["models"][i % len(cfg["models"])]
+        if job.get("launch_baseline") is not None:
+            s["launch_baseline"] = job["launch_baseline"]
+            s["baseline_at"] = job.get("baseline_at")
+        out.append(s)
+    return out
+
+
+def nsample_select(cands):
+    """PURE. Winner id from [{id, passed, diff_lines, order}]: a PASS first, then the
+    smallest diff, then the earliest. None when nothing passed. No voting."""
+    ok = [c for c in cands or [] if c.get("passed")]
+    if not ok:
+        return None
+    ok.sort(key=lambda c: (int(c.get("diff_lines") if c.get("diff_lines") is not None else 10 ** 9),
+                           int(c.get("order") or 0)))
+    return ok[0]["id"]
+
+
+def nsample_group_decision(orig_sig, sibs, cfg, task_cap_s=None, escalated=False, orig_active_s=0.0):
+    """PURE. orig_sig = the original failure's signature (list); sibs = the SIBLING rows of
+    one group, each possibly carrying `nsample_sig` once failed. Returns a dict
+    {state, rule, winner, cancel, escalate, why} with state in
+    open | won | exhausted | capped | respec."""
+    passed = [j for j in sibs if j.get("status") == "done"]
+    if passed:
+        win = nsample_select([{"id": j["id"], "passed": True, "order": j.get("nsample_index") or 0,
+                               "diff_lines": j.get("nsample_diff_lines")} for j in passed])
+        return {"state": "won", "rule": "select", "winner": win, "escalate": False,
+                "cancel": [j["id"] for j in sibs if j["id"] != win and j.get("status") == "pending"
+                           and not _job_has_ever_run(j)],
+                "why": f"{win} passed verify (first green wins; no ranking)"}
+    unrun = [j for j in sibs if j.get("status") == "pending" and not _job_has_ever_run(j)]
+    live = [j for j in sibs if j.get("status") in ("pending", "running", "paused", "launching")]
+    running = [j for j in sibs if j.get("status") in ("running", "launching")]
+    spent = sum(float(j.get("active_s") or 0.0) for j in sibs)
+    if not running and ((cfg and spent >= cfg["gpu_cap_s"])
+                        or (task_cap_s is not None and spent + float(orig_active_s or 0) >= task_cap_s)):
+        return {"state": "capped", "rule": "R6", "winner": None, "escalate": False,
+                "cancel": [j["id"] for j in unrun],
+                "why": f"GPU-spend cap reached ({spent:.0f}s sampled)"}
+    failed = sorted([j for j in sibs if j.get("status") == "failed"],
+                    key=lambda j: j.get("nsample_index") or 0)
+    seq = [list(orig_sig or [])] + [list(j.get("nsample_sig") or []) for j in failed]
+    same_last2 = len(seq) >= 2 and seq[-1] == seq[-2] and bool(seq[-1])
+    esc_failed = any(j.get("nsample_escalation") for j in failed)
+    if esc_failed and same_last2:
+        return {"state": "respec", "rule": "R6", "winner": None, "escalate": False,
+                "cancel": [j["id"] for j in unrun],
+                "why": "escalation attempt ended with the same failing signature -- stop and rewrite the spec"}
+    if same_last2 and not escalated and not running:
+        return {"state": "open", "rule": "R5", "winner": None, "escalate": True,
+                "cancel": [j["id"] for j in unrun],
+                "why": "two fresh attempts ended with the same failing signature -- escalate once"}
+    if live:
+        return {"state": "open", "rule": "R4", "winner": None, "escalate": False, "cancel": [],
+                "why": f"{len(live)} sample(s) still live"}
+    return {"state": "exhausted", "rule": "R6", "winner": None, "escalate": False, "cancel": [],
+            "why": "every sample failed verify"}
+
+
+def nsample_launch_blocker(job, jobs):
+    """PURE. Why a pending SIBLING must not launch yet (another sample of the same group is
+    running in the shared worktree, or an earlier-indexed sibling is still pending), else None."""
+    g = job.get("nsample_group")
+    if not g or not job.get("nsample_of"):
+        return None
+    for o in jobs:
+        if o is job or o.get("nsample_group") != g or not o.get("nsample_of"):
+            continue
+        if o.get("status") in ("running", "launching", "paused"):
+            return f"sample {o.get('id')} of the same group is still running"
+        if o.get("status") == "pending" and (o.get("nsample_index") or 0) < (job.get("nsample_index") or 0):
+            return f"earlier sample {o.get('id')} goes first"
+    return None
+
+
+def _nsample_stash_tree(job):
+    """Stash the worktree's uncommitted dirt (previous attempt's output) before a sibling
+    launches. Evidence is kept in the stash; never deleted. -> ref or None. Fail-open."""
+    cwd = job.get("cwd")
+    if not cwd:
+        return None
+    try:
+        porc = subprocess.run(["git", "-C", str(cwd), "status", "--porcelain"],
+                              capture_output=True, text=True, timeout=15)
+        if porc.returncode != 0 or not porc.stdout.strip():
+            return None
+        ref = f"nsample-{job.get('nsample_group')}-{job.get('nsample_index')}"
+        r = subprocess.run(["git", "-C", str(cwd), "stash", "push", "-u", "-m", ref],
+                           capture_output=True, text=True, timeout=60)
+        return ref if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _nsample_diff_lines(job):
+    try:
+        r = subprocess.run(["git", "-C", str(job.get("cwd")), "diff", "--numstat", "HEAD"],
+                           capture_output=True, text=True, timeout=20)
+        n = 0
+        for ln in r.stdout.splitlines():
+            a, b = (ln.split("\t") + ["0", "0"])[:2]
+            n += (int(a) if a.isdigit() else 0) + (int(b) if b.isdigit() else 0)
+        return n
+    except Exception:
+        return None
+
+
+def nsample_tick(state, cfg_data=None, mode=None, facts_of=None, esc_of=None):
+    """Called once per daemon tick with the state lock held. (1) for a newly failed job of an
+    enabled bundle: spawn siblings (live) or only audit what it would do (shadow); (2) close /
+    advance groups (win, escalate once, exhausted, capped, respec). Mutates state["jobs"];
+    returns [log lines]. Never raises. A no-op for every bundle that is not enabled --
+    the default."""
+    lines = []
+    try:
+        data = nsample_load() if cfg_data is None else cfg_data
+        if not data:
+            return lines
+        mode = ttc_mode("nsample") if mode is None else mode
+        if mode == "off":
+            return lines
+        jobs = state["jobs"]
+        # 1) spawn
+        for j in list(jobs):
+            if j.get("status") != "failed" or j.get("nsample_group") or j.get("nsample_of") \
+                    or j.get("nsample_shadow"):
+                continue
+            try:
+                bundle = job_group_key(j)
+            except Exception:
+                bundle = None
+            cfg = nsample_cfg(bundle, data=data) or nsample_cfg(j.get(BUNDLE_FIELD), data=data)
+            if nsample_should_sample(j, cfg):
+                continue
+            if bundle_is_retired(bundle) or bundle_is_retired(j.get(BUNDLE_FIELD)):
+                j["nsample_shadow"] = True       # settled: never revisited
+                continue
+            facts = (facts_of or (lambda x: job_failure_facts(x, files=_nsample_touched_files(x))))(j)
+            cap_s, cap_basis = ttc_task_cap_s(j, jobs)
+            sibs = nsample_make_siblings(j, cfg, facts=(facts if mode == "live" else None))
+            ttc_audit({"kind": "nsample", "rule": "R3/R4", "action": "spawn" if sibs else "none",
+                       "mode": mode, "applied": bool(sibs) and mode == "live",
+                       "job_id": j.get("id"), "label": j.get("label"), "class": ttc_job_class(j),
+                       "inputs": {"bundle": bundle, "k": cfg["k"], "n": len(sibs),
+                                  "gpu_cap_s": cfg["gpu_cap_s"], "task_cap_s": cap_s,
+                                  "cap_basis": cap_basis, "failure_class": j.get("failure_class"),
+                                  "active_s": j.get("active_s"), "sig": facts.get("sig"),
+                                  "temperatures": cfg["temperatures"][:cfg["k"]]}})
+            if mode != "live":
+                j["nsample_shadow"] = True
+                lines.append(f"[queue] N-SAMPLE (shadow): would enqueue {len(sibs)} fresh sample(s) "
+                             f"for {j['id']} ({j.get('label')}) -- logged to {TTC_AUDIT_PATH.name}")
+                continue
+            j["nsample_group"] = "ns-" + str(j["id"])
+            if not sibs:
+                j["nsample"] = {"group": j["nsample_group"], "state": "capped", "k": cfg["k"],
+                                "members": [], "why": "GPU-spend cap leaves no room for a sample"}
+                lines.append(f"[queue] N-SAMPLE: {j['id']} ({j.get('label')}) failed but the "
+                             f"GPU-spend cap ({cfg['gpu_cap_s']:.0f}s) leaves no room -- not sampled")
+                continue
+            for s in sibs:
+                s[BUNDLE_FIELD] = j.get(BUNDLE_FIELD) or bundle
+                jobs.append(s)
+            j["nsample"] = {"group": j["nsample_group"], "state": "open", "k": len(sibs),
+                            "members": [s["id"] for s in sibs], "cfg": cfg, "sig": facts.get("sig"),
+                            "at": datetime.now(timezone.utc).isoformat()}
+            lines.append(f"[queue] N-SAMPLE: {j['id']} ({j.get('label')}) FAILED "
+                         f"[{j.get('failure_class')}] -- enqueued {len(sibs)} fresh sample(s) "
+                         f"in bundle {bundle!r} (one at a time, T>=0.6, verifier-facts brief only; "
+                         f"first green wins; GPU cap {cfg['gpu_cap_s']:.0f}s)")
+        # 2) close / advance
+        groups = {}
+        for j in jobs:
+            if j.get("nsample_of") and j.get("nsample_group"):
+                groups.setdefault(j["nsample_group"], []).append(j)
+        for g, members in groups.items():
+            orig = next((o for o in jobs if o.get("nsample_group") == g and not o.get("nsample_of")), None)
+            rec = (orig or {}).get("nsample") or {}
+            if rec.get("state") in ("won", "exhausted", "capped", "respec"):
+                if rec.get("state") == "won":     # straggler pending siblings after a win
+                    for m in [m for m in members if m.get("status") == "pending" and not _job_has_ever_run(m)]:
+                        jobs.remove(m)
+                continue
+            for m in members:                      # signature of each failed attempt
+                if m.get("status") == "failed" and m.get("nsample_sig") is None:
+                    m["nsample_sig"] = (facts_of or job_failure_facts)(m).get("sig") or []
+                if m.get("status") == "done" and m.get("nsample_diff_lines") is None:
+                    m["nsample_diff_lines"] = _nsample_diff_lines(m)
+            cfg = rec.get("cfg") or nsample_cfg(job_group_key(members[0]), data=data)
+            cap_s, _b = ttc_task_cap_s(orig or members[0], jobs)
+            d = nsample_group_decision(rec.get("sig"), members, cfg, task_cap_s=cap_s,
+                                       escalated=bool(rec.get("escalated")),
+                                       orig_active_s=(orig or {}).get("active_s"))
+            if d["state"] == "open" and not d["escalate"] and not d["cancel"]:
+                continue
+            if d["rule"] == "R4" and not d["cancel"]:
+                continue
+            for cid in d["cancel"]:
+                c = next((m for m in jobs if m.get("id") == cid), None)
+                if c is not None:
+                    jobs.remove(c)
+            ttc_audit({"kind": "nsample", "rule": d["rule"], "action": d["state"]
+                       + ("+escalate" if d["escalate"] else ""), "mode": "live", "applied": True,
+                       "job_id": (orig or {}).get("id"), "label": (orig or {}).get("label"),
+                       "class": ttc_job_class(orig or members[0]),
+                       "inputs": {"group": g, "winner": d["winner"], "cancelled": d["cancel"],
+                                  "sigs": [m.get("nsample_sig") for m in members],
+                                  "orig_sig": rec.get("sig"), "why": d["why"]}})
+            if d["escalate"]:
+                em = (esc_of or nsample_escalation_model)(orig or members[0])
+                if not em:
+                    d = {**d, "state": "respec", "rule": "R6", "escalate": False,
+                         "why": d["why"] + "; no escalation model configured (model_profiles.yaml escalation:)"}
+                else:
+                    ecfg = {"k": 1, "gpu_cap_s": (cfg or {}).get("gpu_cap_s", NSAMPLE_DEFAULT_GPU_CAP_S),
+                            "temperatures": [0.6], "models": [em]}
+                    facts = (facts_of or (lambda x: job_failure_facts(x, files=[])))(orig or members[0])
+                    es = nsample_make_siblings(orig or members[0], ecfg, facts=facts)
+                    for s in es:
+                        s.update({"nsample_group": g, "nsample_index": 99, "nsample_escalation": True,
+                                  "label": f"{_retry_base((orig or members[0]).get('label'))}-retry-esc",
+                                  BUNDLE_FIELD: (orig or members[0]).get(BUNDLE_FIELD)})
+                        jobs.append(s)
+                    if orig is not None:
+                        orig["nsample"] = {**rec, "escalated": em, "members": rec.get("members", []) + [s["id"] for s in es]}
+                    lines.append(f"[queue] N-SAMPLE R5: group {g} -- {d['why']} -> ONE escalation attempt on {em}")
+                    continue
+            fin = {"state": d["state"], "rule": d["rule"], "winner": d["winner"],
+                   "cancelled": d["cancel"], "why": d["why"],
+                   "spent_s": round(sum(float(m.get("active_s") or 0.0) for m in members), 1),
+                   "closed_at": datetime.now(timezone.utc).isoformat()}
+            if orig is not None:
+                orig["nsample"] = {**rec, **fin}
+            if d["winner"]:
+                w = next((m for m in jobs if m.get("id") == d["winner"]), None)
+                if w is not None:
+                    w["nsample"] = {"group": g, "state": "won", "of": (orig or {}).get("id"), **fin}
+            lines.append(f"[queue] N-SAMPLE {d['state'].upper()} ({d['rule']}): group {g} -- {d['why']}"
+                         + (f"; removed {len(d['cancel'])} unrun sample(s)" if d["cancel"] else ""))
+    except Exception as e:
+        lines.append(f"[queue] N-SAMPLE tick error {type(e).__name__}: {e}")
+    return lines
+
+
+def cmd_nsample(args):
+    """ollama-queue.py nsample enable|disable|status BUNDLE [--k K] [--gpu-cap-s S]
+    [--temperatures a,b,c] [--models m1,m2]"""
+    d = nsample_load()
+    b = args.bundle
+    if args.action == "status":
+        rows = {k: v for k, v in d.items() if not b or k == b}
+        print(json.dumps(rows, indent=2, sort_keys=True) if rows else "no bundle has N-sample enabled")
+        return 0
+    if not b:
+        print("BUNDLE is required", file=sys.stderr)
+        return 2
+    if args.action == "disable":
+        if b in d:
+            d[b]["enabled"] = False
+            d[b]["disabled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            nsample_save(d)
+        print(f"N-sample disabled for {b}")
+        return 0
+    k = max(1, min(int(args.k or NSAMPLE_DEFAULT_K), NSAMPLE_MAX_K))
+    d[b] = {"enabled": True, "k": k,
+            "gpu_cap_s": float(args.gpu_cap_s or NSAMPLE_DEFAULT_GPU_CAP_S),
+            "temperatures": [float(x) for x in (args.temperatures or "").split(",") if x.strip()],
+            "models": [x.strip() for x in (args.models or "").split(",") if x.strip()],
+            "enabled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    nsample_save(d)
+    print(f"N-sample enabled for {b}: k={k} gpu_cap_s={d[b]['gpu_cap_s']:.0f}")
+    return 0
+
+
+def cmd_ttc(args):
+    """ollama-queue.py ttc set continuation|nsample off|shadow|live  |  ttc status  |  ttc audit [-n N]"""
+    if args.action == "set":
+        if args.kind not in ("continuation", "nsample") or args.value not in TTC_MODES:
+            print("usage: ttc set continuation|nsample off|shadow|live", file=sys.stderr)
+            return 2
+        try:
+            d = json.loads(TTC_MODE_PATH.read_text())
+        except (OSError, ValueError):
+            d = {}
+        d[args.kind] = args.value
+        TTC_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TTC_MODE_PATH.with_name(TTC_MODE_PATH.name + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(d, indent=2, sort_keys=True))
+        os.replace(tmp, TTC_MODE_PATH)
+        ttc_audit({"kind": "mode", "rule": "operator", "action": f"{args.kind}={args.value}",
+                   "mode": args.value, "applied": True, "inputs": {"by": "ollama-queue.py ttc set"}})
+        print(f"ttc {args.kind} -> {args.value} (takes effect at the next daemon tick)")
+        return 0
+    if args.action == "audit":
+        try:
+            rows = TTC_AUDIT_PATH.read_text().splitlines()[-int(args.n or 20):]
+        except OSError:
+            rows = []
+        print("\n".join(rows) if rows else "no decisions logged yet")
+        return 0
+    print(json.dumps({"continuation": ttc_mode("continuation"), "nsample": ttc_mode("nsample"),
+                      "policy_version": TTC_POLICY_VERSION, "audit": str(TTC_AUDIT_PATH),
+                      "max_rounds": continuation_max_rounds()}, indent=2))
+    return 0
+
+
+# ===================== END PROGRESS CONTINUATION / N-SAMPLE ===================
 
 
 def _persist_job_completion(job):
@@ -5281,7 +7031,10 @@ def _persist_job_completion(job):
             # pruned handoff sidecar so a ctx/scaffold defect stays legible after
             # the live row is gone. failure_class/_detail (2026-09-22) is the
             # who-is-at-fault axis beside it -- see classify_failure.
-            "terminal_reason", "failure_class", "failure_detail")}
+            "terminal_reason", "failure_class", "failure_detail",
+            # TTC audit (2026-10-09): continuation rounds + N-sample group, and the GPU seconds
+            # the per-task cap's median is computed from
+            "continuations", "nsample", "nsample_of", "nsample_group", "active_s", "thinking_arm")}
         rec["persisted_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         # RESEARCH/DIAGNOSIS answer persistence (Fix 2): these dispatches produce a
         # written ANSWER, not a code diff, and it lived ONLY inside the worker
@@ -7372,6 +9125,8 @@ def seal_prev_round_baseline(job: dict) -> dict | None:
     FAIL-OPEN end to end: any git error leaves the tree exactly as found, so a seal
     that cannot run degrades to the pre-fix behaviour (the finding may still fire)
     rather than blocking the launch."""
+    if job.get("continuation_active"):
+        return None          # an in-place progress continuation resumes its OWN tree
     if not _is_continuation_round(job):
         return None
     cwd = job.get("cwd")
@@ -7630,7 +9385,20 @@ def cmd_enqueue_gpu(args):
           f"bundle={job[BUNDLE_FIELD]}  timeout={spec['timeout_s']}s")
 
 
+def validate_mode_args(mode, fixed_targets):
+    """PURE. '' when OK, else the refusal reason (fixed needs targets; targets need fixed)."""
+    ft = [t for t in (fixed_targets or []) if t]
+    if mode == "fixed" and not ft:
+        return "--mode fixed needs at least one --fixed-target FILE"
+    if ft and mode != "fixed":
+        return "--fixed-target is only meaningful with --mode fixed"
+    return ""
+
+
 def cmd_enqueue(args):
+    _mode_err = validate_mode_args(getattr(args, "mode", None), getattr(args, "fixed_target", None))
+    if _mode_err:
+        sys.exit(f"[queue] {_mode_err}")
     _validate_host(args.host)
     if args.api == "openai" and args.host == "auto":
         sys.exit("--api openai requires an explicit --host (studio/unraid/URL) -- "
@@ -8005,7 +9773,10 @@ def cmd_enqueue(args):
             "max_iters": args.max_iters,
             "temperature": args.temperature,
             "temperature_explicit": args.temperature is not None,
+            "thinking_arm": getattr(args, "thinking_arm", None),
             "role": getattr(args, "role", None),
+            "mode": getattr(args, "mode", None),
+            "fixed_targets": list(getattr(args, "fixed_target", None) or []) or None,
             "chat_timeout": args.chat_timeout,
             "max_tokens": args.max_tokens,
             "capture_final_as": args.capture_final_as,
@@ -8743,6 +10514,60 @@ def cmd_results(args):
                     print(f"           {k}: {r[k]}")
 
 
+# GATE E at POP: re-check the preflight GO snapshot just before a coding row with a harness
+# worktree launches. exit 3 = SPEC_DEFECT / NOP_GREEN -> the row is parked (needs_opus,
+# failure_class spec) into the existing heal ladder instead of burning a lane on a dead spec.
+PREFLIGHT_TOOL = Path.home() / "bin" / "ollama-dispatch-preflight"
+REVALIDATE_TIMEOUT_S = 120
+REVALIDATE_RECHECK_S = 600.0
+
+
+def revalidate_at_pop(job, now=None, run=None, tool=None):
+    """(action, detail): 'launch' (fresh / no snapshot / tool missing / any trouble) or 'park'
+    (exit 3). Fails OPEN: only a clean exit-3 verdict stops a launch."""
+    now = time.time() if now is None else now
+    try:
+        if job.get("runner") or _is_gpu_exclusive_job(job) or job.get("resume_transcript"):
+            return "launch", "not a fresh coding launch"
+        cwd = job.get("cwd")
+        if not cwd or not Path(cwd, ".preflight-state.json").is_file():
+            return "launch", "no preflight snapshot"
+        t = _parse_iso_ts(job.get("revalidated_at"))
+        if t is not None and now - t < REVALIDATE_RECHECK_S:
+            return "launch", "revalidated recently"
+        tl = Path(tool) if tool else PREFLIGHT_TOOL
+        if run is None and not tl.is_file():
+            return "launch", "revalidate tool missing"
+        if run is None:
+            r = subprocess.run(["python3", str(tl), "--revalidate", str(cwd)], capture_output=True,
+                               text=True, timeout=REVALIDATE_TIMEOUT_S)
+            rc, out = r.returncode, (r.stdout or "") + (r.stderr or "")
+        else:
+            rc, out = run(job)
+        if rc == 3:
+            return "park", out.strip()[-1500:] or "SPEC_DEFECT/NOP_GREEN (no detail)"
+        job["revalidated_at"] = datetime.now(timezone.utc).isoformat()
+        return "launch", f"revalidate rc={rc}"
+    except Exception as e:
+        return "launch", f"revalidate skipped ({type(e).__name__}: {e})"
+
+
+def park_spec_defect(job, detail, jobs, now_iso=None):
+    """Park `job` into the needs_opus lane with a spec-defect failure_class (the job ladder /
+    watcher takes it from there). Mutates job; returns ids cascaded to blocked."""
+    job["status"] = ESCALATION_STATUS
+    job["failure_class"] = "spec"
+    job["failure_detail"] = f"revalidate at pop: {detail[:300]}"
+    job["terminal_reason"] = "spec_defect_revalidate"
+    job["escalation"] = {"reason": f"E gate (revalidate at pop) refused the launch: {detail[:600]}",
+                         "category": "other", "escalated_at": now_iso or datetime.now(timezone.utc).isoformat(),
+                         "coordinator_model": "queue", "next_command": None, "prev_status": "pending",
+                         "gate_output_excerpt": detail[-2000:], "recovery": {
+                             k: job.get(k) for k in ("cwd", "task_file", "verify", "model", "label") if job.get(k)}}
+    return _cascade_blocked(jobs)
+
+
+
 def _build_cmd(job, host_url):
     runner = job.get("runner")
     if runner:
@@ -8786,15 +10611,22 @@ def _build_cmd(job, host_url):
         #      the worker's --max-tokens, and each pause/resume cycle requires an explicit
         #      human action in the dashboard (a promote drop or a resume click), so repeated
         #      cycles can't silently multiply a runaway job's budget unnoticed.
-        *iters_flag(job["max_iters"]),
+        *iters_flag(effective_max_iters(job)),
     ]
     # Sampling comes from the model card profile (model_profiles.yaml) in the worker.
     # --temperature is passed ONLY when the operator gave one explicitly at enqueue;
     # legacy rows (no temperature_explicit) carried a hardcoded 0 and are NOT honored.
     if job.get("temperature_explicit") and job.get("temperature") is not None:
         cmd += ["--temperature", str(job["temperature"])]
+    if job.get("seed") is not None and _worker_supports_flag("--seed"):
+        cmd += ["--seed", str(int(job["seed"]))]
     if job.get("role"):
         cmd += ["--role", job["role"]]
+    if job.get("mode") and _worker_supports_flag("--mode"):
+        cmd += ["--mode", str(job["mode"])]
+        if _worker_supports_flag("--fixed-target"):
+            for _ft in job.get("fixed_targets") or []:
+                cmd += ["--fixed-target", str(_ft)]
     if job.get("task_kind"):
         cmd += ["--task-kind", job["task_kind"]]
     if job.get("manual_tools"):
@@ -10684,7 +12516,8 @@ def _gate_output_excerpt(gate_output, limit=4000):
 
 
 def _build_parked_job(reason, category, next_command=None, gate_output_excerpt=None,
-                      coordinator_model=None, cwd=None, label=None, job_id=None, now=None):
+                      coordinator_model=None, cwd=None, label=None, job_id=None, now=None,
+                      bundle=None):
     """PURE builder for a PRE-ENQUEUE escalation placeholder: a job dict BORN in
     needs_opus, never enqueued and never runnable, carrying the same escalation
     metadata escalate_job records on a real job. No I/O -- unit-tested by --self-test.
@@ -10712,6 +12545,9 @@ def _build_parked_job(reason, category, next_command=None, gate_output_excerpt=N
         "id": jid,
         "label": label or f"needs-opus-{category}-{jid}",
         "status": ESCALATION_STATUS,
+        # The ORIGINATING work's bundle (2026-10-09): a bundle-less placeholder made its esc-review
+        # mint `job-<id>` and strand an idle lane / hold an unrelated bundle's next job.
+        BUNDLE_FIELD: bundle or None,
         "cwd": str(cwd) if cwd is not None else None,
         # No upstream: a pre-enqueue placeholder stands alone in the lane.
         "after": None,
@@ -10742,7 +12578,7 @@ def _build_parked_job(reason, category, next_command=None, gate_output_excerpt=N
 
 
 def create_parked_job(reason, category="other", next_command=None, gate_output=None,
-                      coordinator_model=None, cwd=None, label=None):
+                      coordinator_model=None, cwd=None, label=None, bundle=None):
     """Park a PRE-ENQUEUE failure into needs_opus with NO pre-existing job (the
     escalate <job_id> path requires one). Creates a synthetic placeholder job born
     in needs_opus via _build_parked_job and appends it to state. Requires the exact
@@ -10761,7 +12597,9 @@ def create_parked_job(reason, category="other", next_command=None, gate_output=N
     model = coordinator_model or _discover_coordinator_model()
     job = _build_parked_job(reason, category, next_command=next_command,
                             gate_output_excerpt=excerpt, coordinator_model=model,
-                            cwd=cwd, label=label)
+                            cwd=cwd, label=label,
+                            bundle=(bundle or chain_bundle_for_label(label)
+                                    or default_bundle_from_label(label) or None))
     with _Locked() as lock:
         state = lock.load()
         state["jobs"].append(job)
@@ -10786,7 +12624,8 @@ def cmd_escalate(args):
             create_parked_job(args.reason, category=args.category,
                               next_command=args.next_command, gate_output=args.gate_output,
                               coordinator_model=args.coordinator_model,
-                              cwd=args.cwd, label=args.label)
+                              cwd=args.cwd, label=args.label,
+                              bundle=getattr(args, "bundle", None))
             return
         if not args.job_id:
             raise QueueActionError(
@@ -10815,6 +12654,24 @@ def _escalation_row(job):
         "recovery": esc.get("recovery") or {},
         "resolve_hint": f"python3 ~/bin/ollama-queue.py resume {job['id']}",
     }
+
+
+def cmd_retag_bundles(args):
+    """retag_unbundled_rows over the live state (see there). Dry run by default."""
+    with _Locked() as lock:
+        state = lock.load()
+        todo, running = retag_unbundled_rows(state["jobs"])
+        for jid, old, new in todo:
+            print(f"[queue] retag {jid}: bundle {old!r} -> {new!r}" + ("" if args.apply else "  (dry run)"))
+        for jid in running:
+            print(f"[queue] skip {jid}: RUNNING (never retagged while running)")
+        if args.apply and todo:
+            by_id = {j.get("id"): j for j in state["jobs"]}
+            for jid, _o, new in todo:
+                by_id[jid][BUNDLE_FIELD] = new
+            lock.save(state)
+        if not todo and not running:
+            print("[queue] nothing to retag")
 
 
 def cmd_needs_opus(args):
@@ -10869,10 +12726,78 @@ def cmd_needs_opus(args):
     print()
 
 
+# H8 -- POST-CONDITION RECEIPTS. A state-changing verb re-reads the row after the mutation and
+# reports {ok, from, to, changed}; "printed success, changed nothing" (the resume no-op trap)
+# is NO-OP + exit 4.
+RECEIPT_NOOP_RC = 4
+_RECEIPT_RUNNABLE = ("pending", "queued", "running", "scheduled", "held")
+
+
+def job_snapshot(state, job_id):
+    """The comparable facts of one row (None when it does not exist)."""
+    try:
+        j = _resolve_job_id(state, job_id)
+    except QueueActionError:
+        return None
+    return {"id": j.get("id"), "status": j.get("status"), "user_hold": bool(j.get("user_hold")),
+            "pause_reason": j.get("pause_reason"), "idx": state["jobs"].index(j),
+            "focus": (state.get("_focus_override") or {}).get("key"),
+            "pinned": state.get("pinned_group")}
+
+
+def _receipt_label(snap):
+    if snap is None:
+        return "gone"
+    return f"{snap['status']}{'+hold' if snap.get('user_hold') else ''}"
+
+
+def op_receipt(action, before, after):
+    """PURE. {ok, action, id, from, to, changed, reason}: did `action` leave the row in the
+    state it promises, and did anything change at all?"""
+    frm, to = _receipt_label(before), _receipt_label(after)
+    changed = before != after
+    ok, why = True, ""
+    if action == "resume":
+        if after is None or after["status"] not in _RECEIPT_RUNNABLE or after.get("user_hold"):
+            ok, why = False, f"row is still {to}; resume did not take effect"
+        elif not changed:
+            ok, why = False, f"row was already {frm}; nothing to resume"
+    elif action == "promote":
+        if after is None:
+            ok, why = False, "row vanished"
+        elif not changed:
+            ok, why = False, f"nothing moved (row {frm}, position {after['idx']}, focus unchanged)"
+    elif action == "cancel":
+        if after is not None and after["status"] not in ("cancelled",):
+            ok, why = False, f"row still exists as {to}; cancel did not take effect"
+    return {"ok": ok, "action": action, "id": (before or after or {}).get("id"),
+            "from": frm, "to": to, "changed": changed, "reason": why}
+
+
+def run_with_receipt(action, job_id, fn, snapshot=None):
+    """Run fn() (the existing verb), then verify its post-condition from the persisted
+    state. Prints the receipt; exits RECEIPT_NOOP_RC with `NO-OP: <reason>` when nothing
+    changed / the promise does not hold."""
+    snap = snapshot or job_snapshot
+    with _Locked() as lk:
+        before = snap(lk.load(), job_id)
+    res = fn()
+    full = (before or {}).get("id") or job_id
+    with _Locked() as lk:
+        after = snap(lk.load(), full)
+    rc = op_receipt(action, before, after)
+    print(f"[queue] RECEIPT {json.dumps(rc, sort_keys=True)}")
+    if not rc["ok"]:
+        print(f"[queue] NO-OP: {rc['reason']}", file=sys.stderr)
+        sys.exit(RECEIPT_NOOP_RC)
+    return res
+
+
+
 def cmd_promote(args):
     try:
-        promote_job(args.job_id, preempt=args.preempt, force=args.force,
-                    take_focus=args.take_focus)
+        run_with_receipt("promote", args.job_id, lambda: promote_job(
+            args.job_id, preempt=args.preempt, force=args.force, take_focus=args.take_focus))
     except QueueActionError as e:
         sys.exit(f"[queue] {e}")
 
@@ -10898,7 +12823,17 @@ def accept_bundle(key, job_id=None, chain_dir=None):
 
 def cmd_accept_bundle(args):
     try:
-        accept_bundle(args.bundle, job_id=args.job)
+        with _Locked() as _lk:
+            _prev = (_lk.load().get("_bundle_accepted") or {}).get(args.bundle)
+        _jid = accept_bundle(args.bundle, job_id=args.job)
+        with _Locked() as _lk:
+            _now = (_lk.load().get("_bundle_accepted") or {}).get(args.bundle)
+        if _now != str(_jid):
+            sys.exit(f"[queue] NO-OP: accept-bundle {args.bundle} did not persist (recorded {_now!r})")
+        print(f"[queue] RECEIPT {json.dumps({'ok': True, 'action': 'accept-bundle', 'id': _jid, 'from': _prev, 'to': _now, 'changed': _prev != _now}, sort_keys=True)}")
+        if _prev == _now:
+            print(f"[queue] NO-OP: bundle {args.bundle} had already accepted {_now}", file=sys.stderr)
+            sys.exit(RECEIPT_NOOP_RC)
     except QueueActionError as e:
         sys.exit(f"[queue] {e}")
 
@@ -10983,7 +12918,8 @@ def cmd_resume(args):
                           f"(its verify was failing at enqueue, so it cannot prove the work "
                           f"landed -- you are resuming with that known). Check the diff by hand.")
                     _lk.save(_st)
-        resume_job(resolved_id or args.job_id, force=getattr(args, "force", False))
+        run_with_receipt("resume", resolved_id or args.job_id,
+                         lambda: resume_job(resolved_id or args.job_id, force=getattr(args, "force", False)))
     except QueueActionError as e:
         sys.exit(f"[queue] {e}")
 
@@ -11003,7 +12939,8 @@ def cmd_cancel(args):
             # explicit=True: an operator typing `cancel` means REMOVE, and a terminal
             # row's record survives in its never-pruned sidecars regardless.
             # mark_plan only with --plan (2026-10-04, 2c): a bare cancel is job-scoped.
-            cancel_job(args.job_id, explicit=True, mark_plan=_plan_wide)
+            run_with_receipt("cancel", args.job_id,
+                             lambda: cancel_job(args.job_id, explicit=True, mark_plan=_plan_wide))
     except QueueActionError as e:
         sys.exit(f"[queue] {e}")
 
@@ -11077,10 +13014,14 @@ def cmd_run(args):
             if j.get("status") != "running":
                 continue
             pid = j.get("pid")
-            if not _pid_alive(pid) and _is_gpu_exclusive_job(j):
+            _alive = proc_identity_alive(pid, j.get("pid_start"))     # H1: a recycled pid is not our worker
+            if not _alive and _pid_alive(pid):
+                print(f"[queue] {j['id']}: pid {pid} is alive but is NOT the process we launched "
+                      f"(start time changed) -- treating the worker as dead")
+            if not _alive and _is_gpu_exclusive_job(j):
                 _settle_orphaned_gpu_job(j, pid)     # never requeued (see GPU_JOB_KIND)
                 continue
-            if not _pid_alive(pid):
+            if not _alive:
                 # RACE THIS CLOSES (job a01402d61d79, 2026-09-14): a restart that lands
                 # AFTER the worker converged+exited but BEFORE the reap must NOT relaunch it.
                 # The checkpoint transcript already records converged=True, so mark the job
@@ -11220,6 +13161,7 @@ def cmd_run(args):
                 job["exit_code"] = ret
                 job["pid"] = None
                 _accrue_active_s(job)
+                job["continuation_active"] = False      # the continuation round (if any) just ended
                 if job.get("force_stop"):
                     # Bug #1 (2026-09-18): operator/coordinator force-stop (queue `stop` /
                     # `cancel --force` of a RUNNING job). The process is now dead (it honored
@@ -11234,6 +13176,18 @@ def cmd_run(args):
                         job[_k] = None
                     print(f"[queue] {job['id']} ({job['label']}) FORCE-STOPPED on "
                           f"{_lane_name(lane_url)}, exit {ret} -- operator stop honored")
+                elif job.get("driver_dead"):
+                    # H1/item 5: the runner's DRIVER died (or reported a fatal shell error and
+                    # went silent) while the runner process stayed up; the lease lapsed and we
+                    # terminated the runner. A crashed driver is a FAILED job, not a pause.
+                    _dd = job["driver_dead"]
+                    job["status"] = "failed"
+                    job["terminal_reason"] = "driver_crashed"
+                    job["failure_class"] = "harness"
+                    job["failure_detail"] = f"driver died while its runner stayed alive: {_dd.get('why')}"
+                    job["error"] = job["failure_detail"]
+                    print(f"[queue] {job['id']} ({job['label']}) FAILED on {_lane_name(lane_url)}: "
+                          f"{job['failure_detail']} (exit {ret})")
                 elif ret == w.EXIT_CODE_PAUSED:
                     # Worker's graceful-pause exit (external SIGTERM from a promote, or the
                     # model's own review gate): resumable, NOT a failure. The transcript path
@@ -11330,6 +13284,11 @@ def cmd_run(args):
                           + (f" -- {_tr}" if _tr else "")
                           + (f" [class={job['failure_class']}: {job.get('failure_detail')}]"
                              if job.get("failure_class") else ""))
+                # PROGRESS CONTINUATION: a progressing authoring nonconvergence gets ONE
+                # in-place resume round (shadow-logged until `ttc set continuation live`).
+                _cont_msg = _apply_progress_continuation(job, jobs=state["jobs"])
+                if _cont_msg:
+                    print(_cont_msg)
                 # Advisory auto-gate on any terminal (non-resumable) job. COLLECTED here,
                 # FIRED after lock.save() below: firing inline would race the daemon --
                 # the gate reads ollama-queue-state.json off disk, which still holds the
@@ -11339,17 +13298,28 @@ def cmd_run(args):
                 # ever seeing a misleading stale row.
                 if job["status"] in ("done", "done_unconverged", "failed"):
                     gated_jobs.append(job)
+                    _declare_terminal_next_step(state, job)   # same state write as the status
                     # (No lane reservation here anymore. The old time-based gate-hold that
                     # reserved the regate lane for up to GATE_HOLD_SECS is gone -- long jobs
                     # now launch immediately and are PREEMPTED when a Studio gate actually
                     # becomes runnable. See the gate-preempt scan in the launch loop below.)
                 changed = True
 
+            # H1 HEARTBEAT LEASE for wrapper-runner rows (bakeoff / gpu-exclusive): an alive
+            # runner whose driver is gone is not a running job.
+            try:
+                _dead_leases, _lease_dirty = _enforce_runner_leases(state, active, time.time())
+                if _lease_dirty:
+                    changed = True
+            except Exception as _e:
+                _degraded_note("runner_lease", _e)
+
             # Reap adopted orphans: previous daemon died, its worker kept running;
             # now that it's exited, requeue the job (exit code unknown -- we can't
             # waitpid a non-child). Same retry semantics as the dead-pid case above.
             for pid, job_id in list(adopted.items()):
-                if _pid_alive(pid):
+                _aj = next((x for x in state["jobs"] if x.get("id") == job_id), None)
+                if proc_identity_alive(pid, (_aj or {}).get("pid_start")):
                     continue
                 del adopted[pid]
                 job = next((j for j in state["jobs"] if j.get("id") == job_id), None)
@@ -11405,6 +13375,14 @@ def cmd_run(args):
                     job["pid"] = None
                     job["lane"] = None
                     changed = True
+
+            # N-SAMPLE (per-bundle opt-in, shadow until `ttc set nsample live`): spawn fresh
+            # siblings for a newly failed job, close/advance sample groups. No-op by default.
+            _ns_lines = nsample_tick(state)
+            if _ns_lines:
+                for _nl in _ns_lines:
+                    print(_nl)
+                changed = True
 
             # Lanes occupied by ANY running job in shared state (not just ours) --
             # belt-and-braces on top of the daemon lock, so a lane is never
@@ -11668,7 +13646,8 @@ def cmd_run(args):
             _running_key = None
             for _j in state["jobs"]:
                 # GPU-EXCLUSIVE rows never drive focus/commitment (see GPU_JOB_KIND).
-                if _j.get("status") == "running" and not _is_gpu_exclusive_job(_j):
+                if (_j.get("status") == "running" and not _is_gpu_exclusive_job(_j)
+                        and not _is_esc_review_job(_j)):
                     _running_key = _pk(_j)
                     break
             _order = [_oj for _oj in pending_launch_order(state["jobs"], state.get("pinned_group"))
@@ -12059,6 +14038,12 @@ def cmd_run(args):
                     for _bid in _cascade_blocked(state["jobs"]):
                         print(f"[queue] {_bid} BLOCKED (cascade: upstream chain step did not converge)")
                     continue
+                _ns_block = nsample_launch_blocker(job, state["jobs"])
+                if _ns_block:
+                    _job_wait[job["id"]] = wait_note(
+                        "nsample", f"N-sample: {_ns_block}", f"N-sample siblings run one at a time ({_ns_block})",
+                        {"kind": "nsample", "detail": str(_ns_block)})
+                    continue
                 chosen = None
                 _lane_why = []
                 _lanes_try = list(_candidate_lanes(job, w))
@@ -12183,6 +14168,14 @@ def cmd_run(args):
                         changed = True
                         continue
 
+                _rv_act, _rv_detail = revalidate_at_pop(job)
+                if _rv_act == "park":
+                    _nb = park_spec_defect(job, _rv_detail, state["jobs"])
+                    changed = True
+                    print(f"[queue] {job['id']} ({job['label']}): revalidate-at-pop refused the launch "
+                          f"(SPEC_DEFECT/NOP_GREEN) -- parked needs_opus [spec] for the heal ladder; "
+                          f"{len(_nb)} downstream blocked. {_rv_detail[:200]}", file=sys.stderr)
+                    continue
                 log_path = LOG_DIR / f"{job['id']}-{_safe_label(job['label'])}.log"
                 # Runner jobs (e.g. studio-research.py) are not given the worker's
                 # --live-log flag (they own their output under the 5-flag contract),
@@ -12235,6 +14228,11 @@ def cmd_run(args):
                               f"attempt -- stashed its own uncommitted output "
                               f"({', '.join(_dead['stashed'][:6])}) as {_dead['ref']} so the "
                               f"rerun starts from its first launch's clean tree", file=sys.stderr)
+                    if job.get("nsample_of"):
+                        _ns_ref = _nsample_stash_tree(job)     # every sample starts from a clean tree
+                        if _ns_ref:
+                            print(f"[queue] {job['id']} ({job['label']}): N-sample stashed the previous "
+                                  f"attempt's output as {_ns_ref} (evidence kept)", file=sys.stderr)
                     _sealed = seal_prev_round_baseline(job)
                 except Exception:
                     tree_lock_release(_tl)
@@ -12263,6 +14261,7 @@ def cmd_run(args):
                     # direct one -- see its --direct-ok guard. Without this every queued
                     # job would be refused.
                     _env = {**os.environ, "OLLAMA_DISPATCH_VIA_QUEUE": job["id"]}
+                    _env.update(job_env_overrides(job))
                     proc = subprocess.Popen(cmd, cwd=job["cwd"], stdout=logf,
                                             stderr=subprocess.STDOUT, env=_env)
                     tree_lock_release(_tl)
@@ -12286,6 +14285,10 @@ def cmd_run(args):
                 active[proc.pid] = (chosen, proc, logf)
                 job["status"] = "running"
                 job["pid"] = proc.pid
+                job["pid_start"] = _pid_start(proc.pid) or None     # H1: identity = pid + start time
+                job["attempt_id"] = uuid.uuid4().hex[:10]
+                job["driver_dead"] = None
+                job["_no_driver_since"] = None
                 job["lane"] = _lane_name(chosen)
                 job["launched_at"] = datetime.now(timezone.utc).isoformat()
                 job["yield_resume"] = None  # the yield is repaid once it is back on a lane
@@ -12971,6 +14974,49 @@ def _self_test():
             check("chain STUCK advancing > 30 min (pid alive but wedged): released",
                   sticky_active(None, "boStuck", _T - CHAIN_ADVANCE_CEILING - 1, "next", _T,
                                 sticky_incomplete=_incs, driver_live=_drvs), "next")
+            # --- CPU-ONLY CHAIN STAGE does not pin the GPU lanes (2026-10-09, rt-card-bonus) ---
+            _chain("boCpu", "advancing", _T - 60, step="preflight r2")
+            _chain("boEnq", "advancing", _T - 60, step="enqueue auto-refine-x-r2")
+            _ccpu = chain_run_progress("boCpu", runs_dir=_crd, alive=_alive, now=_T)
+            _cenq = chain_run_progress("boEnq", runs_dir=_crd, alive=_alive, now=_T)
+            check("cpu-only chain: step 'preflight rN' is cpu_only; 'enqueue ...' is not",
+                  (_ccpu["cpu_only"], _cenq["cpu_only"]), (True, False))
+            check("cpu-only chain: self-check / harness-check / relevance steps classify cpu-only; author stage does not",
+                  [chain_step_cpu_only(x) for x in ("author continuation c2 self-check", "harness-check",
+                   "relevance", "author stage tests try 1", "start", None)],
+                  [True, True, True, False, False, False])
+            _cst = bundle_commit_status("boCpu", [], _pkc, chain=_ccpu)
+            check("cpu-only chain: only activity is preflight -> 'waiting', not moving (holds no GPU lane)",
+                  (_cst[0], _cst[2]), ("waiting", False))
+            check("cpu-only chain: ...even with a live next-step 'continue' declaration",
+                  bundle_commit_status("boCpu", [], _pkc, chain=_ccpu,
+                                       next_step={"kind": "continue", "at": _T, "expires_at": _T + 600, "actor": "auto"},
+                                       now=_T)[0], "waiting")
+            check("cpu-only chain: a non-cpu advancing step (enqueue) still holds the lane (working, moving)",
+                  bundle_commit_status("boEnq", [], _pkc, chain=_cenq)[0::2], ("working", True))
+            check("cpu-only chain: a RUNNING model row of the bundle keeps it working even during a cpu step",
+                  bundle_commit_status("boCpu", [{"id": "r", "status": "running", "bundle": "boCpu"}],
+                                       lambda j: j.get("bundle"), chain=_ccpu)[0], "working")
+            _stat = {"boCpu": ("waiting", "preflight", False), "B": ("working", "2 live", True)}
+            _cm, _ev = bundle_commit_step(None, {}, None, ["boCpu", "B"], lambda k_: _stat[k_], _T)
+            check("cpu-only chain: the bundle is not committed; another runnable bundle takes the lanes",
+                  (_cm or {}).get("key"), "B")
+            # visitor B committed while boCpu was cpu_wait-parked; boCpu's next model row appears
+            _park = {"boCpu": {"since": _T - 100, "why": "w", "kind": "cpu_wait"}}
+            _stat2 = {"boCpu": ("working", "1 live row(s)", True), "B": ("working", "1 running", True)}
+            _cm2, _ev2 = bundle_commit_step({"key": "B", "since": _T - 90, "empty_since": None,
+                                             "idle_since": None}, _park, "B", ["B"],
+                                            lambda k_: _stat2[k_], _T)
+            check("cpu-only chain: when the parked bundle's next model job is ready it takes the commitment back "
+                  "(the visitor's running job is not preempted, only its later jobs wait)",
+                  ((_cm2 or {}).get("key"), _ev2[0][0], _park.get("B", {}).get("kind")), ("boCpu", "yield", "yielded"))
+            _park3 = {"boCpu": {"since": _T - 100, "why": "w", "kind": "cpu_wait"}}
+            _stat3 = {"boCpu": ("waiting", "preflight", False), "B": ("working", "1 running", True)}
+            _cm3, _ev3 = bundle_commit_step({"key": "B", "since": _T - 90, "empty_since": None,
+                                             "idle_since": None}, _park3, "B", ["B"],
+                                            lambda k_: _stat3[k_], _T)
+            check("cpu-only chain: while its stage is still running the visitor keeps the commitment",
+                  ((_cm3 or {}).get("key"), _ev3), ("B", []))
             _incw, _drvw, _ = bundle_incomplete("boWait", [], _pkc, progress=_nop, chain=_w)
             check("chain waiting past a finished round: held inside the stall ceiling...",
                   sticky_active(None, "boWait", _T, "next", _T + FOCUS_AUTOFEED_GRACE + 1,
@@ -15556,12 +17602,14 @@ def _self_test():
         check("...and reads 0 when nothing landed", stale_base_behind(_cwd4, "87fd8a4", run=_fake_git(0)), (0, "origin/main"))
         check("...and (None, None) with no cwd/head to measure", stale_base_behind(None, None), (None, None))
     _saved_sbb = globals()["stale_base_behind"]
+    _saved_sbt = globals()["stale_base_touched"]
     _sblog = _tf4.NamedTemporaryFile("w", suffix=".log", delete=False)
     _sblog.write("--- iteration 24/24 ---\n[worker] verify stdout:\n[worker] VERIFY FAILED (exit 1) "
                  "(3 new failure(s) attributable to this diff). Do not trust this output as-is.\n")
     _sblog.close()
     try:
         globals()["stale_base_behind"] = lambda cwd, head, run=None: (1, "origin/main")
+        globals()["stale_base_touched"] = lambda cwd, head, ref, scope=None, run=None: ["sidecar/src/costco.js"]
         _sj = {"terminal_reason": "nonconvergence", "log_path": _sblog.name, "exit_code": 1,
                "cwd": "/wt", "launch_baseline": {"head": "87fd8a44447e"}}
         _stamp_failure_class(_sj)
@@ -15577,12 +17625,111 @@ def _self_test():
         _mj = dict(_sj); _mj.pop("failure_class", None)
         _stamp_failure_class(_mj)
         check("...and with no drift the model class stands", _mj["failure_class"], "model")
+        # main moved 23 commits but NONE touch the task's files (smoke 2026-10-09 costco):
+        globals()["stale_base_behind"] = lambda cwd, head, run=None: (23, "origin/main")
+        globals()["stale_base_touched"] = lambda cwd, head, ref, scope=None, run=None: []
+        _uj = dict(_sj); _uj.pop("failure_class", None); _uj.pop("stale_base", None)
+        _stamp_failure_class(_uj)
+        check("...and drift that touches NONE of the task's files stays model, not stale-base",
+              (_uj["failure_class"], "stale_base" in _uj), ("model", False))
     finally:
         globals()["stale_base_behind"] = _saved_sbb
+        globals()["stale_base_touched"] = _saved_sbt
         try:
             os.unlink(_sblog.name)
         except OSError:
             pass
+
+    # --- stale-base scope evidence (smoke 2026-10-09 D4) ---------------------------
+    _scd = _tf4.mkdtemp(prefix="oq-scope-")
+    try:
+        Path(_scd, "TASK.md").write_text(
+            "## Scope\nOnly edit `sidecar/src/costco.js`, `sidecar/src/loginFlow.js`; do not edit "
+            "`verify.sh`, `verify.test.ts` or `TASK.md`.\n")
+        Path(_scd, ".dispatch-harness.json").write_text(json.dumps({"target": "sidecar/src/costco.js"}))
+        check("task_scope_files: target + the Only-edit files, not the do-not-edit ones",
+              task_scope_files(_scd), {"sidecar/src/costco.js", "sidecar/src/loginFlow.js"})
+        def _gd(names, rc=0):
+            return lambda argv, **kw: _CP(rc, "\n".join(names) + "\n")
+        check("stale_base_touched: unrelated commits touch nothing in scope",
+              stale_base_touched(_scd, "aaa", "origin/main", run=_gd(["README.md", "app/x.ts"])), [])
+        check("...a commit to a scope file is reported",
+              stale_base_touched(_scd, "aaa", "origin/main", run=_gd(["README.md", "sidecar/src/loginFlow.js"])),
+              ["sidecar/src/loginFlow.js"])
+        check("...git failure -> [] (no relabel on unproven evidence)",
+              stale_base_touched(_scd, "aaa", "origin/main", run=_gd(["sidecar/src/costco.js"], rc=1)), [])
+        check("...no declared scope -> [] (cannot prove staleness)",
+              stale_base_touched("/nonexistent-dir-xyz", "aaa", "origin/main", run=_gd(["a.js"])), [])
+    finally:
+        _shutil3.rmtree(_scd, ignore_errors=True)
+
+    # --- authoring TODO-placeholder class + progressing nonconvergence (smoke D6/D7) -
+    _ait = "--- iteration 24/24 ---\n"
+    _todo_final = "[worker] verify stdout:\n  FAIL: TASK.md still has TODO placeholders -- fill them in\n\n[worker] VERIFY FAILED (exit 1). Do not trust this output as-is.\n"
+    check("authoring: final-check TODO placeholders is an unfinished MODEL round, not a spec defect",
+          classify_failure("nonconvergence", _ait + _todo_final, authoring=True)[0], "model")
+    check("...while a non-authoring job with that marker stays spec",
+          classify_failure("nonconvergence", _ait + _todo_final, authoring=False)[0], "spec")
+    check("authoring: a REAL spec marker in the final check still classifies spec",
+          classify_failure("nonconvergence", _ait + "[worker] verify stdout:\n  FAIL: verify.sh PASSES at baseline -- cannot fail\n"
+                           "[worker] VERIFY FAILED (exit 1).\n", authoring=True)[0], "spec")
+    _stale_tool = ('[worker] tool run_bash({"command": "python3 auto-harness-check.py"}) -> {"exit_code": 1, "stdout": '
+                   '"  FAIL: TASK.md still has TODO placeholders -- fill them in\\n", "stderr": ""}\n')
+    check("an EARLIER self-check's TODO echo (tool line) with no end-of-run block does not classify spec",
+          classify_failure("nonconvergence", "--- iteration 3/24 ---\n" + _stale_tool + _ait +
+                           "[worker] VERIFY FAILED (exit 1). Do not trust this output as-is.\n")[0], "model")
+    def _tool(fails):
+        return ('[worker] tool run_bash({"command": "python3 auto-harness-check.py 2>&1"}) -> {"exit_code": 1, "stdout": "'
+                + "".join(f"  FAIL: {f}\\n" for f in fails) + '", "stderr": ""}\n')
+    _fin = lambda fails: ("[worker] verify stdout:\n" + "".join(f"  FAIL: {f}\n" for f in fails)
+                          + "\n[worker] VERIFY FAILED (exit 1). Do not trust this output as-is.\n")
+    _shrink = (_tool(["a one", "b two", "c three"]) + _tool(["b two", "c three"]) + _tool(["c three"])
+               + _ait + _fin(["c three"]))
+    _hist = selfcheck_failure_history(_shrink)
+    check("progress: self-check history is read from tool echoes + the final block", len(_hist), 4)
+    check("progress: strictly shrinking failing sets -> 'shrinking'",
+          classify_progress(_hist[:3])[0], "shrinking")
+    check("progress: same failure repeated as the latest -> not progressing",
+          classify_progress(_hist)[0], None)
+    _chg = _tool(["x one"]) + _tool(["x one"]) + _ait + _fin(["y fake dom detail"])
+    check("progress: a NEW failure after repeats -> 'changing'",
+          classify_progress(selfcheck_failure_history(_chg))[0], "changing")
+    check("progress: flapping back to an earlier failure is not headway",
+          classify_progress(selfcheck_failure_history(_tool(["p one"]) + _tool(["q two"]) + _ait + _fin(["p one"])))[0], None)
+    check("progress: fewer outputs than the window -> not enough evidence",
+          classify_progress(selfcheck_failure_history(_ait + _fin(["only one"])))[0], None)
+    _pl = _tf4.NamedTemporaryFile("w", suffix=".log", delete=False)
+    _pl.write(_chg + "[worker] TERMINAL REASON: nonconvergence\n"); _pl.close()
+    try:
+        _pj = {"terminal_reason": "nonconvergence", "log_path": _pl.name, "exit_code": 1, "max_iters": 24,
+               "label": "auto-author-x-c1", "verify": "python3 auto-harness-check.py"}
+        _stamp_failure_class(_pj)
+        check("progressing authoring nonconvergence -> class nonconvergence_progressing",
+              _pj["failure_class"], "nonconvergence_progressing")
+        check("...with a continuation_allowance the auto driver can read",
+              (_pj["continuation_allowance"]["extra_iterations"], _pj["continuation_allowance"]["rounds"],
+               _pj["continuation_allowance"]["kind"]), (12, 1, "changing"))
+        _pc = dict(_pj, label="plain-coding", verify="bash verify.sh"); _pc.pop("failure_class"); _pc.pop("continuation_allowance")
+        _stamp_failure_class(_pc)
+        check("...a non-authoring job is never relabelled progressing", _pc["failure_class"], "model")
+    finally:
+        os.unlink(_pl.name)
+
+    # --- interrupted rows are not failed attempts (smoke D5) ------------------------
+    _ss = {}
+    update_bundle_fail_streaks(
+        [{"id": "c0", "bundle": "cost", "label": "auto-author-cost", "status": "failed",
+          "terminal_reason": "nonconvergence", "exit_code": 1, "launched_at": "2026-10-09T01:00:00+00:00"},
+         {"id": "c1", "bundle": "cost", "label": "auto-author-cost-c1", "status": "failed",
+          "terminal_reason": "force_stopped", "exit_code": 3, "launched_at": "2026-10-09T02:00:00+00:00"}],
+        _ss, lambda j: j.get("bundle"), verdict=lambda j: None)
+    check("a SIGTERM-paused (exit 3, force_stopped) row after one real failure leaves the streak at 1",
+          (_ss, bundle_focus_exhausted("cost", _ss, progress={})[0]), ({"cost": 1}, False))
+    _ss2 = {}
+    update_bundle_fail_streaks(
+        [{"id": "p1", "bundle": "cost", "label": "auto-author-cost", "status": "failed", "exit_code": 3}],
+        _ss2, lambda j: j.get("bundle"), verdict=lambda j: None)
+    check("...and a bare exit-3 failed row never counts", _ss2, {})
 
     # --- plan-add dependency resolution (2026-09-23, Fable pass 3) -----------------
     _pj = [{"id": "aaaa11112222", "label": "plan-s1", "status": PLANNED_STATUS},
@@ -16376,9 +18523,20 @@ def main():
     e.add_argument("--max-iters", type=int, default=None,
                    help="Omit to let ollama-worker.py's DEFAULT_MAX_ITERS (%d) govern -- "
                         "the queue no longer forces a lower value (was silently 20)." % WORKER_DEFAULT_MAX_ITERS)
+    e.add_argument("--thinking-arm", choices=THINKING_ARMS, default=None,
+                   help="thinking-policy A/B arm for this job (sets MODEL_THINKING_ARM for the worker; "
+                        "model_profiles.yaml thinking_policy.ab_roles only)")
     e.add_argument("--temperature", type=float, default=None,
                    help="Explicit sampling-temperature override. Omit to use the model card's "
                         "profile (model_profiles.yaml) for the job's role.")
+    e.add_argument("--mode", choices=["auto", "open", "fixed"], default=None,
+                   help="Worker edit-scope lane (passed to ollama-worker.py --mode when the worker "
+                        "supports it): open = no scope pin, fixed = edits confined to the "
+                        "--fixed-target file(s), auto = the worker decides. Omit to use the "
+                        "worker's default.")
+    e.add_argument("--fixed-target", action="append", default=None, metavar="FILE",
+                   help="With --mode fixed: a file the worker may edit (repeatable; passed to "
+                        "ollama-worker.py as --fixed-target).")
     e.add_argument("--role", default=None,
                    help="Model-profile role for the worker: author/coding (thinking_coding, "
                         "default) or gate/review (non-thinking). See model_profiles.yaml.")
@@ -16619,6 +18777,23 @@ def main():
                          "id in it). Omit to send the bundle to the end of the queue.")
     mg.set_defaults(func=cmd_move_group)
 
+    ns = sub.add_parser("nsample", help="per-bundle N-sample + verify-gated selection (OFF by default): "
+                                         "enable|disable|status BUNDLE")
+    ns.add_argument("action", choices=["enable", "disable", "status"])
+    ns.add_argument("bundle", nargs="?")
+    ns.add_argument("--k", type=int, default=None, help=f"fresh samples (default {NSAMPLE_DEFAULT_K}, max {NSAMPLE_MAX_K})")
+    ns.add_argument("--gpu-cap-s", type=float, default=None, help="GPU-seconds the samples may spend")
+    ns.add_argument("--temperatures", default="", help="comma list, one per sample (default 0.6,0.7,0.8)")
+    ns.add_argument("--models", default="", help="comma list of models to rotate through (default: the job's)")
+    ns.set_defaults(func=cmd_nsample)
+
+    tt = sub.add_parser("ttc", help="test-time-compute policy: set continuation|nsample off|shadow|live, status, audit")
+    tt.add_argument("action", choices=["set", "status", "audit"])
+    tt.add_argument("kind", nargs="?")
+    tt.add_argument("value", nargs="?")
+    tt.add_argument("-n", type=int, default=20)
+    tt.set_defaults(func=cmd_ttc)
+
     rs = sub.add_parser("resume", help="Requeue a paused job; it relaunches from its saved "
                                        "transcript (--resume) on the next free lane")
     rs.add_argument("job_id")
@@ -16686,6 +18861,9 @@ def main():
                          "an existing job (requires --next-command; --cwd/--label optional context).")
     es.add_argument("--cwd", default=None,
                     help="[--new] The directory the failing tool ran in (recovery context).")
+    es.add_argument("--bundle", default=None,
+                    help="[--new] The originating work's bundle (default: resolved from --label via the "
+                         "chain record / default_bundle_from_label).")
     es.add_argument("--label", default=None,
                     help="[--new] A label for the placeholder (default: needs-opus-<category>-<id>).")
     es.add_argument("--reason", required=True,
@@ -16701,6 +18879,12 @@ def main():
                     help="Override the auto-discovered coordinator model recorded on the job.")
     es.set_defaults(func=cmd_escalate)
 
+    rb = sub.add_parser("retag-bundles",
+                        help="One-shot janitor: stamp the real bundle on needs_opus / esc-review rows that "
+                             "have none (or a minted job-<id> slug). Dry run unless --apply; RUNNING rows are "
+                             "never touched.")
+    rb.add_argument("--apply", action="store_true")
+    rb.set_defaults(func=cmd_retag_bundles)
     no = sub.add_parser("needs-opus",
                         help="Escalation worklist: every job parked in needs_opus with its "
                              "reason/category and the resume/worktree pointers a draining Opus "

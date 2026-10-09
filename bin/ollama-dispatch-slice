@@ -182,6 +182,9 @@ _AUTO_DETERMINISTIC = (
     # its OWN refimpl, identically across two self-checks (2026-10-06). Another launch cannot
     # change the shared cause, so escalate on first sight with the failing cases.
     re.compile(r"^ERROR: PLAN SUSPECT: "),
+    # PRE-DISPATCH CONTRADICTION GATE (auto die()s before any authoring job): the SPEC
+    # contradicts the base tree; an identical relaunch cannot change that.
+    re.compile(r"^ERROR: SPEC_DEFECT: "),
 )
 _AUTO_REASON_LINE = re.compile(
     r"^(?:ERROR: .*|REFUSING .*|\S+: error: .*|\w*(?:Error|Exception): .*|"
@@ -614,6 +617,8 @@ def author_budget_block(st, sid, s, rows=None):
 
 
 _ESC_KINDS = (  # (regex on escalation_reason, short TRUE label) -- FIRST match wins
+    (r"SPEC_DEFECT: already satisfied at base", "spec defect -- already satisfied at base (skip, or restate)"),
+    (r"SPEC_DEFECT: ", "spec defect -- spec contradicts the base tree (RE-SPEC the intent)"),
     (r"^HARNESS CONVERGED, PREFLIGHT NO-GO", "converged harness, preflight NO-GO (worktree kept; --regate)"),
     (r"^PIPELINE BUG SUSPECTED", "baseline-green claim disagrees with a re-run (pipeline bug?)"),
     (r"GREEN at the untouched baseline", "verify green at baseline (already satisfied, or leaky fixture)"),
@@ -705,6 +710,10 @@ def respec_on_cap(s, sig, streak, attempts):
             f"{streak}): the previous harness attempts ended on: {str(sig)[:300]}. Do NOT repeat "
             f"that; keep TASK.md must_contain literals real and present in the target or "
             f"introduced by refimpl.py, and author >= 3 adversarial cases.")
+    if is_spec_defect(sig):
+        note += (" The failure was a SPEC_DEFECT: the spec contradicts the BASE tree. Do not "
+                 "'create' files that already exist at base (modify/extend them instead) and "
+                 "do not demand literals the base already satisfies.")
     s["intent"] = (s.get("intent") or "").rstrip() + "\n\n" + note
     s["respec_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     s["respec_history"] = (s.get("respec_history") or []) + [{"sig": str(sig)[:300], "attempts": attempts}]
@@ -2105,6 +2114,34 @@ def topo_sort(slices):
     if len(order) != len(slices):
         die("dependency cycle in plan (topo sort could not order all slices)")
     return order
+
+
+def plan_candidates(arg):
+    """The places a BARE plan label may live: the canonical plan-file store, then a
+    same-named file in the cwd. Empty for anything that looks like a path."""
+    if not arg or os.sep in arg or arg.startswith("~") or arg.endswith(".json"):
+        return []
+    return [os.path.join(os.path.expanduser("~/.ollama-dispatch/slice-plans"),
+                         f"{arg}.slices.json"),
+            os.path.abspath(f"{arg}.slices.json")]
+
+
+def resolve_plan_arg(arg):
+    """`ollama-dispatch-slice <plan>` takes a plan-file PATH; a bare LABEL (what the
+    dashboard, qctl and the cancel marker all call a plan) used to die with a
+    FileNotFoundError traceback (2026-10-08). An existing path wins; otherwise a bare
+    label resolves to slice-plans/<label>.slices.json. Returns the path to use, or
+    raises FileNotFoundError naming every candidate tried."""
+    if os.path.exists(os.path.expanduser(arg)):
+        return arg
+    cands = plan_candidates(arg)
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    if not cands:
+        raise FileNotFoundError(f"no such plan file: {arg}")
+    raise FileNotFoundError(f"no such plan {arg!r}: not a file, and as a bare label "
+                            f"neither {cands[0]} nor {cands[1]} exists")
 
 
 def load_plan(path):
@@ -4863,6 +4900,82 @@ def default_bundle(st):
     return label
 
 
+def auto_launch_argv(st, sid, s, cwt, wt, resume_author=False):
+    """The full ollama-dispatch-auto argv for authoring slice `sid` off the chain tip `cwt`.
+    One function so the launch contract (deterministic --baseline-ref = the chain tip's sha,
+    --lane, bundle, shape, requires) is testable instead of living inline in execute()."""
+    return [AUTO, "--repo", cwt, "--dest", wt,
+            "--intent", authoring_intent(s), "--target", slice_target(st, s),
+            *[f"--edit-file={_f}" for _f in slice_edit_files(st, s)],
+            "--lang", st["lang"], "--label", f"{st['label']}-{sid}",
+            "--slice-plan", st["label"], "--slice-id", sid,
+            "--max-rounds", "4", *_baseline_args(cwt), *_lane_args_auto(st),
+            *_bundle_args(st), *_shape_args(st),
+            *_verify_shape_args(s), *_reqs(s),
+            *(["--resume-author"] if resume_author else [])]
+
+
+def _lane_of(st):
+    """The plan's lane (--lane, persisted in the run state; env DISPATCH_LANE as a fallback)."""
+    lane = (st or {}).get("lane") or os.environ.get("DISPATCH_LANE") or "open"
+    return lane if lane in ("open", "fixed", "auto") else "open"
+
+
+def _lane_args_auto(st):
+    """`--lane X` for AUTO (omitted for the default open lane: argv stays byte-identical)."""
+    lane = _lane_of(st)
+    return [] if lane == "open" else ["--lane", lane]
+
+
+def _lane_enqueue_args(st, cwt=None, targets=()):
+    """`--mode X` for the slice's coding enqueue, via the shared task_class helper; [] for the
+    open lane or when the queue's enqueue has no --mode (fail-closed: never breaks an enqueue)."""
+    lane = _lane_of(st)
+    if lane == "open":
+        return []
+    try:
+        import importlib.util as _ilu
+        _sp = _ilu.spec_from_file_location("task_class", os.path.join(os.path.dirname(
+            os.path.realpath(__file__)), "task_class.py"))
+        m = _ilu.module_from_spec(_sp)
+        _sp.loader.exec_module(m)
+        cls = None
+        if cwt:
+            tc = m.read_task_class(cwt)
+            cls = (tc or {}).get("class")
+        args = m.lane_args(lane, cls, QUEUE, targets=targets)
+    except Exception:
+        args = []
+    if not args:
+        print(f"# lane {lane} requested but the queue enqueue has no --mode: open lane", file=sys.stderr)
+    return args
+
+
+SPEC_DEFECT_MARK = "SPEC_DEFECT: "
+
+
+def is_spec_defect(sig):
+    """PURE. True when a failure signature is a pre-dispatch SPEC_DEFECT (the spec
+    contradicts the base tree). Those route to RE-SPEC on first sight, not a retry."""
+    return SPEC_DEFECT_MARK in str(sig or "")
+
+
+def _baseline_args(cwt):
+    """`--baseline-ref <sha>` for AUTO: the chain worktree's CURRENT tip, resolved
+    here once so the scaffold cuts the slice from exactly the tree the chain is on
+    (no origin fetch, no re-resolution; AUTO records it as base_sha in
+    .dispatch-harness.json). Nothing when the tip cannot be resolved."""
+    try:
+        r = subprocess.run(["git", "-C", str(cwt), "rev-parse", "--verify", "-q", "HEAD^{commit}"],
+                           capture_output=True, text=True, timeout=30)
+        sha = (r.stdout or "").strip()
+        if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", sha):
+            return ["--baseline-ref", sha]
+    except Exception:
+        pass
+    return []
+
+
 def _shape_args(st):
     """AUTO's --kind/--anchor/--symbol for this plan's TS/JS harness shape, or
     nothing (older run states and non-TS plans carry none of these keys)."""
@@ -5679,7 +5792,8 @@ def confirm_and_enqueue(st, sid, s, wt, model, host, max_iters, chat_timeout,
          "--task-kind", "coding", "--verify", "bash verify.sh",
          "--num-ctx", str(num_ctx),
          "--max-iters", str(max_iters), "--chat-timeout", str(chat_timeout),
-         "--label", f"{st['label']}-{sid}", *_bundle_args(st)],
+         "--label", f"{st['label']}-{sid}", *_bundle_args(st),
+         *_lane_enqueue_args(st, wt, [slice_target(st, s), *slice_edit_files(st, s)])],
         capture_output=True, text=True)
     print(cp.stdout.strip())
     job_id = parse_enqueue_id(cp.stdout)
@@ -6142,6 +6256,29 @@ def bound_stale_worktree_retry(st, sid, s, wt, cwt, origin):
     # MAX_IDENTICAL_AUTHOR_FAILURES attempts re-establishing it.
     if AUTHOR_BASELINE_GREEN_MARKER in sig:
         park_if_already_satisfied(st, sid, s, wt, origin)
+        return False
+    # SPEC_DEFECT (auto's pre-dispatch contradiction gate): the SPEC is wrong, so the
+    # only useful move is a (bounded) RE-SPEC on FIRST sight; "already satisfied" is the
+    # baseline-green case and parks like it. Cap spent -> falls to the ESCALATED park.
+    if is_spec_defect(sig) and "already satisfied at base" in str(sig):
+        park_if_already_satisfied(st, sid, s, wt, origin)
+        return False
+    if is_spec_defect(sig) and respec_on_cap(s, sig, streak, int(s.get("author_attempts") or 0)):
+        save_state(st)
+        print(f"# {sid}: SPEC_DEFECT -- RE-SPEC'd on first sight (one bounded respec); "
+              f"re-authoring from a clean baseline with the defect folded into the intent. "
+              f"Latest: {sig}")
+        remove_worktree(cwt, wt)
+        return True
+    if is_spec_defect(sig):
+        # the one re-spec is spent and the SAME contradiction came back: another launch
+        # cannot change it -- park it where a human/Claude re-specs the plan.
+        s["status"] = ESCALATED
+        s["escalation_reason"] = (f"{sig} -- re-spec already tried once ({s.get('respec_count')}x) "
+                                  f"and the spec still contradicts the base tree; fix the plan "
+                                  f"intent, then --retry-slice {sid}.")
+        save_state(st)
+        print(f"# {sid}: ESCALATED -- {s['escalation_reason']}")
         return False
     attempts = int(s.get("author_attempts") or 0)
     _budget_why = author_budget_block(st, sid, s)
@@ -6813,14 +6950,7 @@ def execute(st, model, host, max_iters, chat_timeout, author_mode, num_ctx,
             if author_mode == "auto":
                 # a reason recorded by a PREVIOUS launch must not outlive it
                 s.pop("last_auto_error", None)
-                cp = run_tee([AUTO, "--repo", cwt, "--dest", wt,
-                          "--intent", authoring_intent(s), "--target", slice_target(st, s),
-                          *[f"--edit-file={_f}" for _f in slice_edit_files(st, s)],
-                          "--lang", st["lang"], "--label", f"{st['label']}-{sid}",
-                          "--slice-plan", st["label"], "--slice-id", sid,
-                          "--max-rounds", "4", *_bundle_args(st), *_shape_args(st),
-                          *_verify_shape_args(s), *_reqs(s),
-                          *(["--resume-author"] if resume_author else [])])
+                cp = run_tee(auto_launch_argv(st, sid, s, cwt, wt, resume_author))
                 # ROOT-CAUSE FIX (2026-09-21): AUTO's refine loop now aborts early
                 # (rc=0) if the slice already converged via a different path while
                 # it was running (see slice_already_satisfied() in
@@ -9197,6 +9327,10 @@ def main():
     ap.add_argument("--publish-dag", action="store_true",
                     help="publish every remaining slice into the queue as a "
                          "dependency-gated PLANNED row and exit")
+    ap.add_argument("--lane", choices=("open", "fixed", "auto"), default=None,
+                    help="coding-job lane (default open; persisted in the run state): passed to "
+                         "ollama-dispatch-auto as --lane and to the slice coding enqueue as the "
+                         "worker's --mode, ONLY when `ollama-queue.py enqueue` accepts --mode.")
     ap.add_argument("--no-dag", action="store_true",
                     help="do NOT publish planned rows on --execute (the old "
                          "one-job-at-a-time view)")
@@ -9208,6 +9342,10 @@ def main():
     if not a.plan:
         ap.error("plan is required (only --sweep runs without one)")
 
+    try:
+        a.plan = resolve_plan_arg(a.plan)
+    except FileNotFoundError as e:
+        die(str(e))
     plan = load_plan(a.plan)
     if a.reset:
         p = state_path(plan.get("label", "sliced"))
@@ -9225,6 +9363,12 @@ def main():
                 f"(omnibus_slice / ollama-dispatch-plan now carry the behavior), or "
                 f"pass --accept-behavior-gap to override.", code=3)
     st = load_state(plan, plan_path=a.plan)
+    if getattr(a, "lane", None):
+        st["lane"] = a.lane
+        try:
+            save_state(st)
+        except Exception:
+            pass
 
     # HUMAN CANCEL IS TERMINAL (2026-09-27, see plan_cancel.py). Checked before
     # EVERY lever and before --advance-detached (the completion hook's entry and

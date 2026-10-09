@@ -1227,6 +1227,14 @@ unsupervised 3am agent that "fixes" a stuck loop is how loops get worse.
 Answer in under 400 words, plain markdown, starting with a one-line verdict of
 the form: VERDICT: <a|b|c|d> -- <one sentence>.
 
+MACHINE-CHECKABLE OUTPUT (mandatory, the pipeline ACTS on it with nobody reading
+this file). Your FIRST line is the VERDICT line -- do not narrate your plan or
+"let me analyze" first; read the evidence, then write the answer. Your LAST line
+is exactly one line of JSON (no code fence):
+ESC_RESULT: {{"verdict": "<a|b|c|d>", "confidence": "<high|medium|low>", "why": "<one sentence, <=200 chars>"}}
+The action taken is driven by that verdict: a = close/resume, b = re-spec the
+task, c = harness repair round, d = bigger model / re-slice.
+
 OPTIONAL, AND ONLY IF YOU ARE CONFIDENT: after the prose, you may PROPOSE a fix
 as a unified diff in a single fenced ```diff block. For a slice, write paths
 relative to the slice WORKTREE named in the context file. A diff that touches ONLY
@@ -1705,6 +1713,60 @@ def verdict_line(review, reason=None):
     return base
 
 
+CLASSIFY_PROMPT = """An automated dispatch escalation was reviewed, but the review ended
+WITHOUT a usable verdict. Read the file at {ctx}: it holds the escalation context and,
+at the end, the tail of that earlier review. Do not re-investigate from scratch and do
+not narrate. Output EXACTLY two lines and nothing else:
+VERDICT: <a|b|c|d> -- <one sentence>
+ESC_RESULT: {{"verdict": "<a|b|c|d>", "confidence": "<high|medium|low>", "why": "<<=200 chars>"}}
+a = not a real failure / already satisfied; b = the task spec is wrong or under-specified;
+c = harness/dispatch defect; d = genuine model incapacity. Pick the single best fit.
+"""
+
+
+def ensure_verdict(e, ctx, stem, review, rerun=None, ev=None):
+    """A review with no usable verdict is never left: re-run ONE classify-only review
+    (local queue job, cheap), then fall back to the machine resolution (mechanical
+    failure_class > reason keywords > default b) and WRITE that verdict line so the row,
+    the self-heal ladder and a human all read the same thing. Contained: never raises."""
+    try:
+        if ev is None:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import escalation_verdict as ev
+        if is_review_blocked(review) or ev.has_verdict(review):
+            return review
+        cfg = ev.load_config()
+        key = esc_key(e)
+        led = _load_json(LEDGER) or {}
+        rec = (led.get("records") or {}).get(key) or {}
+        if int(rec.get("verdict_reruns") or 0) < int(cfg["rerun_review_max"]):
+            _merge_ledger(LEDGER, key, dict(rec, verdict_reruns=int(rec.get("verdict_reruns") or 0) + 1))
+            ctx2 = ESC_DIR / ("%s-classify.md" % stem)
+            try:
+                ctx2.write_text(Path(ctx).read_text() + "\n\n## Earlier review (tail, no verdict)\n\n"
+                                + (review or "")[-2500:] + "\n")
+                new = (rerun or spawn_review)(ctx2, prompt=CLASSIFY_PROMPT,
+                                              bundle=review_bundle(e))
+            except Exception:
+                new = ""
+            if new and not is_review_blocked(new) and ev.has_verdict(new):
+                return (review or "").rstrip() + "\n\n---\nclassify-only re-run:\n" + new.strip() + "\n"
+        fc = e.get("failure_class")
+        if not fc and e.get("job_id"):
+            try:
+                st = json.loads((Path.home() / "bin" / "ollama-queue-state.json").read_text())
+                fc = next((j.get("failure_class") for j in st.get("jobs") or []
+                           if j.get("id") == e["job_id"]), None)
+            except Exception:
+                fc = None
+        vd = ev.resolve(review, fc, e.get("reason"), key_parts=(key,))
+        return ((review or "").rstrip() + "\n\nVERDICT: %s -- (machine-resolved from %s: %s)\n"
+                % (vd["verdict"], vd["source"], vd["why"]))
+    except Exception:
+        return review
+
+
+
 def _merge_ledger(path, key, record):
     """Re-read, add one key, write. Returns the merged ledger.
 
@@ -1900,6 +1962,26 @@ def retire_sweep(run=subprocess.run, tool=None):
         print("  hygiene-sweep error: %s" % exc)
 
 
+HANDOFF_AUTOCLEAR = Path(__file__).resolve().parent / "handoff-autoclear.py"
+
+
+def handoff_autoclear(run=subprocess.run, tool=None):
+    """Keep the handoff panel near 0 without a human (2026-10-09): every pass, the
+    mechanical rules clear routine finished jobs; the (rate-limited, kill-switched)
+    Sonnet batch classifier handles the rest. NEVER touches awaiting_signoff or an item a
+    live job/agent still needs (enforced inside the tool). Contained."""
+    tool = Path(tool) if tool else HANDOFF_AUTOCLEAR
+    try:
+        if tool.exists():
+            r = run([sys.executable, str(tool), "--auto"], capture_output=True, text=True,
+                    timeout=900)
+            for l in (r.stdout or "").splitlines():
+                if l.strip():
+                    print("  handoff-autoclear " + l.strip())
+    except Exception as exc:
+        print("  handoff-autoclear error: %s" % exc)
+
+
 def index_janitor(index_files=None):
     """Tick index rows whose item is RESOLVED in pipeline state (slice done/skipped,
     plan cancelled, chain landed, job resolved/done, bundle unparked) -- see
@@ -1994,6 +2076,7 @@ def run_once(dry_run=False):
         retire_sweep()
         index_janitor()
         worktree_reap_daily()
+        handoff_autoclear()
     found = []
     # SLICE_RUNS is passed explicitly, never left to the def-time default: the
     # end-to-end harness overrides these module globals, and a default bound at
@@ -2221,6 +2304,7 @@ def run_once(dry_run=False):
         # no Edit/Write and is not widened for this); the proposal arrives as
         # TEXT in the review, and the only thing done with it here is
         # `git apply --check`. A diff that does not apply is NOT written out.
+        review = ensure_verdict(e, ctx, stem, review)
         vline = verdict_line(review, e.get("reason"))
         repo = (state or {}).get("repo")
         # A slice's harness lives in its OWN worktree (fixture/refimpl are not in
@@ -2289,16 +2373,47 @@ def review_bundle(e):
         try:
             st = json.loads((Path.home() / "bin" / "ollama-queue-state.json").read_text())
             for j in st.get("jobs") or []:
-                if j.get("id") == e["job_id"] and j.get("bundle"):
-                    return j["bundle"]
+                if j.get("id") == e["job_id"]:
+                    if j.get("bundle"):
+                        return j["bundle"]
+                    # a bundle-less row (needs-opus-auto-X placeholder, pruned parent): resolve the REAL
+                    # bundle from the chain record / label, never leave it to the queue's job-<id> slug
+                    # (2026-10-09: that stranded an idle lane and held an unrelated bundle).
+                    b = _queue_label_bundle(j.get("label") or e.get("label"))
+                    if b:
+                        return b
         except Exception:
             pass
+    if e.get("label"):
+        return _queue_label_bundle(e.get("label"))
     return None
+
+
+def _queue_label_bundle(label):
+    """The queue's own resolver (chain auto-runs record, else the default bundle of the label)."""
+    if not label:
+        return None
+    try:
+        import importlib.machinery as _im
+        import importlib.util as _iu
+        ld = _im.SourceFileLoader("_oq_for_bundle", str(Path(__file__).resolve().parent / "ollama-queue.py"))
+        sp = _iu.spec_from_loader(ld.name, ld)
+        m = _iu.module_from_spec(sp)
+        ld.exec_module(m)
+        return m.chain_bundle_for_label(label) or m.default_bundle_from_label(label) or None
+    except Exception:
+        return None
+
+
+# An ACTION that handles the escalation by itself (2026-10-09): the row is recorded [x]
+# with the action in it. If the action later fails, a NEW escalation row is raised.
+ACTED_PREFIXES = ("skip-verified:", "closed:", "respec:", "heal-continuation:", "retired:",
+                  "resumed:")
 
 
 def heal_retired_it(heal):
     """PURE. A VERIFIED auto-skip retired the slice: the index row is written [x]."""
-    return str(heal or "").startswith("skip-verified:")
+    return str(heal or "").startswith(ACTED_PREFIXES)
 
 
 def self_heal(e, ctx, review_path, run=subprocess.run, tool=None):

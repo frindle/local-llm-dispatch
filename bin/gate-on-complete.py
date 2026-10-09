@@ -2535,6 +2535,8 @@ def _relevance_run(cmd, cwd, verify_cmd, task_file, base, bundle=None):
     def _check(res):
         t = (res.stdout or "").strip()
         if not t.startswith("{"):
+            if res.exit_code == 3 and "nothing to mutate" in (res.stderr or "") and not res.timed_out:
+                return None       # verify-relevance's own clean abstain: a local re-run would say the same
             return "not a JSON verdict (rc=%s)" % res.exit_code
         try:
             json.loads(t)
@@ -5124,6 +5126,23 @@ def _janitor_log(job_id, dec, siblings) -> None:
         pass
 
 
+def land_ingest_consider(job_id: str, payload: dict) -> None:
+    """LAND PIPELINE hand-off (2026-10-09, ollama-land): a standalone dispatch that finished with
+    a landable verdict is registered for a LANDING PACKET. Fire-and-forget and best-effort: it
+    only stages a scratch integrate/* branch and writes landing/<chain>/packet.*; it never
+    merges or pushes (REVIEW mode) -- `ollama-land approve` is the only writer of a product
+    repo. Skipped in test mode / sandbox, and when ollama-land is not installed beside us."""
+    if TEST_MODE or os.environ.get("DISPATCH_VERIFY_SANDBOX"):
+        return
+    if str(payload.get("verdict")) not in ("pass", "concerns"):
+        return
+    tool = BIN / "ollama-land"
+    if not tool.is_file():
+        return
+    subprocess.Popen(["python3", str(tool), "ingest", "--job", job_id], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def runstatus_janitor_consider(job_id: str, payload: dict, gate_json: Path,
                                *, fetch=None, post=None) -> None:
     """Daemon-level driver: at a job's terminal completion, auto-archive it (and its
@@ -5610,6 +5629,7 @@ def main() -> int:
                 auto_pipeline_consider(a.job_id, payload, gate_json)
                 slice_pipeline_consider(a.job_id, payload, gate_json)
                 runstatus_janitor_consider(a.job_id, payload, gate_json)
+                land_ingest_consider(a.job_id, payload)
         except Exception:
             pass
         # COMPLETED-CODE-DROP at the SAME terminality signal auto-fix uses: a

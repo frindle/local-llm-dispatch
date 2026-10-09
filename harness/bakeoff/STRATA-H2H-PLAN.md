@@ -69,3 +69,7 @@ Declared differences:
 - Quality: debug-cell verify pass rate (net of tamper flags) and cell-E sites/ident/meta, per arm, over 3 reps.
 - Speed: wall time per converged run and out_tps.
 - Whether to wire Strata as a lane depends on more than its quality. Every Strata job holds the GPU the Unraid pre-gate uses, about 4 minutes of load plus the run time.
+
+
+## Update 2026-10-09: Strata context raised to 131072
+The owner asked for more context at a similar VRAM. Sandbox config (strata-iq2_xs.json, backup .bak-ctx131k) now has `--max-context 131072 --kv int8 --kv-resident 32768`: KV cache lives in pinned host RAM (251 GB box, ~13.7 KB/token => ~1.8 GB at 128K), only the 32K attended window sits in VRAM. Declared difference vs qwen is now context-equal (qwen auto-ctx 131072). The first debug job (b421bd18a41b) was stopped at load and re-enqueued as bo-v12-strata-debug-r2; compare peak VRAM and tok/s against the 32K trial (52 tok/s, 11.6 GB).

@@ -548,7 +548,7 @@ def main():
         "import sys, importlib.util\n"
         "spec = importlib.util.spec_from_file_location('h', 'helper.py')\n"
         "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
-        "CASES = [([], False), ([1, 2], True), ([1, -1], False), ([5], True)]\n"
+        "CASES = [([], False), ([1, 2], True), ([1, -1], False), ([5], True), ([0], False)]\n"
         "fails = sum(1 for xs, want in CASES if bool(m.all_positive(xs)) != want)\n"
         "sys.exit(1 if fails else 0)\n")
     (nf / "verify-behav.sh").write_text(

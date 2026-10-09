@@ -43,7 +43,7 @@ class W:
                 self._s(200, {"m": b.get("model")})
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
-        (self.d / "local.json").write_text(json.dumps({"api_key": KEY, "base_url": "http://127.0.0.1:%d" % self.srv.server_port}))
+        (self.d / "local.json").write_text(json.dumps({"api_key": KEY, "base_url": "http://127.0.0.1:%d/v1" % self.srv.server_port}))
         fb = self.d / "darkbloom"
         failset = fail_set or ""
         fb.write_text('''#!/bin/bash

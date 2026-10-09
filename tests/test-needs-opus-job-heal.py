@@ -101,6 +101,10 @@ def main():
     q = load(a.queue, "oq_under_test")
     w = load(a.watcher, "dew_under_test")
     td = Path(tempfile.mkdtemp(prefix="needsopus-test-"))
+    # 2026-10-09: at the cap / on a (d) the ladder RE-SPECS from the recorded dispatch-auto
+    # argv instead of parking; hermetic here = an EMPTY auto-runs dir, so "no argv" parks.
+    heal.AUTO_RUNS = td / "autoruns"
+    os.environ["ESC_ACTIONS"] = "on"
     wt = td / "wt"
     wt.mkdir()
     (wt / "AUTO-TASK.md").write_text("CONTINUE -- your authoring run ran out of iterations\n")
@@ -246,8 +250,8 @@ def main():
         got = heal.heal_job(row, "VERDICT: d -- model incapacity", jobs=[row], ledger_path=led,
                             slice_runs=runs, enqueue=stub_enqueue, notifier=stub_notify,
                             decisions=dec, log_dir=logs)
-        check("a (d) verdict is not healed (only b/c fixture/harness defects)",
-              (got.startswith("skip:"), len(enq)), (True, 0))
+        check("a (d) verdict with no bigger model and no recorded argv PARKS (never a blind round)",
+              (got.startswith("park:"), len(enq)), (True, 0))
         check("...and is no longer heal-pending (the bundle may park on it)",
               heal.job_heal_pending(row, json.loads(led.read_text()), now, runs), False)
         coding = c1_row(wt, now - 600, label="rt-bg-commitments-fix-getcommitments")

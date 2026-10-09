@@ -98,12 +98,12 @@ def main():
                                 interface="", edit_file=None, verify_shape=None)
     try:
         p = m.author_continue_prompt(a_browser, "lib/x.ts", last)
-        check("prompt: fake-browser helper NOT pasted on MNF", "PASTE THIS VERBATIM" not in p, p[:400])
+        check("prompt: sealed-fixture section NOT repeated on MNF", "Sealed browser/environment fixture" not in p, p[:400])
         p2 = m.author_continue_prompt(a_browser, "lib/x.ts", last.replace(
             "Cannot find module '/a/lib/apiCallLog.ts' imported from /a/wt/verify.test.ts", "0 !== 2")
             .replace("code: 'ERR_MODULE_NOT_FOUND'", ""))
-        check("prompt control: helper still pasted for a real fake failure",
-              "PASTE THIS VERBATIM" in p2, p2[:400])
+        check("prompt control: sealed-fixture section still given for a real fake failure",
+              "Sealed browser/environment fixture" in p2, p2[:400])
     except Exception as e:  # noqa
         check("author_continue_prompt callable", False, repr(e))
 
