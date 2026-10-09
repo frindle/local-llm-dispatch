@@ -2042,6 +2042,10 @@ def check_invariants(sb: Sandbox, R: Result, mon: Monitor, chaos: Chaos, before,
 # `proof_fail` (optional): a substring the RED output must contain, so a revert
 # proves the RIGHT assertion went red (not an import error).
 SEAMS = (
+    dict(id="ctxscaffold",
+         name="queue ctx estimate: harness scaffold files (auto-harness-check.py etc.) named in AUTO-TASK.md are not counted as named files; real target files still are",
+         tool="test-queue-ctx-scaffold-files.py", marker="ALL PASS",
+         proofs=[[{"mut": "ollama-queue.py", "old": '        if rel.rsplit("/", 1)[-1] in CTX_SCAFFOLD_FILES:\n            continue\n', "new": '', "why": 'scaffold files inflate the named-file estimate and the ctx gate refuses the enqueue'}]]),
     dict(id="prefetchfeed",
          name="CPU prefetch feeding: --prefetch / self-heal register work idempotently and never raise; finished entries are never resurrected; a stuck chain's resume stays immediate",
          tool="test-prefetch-register.py", marker="PREFETCH_REGISTER_OK",

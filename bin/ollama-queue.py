@@ -7705,6 +7705,7 @@ CTX_HIST_BUCKET_RATIO = 1.5
 CTX_HIST_MIN_SAMPLES = 3
 # Cheap named-file detection bounds (best-effort, never fatal).
 CTX_NAMED_FILES_MAX = 25
+CTX_SCAFFOLD_FILES = frozenset({"auto-harness-check.py", "check_literals.py", "dispatch_env.py"})
 CTX_NAMED_FILES_MAX_TOTAL_CHARS = 2_000_000
 # Per-file cap on the estimate contribution of ANY single named file (2026-09-18).
 # A task's prose often NAMES a large generated/output data artifact -- e.g. the
@@ -7843,6 +7844,11 @@ def named_files_chars(task_text, cwd,
         if rel in seen:
             continue
         seen.add(rel)
+        # Harness scaffold files (auto-harness-check.py is ~75kB) are named in every
+        # AUTO-TASK.md but the model never needs to read them whole; counting them
+        # pushed a 330kB-target slice over the ctx-gate ceiling (aw-codec-floor s2).
+        if rel.rsplit("/", 1)[-1] in CTX_SCAFFOLD_FILES:
+            continue
         if len(seen) > max_files:
             break
         try:
