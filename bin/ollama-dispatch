@@ -1,0 +1,907 @@
+#!/usr/bin/env python3
+"""ollama-dispatch -- ONE-COMMAND orchestrator for the verify-gated local dispatch pipeline.
+
+Collapses the manual chain (scaffold -> draft -> READ/confirm -> freeze-literals ->
+seal-baseline -> preflight -> enqueue) into a single entrypoint, pausing ONLY at the
+one irreducible human gate: reading the drafted adversarial cases for RELEVANCE.
+
+It INVOKES the existing tools; it never re-implements them:
+  ~/bin/ollama-dispatch-scaffold   -- worktree + TASK.md + verify.sh (+ harness), freeze, seal
+  ~/bin/ollama-dispatch-draft      -- draft CASES with a local model, gate-bounce, --confirm
+  ~/bin/ollama-dispatch-preflight  -- the both-ways GO/NO-GO gate
+  ~/bin/ollama-queue.py enqueue    -- put the job on the queue
+
+Two invocations:
+
+  SETUP (code-fix):
+    ollama-dispatch --repo <path> --target <file> --lang <l> \
+      --defect "<confirmed symptom>" --property "<what the change must satisfy>" \
+      (--symbol S | --kind expression --anchor A) [--ts-runner R] [--entry-point f:NN] \
+      --refimpl-cmd '<cmd>' --require '<literal the fix introduces>' \
+      [--label NAME] [--model TAG] [--host HOST] [--drafter-cmd '<cmd>']
+    -> scaffolds, drafts the cases, then STOPS at a PAUSE banner. Resume with:
+    ollama-dispatch --confirm <worktree>
+
+  SETUP (diagnosis) -- no cases/refimpl, so no human pause:
+    ollama-dispatch --task diagnosis --repo <path> --lang <l> \
+      --defect "..." --property "..." [--label NAME] [--model TAG] [--host HOST]
+    -> scaffolds -> seals -> (preflight --no-refimpl) -> enqueues in one shot.
+
+The two load-bearing gates are made CONVENIENT, never SKIPPABLE:
+  * the DRAFT_UNCONFIRMED marker is surfaced, never auto-confirmed;
+  * a preflight NO-GO stops the chain and never enqueues.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+SCAFFOLD = BIN / "ollama-dispatch-scaffold"
+DRAFT = BIN / "ollama-dispatch-draft"
+PREFLIGHT = BIN / "ollama-dispatch-preflight"
+QUEUE = BIN / "ollama-queue.py"
+
+CONFIG_DIR = Path(os.environ.get("OLLAMA_DISPATCH_HOME",
+                                 Path.home() / ".ollama-dispatch"))
+DEFAULTS_FILE = CONFIG_DIR / "defaults.json"
+STATE_NAME = ".dispatch-orchestrator.json"
+
+# Mirror of ollama-queue.py's documented sizing constants (chars//4, headroom,
+# ascending buckets). We compute an explicit start window that FITS the target;
+# the queue's own diagnosis ctx floor still fires on the explicit path.
+CTX_BUCKETS = (16384, 32768, 49152, 65536)
+CTX_CHARS_PER_TOKEN = 4
+CTX_HEADROOM = 1.4
+DIAGNOSIS_CTX_FLOOR = 49152
+
+# Fallback default when defaults.json is absent -- matches ollama-dispatch-draft's
+# DEFAULT_MODEL (the pipeline's documented default local model).
+FALLBACK_MODEL = "qwen3.8:27b-q4_K_M"
+FALLBACK_HOST = "studio"
+
+
+def die(msg, code=2):
+    print(f"ollama-dispatch: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, **kw):
+    """Run a subprocess, streaming its output to our stdout/stderr. Returns rc."""
+    print(f"\n$ {' '.join(shlex.quote(c) for c in cmd)}", flush=True)
+    return subprocess.run(cmd, **kw).returncode
+
+
+def capture(cmd):
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    return p.returncode, p.stdout, p.stderr
+
+
+# ---------------------------------------------------------------------------
+# config / defaults
+# ---------------------------------------------------------------------------
+def load_defaults():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not DEFAULTS_FILE.is_file():
+        DEFAULTS_FILE.write_text(json.dumps(
+            {"model": FALLBACK_MODEL, "host": FALLBACK_HOST}, indent=2) + "\n")
+        print(f"(wrote pipeline defaults -> {DEFAULTS_FILE})")
+    try:
+        d = json.loads(DEFAULTS_FILE.read_text())
+    except (OSError, ValueError):
+        d = {}
+    return (d.get("model") or FALLBACK_MODEL), (d.get("host") or FALLBACK_HOST)
+
+
+# ---------------------------------------------------------------------------
+# state file (carries resume args + stage across the human pause)
+# ---------------------------------------------------------------------------
+def _has_unconfirmed_marker(wt):
+    """True if any fixture in the tree still carries the DRAFT_UNCONFIRMED marker."""
+    for p in list(Path(wt).glob("*.py")) + list(Path(wt).glob("*.mjs")) \
+            + list(Path(wt).glob("*.ts")) + list(Path(wt).glob("*.js")):
+        try:
+            t = p.read_text(errors="replace")
+        except OSError:
+            continue
+        if "DRAFT_UNCONFIRMED = True" in t or "DRAFT_UNCONFIRMED = true" in t:
+            return True
+    return False
+
+
+def state_path(wt):
+    return Path(wt) / STATE_NAME
+
+
+def load_state(wt):
+    p = state_path(wt)
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(wt, st):
+    state_path(wt).write_text(json.dumps(st, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# TASK.md Must-contain helpers (require derivation + population)
+# ---------------------------------------------------------------------------
+MUST_RE = re.compile(r"(##+\s*Must contain[^\n]*\n)(.*?)(?=\n##\s|\Z)", re.S)
+
+
+def taskmd(wt):
+    return Path(wt) / "TASK.md"
+
+
+def parse_must_contain(wt):
+    """Return concrete (non-TODO) backtick-quoted literals from TASK.md Must contain."""
+    t = taskmd(wt)
+    if not t.is_file():
+        return []
+    m = MUST_RE.search(t.read_text(errors="replace"))
+    if not m:
+        return []
+    lits = []
+    for line in m.group(2).splitlines():
+        for q in re.findall(r"`([^`]+)`", line):
+            if "TODO" not in q:
+                lits.append(q)
+    return lits
+
+
+def ensure_must_contain(wt, requires):
+    """Set TASK.md's Must contain block to EXACTLY the --require literals.
+
+    The scaffold's generated block carries explanatory prose with backtick-quoted
+    EXAMPLE tokens (`in <path>:`, `- in app/api/x/route.ts: `) that its own
+    freeze-literals parser captures as real literals -- which then poison
+    check_literals and make the refimpl fail the benign-verify gate. So in the
+    fast path we REPLACE the whole block body with just the caller's real
+    literal bullets, keeping require<->Must-contain in sync and the gate honest."""
+    if not requires:
+        return
+    t = taskmd(wt)
+    text = t.read_text(errors="replace")
+    m = MUST_RE.search(text)
+    new_block = "\n".join(f"- `{r}`" for r in requires) + "\n"
+    if m:
+        # m.group(1) is the header line (kept); replace only the body group(2)
+        text = text[:m.start(2)] + new_block + text[m.end(2):]
+    else:
+        text = text.rstrip() + "\n\n## Must contain\n\n" + new_block
+    t.write_text(text)
+    print(f"  set Must-contain literals in TASK.md: {', '.join(requires)}")
+
+
+# ---------------------------------------------------------------------------
+# num-ctx fit
+# ---------------------------------------------------------------------------
+def fit_num_ctx(wt, target, diagnosis):
+    chars = 0
+    for f in (taskmd(wt), Path(wt) / (target or "")):
+        try:
+            chars += len(f.read_text(errors="replace"))
+        except OSError:
+            pass
+    est = (chars / CTX_CHARS_PER_TOKEN) * CTX_HEADROOM
+    chosen = CTX_BUCKETS[-1]
+    for b in CTX_BUCKETS:
+        if est <= b:
+            chosen = b
+            break
+    if diagnosis:
+        chosen = max(chosen, DIAGNOSIS_CTX_FLOOR)
+    return chosen
+
+
+# ---------------------------------------------------------------------------
+# scaffold
+# ---------------------------------------------------------------------------
+def build_scaffold_cmd(a, wt):
+    # --repo mode honours --dest (worktree location); --new-project mode roots
+    # the project AT --new-project and IGNORES --dest -- so passing --dest there
+    # produces a worktree the orchestrator's own wt.is_dir() check never finds.
+    cmd = [str(SCAFFOLD), "--label", a.label]
+    if a.repo:
+        cmd += ["--dest", str(wt)]
+    cmd += ["--lang", a.lang]
+    if a.repo:
+        cmd += ["--repo", a.repo]
+    elif a.new_project:
+        cmd += ["--new-project", a.new_project]
+    if a.target:
+        cmd += ["--target", a.target]
+    if a.kind:
+        cmd += ["--kind", a.kind]
+    if a.symbol:
+        cmd += ["--symbol", a.symbol]
+    if a.anchor:
+        cmd += ["--anchor", a.anchor]
+    if a.ts_runner:
+        cmd += ["--ts-runner", a.ts_runner]
+    for tf in (a.test_file or []):
+        cmd += ["--test-file", tf]
+    for ef in (a.edit_file or []):
+        cmd += ["--edit-file", ef]
+    if a.entry_point:
+        cmd += ["--entry-point", a.entry_point]
+    if a.defect:
+        cmd += ["--defect", a.defect]
+    if a.property:
+        cmd += ["--property", a.property]
+    if a.task:
+        cmd += ["--task", a.task]
+    if a.force:
+        cmd += ["--force"]
+    return cmd
+
+
+# ---------------------------------------------------------------------------
+# enqueue
+# ---------------------------------------------------------------------------
+def enqueue(wt, st):
+    wt = Path(wt).resolve()
+    num_ctx = st.get("num_ctx") or fit_num_ctx(
+        wt, st.get("target"), st.get("task") == "diagnosis")
+    cmd = [sys.executable, str(QUEUE), "enqueue",
+           "--model", st["model"], "--host", st["host"],
+           "--cwd", str(wt),
+           "--task-file", str(wt / "TASK.md"),
+           "--task-kind", st.get("task_kind", "coding"),
+           "--verify", "bash verify.sh",
+           "--num-ctx", str(num_ctx),
+           "--max-iters", "30",
+           "--label", st["label"]]
+    if st.get("task") == "diagnosis":
+        cmd += ["--capture-final-as", "DIAGNOSIS.md"]
+    if st.get("dry_run"):
+        print("\n" + "=" * 72)
+        print("DRY-RUN: preflight GO reached. Would enqueue (not submitted):")
+        print("  " + " ".join(shlex.quote(c) for c in cmd))
+        print("=" * 72)
+        st["stage"] = "enqueue_ready"
+        st["num_ctx"] = num_ctx
+        save_state(wt, st)
+        return
+    rc, out, err = capture(cmd)
+    sys.stdout.write(out)
+    sys.stderr.write(err)
+    if rc != 0:
+        die(f"enqueue failed (rc={rc}); NOT recording as enqueued.", rc or 1)
+    # best-effort id extraction
+    jid = None
+    m = re.search(r"\b([0-9a-f]{8,})\b", out)
+    if m:
+        jid = m.group(1)
+    st["stage"] = "enqueued"
+    st["job_id"] = jid
+    st["num_ctx"] = num_ctx
+    save_state(wt, st)
+    print("\n" + "=" * 72)
+    print("ENQUEUED.")
+    if jid:
+        print(f"  job id : {jid}")
+    print(f"  livelog: ~/.ollama-queue/logs/<id>.log  (see `ollama-queue.py status`)")
+    print(f"  review after completion: ollama-dispatch-preflight {wt} --review")
+    print("=" * 72)
+
+
+# ---------------------------------------------------------------------------
+# preflight
+# ---------------------------------------------------------------------------
+def run_preflight(wt, st, no_refimpl=False):
+    wt = Path(wt).resolve()
+    cmd = [str(PREFLIGHT), str(wt)]
+    if no_refimpl or not st.get("refimpl_cmd"):
+        cmd += ["--no-refimpl"]
+    else:
+        cmd += ["--refimpl-cmd", st["refimpl_cmd"]]
+    for r in st.get("require", []):
+        cmd += [f"--require={r}"]
+    rc = run(cmd)
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# SETUP
+# ---------------------------------------------------------------------------
+def do_setup(a):
+    model, host = load_defaults()
+    if a.model:
+        model = a.model
+    if a.host:
+        host = a.host
+
+    if not a.label:
+        base = a.target or a.symbol or a.anchor or "dispatch"
+        a.label = re.sub(r"[^A-Za-z0-9._-]+", "-",
+                         Path(base).stem or "dispatch").strip("-") or "dispatch"
+
+    wt_base = Path(os.environ.get("OLLAMA_DISPATCH_WORKTREES",
+                                  CONFIG_DIR / "worktrees"))
+    if a.new_project:
+        # scaffold roots a --new-project AT the given dir and ignores --dest;
+        # track the worktree where scaffold really puts it so the post-scaffold
+        # wt.is_dir() check (and the saved state) point at the real tree.
+        wt = Path(a.new_project).expanduser().resolve()
+    else:
+        wt = (Path(a.dest) if a.dest else wt_base / f"wt-{a.label}").resolve()
+
+    is_diag = (a.task == "diagnosis")
+
+    if not is_diag and not a.refimpl_cmd:
+        die("code-fix dispatch needs --refimpl-cmd (the gate's both-ways proof). "
+            "For an investigation use --task diagnosis.")
+
+    # 1. scaffold
+    rc = run(build_scaffold_cmd(a, wt))
+    if rc != 0:
+        die(f"scaffold failed (rc={rc})", rc or 1)
+    if not wt.is_dir():
+        die(f"scaffold did not produce the expected worktree at {wt}")
+
+    # populate Must-contain from --require so both the draft gate and preflight's
+    # benign-verify check hold the refimpl against a real literal list.
+    ensure_must_contain(wt, a.require or [])
+    requires = a.require or parse_must_contain(wt)[:1]
+
+    # freeze the literals into check_literals.py so the verify actually asserts
+    # them -- without this the verify prints "no frozen literals", FAILs its
+    # literal section regardless of the code, and is neither discriminating nor
+    # able to pass with the refimpl (the draft gate would never converge).
+    if not is_diag and requires:
+        rc = run([str(SCAFFOLD), "--freeze-literals", str(wt)])
+        if rc != 0:
+            die(f"freeze-literals failed (rc={rc})", rc or 1)
+
+    st = {
+        "worktree": str(wt),
+        "label": a.label,
+        "task": a.task or "code",
+        "lang": a.lang,
+        "target": a.target,
+        "model": model,
+        "host": host,
+        "refimpl_cmd": a.refimpl_cmd,
+        "require": requires,
+        "num_ctx": a.num_ctx,   # None => fit at enqueue
+        "task_kind": "coding",
+        "dry_run": bool(a.dry_run),
+        "stage": "scaffolded",
+    }
+    save_state(wt, st)
+
+    # --split-pure: ALSO emit the integration-shell checklist + auto-register the
+    # pending-fix live-validation item. The PURE core continues through the full
+    # relevance gate + PAUSE below -- this changes only what is ALSO produced.
+    if getattr(a, "split_pure", False):
+        if is_diag:
+            die("--split-pure is for a code fix (pure core + hand-applied shell); "
+                "it is meaningless with --task diagnosis.")
+        emit_split_pure_artifacts(a, wt, st)
+
+    if is_diag:
+        # No adversarial cases, no refimpl, no relevance gate -> no human pause.
+        return diagnosis_chain(wt, st, a)
+
+    # 2. draft the cases (local model or --drafter-cmd stub); gate bounces bad ones
+    dcmd = [str(DRAFT), str(wt), "--refimpl-cmd", a.refimpl_cmd,
+            "--model", model, "--host", host]
+    if a.drafter_cmd:
+        dcmd += ["--drafter-cmd", a.drafter_cmd]
+    if a.num_ctx:
+        dcmd += ["--num-ctx", str(a.num_ctx)]
+    rc = run(dcmd)
+    if rc != 0:
+        die(f"draft did not converge (rc={rc}); read the drafter output above. "
+            f"State saved -- fix and re-run the same setup command.", rc or 1)
+    st["stage"] = "drafted"
+    save_state(wt, st)
+
+    # 3. PAUSE at the one irreducible human gate.
+    fixture = None
+    for name in ("test_fixture.py", "verify.test.ts", "verify_impl.mjs",
+                 "verify_impl.mts"):
+        if (wt / name).is_file():
+            fixture = wt / name
+            break
+    if fixture is None:
+        cands = (list(wt.glob("*.py")) + list(wt.glob("*.mjs"))
+                 + list(wt.glob("*.ts")) + list(wt.glob("*.mts")))
+        fixture = next((c for c in cands
+                        if "CASES" in c.read_text(errors="replace")
+                        or "CASES_AUTHORED" in c.read_text(errors="replace")),
+                       None)
+    print("\n" + "#" * 72)
+    print("#  PAUSE -- HUMAN RELEVANCE GATE (the one step nothing can mechanise)")
+    print("#" * 72)
+    print(f"#  Drafted cases + refimpl are in the worktree:")
+    print(f"#    cases  : {fixture if fixture else '(fixture with the CASES list)'}")
+    print(f"#    refimpl: run via {a.refimpl_cmd!r}")
+    print("#")
+    print("#  READ EACH CASE and ask: \"could this pass on BROKEN work?\"")
+    print("#  The gate proves cases DISCRIMINATE; only you can prove they are")
+    print("#  RELEVANT. A case that fails at baseline and asserts every literal")
+    print("#  can still test the wrong property entirely.")
+    print("#")
+    print("#  When satisfied, resume the WHOLE rest of the chain with ONE command:")
+    print("#")
+    print(f"#      ollama-dispatch --confirm {wt}")
+    print("#")
+    print("#  (confirms the draft, freezes literals, seals the baseline, preflights,")
+    print("#   and enqueues on GO. It will NOT enqueue on a NO-GO.)")
+    print("#" * 72)
+    return 0
+
+
+def diagnosis_chain(wt, st, a):
+    """scaffold -> seal -> (preflight --no-refimpl) -> enqueue, no pause."""
+    print("\n[diagnosis] no adversarial cases / refimpl -> no human relevance gate.")
+    # seal (only meaningful for a --repo worktree; harmless/idempotent otherwise)
+    if a.repo:
+        rc = run([str(SCAFFOLD), "--seal-baseline", str(wt)])
+        if rc != 0:
+            die(f"seal-baseline failed (rc={rc})", rc or 1)
+    st["stage"] = "sealed"
+    save_state(wt, st)
+    # optional preflight timing (no refimpl for a read-only investigation)
+    rc = run_preflight(wt, st, no_refimpl=True)
+    if rc == 2:
+        die("preflight usage/environment error", 2)
+    if rc != 0:
+        # a diagnosis preflight --no-refimpl is UNPROVEN by design; verify-timing
+        # failure is the only hard stop worth blocking on.
+        print("\n[diagnosis] preflight reported NO-GO/UNPROVEN. For a diagnosis this "
+              "is the expected UNPROVEN (no refimpl). Proceeding to enqueue only if "
+              "verify-timing passed; otherwise stopping.")
+        # Re-run json to distinguish a timing failure from the expected UNPROVEN.
+        rcj, out, _ = capture([str(PREFLIGHT), str(wt), "--no-refimpl", "--json"])
+        try:
+            data = json.loads(out)
+            hard = [b for b in data.get("blockers", [])
+                    if b.get("check") not in ("refimpl-proves", "no-refimpl",
+                                              "both-ways", "relevance")]
+        except Exception:
+            hard = [{"check": "parse-error"}]
+        if hard:
+            die("diagnosis preflight has a HARD blocker (not the expected UNPROVEN): "
+                + ", ".join(b.get("check", "?") for b in hard), 1)
+    st["stage"] = "preflight_go"
+    save_state(wt, st)
+    enqueue(wt, st)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# RESUME (--confirm)
+# ---------------------------------------------------------------------------
+def do_confirm(wt):
+    wt = Path(wt).resolve()
+    if not wt.is_dir():
+        die(f"no such worktree: {wt}")
+    st = load_state(wt)
+    if not st:
+        die(f"no orchestrator state ({STATE_NAME}) in {wt} -- was this set up by "
+            "ollama-dispatch?")
+    if st.get("task") == "diagnosis":
+        die("this is a diagnosis dispatch -- it was enqueued in one shot at setup; "
+            "there is nothing to --confirm.")
+    if st.get("stage") == "enqueued":
+        die(f"already enqueued (job {st.get('job_id')}); nothing to resume. "
+            "Re-scaffold for a fresh dispatch.", 0)
+
+    # 4. confirm the draft. draft --confirm exits 1 with "nothing to confirm"
+    #    when the marker is already gone (a resumed --confirm) -- that is the
+    #    idempotent success case, not a failure. Only a still-present marker is.
+    print(f"\n$ {DRAFT} {wt} --confirm")
+    rc, out, err = capture([str(DRAFT), str(wt), "--confirm"])
+    sys.stdout.write(out)
+    sys.stderr.write(err)
+    if rc != 0 and _has_unconfirmed_marker(wt):
+        die(f"draft --confirm failed (rc={rc}) and an unconfirmed draft remains", rc)
+    st["stage"] = "confirmed"
+    save_state(wt, st)
+
+    # 5. freeze literals (skip if setup already froze -- freeze-literals is NOT
+    #    idempotent: it expects the scaffold's multi-line placeholder and errors
+    #    on an already-collapsed `LITERALS = [[...]]`), then seal (idempotent).
+    cl = Path(wt) / "check_literals.py"
+    already_frozen = cl.is_file() and "LITERALS = [[" in cl.read_text(errors="replace")
+    if already_frozen:
+        print(f"\n(freeze-literals: already frozen in {cl.name}, skipping)")
+    else:
+        rc = run([str(SCAFFOLD), "--freeze-literals", str(wt)])
+        if rc != 0:
+            die(f"freeze-literals failed (rc={rc})", rc or 1)
+    rc = run([str(SCAFFOLD), "--seal-baseline", str(wt)])
+    if rc != 0:
+        die(f"seal-baseline failed (rc={rc})", rc or 1)
+    st["stage"] = "sealed"
+    save_state(wt, st)
+
+    # 6. preflight -- the GO/NO-GO gate. NEVER enqueue on NO-GO.
+    rc = run_preflight(wt, st)
+    if rc == 2:
+        die("preflight usage/environment error", 2)
+    if rc != 0:
+        print("\n" + "!" * 72)
+        print("!  PREFLIGHT NO-GO -- STOPPING. Nothing was enqueued.")
+        print("!  Fix the failing check named above, then re-run:")
+        print(f"!      ollama-dispatch --confirm {wt}")
+        print("!" * 72)
+        sys.exit(1)
+    st["stage"] = "preflight_go"
+    save_state(wt, st)
+
+    # 7. enqueue
+    enqueue(wt, st)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Feature #1: --from-diagnosis  (seed a FIX dispatch from a completed DIAGNOSIS.md)
+# ---------------------------------------------------------------------------
+# CONSERVATIVE extraction: only what the diagnosis states verbatim is pre-filled.
+# The fix CONTRACT (property / symbol|anchor / require / refimpl) is never guessed --
+# a fabricated target or property is worse than an empty one, and the property is the
+# human judgement the whole pipeline exists to protect.
+
+_SECTION_RE = re.compile(r"^##+\s*(.+?)\s*$", re.M)
+_PATHLINE_RE = re.compile(r"([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+):(\d+)")
+
+
+def _diag_sections(text):
+    """Split a DIAGNOSIS.md into {heading_lower: body} by `## ` headings."""
+    out, cur, buf = {}, None, []
+    for line in text.splitlines():
+        m = _SECTION_RE.match(line)
+        if m:
+            if cur is not None:
+                out[cur] = "\n".join(buf).strip()
+            cur = m.group(1).strip().lower()
+            buf = []
+        elif cur is not None:
+            buf.append(line)
+    if cur is not None:
+        out[cur] = "\n".join(buf).strip()
+    return out
+
+
+def _diag_id(text, wt):
+    """The diagnosis id: from a `# Diagnosis — <id>` title, else the worktree name."""
+    m = re.search(r"^#\s+Diagnosis\s*[—:-]+\s*(.+?)\s*$", text, re.M | re.I)
+    if m:
+        return m.group(1).strip()
+    base = Path(wt).name
+    return re.sub(r"^wt-", "", base) or base
+
+
+def _extract_defect(sections, diag_id):
+    """The observed/confirmed symptom, prefixed `confirmed (from diagnosis <id>): `.
+
+    Prefer an explicit `Confirmed ...` evidence line (the observed snapshot); else
+    fall back to the first sentence of Root cause. Never invents a symptom."""
+    body = None
+    # 1. an explicit Confirmed... line anywhere (evidence snapshot is the best symptom).
+    for _, sec in sections.items():
+        for line in sec.splitlines():
+            s = line.strip().lstrip("-* ").strip()
+            if re.match(r"(?i)^confirmed\b", s):
+                body = s
+                break
+        if body:
+            break
+    # 2. fall back to the first sentence of Root cause.
+    if not body:
+        rc = sections.get("root cause", "")
+        # first non-empty prose sentence (skip fenced code)
+        prose, in_code = [], False
+        for line in rc.splitlines():
+            if line.strip().startswith("```"):
+                in_code = not in_code
+                continue
+            if in_code:
+                continue
+            if line.strip():
+                prose.append(line.strip())
+        joined = " ".join(prose)
+        m = re.search(r"(.+?[.!?])(\s|$)", joined)
+        body = (m.group(1) if m else joined).strip()
+    if not body:
+        return None
+    # collapse markdown emphasis/backticks whitespace but keep the literal tokens.
+    body = re.sub(r"\s+", " ", body).strip()
+    return f"confirmed (from diagnosis {diag_id}): {body}"
+
+
+def _extract_change_site(sections):
+    """Return (target, entry_point) from the SAME first `path:NN` -- preferring the
+    Fix sketch section (what the diagnosis says to CHANGE), else Root cause. Both
+    fields derive from one match so target and entry-point can never disagree, and
+    nothing is fabricated: if no `path:NN` exists, returns (None, None)."""
+    for key in ("fix sketch", "fix sketch (do not apply)"):
+        for k, sec in sections.items():
+            if k.startswith("fix sketch"):
+                m = _PATHLINE_RE.search(sec)
+                if m:
+                    return m.group(1), f"{m.group(1)}:{m.group(2)}"
+                break
+        break
+    rc = sections.get("root cause", "")
+    m = _PATHLINE_RE.search(rc)
+    if m:
+        return m.group(1), f"{m.group(1)}:{m.group(2)}"
+    return None, None
+
+
+def prep_from_diagnosis(a):
+    diag_wt = Path(a.from_diagnosis).expanduser().resolve()
+    dfile = diag_wt / "DIAGNOSIS.md"
+    if not dfile.is_file():
+        die(f"--from-diagnosis: no DIAGNOSIS.md in {diag_wt}")
+    text = dfile.read_text(errors="replace")
+    sections = _diag_sections(text)
+    diag_id = _diag_id(text, diag_wt)
+    defect = _extract_defect(sections, diag_id)
+    target, entry_point = _extract_change_site(sections)
+
+    # Pre-fill ONLY where the operator did not already override.
+    if defect and not a.defect:
+        a.defect = defect
+    if target and not a.target:
+        a.target = target
+    if entry_point and not a.entry_point:
+        a.entry_point = entry_point
+    if not a.label:
+        a.label = re.sub(r"[^A-Za-z0-9._-]+", "-",
+                         f"fix-{diag_id}").strip("-") or "fix-from-diagnosis"
+
+    # Echo, clearly labelled.
+    print("=" * 72)
+    print(f"[from diagnosis] {dfile}")
+    print(f"  diagnosis id   : {diag_id}")
+    print(f"  [from diagnosis] --target      : {a.target or '(none found — you must supply --target)'}")
+    print(f"  [from diagnosis] --entry-point : {a.entry_point or '(none found — supply --entry-point)'}")
+    print(f"  [from diagnosis] --defect      :")
+    print(f"      {a.defect or '(none found — you must supply --defect)'}")
+    print("  ---")
+    print("  [you must supply] the FIX CONTRACT (never inferred from a diagnosis):")
+    print(f"    --property     : {a.property or '(MISSING)'}")
+    sym = a.symbol or (f'--anchor {a.anchor}' if a.anchor else None)
+    print(f"    --symbol/anchor: {sym or '(MISSING)'}")
+    print(f"    --require      : {', '.join(a.require) if a.require else '(MISSING)'}")
+    print(f"    --refimpl-cmd  : {a.refimpl_cmd or '(MISSING)'}")
+    print("=" * 72)
+
+    # Refuse to proceed if any contract field (or an extracted essential) is missing.
+    missing = []
+    if not a.target:
+        missing.append("--target (no change site in the diagnosis; name the file to edit)")
+    if not a.defect:
+        missing.append("--defect (no symptom extractable; state the confirmed symptom)")
+    if not a.property:
+        missing.append("--property (what the change must satisfy — the human judgement)")
+    if not (a.symbol or a.anchor):
+        missing.append("--symbol S  (or  --kind expression --anchor A)")
+    if not a.require:
+        missing.append("--require '<literal the fix introduces>' (repeatable)")
+    if not a.refimpl_cmd:
+        missing.append("--refimpl-cmd '<the both-ways proof>'")
+    if not a.lang:
+        missing.append("--lang <python|ts|swift>")
+    if not (a.repo or a.new_project):
+        missing.append("--repo <path to the app repo>")
+    if missing:
+        print("\nollama-dispatch --from-diagnosis: NOT scaffolding — the fix contract "
+              "is incomplete.", file=sys.stderr)
+        print("Missing (you must supply these — a diagnosis never defines the fix):",
+              file=sys.stderr)
+        for m in missing:
+            print(f"  - {m}", file=sys.stderr)
+        # Re-run command with what we DO have pre-filled.
+        parts = [Path(sys.argv[0]).name, "--from-diagnosis", str(diag_wt)]
+        if a.repo:
+            parts += ["--repo", a.repo]
+        parts += ["--lang", a.lang or "<lang>"]
+        if a.target:
+            parts += ["--target", a.target]
+        if a.entry_point:
+            parts += ["--entry-point", a.entry_point]
+        parts += ["--property", a.property or "<what the change must satisfy>",
+                  "--symbol", a.symbol or "<Symbol>",
+                  "--require", (a.require[0] if a.require else "<literal>"),
+                  "--refimpl-cmd", a.refimpl_cmd or "<cmd>"]
+        print("\nRe-run (fill the <...> you own):", file=sys.stderr)
+        print("  " + " ".join(shlex.quote(p) for p in parts), file=sys.stderr)
+        sys.exit(1)
+
+    print("[from diagnosis] contract complete — handing off to the normal setup path "
+          "(scaffold → draft → relevance-gate PAUSE).")
+
+
+# ---------------------------------------------------------------------------
+# Feature #2: --split-pure  (INTEGRATION-SHELL.md + auto ledger entry)
+# ---------------------------------------------------------------------------
+LEDGER = BIN / "live-validation-ledger.py"
+
+
+def emit_split_pure_artifacts(a, wt, st):
+    """Emit INTEGRATION-SHELL.md and register a pending-fix live-validation item.
+
+    The PURE core still goes through the full relevance gate + PAUSE (this only
+    changes what is ALSO produced). Called right after the scaffold succeeds."""
+    wt = Path(wt)
+    shell_files = a.shell_file or []
+    note = a.shell_note or ""
+
+    # 1. INTEGRATION-SHELL.md -- the standing reminder that CANNOT be forgotten.
+    lines = [
+        f"# Integration shell — {a.label}",
+        "",
+        "> ⚠️ **NOT COVERED BY THE VERIFY.** The dispatched PURE core is fixture-gated;",
+        "> this integration shell (browser context / cross-frame / live-wiring / a",
+        "> call-site signature change) is hand-applied by the operator and **no static",
+        "> fixture can exercise it**. It MUST be live-validated after it ships — a green",
+        "> dispatch verify says NOTHING about this shell.",
+        "",
+        "## Files the hand-applied shell edits",
+        "",
+    ]
+    if shell_files:
+        for f in shell_files:
+            lines.append(f"- [ ] `{f}`")
+    else:
+        lines.append("- [ ] TODO — name the file(s) the shell wires up (`--shell-file`).")
+    lines += [
+        "",
+        "## Wiring to add",
+        "",
+        (note if note else
+         "TODO — describe the wiring (the call-site change / cross-frame plumbing) "
+         "the pure core needs. Left blank at dispatch time; fill before hand-applying."),
+        "",
+        "## Live validation (REQUIRED — auto-registered in the ledger)",
+        "",
+        "This shell is tracked as a `pending-fix` item in the live-validation ledger.",
+        "After you hand-apply it and it ships, observe the live behaviour and mark it:",
+        "",
+        f"    live-validation-ledger.py pass <id>   # once the wired behaviour is observed live",
+        f"    live-validation-ledger.py list        # see the pending item",
+        "",
+    ]
+    (wt / "INTEGRATION-SHELL.md").write_text("\n".join(lines) + "\n")
+    print(f"  emitted INTEGRATION-SHELL.md ({len(shell_files)} shell file(s) listed; "
+          f"NOT covered by verify — live-validation required)")
+
+    # 2. auto-register the pending-fix live-validation ledger entry.
+    repo_name = Path(a.repo).name if a.repo else (a.label or "dispatch")
+    what = (note or
+            f"the hand-applied integration shell for {a.label} behaves correctly live "
+            f"(the dispatch verify does NOT cover it)")
+    how = ("observe the wired behaviour live (browser/cross-frame/call-site) — the "
+           "static fixture cannot exercise it; " +
+           (f"shell files: {', '.join(shell_files)}" if shell_files
+            else "see INTEGRATION-SHELL.md"))
+    # Deterministic id so a re-run of setup does not double-register.
+    lid = re.sub(r"[^A-Za-z0-9]+", "", f"split{a.label}")[:12] or _gen_split_id(a.label)
+    ledger_cmd = [sys.executable, str(LEDGER), "add",
+                  "--repo", repo_name, "--label", a.label,
+                  "--what", what, "--how", how, "--pending-fix",
+                  "--id", lid,
+                  "--note", "integration shell hand-applied OUTSIDE the verify; "
+                            "see INTEGRATION-SHELL.md in the dispatch worktree"]
+    rc, out, err = capture(ledger_cmd)
+    sys.stdout.write(out)
+    if err:
+        sys.stderr.write(err)
+    if rc == 0:
+        st["ledger_id"] = lid
+        print(f"  registered live-validation ledger item [{lid}] (pending-fix)")
+    elif "already exists" in (out + err):
+        st["ledger_id"] = lid
+        print(f"  live-validation ledger item [{lid}] already registered (re-run) — skipping")
+    else:
+        # Non-fatal: the pure-core dispatch must still proceed. Warn loudly.
+        print(f"  WARNING: could not register live-validation ledger item (rc={rc}); "
+              "register it by hand so the shell isn't forgotten.", file=sys.stderr)
+    save_state(wt, st)
+
+
+def _gen_split_id(label):
+    import hashlib
+    return "split" + hashlib.sha1((label or "").encode()).hexdigest()[:7]
+
+
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ollama-dispatch",
+        description="One-command orchestrator for the verify-gated local dispatch "
+                    "pipeline. Setup runs scaffold+draft and pauses at the human "
+                    "relevance gate; `--confirm <wt>` resumes through enqueue.")
+    ap.add_argument("--confirm", metavar="WORKTREE",
+                    help="resume a paused code-fix dispatch: confirm the draft, "
+                         "freeze, seal, preflight, enqueue.")
+    ap.add_argument("--from-diagnosis", dest="from_diagnosis", metavar="DIAG_WT",
+                    help="seed a FIX dispatch from a completed DIAGNOSIS.md in the "
+                         "given diagnosis worktree: pre-fills --target, --entry-point "
+                         "and --defect from what the diagnosis states verbatim. You "
+                         "still supply the fix contract (--property, --symbol/--anchor, "
+                         "--require, --refimpl-cmd); it REFUSES to fabricate those.")
+    # --split-pure: a fix that is a fixture-gateable PURE core + a NOT-gateable
+    # integration shell (browser/cross-frame/live-wiring/call-site). The pure core
+    # is dispatched + gated as normal; ALSO emits INTEGRATION-SHELL.md and auto-
+    # registers a pending-fix live-validation ledger entry for the hand-applied shell.
+    ap.add_argument("--split-pure", action="store_true", dest="split_pure",
+                    help="the fix splits into a gateable PURE core (dispatched as "
+                         "normal) + a NOT-gateable integration shell you hand-apply. "
+                         "Also emits INTEGRATION-SHELL.md and registers a pending-fix "
+                         "live-validation ledger item so the shell can't be forgotten.")
+    ap.add_argument("--shell-file", dest="shell_file", action="append",
+                    help="(with --split-pure) a file the hand-applied integration "
+                         "shell edits; listed in INTEGRATION-SHELL.md (repeatable).")
+    ap.add_argument("--shell-note", dest="shell_note",
+                    help="(with --split-pure) what the integration shell wires up; "
+                         "seeds INTEGRATION-SHELL.md and the ledger item's `what`.")
+    # scaffold passthrough
+    ap.add_argument("--repo")
+    ap.add_argument("--new-project", dest="new_project")
+    ap.add_argument("--dest")
+    ap.add_argument("--target")
+    ap.add_argument("--lang", choices=["python", "swift", "typescript", "ts",
+                                       "js", "javascript"])
+    ap.add_argument("--kind", choices=["symbol", "expression"])
+    ap.add_argument("--symbol")
+    ap.add_argument("--anchor")
+    ap.add_argument("--ts-runner", dest="ts_runner",
+                    choices=["auto", "tsx", "node-test"])
+    ap.add_argument("--test-file", dest="test_file", action="append")
+    ap.add_argument("--edit-file", dest="edit_file", action="append")
+    ap.add_argument("--entry-point", dest="entry_point")
+    ap.add_argument("--defect")
+    ap.add_argument("--property")
+    ap.add_argument("--task", choices=["merge", "diagnosis"])
+    ap.add_argument("--force", action="store_true")
+    # orchestration
+    ap.add_argument("--label")
+    ap.add_argument("--model")
+    ap.add_argument("--host")
+    ap.add_argument("--refimpl-cmd", dest="refimpl_cmd")
+    ap.add_argument("--drafter-cmd", dest="drafter_cmd")
+    ap.add_argument("--require", action="append",
+                    help="a literal the fix introduces; written into TASK.md's "
+                         "Must-contain and asserted by preflight (repeatable).")
+    ap.add_argument("--num-ctx", dest="num_ctx", type=int,
+                    help="explicit start context window; omit to fit the target file.")
+    ap.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="run the whole chain through a REAL preflight GO but print "
+                         "the enqueue command instead of submitting it (no GPU).")
+    a = ap.parse_args()
+
+    if a.confirm:
+        return do_confirm(a.confirm)
+
+    if a.from_diagnosis:
+        # Pre-fills a.target/a.entry_point/a.defect from the diagnosis, validates
+        # that the operator supplied the fix contract, then falls through to the
+        # normal setup path (or exits non-zero WITHOUT scaffolding if incomplete).
+        prep_from_diagnosis(a)
+
+    if not a.lang:
+        die("setup needs --lang (or use --confirm <wt> to resume).")
+    if not (a.repo or a.new_project):
+        die("setup needs --repo <path> (or --new-project <dir>).")
+    # normalise lang alias for our own fit (scaffold accepts the aliases itself)
+    return do_setup(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

@@ -1,0 +1,152 @@
+{
+ "verdict": "concerns",
+ "issues": [
+  {
+   "severity": "medium",
+   "file": "lib/bfmrLinkReconcile.ts",
+   "line": 0,
+   "what": "The original global deduplication by trackingNumber is removed, allowing multiple links with the sam",
+   "source": "review",
+   "category": "code",
+   "uncertain": true,
+   "reviewer_severity": "high"
+  }
+ ],
+ "counts": {
+  "code_high": 0,
+  "code": 1,
+  "input": 0,
+  "total": 1
+ },
+ "not_checked": [],
+ "review_verdict": "PASS WITH CAVEATS",
+ "verify_exit_reported": 0,
+ "verify_quality_exit": 0,
+ "diff_source": "git diff HEAD",
+ "launch_baseline": {
+  "head": "033db3ce74e3a246728259eb221d9999dbc4033d",
+  "dirty": 0
+ },
+ "baseline_at": "launch",
+ "verify_relevance": {
+  "verdict": "relevant",
+  "score": 0.957,
+  "threshold": 0.8,
+  "mutant_score": 0.957,
+  "site_score": 0.987,
+  "site_coverage": 1.0,
+  "killed": 22,
+  "survived": 1,
+  "evidence_mutants": 23,
+  "generated": 24,
+  "literal_breaking": 1,
+  "crash_kills": 0,
+  "truncated": false,
+  "untried_sites": [],
+  "unexercised_sites": [],
+  "reason": "verify killed 22/23 property-breaking mutants of the reference impl",
+  "seconds": 41.56,
+  "survivors": [
+   {
+    "file": "lib/bfmrLinkReconcile.ts",
+    "line": 56,
+    "class": "compare-flip",
+    "mutation": "< -> <=",
+    "snippet": "if (!existing || l.id <= existing.id) byReservation.set(l.reservationId, l);"
+   }
+  ],
+  "source": "gate-applied",
+  "verify": "bash verify.sh"
+ },
+ "review_tier": "pregate",
+ "review_model": "qwen3:14b",
+ "review_host": "unraid",
+ "review": "done",
+ "review_label": "gate-143d9acfe43a",
+ "review_dir": "/Users/user/bin/ollama-queue-logs/143d9acfe43a-review",
+ "job_id": "143d9acfe43a",
+ "ts": "2026-10-03T21:41:55Z",
+ "advisory": true,
+ "job_status": "done",
+ "job_label": "replay-endorse-s2-per-reservation-collapse",
+ "job_model": "qwen3.6-35b-a3b-vl-mtp-mxfp8",
+ "job_cwd": "/Users/user/.ollama-dispatch/worktrees/wt-slice-replay-endorse-s2-per-reservation-collapse",
+ "job_host": "studio",
+ "job_verify": "bash verify.sh",
+ "job_exit_code": 0,
+ "verify_failed_at_baseline": true,
+ "job_preflight": "preflight-verify-ok (baseline fails as designed)",
+ "scored_arm": false,
+ "task_intent": "TASK: replay-endorse-s2-per-reservation-collapse",
+ "signoff_required": false,
+ "signoff_reviewer": "",
+ "signoff_verdict": null,
+ "pregate_verdict": "pass",
+ "pregate_review_verdict": "PASS",
+ "regate": "done",
+ "regate_label": "regate-143d9acfe43a",
+ "gate_authority": "studio-27b-regate",
+ "auto_fix_class": "undecidable",
+ "auto_fix_action": "escalate",
+ "auto_fix_reasons": [
+  "verdict=concerns; findings from review are not a decidable, model-actionable failure"
+ ],
+ "auto_fix_round": 0,
+ "auto_fix_root": "143d9acfe43a",
+ "auto_fix_mode": "live",
+ "models_tried": [
+  "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+ ],
+ "auto_fix_history": "repair history: r0=1 finding(s) [review]; models tried: qwen3.6-35b-a3b-vl-mtp-mxfp8",
+ "auto_fix_escalate_category": "other",
+ "auto_fix_escalate_cmd": [
+  "python3",
+  "/Users/user/bin/ollama-queue.py",
+  "escalate",
+  "143d9acfe43a",
+  "--reason",
+  "verdict=concerns; findings from review are not a decidable, model-actionable failure | repair history: r0=1 finding(s) [review]; models tried: qwen3.6-35b-a3b-vl-mtp-mxfp8",
+  "--category",
+  "other",
+  "--coordinator-model",
+  "auto-fix-ladder",
+  "--gate-output",
+  "/Users/user/bin/ollama-queue-logs/143d9acfe43a.gate.json"
+ ],
+ "auto_fix_escalated": true,
+ "auto_fix_escalate_status": "parked-needs_opus",
+ "auto_pipeline_stage": "code",
+ "auto_pipeline_action": "none",
+ "auto_pipeline_policy": null,
+ "auto_pipeline_reasons": [
+  "coding job not a clean terminal PASS; nothing to apply"
+ ],
+ "auto_pipeline_mode": "shadow",
+ "slice_autofeed": {
+  "action": "redispatch",
+  "reason": "slice job of plan 'replay-endorse' reached RED verdict 'concerns' (verify not green) -- re-dispatching the owning plan so its bounded retry / needs_opus escalation runs instead of parking the slice dead"
+ },
+ "runstatus_janitor_mode": "shadow",
+ "runstatus_janitor": {
+  "self": {
+   "action": "surface",
+   "category": "live",
+   "reason": "status 'needs_opus' is not terminal (live/active chain)"
+  },
+  "superseded": [
+   {
+    "id": "d8e4ac85fc29",
+    "label": "auto-author-replay-endorse-s2-per-reservation-collapse"
+   },
+   {
+    "id": "390a69c52d23",
+    "label": "auto-refine-replay-endorse-s2-per-reservation-collapse-r1"
+   },
+   {
+    "id": "171bc6bf6517",
+    "label": "auto-author-replay-endorse-s2-per-reservation-collapse"
+   }
+  ]
+ },
+ "runstatus_janitor_done": true
+}

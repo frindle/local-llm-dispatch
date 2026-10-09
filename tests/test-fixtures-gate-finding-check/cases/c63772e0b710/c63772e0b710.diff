@@ -1,0 +1,30 @@
+diff --git a/dashboard_chat.py b/dashboard_chat.py
+index 019043a..1381efe 100644
+--- a/dashboard_chat.py
++++ b/dashboard_chat.py
+@@ -369,10 +369,23 @@ def read_session(base_dir: str, session_id: str) -> dict:
+ def enqueue_job(session_id, message_index):
+     """Enqueue a job via ollama-queue.py --bundle chat."""
+     import subprocess
++    validate_session_id(session_id)
++    base_dir = get_base_dir()
++    sessions_dir = Path(base_dir) / "sessions"
++    session_file = sessions_dir / f"{session_id}.json"
++    session = json.loads(session_file.read_text())
++    messages = session["messages"]
++    user_msg = messages[message_index - 1]
++    user_text = user_msg["content"]
++    task_file = sessions_dir / f"job-{message_index}.task.md"
++    task_file.write_text(user_text)
+     subprocess.run(
+         ["python3", str(Path.home() / "bin" / "ollama-queue.py"), "enqueue",
+-         session_id, str(message_index),
+-         "--bundle", "chat"],
++         "--model", "qwen3.6-35b-a3b-vl-mtp-mxfp8",
++         "--task-file", str(task_file),
++         "--task-kind", "research",
++         "--bundle", "chat",
++         "--label", f"chat-{session_id}-{message_index}"],
+         check=False,
+     )
+ 

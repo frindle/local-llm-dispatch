@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alert Check - Award Search</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; padding: 2rem; }
+        h1 { margin-bottom: 0.5rem; }
+        .nav { display: flex; gap: 2rem; margin-bottom: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 1rem; }
+        .nav a { color: #0066cc; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+        .card { background: white; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .section-title { font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #ddd; }
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; padding: 0.75rem; border-bottom: 2px solid #ddd; color: #666; font-size: 0.875rem; }
+        td { padding: 0.75rem; border-bottom: 1px solid #eee; }
+        .miles { font-weight: bold; color: #0066cc; }
+        .no-results { text-align: center; padding: 2rem; color: #666; }
+        .btn { background: #0066cc; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 1rem; }
+        .btn:hover { background: #0052a3; }
+        .alert-info { margin-bottom: 1rem; }
+        .success-box { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; padding: 1rem; border-radius: 4px; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <nav class="nav">
+            <a href="/">Search</a>
+            <a href="/balances">Balances</a>
+            <a href="/alerts">Alerts</a>
+            <a href="/positioning">Positioning</a>
+            <a href="/settings">Settings</a>
+        </nav>
+
+        <h1>Alert Check Results</h1>
+
+        <div class="card">
+            <div class="alert-info">
+                <strong>{{ alert.origin }} → {{ alert.destination }}</strong> |
+                {{ alert.cabin|title }} |
+                {{ alert.departure_date }}
+            </div>
+
+            {% if results %}
+            {% if alert.notify_pushover %}
+            <div class="success-box">Pushover notification sent for {{ results|length }} result(s)!</div>
+            {% endif %}
+
+            <div class="section-title">Found {{ results|length }} availability options</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Program</th>
+                        <th>Date</th>
+                        <th>Cost (miles)</th>
+                        <th>Seats</th>
+                        <th>Airlines</th>
+                        <th>Direct</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for r in results %}
+                    <tr>
+                        <td>{{ r.source }}</td>
+                        <td>{{ r.date }}</td>
+                        <td class="miles">{{ r.cost|formatnumber }}</td>
+                        <td>{{ r.seats }}</td>
+                        <td>{{ r.airlines|join(', ') if r.airlines else '-' }}</td>
+                        <td>{% if r.direct %}Yes{% else %}No{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="no-results">
+                <p>No availability found for this alert.</p>
+                <p>Alerts check the Seats.aero database. Space may not be released yet or already taken.</p>
+            </div>
+            {% endif %}
+        </div>
+
+        <a href="/alerts" class="btn">Back to Alerts</a>
+    </div>
+</body>
+</html>

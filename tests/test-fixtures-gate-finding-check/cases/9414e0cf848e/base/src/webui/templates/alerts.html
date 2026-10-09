@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alerts - Award Search</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; padding: 2rem; }
+        h1 { margin-bottom: 0.5rem; }
+        .nav { display: flex; gap: 2rem; margin-bottom: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 1rem; }
+        .nav a { color: #0066cc; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+        .card { background: white; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .alert-item { display: flex; justify-content: space-between; align-items: center; padding: 1rem; border-bottom: 1px solid #eee; }
+        .alert-item:last-child { border-bottom: none; }
+        .alert-info { flex: 1; }
+        .alert-route { font-weight: 600; font-size: 1.1rem; }
+        .alert-meta { color: #666; font-size: 0.875rem; margin-top: 0.25rem; }
+        .alert-actions { display: flex; gap: 0.5rem; }
+        .btn { background: #0066cc; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 0.875rem; }
+        .btn:hover { background: #0052a3; }
+        .btn-danger { background: #dc3545; }
+        .btn-danger:hover { background: #c82333; }
+        .btn-small { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+        .message { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; padding: 1rem; border-radius: 4px; margin-bottom: 1rem; }
+        .no-alerts { text-align: center; padding: 2rem; color: #666; }
+        .no-alerts a { color: #0066cc; }
+        .badge { display: inline-block; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: bold; background: #e3f2fd; color: #1565c0; }
+        .badge-enabled { background: #e8f5e9; color: #2e7d32; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <nav class="nav">
+            <a href="/">Search</a>
+            <a href="/balances">Balances</a>
+            <a href="/alerts">Alerts</a>
+            <a href="/positioning">Positioning</a>
+            <a href="/settings">Settings</a>
+        </nav>
+
+        <h1>Award Alerts</h1>
+
+        {% if message %}
+        <div class="message">{{ message }}</div>
+        {% endif %}
+        {% if error %}
+        <div class="error-box">{{ error }}</div>
+        {% endif %}
+
+        {% if alerts %}
+        <div class="card">
+            {% for alert_id, alert in alerts.items() %}
+            <div class="alert-item">
+                <div class="alert-info">
+                    <div class="alert-route">
+                        {{ alert.origin }} → {{ alert.destination }}
+                        <span class="badge">{{ alert.cabin }}</span>
+                        {% if alert.notify_pushover %}
+                        <span class="badge badge-enabled">Pushover</span>
+                        {% endif %}
+                    </div>
+                    <div class="alert-meta">
+                        {{ alert.departure_date }} | {{ alert.programs|join(', ') if alert.programs else 'All programs' }}
+                        | Created {{ alert.created_at[:10] }}
+                        {% if alert.last_checked %}
+                        | Checked {{ alert.last_checked[:19] }}
+                        {% endif %}
+                    </div>
+                </div>
+                <div class="alert-actions">
+                    <form action="/alerts/{{ alert_id }}/check" method="post" style="display: inline;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button type="submit" class="btn btn-small">Check Now</button>
+                    </form>
+                    <form action="/alerts/{{ alert_id }}/delete" method="post" style="display: inline;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this alert?')">Delete</button>
+                    </form>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="card">
+            <div class="no-alerts">
+                <p>No alerts configured.</p>
+                <p>Search for flights and create an alert from the results page.</p>
+                <p><a href="/">Start a search</a></p>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>

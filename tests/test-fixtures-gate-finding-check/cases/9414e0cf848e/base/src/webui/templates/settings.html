@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings - Award Search</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }
+        .container { max-width: 700px; margin: 0 auto; padding: 2rem; }
+        h1 { margin-bottom: 0.5rem; }
+        .nav { display: flex; gap: 2rem; margin-bottom: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 1rem; }
+        .nav a { color: #0066cc; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+        .card { background: white; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .form-group { margin-bottom: 1.5rem; }
+        label { display: block; margin-bottom: 0.25rem; font-size: 0.875rem; color: #666; font-weight: 600; }
+        input { width: 100%; padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px; font-size: 1rem; }
+        input:focus { outline: none; border-color: #0066cc; }
+        input:disabled { background: #f5f5f5; color: #999; }
+        .help { font-size: 0.75rem; color: #999; margin-top: 0.25rem; }
+        .section-title { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #eee; }
+        .configured { color: #5cb85c; font-size: 0.875rem; }
+        .not-configured { color: #f0ad4e; font-size: 0.875rem; }
+        .btn { background: #0066cc; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 4px; cursor: pointer; font-size: 1rem; }
+        .btn:hover { background: #0052a3; }
+        .btn-secondary { background: #6c757d; }
+        .btn-secondary:hover { background: #5a6268; }
+        .status-row { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #f5f5f5; }
+        .status-row:last-child { border-bottom: none; }
+        .success { background: #d4edda; border: 1px solid #c3e6cb; padding: 1rem; border-radius: 4px; margin-bottom: 1rem; color: #155724; }
+        .error-box { background: #f8d7da; border: 1px solid #f5c6cb; padding: 1rem; border-radius: 4px; margin-bottom: 1rem; color: #721c24; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <nav class="nav">
+            <a href="/">Search</a>
+            <a href="/balances">Balances</a>
+            <a href="/alerts">Alerts</a>
+            <a href="/positioning">Positioning</a>
+            <a href="/settings">Settings</a>
+        </nav>
+
+        <h1>Settings</h1>
+
+        {% if request.query_params.get('error') %}
+        <div class="error-box">Invalid request. Please try again.</div>
+        {% endif %}
+        {% if request.query_params.get('saved') %}
+        <div class="success">Settings saved successfully.</div>
+        {% endif %}
+
+        <div class="card">
+            <div class="section-title">Current Status</div>
+            <div class="status-row">
+                <span>Seats.aero</span>
+                <span class="{% if configured.seats_aero %}configured{% else %}not-configured{% endif %}">
+                    {% if configured.seats_aero %}✓ Configured{% else %}Not configured{% endif %}
+                </span>
+            </div>
+            <div class="status-row">
+                <span>AwardWallet</span>
+                <span class="{% if configured.awardwallet %}configured{% else %}not-configured{% endif %}">
+                    {% if configured.awardwallet %}✓ Configured{% else %}Not configured{% endif %}
+                </span>
+            </div>
+            <div class="status-row">
+                <span>SerpAPI</span>
+                <span class="{% if configured.serpapi %}configured{% else %}not-configured{% endif %}">
+                    {% if configured.serpapi %}✓ Configured{% else %}Not configured{% endif %}
+                </span>
+            </div>
+            <div class="status-row">
+                <span>Pushover</span>
+                <span class="{% if configured.pushover %}configured{% else %}not-configured{% endif %}">
+                    {% if configured.pushover %}✓ Configured{% else %}Not configured{% endif %}
+                </span>
+            </div>
+        </div>
+
+        <div class="card">
+            <form action="/settings/save" method="post">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <div class="section-title">API Keys</div>
+
+                <div class="form-group">
+                    <label for="seats_aero_api_key">Seats.aero API Key</label>
+                    <input type="password" id="seats_aero_api_key" name="seats_aero_api_key"
+                           placeholder="{% if configured.seats_aero %}Configured (enter new value to change){% else %}Enter your Seats.aero API key{% endif %}">
+                    <div class="help">Get from <a href="https://seats.aero/settings" target="_blank">seats.aero/settings</a>. Required for award search.</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="awardwallet_api_key">AwardWallet API Key</label>
+                    <input type="password" id="awardwallet_api_key" name="awardwallet_api_key"
+                           placeholder="{% if configured.awardwallet %}Configured (enter new value to change){% else %}Enter your AwardWallet API key{% endif %}">
+                    <div class="help">Get from <a href="https://business.awardwallet.com/profile/api" target="_blank">business.awardwallet.com</a>.</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="awardwallet_user_id">AwardWallet User ID</label>
+                    <input type="text" id="awardwallet_user_id" name="awardwallet_user_id"
+                           value="{{ settings.awardwallet_user_id }}" placeholder="Your AwardWallet user ID">
+                    <div class="help">From your AwardWallet business account URL or API response.</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="serpapi_api_key">SerpAPI Key</label>
+                    <input type="password" id="serpapi_api_key" name="serpapi_api_key"
+                           placeholder="{% if configured.serpapi %}Configured (enter new value to change){% else %}Enter your SerpAPI key{% endif %}">
+                    <div class="help">Get from <a href="https://serpapi.com" target="_blank">serpapi.com</a>. Required for positioning flight search. Free tier: 100 searches/month.</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="pushover_app_token">Pushover App Token</label>
+                    <input type="password" id="pushover_app_token" name="pushover_app_token"
+                           placeholder="{% if configured.pushover %}Configured (enter new value to change){% else %}Enter your Pushover app token{% endif %}">
+                    <div class="help">Create an app at <a href="https://pushover.net/api" target="_blank">pushover.net</a> to get your app token.</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="pushover_user_key">Pushover User Key</label>
+                    <input type="password" id="pushover_user_key" name="pushover_user_key"
+                           placeholder="{% if configured.pushover %}Configured (enter new value to change){% else %}Enter your Pushover user key{% endif %}">
+                    <div class="help">Your Pushover user key from your <a href="https://pushover.net" target="_blank">pushover.net</a> dashboard.</div>
+                </div>
+
+                <div style="display: flex; gap: 1rem;">
+                    <button type="submit" class="btn">Save Settings</button>
+                    <a href="/" class="btn btn-secondary" style="text-decoration: none; display: inline-block; text-align: center;">Cancel</a>
+                </div>
+            </form>
+        </div>
+
+        <div class="card">
+            <div class="section-title">Environment Variables</div>
+            <p style="font-size: 0.875rem; color: #666; margin-bottom: 0.5rem;">
+                You can also set these via environment variables (useful for Docker):
+            </p>
+            <pre style="background: #f5f5f5; padding: 1rem; border-radius: 4px; font-size: 0.75rem; overflow-x: auto;">
+SEATS_AERO_API_KEY=your-key
+AWARDWALLET_API_KEY=your-key
+AWARDWALLET_USER_ID=your-user-id
+SERPAPI_API_KEY=your-key
+PUSHOVER_APP_TOKEN=your-token
+PUSHOVER_USER_KEY=your-key</pre>
+            <div class="help" style="margin-top: 0.5rem;">Environment variables take precedence if set. Saved settings are stored in <code>credentials/settings.json</code>.</div>
+        </div>
+    </div>
+</body>
+</html>

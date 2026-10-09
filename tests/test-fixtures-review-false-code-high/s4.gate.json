@@ -1,0 +1,154 @@
+{
+ "verdict": "fail",
+ "issues": [
+  {
+   "severity": "high",
+   "file": "lib/rivian.ts",
+   "line": 1432,
+   "what": "normalizeRivianServiceState does not validate that input.threads is an array before passing it to pi",
+   "source": "review",
+   "category": "code"
+  }
+ ],
+ "counts": {
+  "code_high": 1,
+  "code": 1,
+  "input": 0,
+  "total": 1
+ },
+ "not_checked": [],
+ "review_verdict": "PASS WITH CAVEATS",
+ "verify_exit_reported": 0,
+ "verify_quality_exit": 0,
+ "diff_source": "git diff HEAD",
+ "launch_baseline": {
+  "head": "e0173bf5bc1d6e15f3546598cc25a4c83900532b",
+  "dirty": 0
+ },
+ "baseline_at": "launch",
+ "verify_relevance": {
+  "verdict": "relevant",
+  "score": 0.975,
+  "threshold": 0.8,
+  "mutant_score": 0.975,
+  "site_score": 0.976,
+  "site_coverage": 1.0,
+  "killed": 39,
+  "survived": 1,
+  "evidence_mutants": 40,
+  "generated": 61,
+  "literal_breaking": 0,
+  "crash_kills": 0,
+  "truncated": true,
+  "untried_sites": [],
+  "unexercised_sites": [],
+  "reason": "verify killed 39/40 property-breaking mutants of the reference impl",
+  "seconds": 46.73,
+  "survivors": [
+   {
+    "file": "lib/rivian.ts",
+    "line": 1455,
+    "class": "boolop-swap",
+    "mutation": "|| -> &&",
+    "snippet": "if (item == null && typeof item !== 'object') continue;"
+   }
+  ],
+  "source": "gate-applied",
+  "verify": "bash verify.sh"
+ },
+ "review_tier": "pregate",
+ "review_model": "qwen3:14b",
+ "review_host": "unraid",
+ "review": "done",
+ "review_label": "gate-5983078bfe69",
+ "review_dir": "/Users/user/bin/ollama-queue-logs/5983078bfe69-review",
+ "job_id": "5983078bfe69",
+ "ts": "2026-10-02T07:38:25Z",
+ "advisory": true,
+ "job_status": "done",
+ "job_label": "ev-service-screen-1-rivian-service-s4-normalize-snapshot",
+ "job_model": "qwen3.6-35b-a3b-vl-mtp-mxfp8",
+ "job_cwd": "/Users/user/.ollama-dispatch/worktrees/wt-slice-ev-service-screen-1-rivian-service-s4-normalize-snapshot",
+ "job_host": "studio",
+ "job_verify": "bash verify.sh",
+ "job_exit_code": 0,
+ "verify_failed_at_baseline": true,
+ "job_preflight": "preflight-verify-ok (baseline fails as designed)",
+ "scored_arm": false,
+ "task_intent": "TASK: ev-service-screen-1-rivian-service-s4-normalize-snapshot",
+ "signoff_required": false,
+ "signoff_reviewer": "",
+ "signoff_verdict": null,
+ "pregate_verdict": "pass",
+ "pregate_review_verdict": "PASS",
+ "regate": "done",
+ "regate_label": "regate-5983078bfe69",
+ "gate_authority": "studio-27b-regate",
+ "auto_fix_class": "reviewer-code-high",
+ "auto_fix_action": "escalate",
+ "auto_fix_reasons": [
+  "reviewer flagged a code high with no red verify (false-FAIL class); GATE_AUTOFIX_TRUST_REVIEWER off"
+ ],
+ "auto_fix_round": 0,
+ "auto_fix_root": "5983078bfe69",
+ "auto_fix_mode": "live",
+ "models_tried": [
+  "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+ ],
+ "auto_fix_history": "repair history: r0=1 finding(s) [review]; models tried: qwen3.6-35b-a3b-vl-mtp-mxfp8",
+ "auto_fix_escalate_category": "other",
+ "auto_fix_escalate_cmd": [
+  "python3",
+  "/Users/user/bin/ollama-queue.py",
+  "escalate",
+  "5983078bfe69",
+  "--reason",
+  "reviewer flagged a code high with no red verify (false-FAIL class); GATE_AUTOFIX_TRUST_REVIEWER off | repair history: r0=1 finding(s) [review]; models tried: qwen3.6-35b-a3b-vl-mtp-mxfp8",
+  "--category",
+  "other",
+  "--coordinator-model",
+  "auto-fix-ladder",
+  "--gate-output",
+  "/Users/user/bin/ollama-queue-logs/5983078bfe69.gate.json"
+ ],
+ "auto_fix_escalated": true,
+ "auto_fix_escalate_status": "parked-needs_opus",
+ "escalation_triage": {
+  "action": "park",
+  "class": "prerequisites-unmet",
+  "reasons": [
+   "verify_relevance has surviving mutants or killed none",
+   "verify_relevance was truncated (partial measurement)"
+  ],
+  "citations": [],
+  "supersessions": []
+ },
+ "escalation_triage_mode": "shadow",
+ "escalation_triage_done": true,
+ "auto_pipeline_stage": "code",
+ "auto_pipeline_action": "none",
+ "auto_pipeline_policy": null,
+ "auto_pipeline_reasons": [
+  "coding job not a clean terminal PASS; nothing to apply"
+ ],
+ "auto_pipeline_mode": "shadow",
+ "slice_autofeed": {
+  "action": "redispatch",
+  "reason": "slice job of plan 'ev-service-screen-1-rivian-service' reached RED verdict 'fail' (verify not green) -- re-dispatching the owning plan so its bounded retry / needs_opus escalation runs instead of parking the slice dead"
+ },
+ "runstatus_janitor_mode": "shadow",
+ "runstatus_janitor": {
+  "self": {
+   "action": "surface",
+   "category": "live",
+   "reason": "status 'needs_opus' is not terminal (live/active chain)"
+  },
+  "superseded": [
+   {
+    "id": "368bc923a303",
+    "label": "auto-author-ev-service-screen-1-rivian-service-s4-normalize-snapshot"
+   }
+  ]
+ },
+ "runstatus_janitor_done": true
+}

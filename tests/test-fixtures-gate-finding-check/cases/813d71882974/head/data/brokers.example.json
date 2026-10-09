@@ -1,0 +1,6 @@
+{
+  "_comment": "Anonymized broker DATASET shape. Real dataset lives in the separate PUBLIC repo and is pulled to data/brokers.json (gitignored here). Contains NO personal data.",
+  "brokers": [
+    {"id": "example-broker", "name": "Example People Search", "url": "https://example.com", "category": "people-search", "optout_url": "https://example.com/optout", "optout_method": "form", "eraser_id": "example"}
+  ]
+}

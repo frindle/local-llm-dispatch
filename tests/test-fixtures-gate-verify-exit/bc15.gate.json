@@ -1,0 +1,87 @@
+{
+ "verdict": "fail",
+ "issues": [
+  {
+   "severity": "high",
+   "file": "verify",
+   "line": 0,
+   "what": "the job's own verify FAILED (exit 1); the diff did not pass the project's check, and a clean diff review does not overturn that",
+   "source": "verify-exit",
+   "category": "code"
+  }
+ ],
+ "counts": {
+  "code_high": 1,
+  "code": 1,
+  "input": 0,
+  "total": 1
+ },
+ "not_checked": [
+  "completeness (task declares no `## Must contain` section, so no literals were asserted -- completeness did not run)"
+ ],
+ "review_verdict": "PASS",
+ "verify_exit_reported": 1,
+ "verify_quality_exit": 0,
+ "diff_source": "git diff HEAD",
+ "scaffold_excluded": [
+  "TASK.md",
+  "check_literals.py",
+  "refimpl.py",
+  "verify.sh",
+  "verify.test.ts"
+ ],
+ "launch_baseline": {
+  "head": "7d7ec7eace76ab1d785ce13f8b4c19db5b97c3a4",
+  "dirty": 0
+ },
+ "baseline_at": "launch",
+ "verify_relevance": {
+  "verdict": "unproven",
+  "score": null,
+  "threshold": 0.8,
+  "mutant_score": null,
+  "site_score": null,
+  "site_coverage": null,
+  "killed": 0,
+  "survived": 0,
+  "evidence_mutants": 0,
+  "generated": 0,
+  "literal_breaking": 0,
+  "crash_kills": 0,
+  "truncated": false,
+  "untried_sites": null,
+  "unexercised_sites": null,
+  "reason": "the reference impl does not turn the verify green (exit 1); nothing to mutate against",
+  "seconds": 2.0527448654174805,
+  "survivors": [],
+  "source": "gate-applied",
+  "verify": "bash verify.sh"
+ },
+ "review_tier": "pregate",
+ "review_model": "qwen3:14b",
+ "review_host": "unraid",
+ "review": "done",
+ "review_label": "gate-bc15112d643a",
+ "review_dir": "/Users/user/bin/ollama-queue-logs/bc15112d643a-review",
+ "job_id": "bc15112d643a",
+ "ts": "2026-10-02T17:04:22Z",
+ "advisory": true,
+ "job_status": "failed",
+ "job_label": "auto-author-bfmr-superseded-reservations-v2",
+ "job_model": "qwen3.6-35b-a3b-vl-mtp-mxfp8",
+ "job_cwd": "/Users/user/.ollama-dispatch/worktrees/wt-bfmr-superseded-reservations-v2",
+ "job_host": "studio",
+ "job_verify": "python3 auto-harness-check.py",
+ "job_exit_code": 1,
+ "verify_failed_at_baseline": true,
+ "job_preflight": "preflight-verify-ok (baseline fails as designed)",
+ "scored_arm": false,
+ "task_intent": "AUTHORING TASK -- write a verify-gated dispatch harness",
+ "signoff_required": false,
+ "signoff_reviewer": "",
+ "signoff_verdict": null,
+ "pregate_verdict": "fail",
+ "pregate_review_verdict": "PASS",
+ "regate": "pending",
+ "regate_label": "regate-bc15112d643a"
+}

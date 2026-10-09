@@ -1,0 +1,215 @@
+commit 1d4db91cc968e313185558d2caf5d0b09cad265e
+Author: frindle <69526085+frindle@users.noreply.github.com>
+Date:   Fri Sep 4 09:36:56 2026 -0700
+
+    ollama-dispatch-draft: add .mjs/.js (JS/TS) awareness
+    
+    Extends the drafter to JS/.mjs fixtures at 6 sites: DRAFT_MARK_JS const;
+    DRAFT_CHECK_JS node analogue (inverted, MIN_CASES=6); fixture_of named+glob
+    for .mjs/.js; apply_cases/mark_drafted stamp the JS marker+// comment (never
+    the Python # marker); run_drafter branches node draft-check.mjs vs python3
+    draft-check.py; cmd_confirm clears both markers. Branch-don't-replace -- the
+    Python path is preserved in every else-branch. Dispatched to qwen3.8:27b,
+    reviewed (verify 12/12 VERIFY_OK, scope clean); first dispatch through the
+    deployed two-tier gate. The 27B re-gate raised 2 'concerns' that are false
+    positives (relocated/generalized literals mis-read as removed) -- see vault.
+
+diff --git a/bin/ollama-dispatch-draft b/bin/ollama-dispatch-draft
+index d027142..7e158c6 100755
+--- a/bin/ollama-dispatch-draft
++++ b/bin/ollama-dispatch-draft
+@@ -55,6 +55,7 @@ import time
+ from pathlib import Path
+ 
+ DRAFT_MARK = "DRAFT_UNCONFIRMED = True"
++DRAFT_MARK_JS = "const DRAFT_UNCONFIRMED = true"
+ GATE = Path.home() / "bin" / "ollama-dispatch-preflight"
+ QUEUE = Path.home() / "bin" / "ollama-queue.py"
+ DEFAULT_MODEL = "qwen3.8:27b-q4_K_M"
+@@ -125,6 +126,73 @@ if fails == 0:
+ sys.exit(1)
+ '''
+ 
++DRAFT_CHECK_JS = r'''#!/usr/bin/env node
++// Verify for the DRAFTING job -- run by the worker after every edit (node).
++// Inverted on purpose, exactly like draft-check.py: this passes when the
++// fixture FAILS. The tree is at the buggy baseline while drafting, so "the
++// fixture fails" IS "the cases discriminate".
++
++import { readFileSync } from 'node:fs';
++import { spawnSync } from 'node:child_process';
++
++const FX = 'verify_impl.mjs';
++const MIN_CASES = 6;
++let fails = 0;
++
++let src;
++try {
++    src = readFileSync(FX, 'utf8');
++} catch (e) {
++    console.log(`  FAIL: cannot read ${FX}: ${e.message}`);
++    console.log('--- 1 failed ---');
++    process.exit(1);
++}
++
++// Count the top-level elements of CASES = [ ... ] -- commas at bracket depth 0.
++function topLevelCount(body) {
++    let depth = 0, count = 0;
++    for (const ch of body) {
++        if (ch === '[' || ch === '{' || ch === '(') depth++;
++        else if (ch === ']' || ch === '}' || ch === ')') depth--;
++        else if (ch === ',' && depth === 0) count++;
++    }
++    return body.trim() ? count + 1 : 0;
++}
++
++const m = src.match(/^\s*(?:(?:export\s+)?(?:const|let|var)\s+)?CASES\s*=\s*\[([\s\S]*?)\n\]/m);
++const n = m ? topLevelCount(m[1]) : 0;
++if (n < MIN_CASES) {
++    console.log(`  FAIL: ${n} case(s), need at least ${MIN_CASES}`);
++    fails++;
++} else {
++    console.log(`  ok: ${n} cases authored`);
++}
++
++const p = spawnSync(process.execPath, [FX], { encoding: 'utf8' });
++const out = ((p.stdout || '') + (p.stderr || '')).trim();
++if (/SyntaxError|ReferenceError/.test(out)) {
++    console.log('  FAIL: the fixture CRASHED rather than reporting failures:');
++    const lines = out.split('\n').filter((l) => l.trim());
++    console.log('    ' + (lines[lines.length - 1] || '').slice(0, 200));
++    fails++;
++} else if (p.status === 0) {
++    console.log('  FAIL: every case PASSES on the current buggy code, so the cases');
++    console.log('        cannot tell a correct fix from no fix at all. Each case must');
++    console.log('        FAIL now and PASS after the fix. Target the exact boundary.');
++    fails++;
++} else {
++    console.log(`  ok: fixture fails on the buggy code (exit ${p.status}) -- the`);
++    console.log('      cases discriminate');
++}
++
++console.log(`--- ${fails} failed ---`);
++if (fails === 0) {
++    console.log('VERIFY_OK');
++    process.exit(0);
++}
++process.exit(1);
++'''
++
+ 
+ def sh(cmd, cwd=None, timeout=None):
+     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+@@ -139,6 +207,14 @@ def fixture_of(wt: Path):
+     for p in sorted(wt.glob("*.py")):
+         if "CASES" in p.read_text(errors="replace"):
+             return p
++    # JS / .mjs fixtures (TypeScript/JS dispatches): named lookup first, then a
++    # glob fallback keyed on CASES -- same shape as the Python lookups above.
++    for name in ("verify_impl.mjs",):
++        if (wt / name).is_file():
++            return wt / name
++    for p in sorted(wt.glob("*.mjs")) + sorted(wt.glob("*.js")):
++        if "CASES" in p.read_text(errors="replace"):
++            return p
+     return None
+ 
+ 
+@@ -267,10 +343,16 @@ def apply_cases(wt: Path, text: str):
+         return False, f"{fx.name} has no CASES block to replace"
+     body = re.sub(r"^CASES\s*=\s*\[.*?^\]", lambda _: new_cases, body,
+                   count=1, flags=re.S | re.M)
+-    if DRAFT_MARK not in body:
++    # JS / .mjs fixtures get the `//` comment and the JS marker -- never the
++    # Python `#` comment or the Python marker.
++    is_js = fx.suffix in (".mjs", ".js")
++    mark = DRAFT_MARK_JS if is_js else DRAFT_MARK
++    comment = ("// Model-drafted; NOT yet read by a human." if is_js
++               else "# Model-drafted; NOT yet read by a human.")
++    if mark not in body:
+         body = body.replace(
+             "CASES = [",
+-            f"# Model-drafted; NOT yet read by a human.\n{DRAFT_MARK}\n\nCASES = [",
++            f"{comment}\n{mark}\n\nCASES = [",
+             1)
+     fx.write_text(body)
+     n = len([l for l in new_cases.splitlines()
+@@ -297,14 +379,22 @@ def run_drafter(wt: Path, prompt: str, a):
+             return None, None, f"--drafter-cmd exited {rc}: {err.strip()[-300:]}"
+         return "stdout", out, "drafter-cmd"
+ 
+-    (wt / "draft-check.py").write_text(DRAFT_CHECK)
++    # JS / .mjs fixtures get the node draft-check; Python keeps python3.
++    fx = fixture_of(wt)
++    is_js = bool(fx and fx.suffix in (".mjs", ".js"))
++    if is_js:
++        (wt / "draft-check.mjs").write_text(DRAFT_CHECK_JS)
++        verify_cmd = "node draft-check.mjs"
++    else:
++        (wt / "draft-check.py").write_text(DRAFT_CHECK)
++        verify_cmd = "python3 draft-check.py"
+     pf = wt / "DRAFT-TASK.md"
+     pf.write_text(prompt)
+     # Studio work goes through the queue, never a direct API call.
+     cmd = [sys.executable, str(QUEUE), "enqueue", "--model", a.model,
+            "--host", a.host, "--cwd", str(wt), "--task-file", str(pf),
+            "--task-kind", "coding", "--num-ctx", str(a.num_ctx),
+-           "--verify", "python3 draft-check.py",
++           "--verify", verify_cmd,
+            "--max-iters", str(a.max_iters), "--label", f"draft-{wt.name}"]
+     rc, out, err = sh(cmd)
+     if rc != 0:
+@@ -352,11 +442,17 @@ def mark_drafted(wt: Path):
+     fx = fixture_of(wt)
+     if not fx:
+         return False, "no fixture file found"
++    # JS / .mjs fixtures get the `//` comment and the JS marker -- never the
++    # Python `#` comment or the Python marker.
++    is_js = fx.suffix in (".mjs", ".js")
++    mark = DRAFT_MARK_JS if is_js else DRAFT_MARK
++    comment = ("// Model-drafted; NOT yet read by a human." if is_js
++               else "# Model-drafted; NOT yet read by a human.")
+     body = fx.read_text(errors="replace")
+-    if DRAFT_MARK in body:
++    if mark in body:
+         return True, f"{fx.name} already marked as an unconfirmed draft"
+     new_body = re.sub(r"^CASES\s*=\s*\[",
+-                      f"# Model-drafted; NOT yet read by a human.\n{DRAFT_MARK}\n\nCASES = [",
++                      f"{comment}\n{mark}\n\nCASES = [",
+                       body, count=1, flags=re.M)
+     # VERIFY the marker landed. re.sub is a no-op when the pattern misses (e.g.
+     # CASES indented inside a function, so `^CASES` never matches), and the
+@@ -366,9 +462,9 @@ def mark_drafted(wt: Path):
+     # unreviewed model-drafted fixture would sail through to GO and the ONE
+     # invariant this tool exists to enforce -- a human read the cases -- would
+     # be silently off.
+-    if DRAFT_MARK not in new_body:
++    if mark not in new_body:
+         return False, (f"could not mark {fx.name}: no top-level `CASES = [` to "
+-                       f"anchor on. Add `{DRAFT_MARK}` by hand before gating, "
++                       f"anchor on. Add `{mark}` by hand before gating, "
+                        "or the draft-confirmed check cannot fire.")
+     fx.write_text(new_body)
+     return True, f"marked {fx.name} as an unconfirmed draft"
+@@ -377,13 +473,18 @@ def mark_drafted(wt: Path):
+ def cmd_confirm(wt: Path):
+     """Remove the marker. The one step that says a human read the cases."""
+     touched = []
+-    for p in list(wt.glob("*.py")) + [wt / "TASK.md"]:
++    files = (list(wt.glob("*.py")) + list(wt.glob("*.mjs"))
++             + list(wt.glob("*.js")) + [wt / "TASK.md"])
++    for p in files:
+         try:
+-            if p.is_file() and DRAFT_MARK in p.read_text(errors="replace"):
++            text = p.read_text(errors="replace") if p.is_file() else ""
++            if DRAFT_MARK in text or DRAFT_MARK_JS in text:
+                 b = p.read_text()
+                 b = "\n".join(l for l in b.splitlines()
+                               if DRAFT_MARK not in l
+-                              and l.strip() != "# Model-drafted; NOT yet read by a human.")
++                              and DRAFT_MARK_JS not in l
++                              and l.strip() != "# Model-drafted; NOT yet read by a human."
++                              and l.strip() != "// Model-drafted; NOT yet read by a human.")
+                 p.write_text(b + ("\n" if not b.endswith("\n") else ""))
+                 touched.append(p.name)
+         except Exception:

@@ -1,0 +1,173 @@
+{
+ "verdict": "fail",
+ "issues": [
+  {
+   "severity": "high",
+   "file": "src/scheduled_runner.py",
+   "line": 75,
+   "what": "The change introduces a new dependency on the name `SeatsAeroClient` in the module scope of `src/sch",
+   "source": "review",
+   "category": "code"
+  }
+ ],
+ "counts": {
+  "code_high": 1,
+  "code": 1,
+  "input": 0,
+  "total": 1
+ },
+ "not_checked": [],
+ "review_verdict": "PASS WITH CAVEATS",
+ "verify_exit_reported": 0,
+ "verify_quality_exit": 0,
+ "diff_source": "git diff HEAD",
+ "launch_baseline": {
+  "head": "3558e3abb4729803141bca007cb501c96a6c2cdc",
+  "dirty": 0
+ },
+ "baseline_at": "launch",
+ "verify_relevance": {
+  "verdict": "relevant",
+  "score": 1.0,
+  "threshold": 0.8,
+  "mutant_score": 1.0,
+  "site_score": 1.0,
+  "site_coverage": 1.0,
+  "killed": 4,
+  "survived": 0,
+  "evidence_mutants": 4,
+  "generated": 7,
+  "literal_breaking": 3,
+  "crash_kills": 0,
+  "truncated": false,
+  "untried_sites": [],
+  "unexercised_sites": [],
+  "reason": "verify killed 4/4 property-breaking mutants of the reference impl",
+  "seconds": 29.04,
+  "survivors": [],
+  "source": "gate-applied",
+  "verify": "bash verify.sh"
+ },
+ "review_tier": "pregate",
+ "review_model": "qwen3:14b",
+ "review_host": "unraid",
+ "review": "done",
+ "review_label": "gate-9414e0cf848e",
+ "review_dir": "/Users/user/bin/ollama-queue-logs/9414e0cf848e-review",
+ "job_id": "9414e0cf848e",
+ "ts": "2026-09-21T15:28:53Z",
+ "advisory": true,
+ "job_status": "done",
+ "job_label": "aw-sched-runner-s11-client-none-seatsaerocli",
+ "job_model": "qwen3.8:27b-q4_K_M",
+ "job_cwd": "/Users/user/.ollama-dispatch/worktrees/wt-slice-aw-sched-runner-s11-client-none-seatsaerocli",
+ "job_host": "studio",
+ "job_verify": "bash verify.sh",
+ "job_exit_code": 0,
+ "verify_failed_at_baseline": true,
+ "job_preflight": "preflight-verify-ok (baseline fails as designed)",
+ "scored_arm": false,
+ "task_intent": "TASK: aw-sched-runner-s11-client-none-seatsaerocli",
+ "signoff_required": false,
+ "signoff_reviewer": "",
+ "signoff_verdict": null,
+ "pregate_verdict": "fail",
+ "pregate_review_verdict": "PASS WITH CAVEATS",
+ "regate": "done",
+ "regate_label": "regate-9414e0cf848e",
+ "gate_authority": "studio-27b-regate",
+ "auto_fix_class": "reviewer-code-high",
+ "auto_fix_action": "escalate",
+ "auto_fix_reasons": [
+  "reviewer flagged a code high with no red verify (false-FAIL class); GATE_AUTOFIX_TRUST_REVIEWER off"
+ ],
+ "auto_fix_round": 0,
+ "auto_fix_root": "9414e0cf848e",
+ "auto_fix_mode": "live",
+ "models_tried": [
+  "qwen3.8:27b-q4_K_M"
+ ],
+ "auto_fix_history": "repair history: r0=1 finding(s) [review]; models tried: qwen3.8:27b-q4_K_M",
+ "auto_fix_escalate_category": "other",
+ "auto_fix_escalate_cmd": [
+  "python3",
+  "/Users/user/bin/ollama-queue.py",
+  "escalate",
+  "9414e0cf848e",
+  "--reason",
+  "reviewer flagged a code high with no red verify (false-FAIL class); GATE_AUTOFIX_TRUST_REVIEWER off | repair history: r0=1 finding(s) [review]; models tried: qwen3.8:27b-q4_K_M",
+  "--category",
+  "other",
+  "--coordinator-model",
+  "auto-fix-ladder",
+  "--gate-output",
+  "/Users/user/bin/ollama-queue-logs/9414e0cf848e.gate.json"
+ ],
+ "auto_fix_escalated": true,
+ "auto_fix_escalate_status": "parked-needs_opus",
+ "escalation_triage": {
+  "action": "park",
+  "class": "not-a-proven-intended-removal",
+  "reasons": [
+   "flagged literal is NOT a line this diff removed -- it is live/added code: 'c = client or SeatsAeroClient()'",
+   "TASK.md does not quote the removed literal (longest cited run 14 < 40 chars) -- removal is not provably contract-mandated: 'return list(client.search('"
+  ],
+  "citations": [
+   {
+    "quote": "c = client or SeatsAeroClient()",
+    "removed": false,
+    "readded": true,
+    "contract_cite_chars": 31,
+    "cites_contract": false,
+    "superseded": false,
+    "supersession": null
+   },
+   {
+    "quote": "return list(client.search(",
+    "removed": true,
+    "readded": false,
+    "contract_cite_chars": 14,
+    "cites_contract": false,
+    "superseded": false,
+    "supersession": null
+   }
+  ],
+  "supersessions": []
+ },
+ "escalation_triage_mode": "shadow",
+ "escalation_triage_done": true,
+ "auto_pipeline_stage": "code",
+ "auto_pipeline_action": "none",
+ "auto_pipeline_policy": null,
+ "auto_pipeline_reasons": [
+  "coding job not a clean terminal PASS; nothing to apply"
+ ],
+ "auto_pipeline_mode": "shadow",
+ "slice_autofeed": {
+  "action": "skip",
+  "reason": "verdict 'fail' is not advanceable (needs one of pass, skipped)"
+ },
+ "runstatus_janitor_mode": "shadow",
+ "runstatus_janitor": {
+  "self": {
+   "action": "surface",
+   "category": "live",
+   "reason": "status 'needs_opus' is not terminal (live/active chain)"
+  },
+  "superseded": [
+   {
+    "id": "3c64da71fcee",
+    "label": "auto-refine-aw-sched-runner-s11-client-none-seatsaerocli-r1"
+   },
+   {
+    "id": "c79c7d0c23f5",
+    "label": "auto-author-aw-sched-runner-s11-client-none-seatsaerocli"
+   },
+   {
+    "id": "d7d6a0a9ad5c",
+    "label": "auto-author-aw-sched-runner-s11-client-none-seatsaerocli"
+   }
+  ]
+ },
+ "runstatus_janitor_done": true
+}

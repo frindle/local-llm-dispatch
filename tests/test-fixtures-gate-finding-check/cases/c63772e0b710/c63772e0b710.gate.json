@@ -1,0 +1,141 @@
+{
+ "verdict": "concerns",
+ "issues": [
+  {
+   "severity": "medium",
+   "file": "dashboard_chat.py",
+   "line": 0,
+   "what": "The new implementation crashes with a KeyError or IndexError if the session file is missing, malform",
+   "source": "review",
+   "category": "code",
+   "uncertain": true,
+   "reviewer_severity": "high"
+  }
+ ],
+ "counts": {
+  "code_high": 0,
+  "code": 1,
+  "input": 0,
+  "total": 1
+ },
+ "not_checked": [],
+ "review_verdict": "PASS WITH CAVEATS",
+ "verify_exit_reported": 0,
+ "verify_quality_exit": 0,
+ "diff_source": "git diff HEAD",
+ "launch_baseline": {
+  "head": "1447d0e04978f3cc4a36006d8fcb9d76be111087",
+  "dirty": 0
+ },
+ "baseline_at": "launch",
+ "verify_relevance": {
+  "verdict": "relevant",
+  "score": 1.0,
+  "threshold": 0.8,
+  "mutant_score": 1.0,
+  "site_score": 1.0,
+  "site_coverage": 1.0,
+  "killed": 17,
+  "survived": 0,
+  "evidence_mutants": 17,
+  "generated": 20,
+  "literal_breaking": 3,
+  "crash_kills": 0,
+  "truncated": false,
+  "untried_sites": [],
+  "unexercised_sites": [],
+  "reason": "verify killed 17/17 property-breaking mutants of the reference impl",
+  "seconds": 2.52,
+  "survivors": [],
+  "source": "gate-applied",
+  "verify": "bash verify.sh"
+ },
+ "review_tier": "pregate",
+ "review_model": "qwen3:14b",
+ "review_host": "unraid",
+ "review": "done",
+ "review_label": "gate-c63772e0b710",
+ "review_dir": "/Users/user/bin/ollama-queue-logs/c63772e0b710-review",
+ "job_id": "c63772e0b710",
+ "ts": "2026-10-04T20:05:57Z",
+ "advisory": true,
+ "job_status": "done",
+ "job_label": "chat-fixes2-s1-enqueue-argv",
+ "job_model": "qwen3.6-35b-a3b-vl-mtp-mxfp8",
+ "job_cwd": "/Users/user/.ollama-dispatch/worktrees/wt-slice-chat-fixes2-s1-enqueue-argv",
+ "job_host": "studio",
+ "job_verify": "bash verify.sh",
+ "job_exit_code": 0,
+ "verify_failed_at_baseline": true,
+ "job_preflight": "preflight-verify-ok (baseline fails as designed)",
+ "scored_arm": false,
+ "task_intent": "TASK: chat-fixes2-s1-enqueue-argv",
+ "signoff_required": false,
+ "signoff_reviewer": "",
+ "signoff_verdict": null,
+ "pregate_verdict": "concerns",
+ "pregate_review_verdict": "PASS WITH CAVEATS",
+ "regate": "done",
+ "regate_label": "regate-c63772e0b710",
+ "gate_authority": "studio-27b-regate",
+ "deferral_refused": "unmapped concern (reviewer did not tag it [restored-by: ...]): The new implementation crashes with a KeyError or IndexError if the session file is missing, malform",
+ "auto_fix_class": "undecidable",
+ "auto_fix_action": "escalate",
+ "auto_fix_reasons": [
+  "verdict=concerns; findings from review are not a decidable, model-actionable failure"
+ ],
+ "auto_fix_round": 0,
+ "auto_fix_root": "c63772e0b710",
+ "auto_fix_mode": "live",
+ "models_tried": [
+  "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+ ],
+ "auto_fix_history": "repair history: r0=1 finding(s) [review]; models tried: qwen3.6-35b-a3b-vl-mtp-mxfp8",
+ "auto_fix_escalate_category": "other",
+ "auto_fix_escalate_cmd": [
+  "python3",
+  "/Users/user/bin/ollama-queue.py",
+  "escalate",
+  "c63772e0b710",
+  "--reason",
+  "verdict=concerns; findings from review are not a decidable, model-actionable failure | repair history: r0=1 finding(s) [review]; models tried: qwen3.6-35b-a3b-vl-mtp-mxfp8",
+  "--category",
+  "other",
+  "--coordinator-model",
+  "auto-fix-ladder",
+  "--gate-output",
+  "/Users/user/bin/ollama-queue-logs/c63772e0b710.gate.json"
+ ],
+ "auto_fix_escalated": true,
+ "auto_fix_escalate_status": "parked-needs_opus",
+ "auto_pipeline_stage": "code",
+ "auto_pipeline_action": "none",
+ "auto_pipeline_policy": null,
+ "auto_pipeline_reasons": [
+  "coding job not a clean terminal PASS; nothing to apply"
+ ],
+ "auto_pipeline_mode": "shadow",
+ "slice_autofeed": {
+  "action": "redispatch",
+  "reason": "slice job of plan 'chat-fixes2' reached RED verdict 'concerns' (verify not green) -- re-dispatching the owning plan so its bounded retry / needs_opus escalation runs instead of parking the slice dead"
+ },
+ "runstatus_janitor_mode": "shadow",
+ "runstatus_janitor": {
+  "self": {
+   "action": "surface",
+   "category": "live",
+   "reason": "status 'needs_opus' is not terminal (live/active chain)"
+  },
+  "superseded": [
+   {
+    "id": "35cec551a27d",
+    "label": "auto-refine-chat-fixes2-s1-enqueue-argv-r1"
+   },
+   {
+    "id": "9ce8423ebd81",
+    "label": "auto-author-chat-fixes2-s1-enqueue-argv"
+   }
+  ]
+ },
+ "runstatus_janitor_done": true
+}

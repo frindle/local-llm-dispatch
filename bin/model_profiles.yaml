@@ -1,0 +1,172 @@
+# model_profiles.yaml -- the SINGLE source of truth for what we send to a model.
+#
+# Every number below is copied from the vendored model card named in `card:`
+# (resolved against `cards_root`), with the line/section in `source:`. Nothing
+# here comes from memory. Loader: ~/bin/model_profile.py. Conformance test:
+# ~/bin/test-model-profile-conformance.py (+ pipeline-canary seams
+# model-profile-conformance and model-card-drift).
+#
+# Roles -> modes (see `roles`): author/coding -> thinking_coding;
+# gate/review -> review; explicit non_thinking is available too.
+#
+# Fields per mode: temperature top_p top_k min_p presence_penalty
+# repetition_penalty max_tokens ctx enable_thinking preserve_thinking
+# preserve_reasoning stop. `enable_thinking: null` = do not send any thinking
+# control (always-thinking / no switch). `card_sha256` pins the card text the
+# profile was transcribed from; the drift check fails if the card changes
+# without the profile being re-reviewed (re-run `model_profile.py --rehash`).
+#
+# Backend notes (d-inference/docs/architecture/inference.md "Sampling parameters"):
+# Darkbloom honours temperature, top_p, top_k, repetition_penalty,
+# presence_penalty/frequency_penalty, stop, max_tokens; it IGNORES min_p (always 0,
+# which is also the card value). max_tokens defaults to 4096 server-side if omitted.
+# The enable_thinking / preserve_thinking switch rides chat_template_kwargs on the
+# OpenAI path (cards: qwen3.6 L827/L857, qwen3.5 L992). Whether the live
+# Darkbloom build honours them is verified by ~/bin/darkbloom-field-probe.py.
+
+version: 1
+cards_root: "~/Desktop/GitHub Projects/references"
+
+roles:
+  author: thinking_coding
+  coding: thinking_coding
+  thinking_coding: thinking_coding
+  gate: review
+  review: review
+  non_thinking: non_thinking
+
+# Explicit, logged aliases (replaces the old silent rewrite in ollama-queue.py
+# _darkbloom_model / darkbloom_chat.alias_model). `lanes` limits where it applies.
+aliases:
+  "qwen3.8:27b-q4_K_M":
+    to: qwen3.6-35b-a3b-vl-mtp-mxfp8
+    lanes: [darkbloom]
+    reason: "Qwen3.8-27B is not eligible on this machine (needs M5/NAX); Darkbloom serves qwen3.6-35b-a3b instead"
+    source: "models/INDEX.md L7 (Qwen3.8 not eligible on this machine)"
+  "qwen3.8:27b-q8_0":
+    to: qwen3.6-35b-a3b-vl-mtp-mxfp8
+    lanes: [darkbloom]
+    reason: "same as qwen3.8:27b-q4_K_M"
+    source: "models/INDEX.md L7"
+
+# Phase 3 model-output robustness knobs (worker_robust.py). Per-model `robust:` overrides these.
+#   tool_extractor     small-model tool-call extractor (last repair layer). OFF by default.
+#   bash_only          mini-swe-agent action mode: one ```bash block per turn instead of tool calls. OFF.
+#   format_requery_max consecutive unparseable tool calls re-prompted free before repeated_format_error
+#   reasoning_budget_chars  thinking chars with no content/tool call before a turn is cut (0 = off)
+#   stop_gate_max      task_complete refusals (files/must-contain criteria) before stop_gate_failed
+#   loop_detector      thresholds (see worker_robust.LOOP_DEFAULTS); WORKER_LOOP_<KEY> env overrides
+robust_defaults:
+  tool_extractor: false
+  bash_only: false
+  format_requery_max: 3
+  reasoning_budget_chars: 24000
+  stop_gate_max: 3
+  loop_detector: {enabled: true}
+
+# Used for a model with no entry. LOUD warning on first use per process.
+# These are the pre-profile legacy values, kept only so unknown models keep working.
+fallback:
+  fallback: true
+  source: "NO MODEL CARD -- legacy worker defaults (ollama-worker.py pre-2026-10-08)"
+  modes:
+    thinking_coding: &fb {temperature: 0.15, top_p: null, top_k: null, min_p: null, presence_penalty: null, repetition_penalty: 1.1, max_tokens: 8192, ctx: 16384, enable_thinking: null, preserve_thinking: null, preserve_reasoning: false, stop: []}
+    non_thinking: *fb
+    review: *fb
+  tool_call_format: native
+
+models:
+  qwen3.6-35b-a3b-vl-mtp-mxfp8:
+    card: models/qwen3.6-35b-a3b-modelcard.md
+    card_sha256: "c4ddaa065649ff6352648f64747a16eda31726f3e34add94ce04abb461c77b75"
+    names: [qwen3.6-35b-a3b, "qwen3.6:35b-a3b"]
+    backend: darkbloom
+    tool_call_format: qwen3_coder   # card L611 (--tool-call-parser qwen3_coder), XML-style
+    ctx_native: 262144              # card L555
+    source: "card L663-665 (sampling), L555-557 (ctx >=128K advised), L611 (tool parser), L827/L857 (chat_template_kwargs), L1012 (output length)"
+    modes:
+      thinking_coding:   # "Thinking mode for precise coding tasks", L664
+        {temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: true, preserve_thinking: true, preserve_reasoning: true, stop: []}
+      non_thinking:      # "Instruct (or non-thinking) mode", L665
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+      review:            # reviewers/gates: non-thinking card values (L665)
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+
+  Qwen3.5-9B:
+    card: models/qwen3.5-9b-modelcard.md
+    card_sha256: "c5f5a8c2dddab69cfbf05279235aa5fddb137939a06539c4c7637aa900fef6d0"
+    names: [qwen3.5-9b, "qwen3.5:9b"]
+    backend: darkbloom
+    tool_call_format: qwen3_coder   # card L752/L783
+    ctx_native: 262144              # card L64
+    source: "card L833-836 (sampling), L728-730 (ctx), L783 (tool parser), L992 (chat_template_kwargs), L1145 (output length)"
+    modes:
+      thinking_coding:   # L834
+        {temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: true, preserve_thinking: null, preserve_reasoning: true, stop: []}
+      non_thinking:      # L835
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+      review:            # L835
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+
+  "qwen3.8:27b-q4_K_M":     # Unraid/Ollama-only; on the Darkbloom lane the alias above applies
+    card: models/Qwen_Qwen3.8-27B.md
+    card_sha256: "57e4bdb258ee1a7d2635c5174ebd4e56abe392505cdb5f8bbb356b0dc4293641"
+    names: ["qwen3.8:27b-q8_0"]
+    backend: ollama
+    tool_call_format: qwen3_coder   # card gives no parser line; Qwen3.5/3.6 family format (INDEX.md)
+    ctx_native: 262144              # card L53
+    source: "card L252-253 (sampling), L53 (ctx), L459 (chat_template_kwargs), L507-512 (output length)"
+    modes:
+      thinking_coding:   # L252 (card lists a single thinking set)
+        {temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 65536, enable_thinking: true, preserve_thinking: null, preserve_reasoning: true, stop: []}
+      non_thinking:      # L253
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0, max_tokens: 32768, ctx: 65536, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+      review:
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0, max_tokens: 32768, ctx: 65536, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+
+  "qwen3:14b":                # Unraid RTX 3080 12GB, the pre-gate / reviewer model
+    card: models/Qwen_Qwen3-14B.md
+    card_sha256: "7ef503e68996a4e32007fedc7d8e198846e9b1f36620d38a79b89934100b1250"
+    names: ["qwen3:14b-q4_K_M"]
+    backend: ollama
+    tool_call_format: hermes    # card L215 defers to Qwen-Agent (hermes-style tool template); not named explicitly
+    ctx_native: 32768           # card L34 (131072 with YaRN)
+    source: "card L129 (thinking), L148 (non-thinking), L327-329 (best practices, presence_penalty 0-2 optional), L34 (ctx), L215 (tools)"
+    modes:
+      thinking_coding:   # L327: T0.6 P0.95 K20 MinP0, never greedy
+        {temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 32768, enable_thinking: true, preserve_thinking: null, preserve_reasoning: true, stop: []}
+      non_thinking:      # L328: T0.7 P0.8 K20 MinP0 (presence_penalty optional, 0 here)
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 32768, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+      review:
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 32768, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+
+  "qwen3:8b":
+    card: models/Qwen_Qwen3-8B.md
+    card_sha256: "0f36caaff9c2516411a7738db384606263ba653c1e63e61d72f511606164d5a6"
+    backend: ollama
+    tool_call_format: hermes
+    ctx_native: 32768
+    source: "card L129/L148/L327-328 (same Qwen3 sampling block as Qwen3-14B)"
+    modes:
+      thinking_coding:
+        {temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 32768, enable_thinking: true, preserve_thinking: null, preserve_reasoning: true, stop: []}
+      non_thinking:
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 32768, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+      review:
+        {temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 32768, enable_thinking: false, preserve_thinking: null, preserve_reasoning: false, stop: []}
+
+  gemma-4-26b-qat-4bit:        # currently the only model Darkbloom serves outside the pair
+    card: models/google_gemma-4-26B-A4B-it.md
+    card_sha256: "4f463225c4fe49ec120115b0f9bb6713ff1556293a909903ffdae3df7bf974da"
+    names: [gemma-4-26b, gemma-4-26b-8bit]
+    backend: darkbloom
+    tool_call_format: native
+    ctx_native: 262144           # card L58 (256K for medium models)
+    source: "card L366-368 (one sampling config for all use cases), L374 (thinking via <|think|> system token, not chat_template_kwargs)"
+    modes:
+      thinking_coding:
+        {temperature: 1.0, top_p: 0.95, top_k: 64, min_p: null, presence_penalty: null, repetition_penalty: null, max_tokens: 32768, ctx: 65536, enable_thinking: null, preserve_thinking: null, preserve_reasoning: false, stop: []}
+      non_thinking:
+        {temperature: 1.0, top_p: 0.95, top_k: 64, min_p: null, presence_penalty: null, repetition_penalty: null, max_tokens: 32768, ctx: 65536, enable_thinking: null, preserve_thinking: null, preserve_reasoning: false, stop: []}
+      review:
+        {temperature: 1.0, top_p: 0.95, top_k: 64, min_p: null, presence_penalty: null, repetition_penalty: null, max_tokens: 32768, ctx: 65536, enable_thinking: null, preserve_thinking: null, preserve_reasoning: false, stop: []}

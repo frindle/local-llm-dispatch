@@ -1,0 +1,36 @@
+{
+  "_comment": "Named diagnostic sources a dispatched model may ask for via request_diagnostics. Only names listed here are reachable; the transport and credential location are harness-owned, never model-supplied. key_from points at an existing credential file (Keychain-backed files are fine); the key never enters a task, transcript or tool result.",
+  "docker": {
+    "reselling-app-1": {
+      "host": "unraid-host",
+      "transport": "unraid-graphql",
+      "url": "https://unraid.example.com/graphql",
+      "key_from": {
+        "file": "~/.claude.json",
+        "path": "mcpServers.unraid.env.UNRAID_API_KEY"
+      }
+    },
+    "sidecar": {
+      "host": "unraid-host",
+      "transport": "unraid-graphql",
+      "url": "https://unraid.example.com/graphql",
+      "key_from": {
+        "file": "~/.claude.json",
+        "path": "mcpServers.unraid.env.UNRAID_API_KEY"
+      },
+      "_alias_of": "reselling-app-1",
+      "_comment": "alias: sidecar/giftcard-ocr were merged into reselling-app-1 (one-container). Logs of x11vnc/numlockx/Chrome live here."
+    },
+    "giftcard-ocr": {
+      "host": "unraid-host",
+      "transport": "unraid-graphql",
+      "url": "https://unraid.example.com/graphql",
+      "key_from": {
+        "file": "~/.claude.json",
+        "path": "mcpServers.unraid.env.UNRAID_API_KEY"
+      },
+      "_alias_of": "reselling-app-1",
+      "_comment": "alias: sidecar/giftcard-ocr were merged into reselling-app-1 (one-container). Logs of x11vnc/numlockx/Chrome live here."
+    }
+  }
+}

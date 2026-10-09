@@ -1,0 +1,43 @@
+#!/bin/bash
+# queue-submit — enqueue an ollama-queue dispatch WITHOUT hand-rolling JSON in the shell.
+#
+# The failure this prevents: building the POST body with an inline `python3 -c 'json.dumps(...)'`
+# inside a curl command. Env-var/quote escaping there silently corrupts the task text (bit us on
+# the pet-portrait dispatch). The queue's own CLI already takes a --task-file and --verify as real
+# args — this is a thin, guard-railed front door to it.
+#
+# Usage:
+#   queue-submit --model M --task-file FILE --verify CMD [--label L] [--host studio|unraid|auto]
+#                [--cwd DIR | --repo GITREPO] [--runner PATH] [--task-kind coding|research]
+#                [--num-ctx N] [--max-iters N] [--no-preflight]
+# Any other ollama-queue.py enqueue flag is passed straight through.
+# Prints the enqueued job id on success.
+set -euo pipefail
+QUEUE="$HOME/bin/ollama-queue.py"
+
+# minimal sanity: a task-file must exist (this is the whole point — no inline task strings)
+tf=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --task-file) tf="${args[$((i+1))]:-}";;
+    --task-file=*) tf="${args[$i]#--task-file=}";;
+  esac
+done
+if [ -z "$tf" ]; then
+  echo "queue-submit: --task-file is required (write the task to a file, don't inline it)" >&2
+  exit 2
+fi
+if [ ! -f "$tf" ]; then
+  echo "queue-submit: task file not found: $tf" >&2
+  exit 2
+fi
+
+out="$(python3 "$QUEUE" enqueue "$@")"
+echo "$out"
+# surface just the id if the CLI printed JSON like {"id": "..."} or a plain line
+echo "$out" | python3 -c 'import sys,re,json
+s=sys.stdin.read().strip()
+try: print("job_id:", json.loads(s).get("id", s))
+except Exception:
+    m=re.search(r"[0-9a-f]{10,}", s); print("job_id:", m.group(0) if m else s)' 2>/dev/null || true

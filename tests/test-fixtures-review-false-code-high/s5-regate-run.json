@@ -1,0 +1,81 @@
+{
+  "mode": "review",
+  "model": "qwen3.6-35b-a3b-vl-mtp-mxfp8",
+  "num_ctx": 65536,
+  "target": "lib/rivian.ts",
+  "intent": "# TASK: ev-service-screen-1-rivian-service-s5-fetch-returns-snapshot\n## Confirmed defect (observed, not suspected)\n\n`fetchRivianServiceState()` returns the old `RivianServiceState` shape (threads,\nlineItems, timing, itemsComplete, itemsTotal arrays) instead of the normalized\n`RivianServiceSnapshot` that the UI layer expects. The function makes the three\nGraphQL calls (commsListDiscussions, consumerServiceRequests, queryByWorkOrderId)\nbut then manually assembles a `RivianServiceState` object instead of passing the\nraw data into `normalizeRivianServiceState()` which already exists in this file\nand produces the correct `RivianServiceSnapshot` with `apptNumber`,\n`requests[].label/status`, `done`/`total`, `fetchedAt`, `dropoffStartIso`.\n## Entry point\n\n`lib/rivian.ts:1430` \u2014 `fetchRivianServiceState(vehicleId?: string)`\n## Required change\n\nChange the existing `fetchRivianServiceState()` so it resolves\n`Promise<RivianServiceSnapshot | null>`: keep its existing three GraphQL calls,\ngateways, headers and `RIVIAN_SERVICE_MODE` gate unchanged; pass the raw\ncommsListDiscussions array, consumerServiceRequests.result array and the\nwork-order detail object into `normalizeRivianServiceState` and return that.\nWhen `RIVIAN_SERVICE_MODE !== '1'` return null WITHOUT issuing any network\nrequest. When any of the calls throws or returns a non-OK response, log via the\nexisting logger and return null (never throw, never touch the shared Rivian\nbackoff/alert counters). If there is no active work order, skip the\nGetActiveRequests/QueryByWorkOrderId calls and return the snapshot with inService\nfalse. Update any existing caller types accordingly (there should be none -- the\nlayer was dormant).\n\nNOTES FROM THE REVIEW OF A PREVIOUS FAILED ATTEMPT -- address these; the intent\nabove still defines the property:\n\nCOORDINATOR NOTES (supersede the earlier \"kind: null\" diagnosis -- the scaffold\nnow resolves --symbol fetchRivianServiceState itself):\n\nThe previous attempt failed because its fixture (verify_impl.mts) could never\ndiscriminate and its self-check hung for 300s:\n\n1. It wrapped every check in node:test `test(async () => ...)` callbacks. Those\n   run AFTER the module's top-level code, so `checks < 3` fired with 0 checks\n   and exited 1. Do NOT use node:test `test()`. Write the cases as plain\n   top-level `await` code calling `chk(...)` in sequence.\n\n2. It called the real function with whatever tokens/network existed. The fixture\n   must NEVER touch the network or real keys:\n   - Before importing lib/rivian.ts: set\n     `process.env.RIVIAN_SERVICE_MODE = '1'` and `process.env.KEYS_DIR` to a\n     fresh temp dir (fs.mkdtempSync) containing a fake `rivian-tokens.json`\n     (readRivianTokens reads `$KEYS_DIR/rivian-tokens.json`; give it the fields\n     authHeaders() needs).\n   - Replace `globalThis.fetch` with a stub BEFORE calling the function.\n     gql() posts `{query, variables}` JSON; route on the GraphQL operation name\n     in `JSON.parse(init.body).query` (the threads query, the\n     active-requests/line-items query, QueryByWorkOrderId) and return\n     `new Response(JSON.stringify({data: ...}))` with canned data. Count calls\n     per operation so a case can assert which calls were (not) made.\n   - Use a dynamic `await import('./lib/rivian.ts')` AFTER the env + fetch\n     stub are in place.\n\n3. Cases that DISCRIMINATE baseline (returns the old RivianServiceState shape)\n   from the target (returns RivianServiceSnapshot via\n   normalizeRivianServiceState):\n   - IN_PROGRESS thread + requests + timing -> result has `apptNumber`\n     (formatApptNumber of the work order id), `requests[].label/status`,\n     `done`/`total`, `fetchedAt` string, `dropoffStartIso` from\n     appointmentStartAtIso.\n   - no IN_PROGRESS thread -> snapshot with `inService === false`,\n     `apptNumber === null`, and the line-items / work-order calls NOT made.\n   - stubbed fetch that throws / returns `{errors:[...]}` -> resolves `null`,\n     never throws.\n   - RIVIAN_SE\n[...]\n\n[4 section(s) omitted to fit the review window]",
+  "findings": [
+    {
+      "hunk": 1,
+      "path": "lib/rivian.ts",
+      "quote": "const threadsData = await gql<{ commsListDiscussions?: RawServiceThread[] | null }>(\n      GET_ASYNC_MESSAGE_THREAD_LIST,\n      {},\n      authHeaders(tokens),\n    );",
+      "severity": "high",
+      "claim": "The removed `fetchRivianServiceThreads()` call is replaced by an inline `gql` call that does not pass the required `VS_GATEWAY` argument, causing the threads query to hit the wrong endpoint or fail.",
+      "failure_scenario": "When `fetchRivianServiceState` is called, the `gql` call for `GET_ASYNC_MESSAGE_THREAD_LIST` omits the `VS_GATEWAY` parameter (unlike the subsequent `GET_ACTIVE_REQUESTS` and `QUERY_BY_WORK_ORDER_ID` calls which explicitly pass it). If the GraphQL client requires the gateway parameter to route to the correct service for thread data, this call will fail or return stale/wrong data, causing `threads` to be empty or incorrect, leading to `inService` being false even when a service is in progress.",
+      "verdict": "REAL_DEFECT",
+      "verdict_reason": "The finding identifies that the new inline gql call for GET_ASYNC_MESSAGE_THREAD_LIST omits the VS_GATEWAY argument, while the subsequent calls for GET_ACTIVE_REQUESTS and QUERY_BY_WORK_ORDER_ID explicitly pass it. If the old fetchRivianServiceThreads() helper used VS_GATEWAY (which is likely given the pattern of the other two inlined calls), then this change introduces a regression where the threads query either fails or hits the wrong endpoint. This results in an empty threads array, causing pickActiveWorkOrder to return null, and ultimately returning a snapshot with inService=false even when a service is in progress. This is a concrete defect triggered by calling fetchRivianServiceState() with a valid vehicleId when a service is active.",
+      "concrete_trigger": "Call fetchRivianServiceState() with a valid vehicleId when RIVIAN_SERVICE_MODE='1'. The function executes the first gql call: gql<{commsListDiscussions?: RawServiceThread[] | null}>(GET_ASYNC_MESSAGE_THREAD_LIST, {}, authHeaders(tokens)). This call does NOT pass VS_GATEWAY. The subsequent calls (GET_ACTIVE_REQUESTS, QUERY_BY_WORK_ORDER_ID) DO pass VS_GATEWAY. If the GraphQL client implementation requires VS_GATEWAY to route to the correct backend service for thread data, this call will fail (network error, 404, or routing error) or return empty data, resulting in an empty threads array. Consequently, pickActiveWorkOrder(threads) returns null, and the function returns a snapshot with inService=false, even if a service is actually in progress.",
+      "probe": "The finding claims the omission of VS_GATEWAY in the first gql call is a defect. I need to verify if the gql function signature and usage in the existing codebase (or the implied interface) requires VS_GATEWAY for all calls, or if it's optional. Looking at the diff:\n\nOLD CODE:\nconst threads = await fetchRivianServiceThreads();\nconst lineItems = inService ? await fetchRivianServiceLineItems(vehicleId) : [];\nconst timing = active?.workOrderId ? await fetchRivianWorkOrderTiming(active.workOrderId) : null;\n\nNEW CODE:\nconst threadsData = await gql<{...}>(GET_ASYNC_MESSAGE_THREAD_LIST, {}, authHeaders(tokens));\n// ... later ...\nconst reqData = await gql<{...}>(GET_ACTIVE_REQUESTS, { vehicleId: vid }, authHeaders(tokens), VS_GATEWAY);\nconst woData = await gql<{...}>(QUERY_BY_WORK_ORDER_ID, { workOrderId: active.workOrderId }, authHeaders(tokens), VS_GATEWAY);\n\nThe key is: does fetchRivianServiceThreads() internally use VS_GATEWAY? The name 'fetchRivianServiceThreads' suggests it's a helper. The new code inlines the call. The new code explicitly passes VS_GATEWAY for the other two calls but NOT for the first one.\n\nIf fetchRivianServiceThreads() was defined elsewhere and used VS_GATEWAY, then removing it and NOT passing VS_GATEWAY here is a regression. However, if fetchRivianServiceThreads() did NOT use VS_GATEWAY (e.g., it hit a different endpoint or the default endpoint), then the new code is consistent with the old behavior.\n\nThe finding assumes that omitting VS_GATEWAY causes a failure. But the old code didn't pass it either (implicitly, via the helper). The defect would only exist if the helper fetchRivianServiceThreads() used VS_GATEWAY and the new inline call does not.\n\nLet's look at the helper names. fetchRivianServiceThreads, fetchRivianServiceLineItems, fetchRivianWorkOrderTiming. The new code inlines them. The new code for lineItems and timing passes VS_GATEWAY. The new code for threads does NOT.\n\nIf the old fetchRivianServiceThreads() used VS_GATEWAY, then this is a defect. If it didn't, it's not.\n\nThe finding states: 'causing the threads query to hit the wrong endpoint or fail'. This implies that the default endpoint (without VS_GATEWAY) is wrong for thread data.\n\nHowever, the old code worked (presumably, or was dormant). If the old code didn't use VS_GATEWAY for threads, and the new code doesn't either, there's no change in behavior regarding the gateway. The finding claims a NEW defect is introduced. This requires that the OLD code used VS_GATEWAY for threads, and the NEW code does not.\n\nDoes fetchRivianServiceThreads() exist in the diff? No. It's removed. We don't see its implementation. We only see the new inline code.\n\nThe finding is based on the assumption that the old helper used VS_GATEWAY. Without seeing the old helper, we cannot confirm this. However, the pattern of the other two calls (which are inlined from similar helpers) suggests they used VS_GATEWAY. It is highly likely that fetchRivianServiceThreads() also used VS_GATEWAY if it was a service-specific call.\n\nBut wait: the finding says 'causing the threads query to hit the wrong endpoint OR fail'. If it fails, the catch block logs and returns null. If it hits the wrong endpoint, it might return wrong data.\n\nThe critical question: Did the old fetchRivianServiceThreads() use VS_GATEWAY? If yes, this is a REAL_DEFECT. If no, it's NOT_A_DEFECT.\n\nThe diff shows that the new code for lineItems and timing explicitly passes VS_GATEWAY. The old code for lineItems and timing was fetchRivianServiceLineItems and fetchRivianWorkOrderTiming. It is reasonable to assume these helpers used VS_GATEWAY. Therefore, it is also reasonable to assume fetchRivianServiceThreads used VS_GATEWAY.\n\nIf fetchRivianServiceThreads used VS_GATEWAY, then the new code omitting it is a regression. The threads call will fail or hit the wrong endpoint. This will result in empty threads. pickActiveWorkOrder returns null. inService is false. The snapshot is incorrect.\n\nThis is a concrete trigger: Call fetchRivianServiceState() when a service is in progress. The threads call fails/returns wrong data because VS_GATEWAY is missing. The result is inService=false.\n\nHowever, I must be careful. The finding might be wrong if fetchRivianServiceThreads() did NOT use VS_GATEWAY. But the pattern of the other calls strongly suggests it did. The finding is plausible and likely correct if the old helper used VS_GATEWAY.\n\nLet's assume the old helper used VS_GATEWAY. Then the defect is real.\n\nConcrete trigger: Call fetchRivianServiceState('vehicle123') with RIVIAN_SERVICE_MODE='1'. The first gql call fails because VS_GATEWAY is missing. threads is empty. active is null. inService is false. The function returns a snapshot with inService=false, even if a service is in progress.\n\nThis matches the finding's claim.\n\nIs it a REAL_DEFECT? Yes, if the old helper used VS_GATEWAY. Given the context of the other calls, this is highly probable. The finding is not vague; it identifies a specific missing argument in a specific call that contrasts with the other calls in the same function.\n\nTherefore, REAL_DEFECT.",
+      "probe_shows_difference": true
+    },
+    {
+      "hunk": 0,
+      "path": "lib/rivian.ts",
+      "quote": "const lineItems = inService ? await fetchRivianServiceLineItems(vehicleId) : [];",
+      "severity": "high",
+      "claim": "The deletion removes the conditional logic that prevents fetching line items when there is no active work order. The new code only fetches line items if `vid` (vehicleId) is truthy, but does not check if there is an active work order (`active` is null).",
+      "failure_scenario": "When `RIVIAN_SERVICE_MODE` is enabled but there are no active service threads (e.g., a vehicle with no open work orders), the old code returned an empty `lineItems` array without making any network calls. The new code, however, will attempt to call `fetchRivianServiceLineItems` (via `gql` with `GET_ACTIVE_REQUESTS`) if a `vehicleId` is provided (either explicitly or from tokens), even if there is no active work order. This results in unnecessary network traffic and potential errors if the API rejects requests for non-active work orders.",
+      "hunk_header": "@@ -1306,30 +1306,62 @@ export async function fetchRivianWorkOrderTiming(workOrderId: string): Promise<R",
+      "source": "removal-pass",
+      "verdict": "NOT_A_DEFECT",
+      "verdict_reason": "The finding claims that the new code fetches line items when there is no active work order, but the diff clearly shows the line-item fetch is inside an `if (active)` block. The old code also had this check (`inService` was derived from `active`). The new code preserves this guard: `if (active) { ... fetch line items ... }`. The additional check for `vid` inside that block does not remove the `active` check. Therefore, no unnecessary network calls are made when there is no active work order.",
+      "concrete_trigger": "",
+      "probe": "The finding claims the new code fetches line items without checking for an active work order. Looking at the diff:\n\nOLD:\n```\nconst active = threads.find((t) => t.workOrderStatus === 'IN_PROGRESS') ?? null;\nconst inService = active !== null;\nconst lineItems = inService ? await fetchRivianServiceLineItems(vehicleId) : [];\n```\n\nNEW:\n```\nconst active = pickActiveWorkOrder(threads);\n// ...\nif (active) {\n  if (vid) {\n    // fetch line items\n  }\n  // fetch timing\n}\n```\n\nIn both cases, the line items fetch is conditional on `active` being truthy. The new code adds a nested check for `vid`, but does not remove the outer `if (active)` check. When `active` is null (no active work order), the block containing the line items fetch is skipped entirely in both old and new code. The finding incorrectly states that the new code 'does not check if there is an active work order'.",
+      "probe_shows_difference": false
+    }
+  ],
+  "causes": [],
+  "stats": {
+    "quote_rejected": 0,
+    "no_failure_scenario": 0,
+    "review_parse_fail": 0,
+    "verify_parse_fail": 0,
+    "diagnose_parse_fail": 0,
+    "unfalsifiable": 0,
+    "deduped": [
+      "model: The removed `fetchRivianServiceThreads()` function likely contained specific err",
+      "model: The removed `fetchRivianServiceLineItems(vehicleId)` call is replaced by a condi",
+      "removal-pass: The deletion removes the conditional logic that prevents fetching timing data wh",
+      "removal-pass: The deletion removes the calculation of `itemsTotal` and `itemsComplete`. The ne"
+    ],
+    "probe_unsound": 1,
+    "verdict_real_defect": 1,
+    "verdict_not_a_defect": 1
+  },
+  "model_calls": 4,
+  "elapsed_s": 54.7,
+  "darkbloom_stats": {
+    "calls": 4,
+    "prompt_tokens": 12431,
+    "completion_tokens": 3533,
+    "seconds": 40.36,
+    "schema_422": 1,
+    "schema_dropped": 0,
+    "schema_rungs": {
+      "strict": 3,
+      "relaxed": 1
+    },
+    "schema_violations": [
+      {
+        "rung": "relaxed",
+        "schema_keys": [
+          "findings"
+        ],
+        "violation": "none -- output validates locally",
+        "finish_reason": "stop",
+        "out_head": "{\n  \"findings\": [\n    {\n      \"quote\": \"const lineItems = inService ? await fetchRivianServiceLineIt"
+      }
+    ],
+    "tok_s": 87.5
+  }
+}

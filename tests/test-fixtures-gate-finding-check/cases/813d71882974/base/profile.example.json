@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy to profile.local.json (gitignored) and fill with YOUR real identity. Dummy values below.",
+  "first_name": "Jane",
+  "last_name": "Doe",
+  "middle_name": "Q",
+  "city": "Springfield",
+  "state": "IL",
+  "emails": ["jane.doe@example.com"],
+  "phones": ["+1-555-0100"]
+}

@@ -1,0 +1,3358 @@
+#!/usr/bin/env python3
+"""ollama-dispatch-integrate -- classify a finished dispatch against a MOVING main,
+and print an integration plan. READ-ONLY / DRY-RUN ONLY in this slice.
+
+WHY THIS EXISTS
+---------------
+`ollama-dispatch-preflight --review` audits a finished tree against ITS OWN
+baseline (did the model stay in scope, is the scaffold untouched). That is a
+different axis from INTEGRATION: integration holds the branch against the
+target repo's `main`, which has usually ADVANCED since the dispatch's baseline.
+Three failure modes we hit by hand every session:
+
+  1. Scaffold leak on merge -- `git merge --no-ff <branch>` drags TASK.md,
+     verify.sh, the fixture, etc. into the real repo. Integration must apply the
+     CODE diff of the declared target file(s) only, never scaffold artifacts.
+  2. main advanced -> conflicts. Some are trivial (package.json "test" script:
+     two dispatches each append a test entry -> a list-union resolves it); some
+     need real reasoning (two edits to one function).
+  3. Work already reached main by another path. A naive merge REGRESSES (drags
+     the branch's OLD package.json back over main's newer one). Must detect
+     "already integrated / redundant" and recommend acted+prune, no merge.
+
+WHAT THIS DOES (phase 1 -- read-only)
+  * Resolves the SCOPE CONTRACT the gate already recorded (declared_scope +
+    baseline_commit), from the in-tree .preflight-state.json or the external
+    preflight ledger. Falls back to an INFERRED scope (diff files minus known
+    scaffold names) and says so, at lower confidence.
+  * Classifies the branch vs the current target default branch:
+      redundant        -> already integrated; recommend acted + prune, NO merge
+      clean            -> code-only diff applies onto main with no conflict
+      conflict         -> per-file trivial (mechanically resolvable) vs semantic
+  * Emits a human plan and (with --json) a machine-readable verdict.
+
+  * --recommend-prune (phase 3): runs the SAME classifier and, for any worktree
+    whose work has ALREADY reached main by any path (redundant -- HEAD is an
+    ancestor of main, i.e. merged; OR every in-scope file is byte-identical on
+    main, ours==theirs), prints a PRUNE recommendation with the reason and the
+    exact ack + worktree-remove + branch-delete commands to run BY HAND. Anything
+    not yet on main (clean / conflict-trivial / conflict-semantic / empty-scope)
+    prints "keep -- not yet on main" and is NEVER recommended for prune. This
+    closes the dispatch-ack-reconcile gap ("reached main by another path, e.g.
+    cherry-pick not merge") WITHOUT acking or pruning anything itself.
+
+  * --stage (phase 2): for a CLEAN verdict, land the code-only diff on a scratch
+    integrate/<slug>-<id> branch via git plumbing. Writes ONLY that branch.
+
+  * --merge-dispatch (phase 4): for a CONFLICT-SEMANTIC verdict on a PROVEN
+    scope, a GATED, DRY-RUN planner for a bounded ollama merge-resolution
+    dispatch. It (1) refuses any non-semantic verdict or an inferred scope,
+    (2) applies the DECIDABLE precondition -- both sides must carry a behavioural
+    test importing the conflicted file (else STOP -> human merge; it never lowers
+    the verify bar to force a dispatch), (3) builds the both-ways-proven verify
+    contract (run_merge_verify: no conflict markers + tsc clean + BOTH sides'
+    tests registered in scripts.test + both green; repo npm test WARN-only) and,
+    per conflicted file, one bounded scaffold/preflight/enqueue command set
+    (multi-file = N dispatches, never one blob). It PRINTS these; it runs NO
+    scaffold, NO preflight, NO enqueue, and lands NOTHING live. The only write is
+    land_resolution() staging a verify-green resolution on a scratch integrate/*
+    branch -- exercised in this build only by --self-test with a MOCK resolution.
+    The first LIVE dispatch is left to the coordinator.
+
+It NEVER mutates main, pushes, merges, acks, or prunes. --recommend-prune and
+--merge-dispatch only PRINT commands. --stage / land_resolution write ONLY a new
+scratch integrate/* branch (never main, never a checkout, never a push).
+
+Exit: classify/plan modes 0; --merge-dispatch 0=plan ready, 3=STOP->human,
+2=REFUSE. --run-merge-verify 0=PASS/1=FAIL. --json prints the verdict object.
+"""
+from __future__ import annotations
+import argparse, hashlib, io, json, os, re, shlex, shutil, subprocess, sys, tarfile, tempfile
+import posixpath
+from datetime import datetime, timezone
+from pathlib import Path
+
+# NOTE: this env var MUST match ollama-dispatch-preflight / -signoff, which both
+# read OLLAMA_PREFLIGHT_LEDGER. An override here has to resolve the SAME ledger
+# dir the gate wrote to, else resolve_contract() silently misses the contract.
+PREFLIGHT_LEDGER = Path(os.environ.get(
+    "OLLAMA_PREFLIGHT_LEDGER",
+    Path.home() / "bin" / "ollama-queue-logs" / "preflight-ledger"))
+STATE_FILE = ".preflight-state.json"
+
+# Subprocess wall-clock ceiling for anything that could hang (node/npm/tsc/git).
+_SUBPROC_TIMEOUT = 300
+
+# Kept in sync with seal_baseline() in ollama-dispatch-scaffold and
+# HARNESS_FILES in ollama-dispatch-preflight. Never integrated -- these are the
+# scaffold, not the model's work.
+SCAFFOLD_FILES = {
+    "TASK.md", "verify.sh", "verify_impl.mts", "verify_impl.mjs",
+    "verify_impl.js", "test_fixture.py", "check_literals.py",
+    "refimpl.py", "fix.patch", "Package.swift", STATE_FILE,
+    ".dispatch-harness.json",
+}  # STATE_FILE == ".preflight-state.json"; single entry (dedup, improvement I).
+# .dispatch-harness.json is scaffold metadata (the seal manifest) -- like
+# STATE_FILE it stays untracked via info/exclude, but strip it defensively so it
+# is never mistaken for model work. The AUTHORED harness (incl. a dynamic
+# --test-file / --edit-file) is sealed into the baseline commit by
+# ollama-dispatch-scaffold's seal_baseline() reading this manifest; that dynamic
+# set is the cross-tool source of truth, not this static basename list, which
+# only lists what to STRIP from an integration diff.
+# verify.test.ts is a scaffold STARTER only when it is NOT a declared target.
+# We never infer-strip a *.test.ts file, because a dispatch's real deliverable
+# is often exactly its new behavioural test. Contract scope is authoritative.
+
+
+# VERIFY-SANDBOX (2026-10-05): env for the verify.sh / test runs below -- code
+# under test must never reach the REAL queue (ollama-queue.py refuses any
+# mutating subcommand when DISPATCH_VERIFY_SANDBOX is set).
+_SANDBOX_ENV = {**os.environ, "DISPATCH_VERIFY_SANDBOX": "1"}
+
+
+def _run(cmd: list[str], **kw):
+    """subprocess.run with a wall-clock timeout and graceful handling of a
+    missing binary (node/npm/tsc/git). Returns a CompletedProcess-like object;
+    on FileNotFoundError/TimeoutExpired returns a stand-in with rc 127/124
+    (improvement G -- never let a missing tool or a hang crash the tool)."""
+    kw.setdefault("timeout", _SUBPROC_TIMEOUT)
+    kw.setdefault("capture_output", True)
+    try:
+        return subprocess.run(cmd, **kw)
+    except FileNotFoundError as e:
+        return subprocess.CompletedProcess(cmd, 127, b"" if not kw.get("text") else "",
+                                           f"missing binary: {e}" if kw.get("text")
+                                           else f"missing binary: {e}".encode())
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, b"" if not kw.get("text") else "",
+                                           "timeout" if kw.get("text") else b"timeout")
+
+
+def git(cwd: str, *args: str) -> tuple[int, str, str]:
+    p = _run(["git", "-C", cwd, *args], text=True)
+    return p.returncode, p.stdout, p.stderr
+
+
+def show(cwd: str, rev: str, path: str) -> bytes | None:
+    """Blob bytes at rev:path, or None. Uses cat-file so a rev:DIRECTORY (a tree)
+    returns None rather than a bogus directory LISTING (improvement F). This also
+    makes a malformed scope path -- a directory, a typo -- resolve to None, which
+    the classifier turns into an ERROR verdict instead of a false 'no-change'."""
+    t = _run(["git", "-C", cwd, "cat-file", "-t", f"{rev}:{path}"], text=True)
+    if t.returncode != 0 or t.stdout.strip() != "blob":
+        return None
+    p = _run(["git", "-C", cwd, "cat-file", "-p", f"{rev}:{path}"])
+    return p.stdout if p.returncode == 0 else None
+
+
+def default_ref(cwd: str) -> str | None:
+    rc, out, _ = git(cwd, "symbolic-ref", "refs/remotes/origin/HEAD")
+    if rc == 0 and out.strip():
+        return out.strip().replace("refs/remotes/", "")  # origin/main
+    for cand in ("origin/main", "origin/master", "main", "master"):
+        if git(cwd, "rev-parse", "--verify", "--quiet", cand)[0] == 0:
+            return cand
+    return None
+
+
+def ledger_for(worktree: str) -> Path:
+    key = hashlib.sha256(str(Path(worktree).resolve()).encode()).hexdigest()[:16]
+    return PREFLIGHT_LEDGER / f"{key}.json"
+
+
+def resolve_contract(wt: str) -> dict:
+    """Return {declared_scope, baseline_commit, source, inferred}.
+
+    Priority: in-tree .preflight-state.json (seal-baseline flow) > external
+    ledger keyed by worktree path (repo/auto-worktree flow keeps the scaffold
+    OUTSIDE the tree) > None (caller infers)."""
+    def _validate(raw, source):
+        """A recorded declared_scope MUST be list[str]. A bare string is a
+        contract error (splitting it into 1-char paths is the HIGH5 bug), and so
+        is a list with a non-string element. Return {..., 'scope_error': str} on
+        a malformed contract so the caller can STOP rather than guess."""
+        sc = raw.get("declared_scope")
+        if isinstance(sc, str) or not isinstance(sc, list) or \
+                not all(isinstance(x, str) for x in sc):
+            return {"declared_scope": None, "baseline_commit": raw.get("baseline_commit"),
+                    "source": source, "inferred": False,
+                    "scope_error": f"declared_scope in {source} is not list[str] "
+                                   f"(got {type(sc).__name__}: {sc!r}) -- contract error"}
+        return {"declared_scope": list(sc),
+                "baseline_commit": raw.get("baseline_commit"),
+                "source": source, "inferred": False}
+
+    sf = Path(wt) / STATE_FILE
+    if sf.is_file():
+        try:
+            d = json.loads(sf.read_text())
+            if d.get("declared_scope") is not None:
+                return _validate(d, "in-tree state")
+        except Exception:
+            pass
+    lf = ledger_for(wt)
+    if lf.is_file():
+        try:
+            d = json.loads(lf.read_text())
+            if d.get("declared_scope") is not None:
+                return _validate(d, f"ledger {lf.name}")
+        except Exception:
+            pass
+    return {"declared_scope": None, "baseline_commit": None,
+            "source": "none", "inferred": True}
+
+
+def merge_base(cwd: str, a: str, b: str) -> str | None:
+    rc, out, _ = git(cwd, "merge-base", a, b)
+    return out.strip() if rc == 0 else None
+
+
+def three_way(base: bytes | None, ours: bytes | None,
+              theirs: bytes | None) -> tuple[str, bytes | None]:
+    """Per-file 3-way merge, entirely in temp files (read-only wrt the repo).
+
+    base = merge-base version, ours = current main version, theirs = branch.
+    Returns (status, merged_bytes). status in:
+      no-change   branch did not touch this file (base == theirs)
+      integrated  branch content already equals main (ours == theirs)
+      add-clean   new file on branch, absent/created on main w/o collision
+      clean       main untouched OR 3-way merges with no conflict
+      deleted     branch REMOVED the file main still has (theirs is None) --
+                  never staged as clean; a None blob must never force-remove
+                  main's file (this is also the rename-source case, MED12)
+      conflict    3-way merge produced conflict markers, or delete/modify clash
+    """
+    if theirs == base:
+        return "no-change", ours
+    if ours == theirs:
+        return "integrated", ours
+    if theirs is None:                    # branch deleted / renamed-away the file
+        if ours == base:                  # main untouched -> a clean deletion
+            return "deleted", None
+        return "conflict", None           # main modified what branch deleted
+    if ours == base:                      # main never touched it since baseline
+        return "clean", theirs
+    if base is None and ours is None:     # brand-new file, not on main
+        return "add-clean", theirs
+    # real 3-way needed
+    with tempfile.TemporaryDirectory() as td:
+        po = Path(td) / "ours"; pb = Path(td) / "base"; pt = Path(td) / "theirs"
+        po.write_bytes(ours or b""); pb.write_bytes(base or b""); pt.write_bytes(theirs or b"")
+        p = subprocess.run(["git", "merge-file", "-p", "--diff3",
+                            str(po), str(pb), str(pt)], capture_output=True)
+        # exit code: 0 clean, >0 = number of conflicts, <0 error
+        if p.returncode == 0:
+            if p.stdout == ours:
+                # Every hunk the branch added relative to base is ALREADY in main
+                # (main = branch's change + more). Applying the branch changes
+                # nothing, so this is integrated-by-content, not "clean work to
+                # stage" -- staging it would produce an empty commit and a
+                # no-op landing. Same family as `superseded` below (2026-09-24).
+                return "integrated", ours
+            return "clean", p.stdout
+        return "conflict", p.stdout
+
+
+def landed_on_default(cwd: str, mb: str | None, dref: str, path: str,
+                      theirs: bytes | None) -> str | None:
+    """The commit on `dref` since the merge-base at which `path` was BYTE-IDENTICAL to
+    the branch's blob, or None. Read-only.
+
+    WHY (2026-09-24, integration-gate follow-on): chains land onto main by
+    commit-tree (a code-only tree, one new commit whose only parent is main's tip),
+    so the chain branch itself NEVER becomes an ancestor of main and
+    merge-base(main, chain) stays pinned at the original fork point forever. The
+    classifier compares base (fork) / ours (main NOW) / theirs (branch): once main
+    has hardened the landed file past the chain's version, all three differ and the
+    three-way reads `conflict` -- indistinguishable from a real diverging edit,
+    although main's own history explains the divergence completely (the branch's
+    exact content is IN it, and later commits moved past it). Eleven broker-guard
+    chains sat as `conflict-semantic` for this reason. Ancestry is structurally
+    unavailable, so ask history the content question directly: did `path` on `dref`
+    ever carry exactly the branch's bytes after the fork? If so the branch is
+    SUPERSEDED (landed, then hardened), and a merge would only drag main back."""
+    if theirs is None or not mb:
+        return None
+    rc, out, _ = git(cwd, "rev-list", f"{mb}..{dref}", "--", path)
+    if rc != 0:
+        return None
+    for c in out.split():
+        if show(cwd, c, path) == theirs:
+            return c
+    return None
+
+
+# ---------------------------------------------------------------------------
+# RETIRED-ON-DEFAULT: main satisfies the chain's own test (2026-09-25)
+#
+# THE GAP landed_on_default() CANNOT CLOSE. That function asks a BYTE-IDENTITY
+# question: did `path` on main ever carry exactly the branch's bytes? When main
+# reimplemented the same property differently -- a rename, a refactor, a different
+# but equivalent expression -- the answer is no, forever, even though main
+# functionally does everything the chain asked for. The three-way then reads
+# `conflict-semantic` on every sweep, and the recommendation is "STOP -> human, or
+# merge-dispatch", so 22 escalation files across 11 plans (2026-09-24/25: bg-actions,
+# bg-alert, bg-detection, bg-escalation, bg-health, bg-profile, bg-serpwatch,
+# bg-state, bg-webui, playwright_checks, scheduler) re-escalated indefinitely. 21 of
+# them were disposed of by hand-annotating the ledger, because no retire lever
+# existed at all.
+#
+# WHAT "RETIRED" MEANS (the owner, 2026-09-25, via the coordinator). Not byte identity
+# and not a hash: the chain's OWN verify.sh, run directly against main's CURRENT
+# code, passes. This is the precedent already set in-session for the bg-health
+# chain, which was ratified "don't land" and closed only after each slice's own
+# adversarial verify was run against main's actual code rather than a byte-identity
+# proxy. The question is functional -- does main satisfy what the chain asked for --
+# and the chain's own adversarial test is the instrument that answers it.
+#
+# WHY IT IS A BOTH-WAYS PROOF, NOT JUST "GREEN ON MAIN". A verify that passes
+# against main proves nothing on its own: a leaky or vacuous harness passes against
+# anything, and auto-retiring on it would silently discard real unlanded work --
+# precisely the failure this gate exists to prevent. So the proof has two legs, and
+# BOTH must hold:
+#     GREEN on main now (dref)  -- main satisfies the property, AND
+#     RED   at the fork point (mb) -- the harness actually discriminates it.
+# A harness green at the fork point too is not evidence of anything and is refused
+# by name (`vacuous-harness`), which is the same standard the authoring preflight
+# already applies (verify RED at baseline, GREEN under refimpl). Red on main means
+# the chain's work genuinely is not there and the chain STAYS OPEN.
+#
+# THE SOLUTION FILES ARE NEVER COPIED. Only the harness travels into main's tree --
+# refimpl.py and fix.patch hold the reference implementation, so copying them would
+# make the verify green regardless of what main contains, turning the whole proof
+# into a tautology. They are excluded by name and the exclusion is asserted in the
+# guard test.
+RETIRE_KEY = "retired_on_default"
+# The harness files that may travel into main's tree for the proof. SCAFFOLD_FILES
+# minus the ones that carry the ANSWER (see above) and minus pure bookkeeping.
+RETIRE_SOLUTION_FILES = {"refimpl.py", "fix.patch", STATE_FILE,
+                         ".dispatch-harness.json"}
+RETIRE_VERIFY_TIMEOUT = 900
+
+
+def retire_harness_files(cwd: str, head: str) -> list[str]:
+    """Harness paths committed on the branch that may be copied into main's tree for
+    the retirement proof, never including a file that carries the solution."""
+    rc, out, _ = git(cwd, "ls-tree", "-r", "--name-only", head)
+    if rc != 0:
+        return []
+    return sorted(p for p in out.split("\n") if p.strip()
+                  and Path(p).name in SCAFFOLD_FILES
+                  and Path(p).name not in RETIRE_SOLUTION_FILES)
+
+
+def verify_against_ref(cwd: str, ref: str, head: str, harness: list[str],
+                       timeout: int = RETIRE_VERIFY_TIMEOUT) -> tuple[bool, str]:
+    """Run the branch's `verify.sh` against a pristine checkout of `ref`, with the
+    branch's HARNESS copied in and nothing else. Returns (passed, detail).
+
+    Read-only with respect to both the repo and the chain worktree: the checkout is
+    a detached temp worktree in a temp dir, and it is always removed. Never raises --
+    a missing verify.sh, an unresolvable ref or a hang is (False, reason), because
+    this proof may only ever retire a chain on a fact it positively established."""
+    if not any(Path(p).name == "verify.sh" for p in harness):
+        return False, "the branch commits no verify.sh -- nothing to prove retirement with"
+    tmp = tempfile.mkdtemp(prefix="retire-proof-")
+    tree = os.path.join(tmp, "t")
+    try:
+        rc, _, err = git(cwd, "worktree", "add", "--detach", tree, ref)
+        if rc != 0:
+            return False, f"could not check out {ref}: {err.strip()[:200]}"
+        vsh = None
+        for p in harness:
+            blob = show(cwd, head, p)
+            if blob is None:
+                continue
+            dest = Path(tree) / p
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(blob)
+            if Path(p).name == "verify.sh":
+                vsh = p
+                dest.chmod(0o755)
+        if vsh is None:
+            return False, "verify.sh is listed on the branch but its blob is unreadable"
+        cp = _run(["bash", os.path.basename(vsh)], cwd=str(Path(tree) / Path(vsh).parent),
+                  text=True, timeout=timeout, env=_SANDBOX_ENV)  # VERIFY-SANDBOX
+        out = (cp.stdout or "") + (cp.stderr or "")
+        if cp.returncode == 124:
+            return False, f"verify.sh timed out after {timeout}s against {ref}"
+        ok = cp.returncode == 0 and "VERIFY_OK" in out
+        return ok, ("VERIFY_OK" if ok else
+                    f"verify.sh rc={cp.returncode}, no VERIFY_OK: {out.strip()[-300:]}")
+    finally:
+        git(cwd, "worktree", "remove", "--force", tree)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def prove_retired_on_default(cwd: str, dref: str, mb: str | None, head: str,
+                             timeout: int = RETIRE_VERIFY_TIMEOUT) -> dict:
+    """The BOTH-WAYS retirement proof. Returns a record; `retired` is True only when
+    main satisfies the chain's own verify AND that verify discriminates.
+
+    {"retired": bool, "reason": str, "green_on_main": bool, "red_at_fork": bool,
+     "harness": [...], "main": <dref sha>, "fork": <mb>, "head": <head>, "at": iso}
+    """
+    rec = {"retired": False, "green_on_main": False, "red_at_fork": False,
+           "harness": [], "main": git(cwd, "rev-parse", dref)[1].strip()[:12],
+           "fork": (mb or "")[:12], "head": (head or "")[:12],
+           "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    if not mb:
+        rec["reason"] = ("no merge-base with the default ref, so the harness cannot be "
+                         "shown to discriminate -- refusing to retire on one leg")
+        return rec
+    harness = retire_harness_files(cwd, head)
+    rec["harness"] = harness
+    green, gdet = verify_against_ref(cwd, dref, head, harness, timeout)
+    rec["green_on_main"] = green
+    if not green:
+        rec["reason"] = (f"the chain's own verify.sh does NOT pass against {dref}: {gdet} "
+                         f"-- main does not satisfy this chain, so it stays open")
+        return rec
+    fork_green, fdet = verify_against_ref(cwd, mb, head, harness, timeout)
+    rec["red_at_fork"] = not fork_green
+    if fork_green:
+        rec["reason"] = ("vacuous-harness: the chain's verify.sh passes at the FORK POINT "
+                         "too, so its passing against main is not evidence of anything. "
+                         "Refusing to retire -- fix or re-author the harness.")
+        return rec
+    rec["retired"] = True
+    rec["reason"] = (f"the chain's own verify.sh PASSES against {dref} and FAILS at the "
+                     f"fork point {mb[:12]} ({fdet.splitlines()[0][:120] if fdet else 'red'})"
+                     f" -- main functionally satisfies this chain and the test proves it")
+    return rec
+
+
+def read_retire_record(wt: str) -> dict | None:
+    """A persisted retirement proof for this worktree, or None. Only honoured while
+    it still describes THIS branch head: a chain that committed more work since the
+    proof has not been shown to be satisfied by main, so the proof is stale."""
+    try:
+        d = json.loads((Path(wt) / STATE_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    rec = (d or {}).get(RETIRE_KEY)
+    return rec if isinstance(rec, dict) and rec.get("retired") else None
+
+
+def write_retire_record(wt: str, rec: dict) -> None:
+    """Persist the proof into the worktree's state file, so a later sweep reads
+    settled evidence instead of re-running the verify. Never raises."""
+    p = Path(wt) / STATE_FILE
+    try:
+        d = json.loads(p.read_text()) if p.exists() else {}
+        if not isinstance(d, dict):
+            d = {}
+    except (OSError, ValueError):
+        d = {}
+    d[RETIRE_KEY] = rec
+    try:
+        p.write_text(json.dumps(d, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def still_scaffold_stub(path: str, theirs: bytes | None,
+                        ours: bytes | None) -> bool:
+    """True when the BRANCH's version of an in-scope file still carries the stub
+    marker that `ollama-dispatch-scaffold` itself wrote for that exact path, and
+    the default branch's version does not.
+
+    WHY (2026-09-25, integration-gate follow-on): a chain can report convergence
+    while one of its in-scope files was never actually implemented -- the file
+    still holds the scaffold placeholder. Against a main that DOES implement it,
+    the three-way then reads `conflict`, which is doubly wrong: it invites a
+    merge-dispatch to "resolve" a file that has nothing to merge, and if main
+    happens not to have moved it reads `clean` and would STAGE A STUB ONTO MAIN.
+    Neither is a semantic conflict; the chain simply did not converge.
+
+    This is deliberately NOT a heuristic about content being a subset of main's.
+    The marker is written by our own scaffold, so its presence is evidence, not
+    inference -- the one thing a proxy cannot give us. A rule loose enough to
+    catch "the branch looks worse than main" would auto-retire genuine diverging
+    edits, which is exactly the failure this gate exists to prevent."""
+    if not theirs:
+        return False
+    marker = f"Stub for {path} -- implement per TASK.md".encode()
+    if marker not in theirs:
+        return False
+    # If main carries the same placeholder, nobody implemented it and there is no
+    # "main already has the work" claim to make; ours==theirs is `integrated`.
+    return not (ours and marker in ours)
+
+
+def _pkg_scripts(raw: bytes | None) -> dict | None:
+    try:
+        return json.loads(raw.decode()) if raw else None
+    except Exception:
+        return None
+
+
+def classify_pkg_json_trivial(base: bytes | None, ours: bytes | None,
+                              theirs: bytes | None) -> dict | None:
+    """The one trivial resolver we ship.
+
+    SAFE-TRIVIAL condition (3-way, not 2-way): the branch's ONLY change to
+    package.json vs the merge-base is appending test file(s) to the
+    `scripts.test` command. Main may have made its own independent additions
+    (extra scripts, more test files) -- those are NOT the branch's doing and
+    must survive. So we compare theirs-vs-base (what the branch actually did),
+    require it to be confined to scripts.test, and then resolve by UNIONing the
+    whitespace-separated tokens of main's test line with the branch's -- which
+    never regresses main-only additions. Returns None if the branch touched
+    anything else, i.e. the conflict is not purely a test-file union.
+
+    The `scripts.test` line in this repo is a single space-separated
+    `TZ=... node --experimental-strip-types --test a.test.ts b.test.ts ...`
+    command, so the union is over whitespace tokens (shared flag prefix is
+    identical on both sides and dedupes to itself); an `&&`-joined form unions
+    the same way because `&&` tokens survive the split too.
+    """
+    jb, jo, jt = _pkg_scripts(base), _pkg_scripts(ours), _pkg_scripts(theirs)
+    if not (jb and jo and jt):
+        return None
+
+    def strip_scripts(d):
+        d = json.loads(json.dumps(d))
+        d.pop("scripts", None)
+        return d
+
+    # Outside `scripts`, the branch must have changed NOTHING vs baseline.
+    if strip_scripts(jt) != strip_scripts(jb):
+        return None
+    sb, so, st = (jb.get("scripts") or {}), (jo.get("scripts") or {}), (jt.get("scripts") or {})
+    # The branch's only script changes vs base may be: (a) the `test` line
+    # (append-only, checked below), and (b) BRAND-NEW keys (absent in base).
+    # A branch that MODIFIED an existing non-test script is not trivially safe.
+    new_keys = []
+    for k in st:
+        if k == "test":
+            continue
+        if k not in sb:
+            new_keys.append(k)          # branch added a new script
+        elif sb[k] != st[k]:
+            return None                 # branch modified an existing script
+    # branch must not have removed any non-test script either
+    if any(k not in st for k in sb if k != "test"):
+        return None
+    # A new key that collides with main under a DIFFERENT value is a real
+    # conflict, not a trivial add.
+    add_scripts, script_collisions = {}, []
+    for k in new_keys:
+        if k in so and so[k] != st[k]:
+            script_collisions.append(k)
+        elif k not in so:
+            add_scripts[k] = st[k]
+    if script_collisions:
+        return None
+    tb = sb.get("test", "")
+    to = so.get("test", "")   # main
+    tt = st.get("test", "")   # branch
+    base_toks, main_toks = tb.split(), to.split()
+    branch_toks = tt.split()
+    # A blind UNION is only safe if the branch strictly ADDED to the base test
+    # line (no token removed). If the branch dropped a base token, unioning would
+    # silently resurrect it -> not trivially safe (MED9).
+    if not set(base_toks) <= set(branch_toks):
+        return None
+    branch_added = [x for x in branch_toks if x not in base_toks]  # files it registered
+    # Every non-flag token the branch added must be a test file (a real test
+    # extension). A branch that appended a non-test token to `test` is doing
+    # something we will not blind-union (MED9).
+    for x in branch_added:
+        if x.startswith("-"):
+            continue
+        if not x.endswith(_TEST_EXTS):
+            return None
+    if tt != tb and not branch_added:
+        return None  # branch only REMOVED test tokens -> not a safe blind union
+    if tt == tb and not add_scripts:
+        return None  # branch changed nothing here at all
+    # Union main's test line with the branch-added tokens not already present.
+    add_test_toks = [x for x in branch_added if x not in main_toks]
+    merged_test = " ".join(main_toks + add_test_toks) if to or add_test_toks else tt
+    noop = (not add_test_toks) and (not add_scripts)
+    return {"resolver": "pkg-json-test-union",
+            "main_test": to, "branch_test": tt, "merged_test": merged_test,
+            "branch_added_files": branch_added,
+            "test_tokens_not_on_main": add_test_toks,
+            "new_scripts_added": sorted(add_scripts),
+            "noop": noop}
+
+
+def _unquote_porcelain(p: str) -> str:
+    """Undo git's C-style path quoting (only applied when a path has unusual
+    chars). A bare `strip('"')` leaves backslash escapes intact -> broken shell
+    commands for such paths (LOW17). Spaces are NOT quoted by git, so the common
+    space case is handled downstream by shlex-quoting the emitted commands."""
+    if len(p) >= 2 and p.startswith('"') and p.endswith('"'):
+        try:
+            return p[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
+        except Exception:
+            return p[1:-1]
+    return p
+
+
+def worktree_status(cwd: str) -> tuple[bool, list[dict]]:
+    """WHOLE-TREE porcelain status (not scope-only). Returns (ok, entries) where
+    each entry = {path, xy}. ok=False means `git status` itself failed (rc != 0)
+    -- the caller must FAIL CLOSED (error verdict), never treat an unreadable
+    status as 'clean' (MED6: an unresolvable pathspec used to exit 128 -> [] ->
+    a false clean). `--no-optional-locks` so a concurrent git op can't wedge us.
+
+    Statuses the WHOLE tree so out-of-scope dirt (untracked files, edits to files
+    outside the declared scope) is visible -- a 0-ahead worktree with such dirt
+    must NOT be pruned (MED6)."""
+    rc, out, _ = git(cwd, "--no-optional-locks", "status", "--porcelain")
+    if rc != 0:
+        return False, []
+    res = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        xy = line[:2]
+        path = line[3:]
+        if " -> " in path:                     # rename: report the new path
+            path = path.split(" -> ", 1)[1]
+        res.append({"path": _unquote_porcelain(path.strip()), "xy": xy})
+    return True, res
+
+
+def dirty_scope(cwd: str, scope: list[str] | None) -> list[dict]:
+    """Back-compat shim: uncommitted changes to IN-SCOPE files only, derived from
+    the whole-tree status. THE CRITICAL GUARD -- classify() otherwise compares
+    COMMITTED HEAD vs main only, so an uncommitted fix (working-tree M, 0 ahead)
+    would look byte-identical to main and be mis-called `redundant` -> `branch -D`
+    deletes unmerged work. Returns [{path, xy}]; [] == in-scope clean."""
+    if not scope:
+        return []
+    ok, entries = worktree_status(cwd)
+    if not ok:
+        return []
+    sset = set(scope)
+    return [e for e in entries if e["path"] in sset]
+
+
+def _branch_renames(cwd: str, mb: str) -> dict:
+    """old_path -> new_path for files the branch RENAMED since the merge-base
+    (MED12). A scope contract holding the OLD path would otherwise see theirs=None
+    (renamed away) and, on an untouched main, resolve `deleted` -> a stale merge
+    could force-remove main's file. We surface the rename so the caller STOPs."""
+    rc, out, _ = git(cwd, "diff", "--find-renames", "--name-status", f"{mb}..HEAD")
+    if rc != 0:
+        return {}
+    renames = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if parts and parts[0].startswith("R") and len(parts) >= 3:
+            renames[parts[1]] = parts[2]
+    return renames
+
+
+def classify(wt: str, scope_override: list[str] | None = None,
+             onto: str | None = None) -> dict:
+    """Classify `wt`'s branch against the default ref.
+
+    scope_override -- a PROVEN scope supplied by the caller (ollama-dispatch-slice
+        passes the files its chain branch committed: the plan's target plus any
+        extra deliverable). A chain worktree carries no .preflight-state.json and
+        no ledger row, so without this every chain classified as scope-INFERRED
+        and --stage refused it -- the reason converged chains were only ever
+        integrated by hand (2026-09-23, Fable pass 2). It is recorded as source
+        "caller" and is NOT inferred.
+    onto -- classify/stage against this ref instead of default_ref(). The slicer
+        lands onto the LOCAL default branch by fast-forward, so the staged commit
+        must be built on that exact tip, not on a possibly-stale origin/main."""
+    cwd = wt
+    rc, _, _ = git(cwd, "rev-parse", "--is-inside-work-tree")
+    if rc != 0:
+        return {"error": f"not a git worktree: {wt}"}
+    branch = git(cwd, "rev-parse", "--abbrev-ref", "HEAD")[1].strip()
+    head = git(cwd, "rev-parse", "HEAD")[1].strip()
+    if onto:
+        if git(cwd, "rev-parse", "--verify", "--quiet", f"{onto}^{{commit}}")[0] != 0:
+            return {"error": f"--onto ref {onto!r} does not resolve to a commit"}
+        dref = onto
+    else:
+        dref = default_ref(cwd)
+    if not dref:
+        return {"error": "no default branch (origin/HEAD/main) found"}
+    main_tip = git(cwd, "rev-parse", dref)[1].strip()
+    mb = merge_base(cwd, dref, "HEAD")
+    ahead = git(cwd, "rev-list", "--count", f"{dref}..HEAD")[1].strip()
+    behind = git(cwd, "rev-list", "--count", f"HEAD..{dref}")[1].strip()
+
+    if scope_override is not None:
+        bad = [x for x in scope_override if not isinstance(x, str) or not x.strip()]
+        if bad or not scope_override:
+            return {"error": f"--scope must be one or more non-empty paths (got {scope_override!r})",
+                    "worktree": wt}
+        contract = {"declared_scope": list(dict.fromkeys(scope_override)),
+                    "baseline_commit": mb, "source": "caller", "inferred": False}
+    else:
+        contract = resolve_contract(wt)
+    # A structurally malformed recorded scope (a bare string, a non-str element)
+    # is a CONTRACT error, not something to guess around (HIGH5). Fail closed.
+    if contract.get("scope_error"):
+        return {"error": contract["scope_error"], "worktree": wt}
+    scope = contract["declared_scope"]
+
+    # A stale remote-tracking default ref silently classifies against an OLD main
+    # (MED11). We do NOT fetch (a read-only tool must not mutate refs / hit the
+    # network unbidden); we WARN so the caller can `git fetch` first.
+    main_ref_note = None
+    if dref.startswith("origin/"):
+        main_ref_note = (f"{dref} is a remote-tracking ref -- NOT refreshed by this "
+                         "read-only tool. If it is stale the verdict is against an "
+                         "OLD main; run `git -C <repo> fetch` before trusting a prune.")
+
+    # Files the branch actually changed since the merge-base.
+    rc, out, _ = git(cwd, "diff", "--name-only", f"{mb}..HEAD") if mb else (1, "", "")
+    changed = [p for p in out.splitlines() if p.strip()]
+    renames = _branch_renames(cwd, mb) if mb else {}
+
+    if scope is None:
+        # Inferred: everything the branch changed minus known scaffold names.
+        # Never strip a declared-looking code/test file we cannot prove is
+        # scaffold; only the exact scaffold basenames are dropped.
+        scope = [p for p in changed if Path(p).name not in SCAFFOLD_FILES]
+        stripped = [p for p in changed if Path(p).name in SCAFFOLD_FILES]
+    else:
+        stripped = [p for p in changed if p not in scope]
+
+    # WHOLE-TREE status (MED6). ok=False -> git status itself failed -> FAIL CLOSED.
+    status_ok, tree_entries = worktree_status(cwd)
+    if not status_ok:
+        return {"error": f"git status failed on {wt} (cannot prove clean; "
+                          "refusing to classify)", "worktree": wt}
+    sset = set(scope)
+    dirty = [e for e in tree_entries if e["path"] in sset]         # in-scope dirt
+    # Out-of-scope, non-scaffold dirt (untracked or edited). A would-be-redundant
+    # worktree carrying this must NOT be pruned -- worktree-remove would discard
+    # the uncommitted out-of-scope work (MED6/HIGH5).
+    dirty_out = [e for e in tree_entries
+                 if e["path"] not in sset and Path(e["path"]).name not in SCAFFOLD_FILES]
+
+    # Fast path: branch HEAD is already an ancestor of main -> fully merged.
+    already_merged = git(cwd, "merge-base", "--is-ancestor", "HEAD", dref)[0] == 0
+
+    files = []
+    scope_errors = []
+    for path in scope:
+        base_b = show(cwd, mb, path) if mb else None
+        ours_b = show(cwd, dref, path)
+        theirs_b = show(cwd, "HEAD", path)
+        # A scope path present at NONE of base/ours/HEAD is malformed (typo,
+        # directory, absolute/`./` path). NEVER a false 'no-change' (HIGH5).
+        if base_b is None and ours_b is None and theirs_b is None:
+            scope_errors.append(path)
+            files.append({"path": path, "status": "error", "_merged": None})
+            continue
+        if path in renames:                       # branch renamed this scope path
+            files.append({"path": path, "status": "renamed",
+                          "renamed_to": renames[path], "_merged": None})
+            continue
+        status, _merged = three_way(base_b, ours_b, theirs_b)
+        rec = {"path": path, "status": status, "_merged": _merged}
+        if status == "conflict":
+            landed = landed_on_default(cwd, mb, dref, path, theirs_b)
+            if landed:
+                # Landed by commit-tree (no ancestry), then hardened on main: the
+                # branch's exact bytes are in main's history and main moved past
+                # them. Settled -- a merge would regress main to the older version.
+                rec["status"] = "superseded"
+                rec["landed_in"] = landed[:12]
+            elif Path(path).name == "package.json":
+                triv = classify_pkg_json_trivial(base_b, ours_b, theirs_b)
+                if triv and triv.get("noop"):
+                    rec["status"] = "integrated"   # union already on main
+                    rec["resolution"] = triv
+                elif triv:
+                    rec["status"] = "conflict-trivial"
+                    rec["resolution"] = triv
+                else:
+                    rec["subclass"] = "semantic"
+            else:
+                rec["subclass"] = "semantic"
+        # An in-scope file the chain never implemented is not a conflict to merge
+        # and MUST NOT be staged (it would write a placeholder onto main). Checked
+        # after `superseded`: if the branch's exact bytes are already in main's
+        # history then main accepted them and there is no hazard to flag.
+        if rec["status"] in ("conflict", "clean", "add-clean") \
+                and still_scaffold_stub(path, theirs_b, ours_b):
+            rec["status"] = "unconverged"
+            rec.pop("subclass", None)
+        files.append(rec)
+
+    if scope_errors:
+        return {"error": "scope path(s) resolve at none of base/ours/HEAD "
+                         f"(malformed/typo/directory?): {', '.join(scope_errors)}",
+                "worktree": wt, "declared_scope": scope}
+
+    # Overall classification.
+    to_integrate = [f for f in files if f["status"] in ("clean", "add-clean")]
+    conflicts = [f for f in files if f["status"].startswith("conflict")]
+    trivial = [f for f in files if f["status"] == "conflict-trivial"]
+    semantic = [f for f in files if f.get("subclass") == "semantic"]
+    review = [f for f in files if f["status"] in ("renamed", "deleted")]
+    unconverged = [f for f in files if f["status"] == "unconverged"]
+    # `superseded` = landed then hardened (see landed_on_default): settled evidence
+    # of the same kind as `integrated` -- main carries the branch's content.
+    has_integrated = any(f["status"] in ("integrated", "superseded") for f in files)
+    all_settled = bool(files) and all(f["status"] in ("no-change", "integrated", "superseded")
+                                      for f in files)
+    # REDUNDANT-BY-CONTENT requires at least one file actually INTEGRATED (ours ==
+    # theirs). All-`no-change` means the branch touched NOTHING in scope -- its
+    # real change is out of scope; that is a review case, never a prune (HIGH5).
+    integrated_only = all_settled and has_integrated
+    would_be_redundant = already_merged or integrated_only
+
+    if dirty:
+        # Top precedence: real, uncommitted in-scope work exists. NEVER redundant.
+        overall = "dirty-scope"
+    elif would_be_redundant and dirty_out:
+        # Otherwise-redundant, but out-of-scope uncommitted dirt would be lost by
+        # worktree-remove -- keep, do not prune (MED6/HIGH5).
+        overall = "dirty-tree"
+    elif already_merged:
+        overall = "redundant"
+    elif review:
+        # A renamed/deleted scope file needs a human -- auto-staging risks
+        # deleting main's file via a stale/None blob (MED12).
+        overall = "needs-review"
+    elif unconverged:
+        # Precedence over `conflict-semantic` ON PURPOSE: this must not reach
+        # merge-dispatch (which requires exactly conflict-semantic), because there
+        # is no branch-side work to merge -- and it must never be staged.
+        overall = "unconverged"
+    elif not files or all_settled:
+        # No in-scope changes (empty scope, or every scope file is no-change/
+        # already-on-main-but-no integration to prove). all-no-change lands here.
+        overall = "redundant" if integrated_only else "empty-scope"
+    elif semantic:
+        # RETIRED beats conflict-semantic, but ONLY on a persisted both-ways proof
+        # (see prove_retired_on_default). classify() stays fast and read-only: it
+        # never runs a verify itself, it only reads a proof `--retire-check` already
+        # established and recorded. A chain that committed work after the proof no
+        # longer matches its recorded head, so the proof is ignored as stale.
+        _rr = read_retire_record(wt)
+        overall = "retired" if _rr and _rr.get("head") == head[:12] else "conflict-semantic"
+    elif trivial and not to_integrate:
+        overall = "conflict-trivial"
+    elif conflicts:
+        overall = "conflict-trivial"           # semantic already handled above (B)
+    else:
+        overall = "clean"
+
+    out_v = {
+        "worktree": wt, "branch": branch, "head": head[:12],
+        "default_ref": dref, "main_tip": main_tip[:12],
+        "merge_base": (mb or "")[:12], "ahead": ahead, "behind": behind,
+        "already_merged": already_merged,
+        "dirty_scope_files": dirty, "dirty_out_of_scope_files": dirty_out,
+        "contract_source": contract["source"], "scope_inferred": contract["inferred"],
+        "declared_scope": scope, "scaffold_stripped": stripped,
+        "branch_changed": changed,
+        "files": files, "overall": overall,
+        "recommendation": RECS.get(overall, "review by hand"),
+    }
+    if main_ref_note:
+        out_v["main_ref_note"] = main_ref_note
+    if overall == "retired":
+        # Carry the proof in the verdict, so a reader never has to take "retired" on
+        # trust: it states which verify ran, against which main tip and fork point.
+        out_v["retired_proof"] = read_retire_record(wt)
+    return out_v
+
+
+RECS = {
+    "dirty-scope": "STOP -- do NOT prune. Uncommitted in-scope changes exist "
+                   "(the real fix is not committed). Commit them in the worktree, "
+                   "then re-run. Pruning now would DELETE unmerged work.",
+    "redundant": "ACTED + PRUNE. Branch content already on main; a merge would "
+                 "regress (drags the branch's older siblings back). No merge.",
+    "clean": "INTEGRATE CODE-ONLY. Apply the declared-file diff onto a scratch "
+             "integration branch; scaffold is never touched. Then human gate.",
+    "conflict-trivial": "AUTO-RESOLVE (mechanical) then human gate. Only the "
+                        "package.json test-script union; everything else stops.",
+    "conflict-semantic": "STOP -> human, or bounded ollama merge-dispatch IF "
+                         "both sides carry behavioural tests (see design doc). "
+                         "If main may already satisfy this chain a different way, "
+                         "run --retire-check <worktree> first.",
+    "retired": "ACTED + PRUNE. Main functionally satisfies this chain: its OWN "
+               "verify.sh passes against main's current code and fails at the fork "
+               "point, so the property is there and the test proves it. A merge "
+               "would only re-litigate work main already has. No merge.",
+    "empty-scope": "REVIEW: no in-scope changes found (0-file dispatch? or the "
+                   "branch's real change is OUT of the declared scope).",
+    "dirty-tree": "STOP -- do NOT prune. Work looks redundant, but uncommitted "
+                  "OUT-OF-SCOPE changes exist; worktree-remove would discard them. "
+                  "Commit or clean the worktree first, then re-run.",
+    "needs-review": "STOP -> human. A declared-scope file was RENAMED or DELETED "
+                    "on the branch; auto-staging risks deleting main's file. "
+                    "Resolve the rename/deletion by hand.",
+    "unconverged": "STOP -- the CHAIN never converged: an in-scope file still "
+                   "carries the scaffold stub. Nothing to merge and nothing to "
+                   "stage (staging would put a placeholder on main). NOT a "
+                   "semantic conflict; re-dispatch the slice or retire the chain.",
+}
+
+
+def _strip_bytes(obj):
+    """Recursively drop underscore-prefixed keys (e.g. the `_merged` blob bytes
+    classify carries for --stage) so a verdict is JSON-serialisable. HIGH1: the
+    merged bytes ride IN the verdict but must never reach json.dumps."""
+    if isinstance(obj, dict):
+        return {k: _strip_bytes(x) for k, x in obj.items()
+                if not (isinstance(k, str) and k.startswith("_"))}
+    if isinstance(obj, list):
+        return [_strip_bytes(x) for x in obj]
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", "replace")
+    return obj
+
+
+def human_report(v: dict) -> str:
+    if "error" in v:
+        return f"ERROR: {v['error']}"
+    L = []
+    L.append(f"integration plan: {v['worktree']}")
+    L.append(f"  branch {v['branch']} @ {v['head']}  vs  {v['default_ref']} @ {v['main_tip']}")
+    L.append(f"  merge-base {v['merge_base']}  ahead {v['ahead']} / behind {v['behind']}")
+    src = v["contract_source"] + (" (INFERRED scope -- lower confidence)" if v["scope_inferred"] else "")
+    L.append(f"  scope contract: {src}")
+    L.append(f"  declared scope: {', '.join(v['declared_scope']) or '(none)'}")
+    if v["scaffold_stripped"]:
+        L.append(f"  scaffold stripped (never integrated): {', '.join(v['scaffold_stripped'])}")
+    if v.get("dirty_scope_files"):
+        L.append("  *** UNCOMMITTED IN-SCOPE CHANGES (the real fix is NOT committed) ***")
+        for d in v["dirty_scope_files"]:
+            L.append(f"    {d['xy']}  {d['path']}")
+        L.append("  commit first, then re-run. Guidance (PRINT-ONLY):")
+        for c in commit_guidance(v):
+            L.append(f"    $ {c}")
+    if v.get("dirty_out_of_scope_files"):
+        L.append("  out-of-scope uncommitted changes (block prune -- would be lost):")
+        for d in v["dirty_out_of_scope_files"]:
+            L.append(f"    {d['xy']}  {d['path']}")
+    L.append("  per-file:")
+    for f in v["files"]:
+        line = f"    {f['status']:16} {f['path']}"
+        if f.get("renamed_to"):
+            line += f"  -> {f['renamed_to']}"
+        if f.get("subclass"):
+            line += f"  [{f['subclass']}]"
+        if f.get("resolution"):
+            r = f["resolution"]
+            bits = []
+            if r.get("test_tokens_not_on_main"):
+                bits.append(f"+test {r['test_tokens_not_on_main']}")
+            if r.get("new_scripts_added"):
+                bits.append(f"+scripts {r['new_scripts_added']}")
+            line += f"  [union: {'; '.join(bits) or 'already on main'}]"
+        L.append(line)
+    L.append(f"  ==> {v['overall'].upper()}")
+    L.append(f"  ==> {v['recommendation']}")
+    if v.get("main_ref_note"):
+        L.append(f"  note: {v['main_ref_note']}")
+    return "\n".join(L)
+
+
+def main_worktree(cwd: str) -> str:
+    """Path of the repo's PRIMARY worktree (the first `git worktree list` entry).
+
+    Used only to phrase the by-hand `git -C <repo> ...` commands so they still
+    work after `worktree remove` deletes the dispatch worktree. READ-ONLY."""
+    rc, out, _ = git(cwd, "worktree", "list", "--porcelain")
+    if rc == 0:
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                return line.split(" ", 1)[1].strip()
+    return cwd
+
+
+def commit_guidance(v: dict) -> list[str]:
+    """Exact `git -C <wt> add/commit` guidance for the dirty-scope STOP case.
+
+    PRINTED, NEVER RUN. Directs the human to commit the uncommitted in-scope work
+    (so it becomes a real branch commit) and re-run the classifier."""
+    wt = v["worktree"]
+    files = [d["path"] for d in v.get("dirty_scope_files") or []] or (v.get("declared_scope") or [])
+    # shlex-quote each path so a path with a space / special char yields a valid
+    # command instead of a broken one (LOW17).
+    paths = " ".join(shlex.quote(f) for f in files) if files else "<in-scope files>"
+    return [
+        f"git -C {shlex.quote(wt)} add {paths}",
+        f"git -C {shlex.quote(wt)} commit -m 'dispatch: <describe the in-scope fix>'",
+        f"# then re-run: ollama-dispatch-integrate {shlex.quote(wt)}",
+    ]
+
+
+def prune_commands(v: dict) -> list[str]:
+    """The exact ack + prune commands a human would run. PRINTED, NEVER RUN.
+
+    The tool emits these as text; it does not execute a single one of them."""
+    wt, branch = v["worktree"], v["branch"]
+    repo = main_worktree(wt)
+    return [
+        f"python3 ~/bin/handoff-emit.py --acted <job-id>   "
+        f"# mark the dispatch acted-on (branch {branch}); job-id from the complete/ bucket",
+        f"git -C {shlex.quote(repo)} worktree remove {shlex.quote(wt)}",
+        f"git -C {shlex.quote(repo)} branch -D {shlex.quote(branch)}   # HEAD already on main, so -D is safe",
+    ]
+
+
+def prune_recommendation(v: dict) -> dict:
+    """Reduce a classifier verdict to a print-only prune recommendation.
+
+    Recommends PRUNE iff the branch's work has already reached main by ANY path
+    (overall == redundant: merged ancestor OR byte-identical on main). Everything
+    else -> keep. This never mutates and never runs the printed commands."""
+    if "error" in v:
+        return {"worktree": v.get("worktree"), "branch": None, "prune": False,
+                "verdict": "error", "via": None, "reason": f"error: {v['error']}",
+                "ahead": None, "behind": None}
+    overall = v["overall"]
+    base = {"worktree": v["worktree"], "branch": v["branch"], "verdict": overall,
+            "ahead": v["ahead"], "behind": v["behind"]}
+    if overall == "dirty-scope":
+        # CRITICAL: uncommitted in-scope work -> NEVER prune. Commit-first guidance.
+        dirty = ", ".join(d["path"] for d in (v.get("dirty_scope_files") or [])) or "(in-scope files)"
+        return {**base, "prune": False, "via": None,
+                "reason": f"uncommitted in-scope changes -- commit first "
+                          f"(real unmerged work; pruning would DELETE it): {dirty}",
+                "commit_guidance": commit_guidance(v)}
+    if overall == "dirty-tree":
+        # Would look redundant, but out-of-scope uncommitted work would be lost by
+        # worktree-remove. NEVER prune (MED6/HIGH5).
+        dout = ", ".join(d["path"] for d in (v.get("dirty_out_of_scope_files") or [])) or "(out-of-scope files)"
+        return {**base, "prune": False, "via": None,
+                "reason": f"work is redundant, but UNCOMMITTED OUT-OF-SCOPE changes "
+                          f"would be discarded by worktree-remove -- clean/commit "
+                          f"the worktree first, do NOT prune: {dout}"}
+    if overall == "needs-review":
+        rn = [f"{f['path']} -> {f.get('renamed_to')}" for f in v["files"]
+              if f["status"] == "renamed"]
+        dl = [f["path"] for f in v["files"] if f["status"] == "deleted"]
+        return {**base, "prune": False, "via": None,
+                "reason": "declared-scope file renamed/deleted on the branch -- "
+                          "resolve by hand, do NOT prune (a stale/None blob could "
+                          f"delete main's file). renamed: {rn or '-'}; deleted: {dl or '-'}"}
+    if overall == "retired":
+        # Settled evidence of the same standing as `redundant`, reached functionally
+        # rather than by byte identity. classify() only reports this verdict off a
+        # persisted both-ways proof, so the prune decision quotes that proof instead
+        # of re-deriving it. dirty-scope/dirty-tree already took precedence above, so
+        # no uncommitted work can be discarded here.
+        pr = v.get("retired_proof") or {}
+        return {**base, "prune": True, "via": "verify-on-main",
+                "reason": ("retired -- main functionally satisfies this chain: its own "
+                           "verify.sh PASSES against %s @ %s and FAILS at the fork point "
+                           "%s, so the property is on main and the test proves it (a "
+                           "merge would re-litigate work main already has). harness: %s"
+                           % (v["default_ref"], pr.get("main", "?"), pr.get("fork", "?"),
+                              ", ".join(pr.get("harness") or []) or "(none)")),
+                "suggested_commands": prune_commands(v)}
+    if overall == "redundant":
+        if v["already_merged"]:
+            via, why = "merge", (
+                f"already on main via merge -- HEAD {v['head']} is an ancestor of "
+                f"{v['default_ref']} @ {v['main_tip']} (ahead {v['ahead']})")
+        else:
+            integ = [f["path"] for f in v["files"] if f["status"] == "integrated"]
+            sup = [f"{f['path']} (landed at {f.get('landed_in', '?')}, since hardened)"
+                   for f in v["files"] if f["status"] == "superseded"]
+            via, why = "identical", (
+                "already on main via identical content -- in-scope file(s) are "
+                f"byte-identical (ours==theirs) on {v['default_ref']}: "
+                f"{', '.join(integ) or ('(none)' if sup else '(all in-scope files)')}"
+                + (f"; superseded (branch bytes landed on {v['default_ref']} and it has "
+                   f"since moved past them -- a merge would regress): {', '.join(sup)}"
+                   if sup else ""))
+        return {**base, "prune": True, "via": via, "reason": why,
+                "suggested_commands": prune_commands(v)}
+    reason = {
+        "clean": "not yet on main -- code-only diff still needs integrating",
+        "conflict-trivial": "not yet on main -- trivially resolvable conflict vs main",
+        "conflict-semantic": "not yet on main -- SEMANTIC conflict vs main (diverging edit)",
+        "unconverged": "NOT branch work vs main -- an in-scope file still holds the "
+                       "scaffold stub, so the chain never converged on it: "
+                       + ", ".join(f["path"] for f in v["files"]
+                                   if f["status"] == "unconverged"),
+        "empty-scope": "cannot prove integrated -- no in-scope changes found",
+    }.get(overall, f"not yet on main -- overall={overall}")
+    return {**base, "prune": False, "via": None, "reason": reason}
+
+
+def prune_report(r: dict) -> str:
+    tag = "PRUNE" if r["prune"] else "KEEP "
+    L = [f"[{tag}] {r['worktree']}"]
+    L.append(f"  branch {r.get('branch')}  verdict={r['verdict']}  "
+             f"ahead {r.get('ahead')}/behind {r.get('behind')}")
+    L.append(f"  reason: {r['reason']}")
+    if r["prune"]:
+        L.append("  RECOMMEND ack + prune. Commands below are PRINT-ONLY -- this "
+                 "tool runs none of them; run them yourself after review:")
+        for c in r["suggested_commands"]:
+            L.append(f"    $ {c}")
+    elif r.get("commit_guidance"):
+        L.append("  RECOMMEND KEEP -- uncommitted in-scope changes; commit first, "
+                 "do NOT prune. Guidance (PRINT-ONLY):")
+        for c in r["commit_guidance"]:
+            L.append(f"    $ {c}")
+    else:
+        L.append("  RECOMMEND keep -- not yet on main; do NOT ack or prune.")
+    return "\n".join(L)
+
+
+def _slug(v: dict) -> str:
+    b = v.get("branch") or ""
+    base = b if b and b != "HEAD" else Path(v["worktree"]).name
+    s = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+    return s or "dispatch"
+
+
+def _build_commit_onto(cwd: str, base_full: str, blob_map: dict,
+                       msg: str) -> tuple[int, str]:
+    """Pure plumbing: seed a TEMP index from `base_full`, overlay each path in
+    `blob_map` (value = new bytes, or None to force-remove the path), write a
+    tree, and commit-tree it onto `base_full`. Returns (0, commit_sha) -- a
+    DANGLING commit: NO ref is created, NO HEAD moves, NO worktree is touched
+    (throwaway GIT_INDEX_FILE). Callers that want a branch add one themselves
+    (_commit_blobs_onto); materialize_conflicted_baseline wants the dangling
+    commit as a scaffold baseline and creates no ref (HARD INVARIANT: the only
+    real ref this tool ever writes is land_resolution's integrate/* branch)."""
+    idx = tempfile.NamedTemporaryFile(prefix="odi-idx-", delete=False)
+    idx.close()
+    env = dict(os.environ, GIT_INDEX_FILE=idx.name)
+
+    def gi(*a):
+        return subprocess.run(["git", "-C", cwd, *a],
+                              capture_output=True, text=True, env=env)
+    try:
+        r = gi("read-tree", base_full)                 # seed index from base
+        if r.returncode != 0:
+            return 3, f"stage failed (read-tree {base_full[:12]}): {r.stderr.strip()}"
+        for path, content in blob_map.items():
+            if content is None:                        # remove the path
+                rm = gi("update-index", "--force-remove", "--", path)
+                if rm.returncode != 0:
+                    return 3, f"stage failed (remove {path}): {rm.stderr.strip()}"
+                continue
+            # preserve the source file mode where the path already has a blob.
+            lt = git(cwd, "ls-tree", "HEAD", "--", path)[1].split()
+            mode = lt[0] if lt else "100644"
+            # hash the merged bytes VERBATIM: NO `--path` (improvement E) -- passing
+            # --path re-runs the repo's clean filters / LFS smudge on our already-
+            # resolved content, which would corrupt it. We hold exact bytes; store
+            # them as-is.
+            h = subprocess.run(["git", "-C", cwd, "hash-object", "-w", "--stdin"],
+                               input=content, capture_output=True)
+            if h.returncode != 0:
+                return 3, f"stage failed (hash-object {path}): {h.stderr.decode().strip()}"
+            blob = h.stdout.decode().strip()
+            u = gi("update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}")
+            if u.returncode != 0:
+                return 3, f"stage failed (update-index {path}): {u.stderr.strip()}"
+        tree = gi("write-tree")
+        if tree.returncode != 0:
+            return 3, f"stage failed (write-tree): {tree.stderr.strip()}"
+        ct = subprocess.run(["git", "-C", cwd, "commit-tree", tree.stdout.strip(),
+                             "-p", base_full, "-m", msg],
+                            capture_output=True, text=True)
+        if ct.returncode != 0:
+            return 3, f"stage failed (commit-tree): {ct.stderr.strip()}"
+        return 0, ct.stdout.strip()
+    finally:
+        os.unlink(idx.name)
+
+
+def _commit_blobs_onto(cwd: str, base_full: str, blob_map: dict,
+                       target_branch: str, msg: str) -> tuple[int, object]:
+    """Shared write plumbing for --stage AND the phase-4 merge-lander.
+
+    Builds a commit via _build_commit_onto, then creates ONE new branch ref
+    `target_branch`. NEVER writes the base ref, NEVER checks anything out,
+    NEVER pushes, NEVER merges.
+
+    Returns (0, {commit, ...}) on success or (>=2, err_string). Caller owns all
+    verdict/refusal gating; this helper is pure plumbing so --stage and
+    land_resolution() share exactly one copy (no second stager).
+    """
+    if git(cwd, "rev-parse", "--verify", "--quiet",
+           f"refs/heads/{target_branch}")[0] == 0:
+        return 2, f"target branch already exists: {target_branch}"
+    rc, commit = _build_commit_onto(cwd, base_full, blob_map, msg)
+    if rc != 0:
+        return rc, commit
+    br = git(cwd, "branch", target_branch, commit)
+    if br[0] != 0:
+        return 3, f"stage failed (branch {target_branch}): {br[2].strip()}"
+    diff_files = [p for p in git(cwd, "diff", "--name-only",
+                                 f"{base_full}..{target_branch}")[1].splitlines()
+                  if p.strip()]
+    return 0, {"commit": commit, "diff_files": diff_files}
+
+
+def stage(v: dict) -> tuple[int, object]:
+    """PHASE 2: stage a `clean` classification's CODE-ONLY diff onto a NEW scratch
+    branch `integrate/<slug>-<shortid>`. Returns (exit_code, report_or_dict).
+
+    Writes ONLY the new scratch branch (via _commit_blobs_onto: a temp index
+    seeded from main + the branch's in-scope blobs, commit-tree onto main, one
+    branch ref). NEVER writes main, NEVER checks anything out, NEVER pushes,
+    NEVER merges.
+
+    Hard refusals (exit != 0, stage nothing):
+      * classify error
+      * scope_inferred (unproven scope)
+      * verdict != clean (covers dirty-scope / conflict-* / redundant / empty-scope)
+      * target branch already exists
+    """
+    if "error" in v:
+        return 2, f"REFUSE stage: {v['error']}"
+    cwd = v["worktree"]
+    if v.get("scope_inferred"):
+        return 2, ("REFUSE stage: scope is INFERRED (no recorded contract). "
+                   "Refusing to stage an unproven scope.")
+    overall = v["overall"]
+    if overall != "clean":
+        return 2, (f"REFUSE stage: verdict is {overall.upper()}, not CLEAN. "
+                   "Only a clean, conflict-free code-only diff is stageable.")
+    scope = v.get("declared_scope") or []
+    if not scope:
+        return 2, "REFUSE stage: empty declared scope."
+    target = f"integrate/{_slug(v)}-{v['head'][:8]}"
+    if git(cwd, "rev-parse", "--verify", "--quiet", f"refs/heads/{target}")[0] == 0:
+        return 2, f"REFUSE stage: target branch already exists: {target}"
+
+    dref = v["default_ref"]
+    main_full = git(cwd, "rev-parse", dref)[1].strip()
+
+    # HIGH1: build the blob map from the PER-FILE VERDICT, not a blind
+    # `show(HEAD, path)` for every scope file. Writing HEAD's blob for every path
+    # regresses main three ways: (a) a `no-change` sibling gets the branch's STALE
+    # blob over main's newer content; (b) a `clean` 3-way merge discards the
+    # computed _merged and writes theirs, losing main's hunk; (c) a path absent at
+    # HEAD but present on main -> None -> force-remove DELETES main's file.
+    # So: write ONLY `clean` (the merged bytes) and `add-clean` (theirs); SKIP
+    # `no-change`/`integrated` (branch did not change them -- leave main's blob).
+    blob_map = {}
+    for f in v["files"]:
+        st, path = f["status"], f["path"]
+        if st in ("clean", "add-clean"):
+            merged = f.get("_merged")
+            if merged is None:
+                # A clean/add-clean status must carry real bytes. None here would
+                # force-remove -- refuse rather than delete main's file.
+                return 2, (f"REFUSE stage: {path} is {st} but carries no merged "
+                           "bytes (would force-remove); refusing to delete/regress.")
+            blob_map[path] = merged
+        # no-change / integrated: intentionally NOT written.
+
+    # ASSERT: the set of staged paths == the set of scope files the branch
+    # actually CHANGED (never a stale/None blob for an untouched file). HIGH1.
+    branch_changed = set(v.get("branch_changed") or [])
+    staged_paths = set(blob_map)
+    should_stage = {f["path"] for f in v["files"] if f["status"] in ("clean", "add-clean")}
+    if staged_paths != should_stage:
+        return 2, (f"REFUSE stage: staged set {sorted(staged_paths)} != clean/add-clean "
+                   f"set {sorted(should_stage)} (internal inconsistency).")
+    stray = staged_paths - branch_changed
+    if stray:
+        return 2, (f"REFUSE stage: would write file(s) the branch did NOT change: "
+                   f"{sorted(stray)} -- refusing to stage a stale blob.")
+    if not blob_map:
+        return 2, ("REFUSE stage: nothing to stage (no clean/add-clean files -- "
+                   "the branch changed nothing integrable in scope).")
+
+    msg = (f"integrate: {', '.join(sorted(blob_map))} (code-only, scaffold stripped)\n\n"
+           f"Staged from {v['branch']} @ {v['head']} onto {dref} @ {v['main_tip']}. "
+           f"Scaffold NOT included. No merge, no push -- scratch branch only.")
+    rc, r = _commit_blobs_onto(cwd, main_full, blob_map, target, msg)
+    if rc != 0:
+        return rc, f"REFUSE stage: {r}" if rc == 2 else r
+    diff_files = r["diff_files"]
+    leaked = [p for p in diff_files if Path(p).name in SCAFFOLD_FILES]
+    return 0, {
+        "staged": True, "target_branch": target, "commit": r["commit"][:12],
+        "base": dref, "base_tip": main_full[:12],
+        "scope": scope, "staged_files": sorted(blob_map),
+        "diff_files": diff_files, "scaffold_leaked": leaked,
+        "source_branch": v["branch"], "source_head": v["head"],
+    }
+
+
+def stage_report(rc: int, r: object) -> str:
+    if rc != 0:
+        return str(r)
+    L = [f"STAGED code-only integration branch: {r['target_branch']} @ {r['commit']}"]
+    L.append(f"  from {r['source_branch']} @ {r['source_head']}  onto {r['base']} @ {r['base_tip']}")
+    L.append(f"  in-scope files staged: {', '.join(r['scope'])}")
+    L.append(f"  diff vs {r['base']}: {', '.join(r['diff_files']) or '(none)'}")
+    if r["scaffold_leaked"]:
+        L.append(f"  !! SCAFFOLD LEAKED: {', '.join(r['scaffold_leaked'])}")
+    else:
+        L.append("  scaffold: none (clean code-only diff)")
+    L.append(f"  main ({r['base']}) NOT written, no push, no merge. Review then:")
+    L.append(f"    $ git -C <repo> log -p {r['target_branch']}")
+    return "\n".join(L)
+
+
+# ===========================================================================
+# PHASE 4 -- gated ollama merge-dispatch for SEMANTIC conflicts.
+#
+# The highest-risk mode. It NEVER runs a live dispatch, NEVER enqueues, NEVER
+# writes/pushes main. `--merge-dispatch` is a DRY-RUN PLANNER: it (1) refuses
+# unless the verdict is exactly conflict-semantic on a PROVEN scope, (2) applies
+# the decidable precondition gate (both sides must carry a behavioural test that
+# pins their intent -- else STOP -> human), (3) builds the both-ways-proven
+# verify contract and the per-file scaffold/preflight/enqueue COMMANDS, and (4)
+# stops, printing them for the coordinator to run. The only WRITE it can make is
+# landing a resolution on a scratch integrate/* branch (land_resolution), which
+# in this build is exercised only by --self-test with a MOCK resolution.
+# ===========================================================================
+
+# extensions we treat as importable JS/TS behaviour (the conflict file must be
+# one of these to be dispatchable at all -- .json/.css/.md/config prose is not).
+_CODE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+_TEST_EXTS = _CODE_EXTS
+
+
+def _pkg_test_script_at(cwd: str, rev: str) -> str:
+    raw = show(cwd, rev, "package.json")
+    d = _pkg_scripts(raw)
+    if not d:
+        return ""
+    return str((d.get("scripts") or {}).get("test", ""))
+
+
+def registered_test_files(cwd: str, rev: str) -> list[str]:
+    """Test-file paths registered in `scripts.test` at `rev` that actually
+    resolve (blob present) at that rev. A token is a candidate iff it does not
+    start with '-' (flags) and has a JS/TS extension. Decidable, no model."""
+    toks = _pkg_test_script_at(cwd, rev).split()
+    out = []
+    for t in toks:
+        if t.startswith("-"):
+            continue
+        if not t.endswith(_TEST_EXTS):
+            continue
+        if show(cwd, rev, t) is not None:
+            out.append(t)
+    return out
+
+
+_IMPORT_RE = re.compile(r"""(?:from|import|require)\s*\(?\s*['"]([^'"]+)['"]""")
+
+
+def _import_specifiers(src: str) -> list[str]:
+    return _IMPORT_RE.findall(src or "")
+
+
+def _alias_root(cwd: str, rev: str) -> str:
+    """The repo-root-relative directory that a `@/` alias maps to, from
+    tsconfig/jsconfig at `rev` (compilerOptions.paths['@/*'] or baseUrl). Next.js
+    default is baseUrl='.' with '@/*' -> './*', i.e. root ''. Best-effort."""
+    for cfg in ("tsconfig.json", "jsconfig.json"):
+        raw = show(cwd, rev, cfg)
+        if not raw:
+            continue
+        try:
+            co = (json.loads(raw.decode("utf-8", "replace")).get("compilerOptions") or {})
+        except Exception:
+            continue
+        paths = co.get("paths") or {}
+        for key in ("@/*", "@/"):
+            if key in paths and paths[key]:
+                entry = paths[key][0]
+                entry = entry[:-1] if entry.endswith("*") else entry
+                base = co.get("baseUrl", ".") or "."
+                return posixpath.normpath(posixpath.join(base, entry)).lstrip("./") or ""
+        if "baseUrl" in co:
+            return posixpath.normpath(co["baseUrl"]).lstrip("./") or ""
+    return ""
+
+
+def _resolve_specifier(spec: str, testfile: str, alias_root: str) -> str | None:
+    """Resolve an import specifier to a repo-root-relative path WITHOUT extension.
+    Relative ('.'/'..') against the test file's dir; '@/x' against the alias root.
+    Bare module specifiers (node_modules) return None -- they are never our target
+    (HIGH4: match on FULL resolved path, not a bare basename stem that collides on
+    every route.ts / index / utils in a Next.js tree)."""
+    if spec.startswith("."):
+        d = posixpath.dirname(testfile)
+        full = posixpath.normpath(posixpath.join(d, spec))
+    elif spec.startswith("@/"):
+        full = posixpath.normpath(posixpath.join(alias_root, spec[2:]))
+    else:
+        return None                              # bare module: not our target
+    for ext in _CODE_EXTS:
+        if full.endswith(ext):
+            full = full[: -len(ext)]
+            break
+    return full.lstrip("./")
+
+
+def _target_no_ext(target: str) -> str:
+    for ext in _CODE_EXTS:
+        if target.endswith(ext):
+            return target[: -len(ext)]
+    return target
+
+
+def test_imports(cwd: str, rev: str, testfile: str, target: str) -> bool:
+    """Does `testfile` at `rev` import/require the conflicted `target` module?
+
+    Resolves each import specifier to a FULL repo-root-relative path (relative
+    specifiers against the test's dir, '@/' against baseUrl) and compares the
+    full path sans extension to the target's -- NOT the bare stem, which collides
+    across every same-named file in the tree and made the run-leg inert (HIGH4).
+    Also accepts a same-directory import matching by the resolved dir + stem."""
+    src = show(cwd, rev, testfile)
+    if src is None:
+        return False
+    src = src.decode("utf-8", "replace")
+    tgt = _target_no_ext(target)
+    alias_root = _alias_root(cwd, rev)
+    for spec in _import_specifiers(src):
+        resolved = _resolve_specifier(spec, testfile, alias_root)
+        if resolved is not None and resolved == tgt:
+            return True
+    return False
+
+
+def is_behavioural(cwd: str, rev: str, testfile: str) -> bool:
+    """A test file is BEHAVIOURAL iff it actually asserts something -- it carries
+    a test-runner call and an assertion. A file that only imports the symbol
+    (structural pin, no behaviour) does NOT qualify; a green verify over it would
+    not constrain the merge. Decidable, no model."""
+    src = show(cwd, rev, testfile)
+    if src is None:
+        return False
+    src = src.decode("utf-8", "replace")
+    has_runner = re.search(r"\b(test|it|describe)\s*\(", src) or "node:test" in src
+    has_assert = re.search(r"\b(assert|expect)\b", src) or "node:assert" in src
+    return bool(has_runner and has_assert)
+
+
+def _materialize(cwd: str, rev: str, dest: str) -> bool:
+    """Extract `rev`'s full tree into `dest` via `git archive` (read-only wrt the
+    repo). Returns False if the archive/extract fails."""
+    p = _run(["git", "-C", cwd, "archive", "--format=tar", rev])
+    if p.returncode != 0 or not p.stdout:
+        return False
+    try:
+        with tarfile.open(fileobj=io.BytesIO(p.stdout)) as tf:
+            try:
+                tf.extractall(dest, filter="data")     # py3.12+
+            except TypeError:
+                tf.extractall(dest)
+    except Exception:
+        return False
+    return True
+
+
+def _run_side_verify(cwd: str, dref: str, target: str,
+                     ours_test: str, theirs_test: str,
+                     take_rev: str) -> tuple[bool | None, list[dict]]:
+    """Materialise a take-<side> tree (the side's `target`), overlay BOTH tests,
+    register both in scripts.test, and run the exact verify contract. Returns
+    (genuinely_failed, legs):
+      True  -> the tree FAILED specifically because the OTHER side's test went red
+               (the run leg bit) -- the sides are genuinely distinct.
+      False -> the tree PASSED -- taking this side does NOT break the other's test,
+               so the two intents are not distinct (under-constrained).
+      None  -> could not decide (archive failed / node missing / timeout).
+    HIGH3+4: this is the bite-proof -- the real gate, not the weak import regex."""
+    td = tempfile.mkdtemp(prefix="odi-bite-")
+    try:
+        if not _materialize(cwd, take_rev, td):
+            return None, []
+        for tf in (ours_test, theirs_test):
+            dest = os.path.join(td, tf)
+            if not os.path.isfile(dest):
+                content = (show(cwd, take_rev, tf) or show(cwd, "HEAD", tf)
+                           or show(cwd, dref, tf))
+                if content is None:
+                    return None, []
+                os.makedirs(os.path.dirname(dest) or td, exist_ok=True)
+                Path(dest).write_bytes(content)
+        env, prefix = _test_runner_prefix(_pkg_test_script_at(cwd, take_rev))
+        pjp = os.path.join(td, "package.json")
+        try:
+            pj = json.loads(Path(pjp).read_text())
+        except Exception:
+            pj = {"name": "bite", "version": "0.0.0"}
+        pj.setdefault("scripts", {})
+        pj["scripts"]["test"] = " ".join(prefix + [ours_test, theirs_test])
+        Path(pjp).write_text(json.dumps(pj, indent=2) + "\n")
+        passed, legs = run_merge_verify(td, target, ours_test, theirs_test)
+        run_leg = next((l for l in legs if l["name"] == "both-tests-green"), None)
+        if run_leg is None:
+            return None, legs
+        detail = str(run_leg.get("detail", ""))
+        if "missing binary" in detail or detail == "timeout":
+            return None, legs                      # node unavailable -> undecidable
+        if passed:
+            return False, legs                     # side passed -> not distinct
+        # failed -- confirm it was the run leg (the other side's test), not markers
+        # (there are none) or an infra leg.
+        if not run_leg["ok"]:
+            return True, legs
+        return None, legs
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def precondition_gate(cwd: str, dref: str, mb: str | None, target: str) -> dict:
+    """DECIDABLE precondition (no model): the merge is worth a dispatch only when
+    BOTH sides contribute a behavioural test that pins their intent for `target`,
+    AND those tests genuinely distinguish the sides (bite-proof).
+
+    Cheap pre-filters (fast, no node): each side's `scripts.test` must register a
+    test that (a) imports `target` by FULL resolved path, (b) is behavioural, and
+    (c) is NEW/CHANGED vs the merge-base on that side (a base-era test unchanged
+    on both sides pins neither intent -- HIGH3). Then the REAL gate: build take-
+    ours and take-theirs trees and require the verify to FAIL on BOTH (HIGH3+4).
+    Any failure to prove -> STOP -> human merge (never lower the bar).
+    """
+    if not target.endswith(_CODE_EXTS):
+        return {"ok": False, "target": target, "ours_tests": [], "theirs_tests": [],
+                "reason": f"{target} is not importable JS/TS behaviour "
+                          "(pure JSX/layout/config/prose) -- a verify cannot "
+                          "encode intent here. Human merge."}
+
+    def _changed_vs_base(side_rev, t):
+        # new/changed vs the merge-base on this side (HIGH3): a test identical at
+        # base and on the side pins nothing this side introduced.
+        return mb is None or show(cwd, mb, t) != show(cwd, side_rev, t)
+
+    ours_all = registered_test_files(cwd, dref)
+    theirs_all = registered_test_files(cwd, "HEAD")
+    ours = [t for t in ours_all
+            if test_imports(cwd, dref, t, target) and is_behavioural(cwd, dref, t)
+            and _changed_vs_base(dref, t)]
+    theirs = [t for t in theirs_all
+              if test_imports(cwd, "HEAD", t, target) and is_behavioural(cwd, "HEAD", t)
+              and _changed_vs_base("HEAD", t)]
+    if not ours:
+        return {"ok": False, "target": target, "ours_tests": ours, "theirs_tests": theirs,
+                "reason": "main (ours) side has NO NEW/CHANGED behavioural test "
+                          f"importing {target} -- its intent is structurally-pinned "
+                          "or base-era only. Under-constrained; human merge."}
+    if not theirs:
+        return {"ok": False, "target": target, "ours_tests": ours, "theirs_tests": theirs,
+                "reason": "branch (theirs) side has NO NEW/CHANGED behavioural test "
+                          f"importing {target} -- its intent is structurally-pinned "
+                          "or base-era only. Under-constrained; human merge."}
+    # distinct intents: find ANY pair (o, t) with o != t. Handles ours=[A,B],
+    # theirs=[A] without a StopIteration crash (HIGH2).
+    pair = next(((o, t) for o in ours for t in theirs if o != t), None)
+    if pair is None:
+        return {"ok": False, "target": target, "ours_tests": ours, "theirs_tests": theirs,
+                "reason": "both sides register only the SAME single test -- one "
+                          "intent. Under-constrained; human merge."}
+    picked_ours, picked_theirs = pair
+
+    # THE BITE-PROOF (HIGH3+4): take-ours must break theirs' test, take-theirs
+    # must break ours' test. Both trees must FAIL the verify for THIS dispatch.
+    to_failed, _lo = _run_side_verify(cwd, dref, target, picked_ours, picked_theirs, dref)
+    tt_failed, _lt = _run_side_verify(cwd, dref, target, picked_ours, picked_theirs, "HEAD")
+    if to_failed is None or tt_failed is None:
+        return {"ok": False, "target": target, "ours_tests": ours, "theirs_tests": theirs,
+                "picked_ours": picked_ours, "picked_theirs": picked_theirs,
+                "reason": "could not PROVE the union bites (git archive failed, or "
+                          "node/npm unavailable to run the take-ours/take-theirs "
+                          "trees). Not lowering the bar; human merge."}
+    if not (to_failed and tt_failed):
+        which = " and ".join(s for s, passed in (("take-ours passed", not to_failed),
+                                                 ("take-theirs passed", not tt_failed))
+                             if passed)
+        return {"ok": False, "target": target, "ours_tests": ours, "theirs_tests": theirs,
+                "picked_ours": picked_ours, "picked_theirs": picked_theirs,
+                "reason": "the tests do NOT distinguish the sides -- a single-side "
+                          f"take already passes the union verify ({which}). "
+                          "Under-constrained; human merge."}
+    return {"ok": True, "target": target, "ours_tests": ours, "theirs_tests": theirs,
+            "picked_ours": picked_ours, "picked_theirs": picked_theirs,
+            "bite_proven": True,
+            "reason": "both sides carry a distinct behavioural test importing "
+                      f"{target} AND take-ours/take-theirs each FAIL the union "
+                      "verify -- the merge is genuinely constrained."}
+
+
+def _resolve_tsc(repo_root: str) -> str | None:
+    p = Path(repo_root) / "node_modules" / ".bin" / "tsc"
+    return str(p) if p.is_file() else None
+
+
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _test_runner_prefix(script: str) -> tuple[dict, list[str]]:
+    """Split a `scripts.test` command into (env, runner_prefix) so leg-4 runs the
+    tests through the SAME runner the repo uses (MED10) instead of a bare
+    `node --test`, which drops `TZ=...`, `--experimental-strip-types`,
+    `--import tsx`, etc. and makes TS tests inert. Leading KEY=VAL tokens become
+    env; the remaining non-testfile tokens are the command+flags prefix."""
+    toks = script.split()
+    env, prefix, seen_cmd = {}, [], False
+    for t in toks:
+        if not seen_cmd and _ENV_ASSIGN_RE.match(t):
+            k, val = t.split("=", 1)
+            env[k] = val
+            continue
+        seen_cmd = True
+        if t.startswith("-") or not t.endswith(_TEST_EXTS):
+            prefix.append(t)                       # command / flag
+        # test-file tokens are dropped -- we append our own pair
+    # require an actual command; fall back to node --test if none parsed.
+    if not any(not p.startswith("-") for p in prefix):
+        prefix = ["node", "--test"]
+    elif "--test" not in prefix and "test" not in [Path(p).name for p in prefix]:
+        prefix.append("--test")
+    return env, prefix
+
+
+def run_merge_verify(repo_root: str, target: str,
+                     ours_test: str, theirs_test: str) -> tuple[bool, list[dict]]:
+    """THE VERIFY CONTRACT (authoritative). Runs against a working tree at
+    `repo_root`. Returns (passed, legs) where each leg = {name, ok, detail}.
+
+    Legs (all must pass except npm-test which is WARN-only):
+      1. no-conflict-markers  target has no <<<<<<< / ======= / >>>>>>> (this is
+         what makes the conflicted BASELINE fail for free; also what `tsc` would
+         catch -- kept as a toolchain-independent hard floor).
+      2. tsc-noemit           if a local tsc resolves and target is .ts*, tsc
+         --noEmit must be clean (types resolve, markers gone). Skipped (not
+         failed) when no tsc is installed -- leg 1 still guards the baseline.
+      3. both-tests-registered  BOTH ours_test and theirs_test basenames appear
+         in scripts.test (assert the union LITERALLY -- a proxy like a count is
+         inert).
+      4. both-tests-green     `node --test ours_test theirs_test` exits 0 -- each
+         side's intent still holds. A naive take-ours/take-theirs that broke the
+         other side's behaviour fails HERE.
+      5. npm-test             repo `npm test` as a WARN-only safety net (never
+         fails the verify; only runs if node_modules is present).
+
+    verify.sh (emitted by merge_verify_script) shells out to THIS function via
+    `--run-merge-verify`, so the model's verify and the bite-proof share ONE
+    contract -- no second copy to drift.
+    """
+    root = Path(repo_root)
+    legs: list[dict] = []
+
+    def leg(name, ok, detail=""):
+        legs.append({"name": name, "ok": bool(ok), "detail": detail})
+        return ok
+
+    # 1. conflict markers -- ANCHORED per-line so a legit `======` in a comment
+    # or a `>>>>>>>` in prose does not false-trip (LOW13). A real git conflict
+    # marker is a line that STARTS with exactly 7 of the char, then a space or EOL.
+    tf = root / target
+    text = tf.read_text(errors="replace") if tf.is_file() else ""
+    marker_re = re.compile(r"^(<{7}|={7}|>{7})( |$)")
+    marker_lines = [ln[:20] for ln in text.splitlines() if marker_re.match(ln)]
+    leg("no-conflict-markers", (not marker_lines) and tf.is_file(),
+        "target missing" if not tf.is_file()
+        else (f"markers present: {marker_lines}" if marker_lines else "clean"))
+
+    # 2. tsc --noEmit (production; skipped without a local tsc)
+    tsc = _resolve_tsc(repo_root)
+    if tsc and target.endswith((".ts", ".tsx", ".mts", ".cts")):
+        p = _run([tsc, "--noEmit"], cwd=repo_root, text=True)
+        leg("tsc-noemit", p.returncode == 0,
+            (p.stdout + p.stderr).strip()[:400] or "clean")
+    else:
+        legs.append({"name": "tsc-noemit", "ok": True, "skip": True,
+                     "detail": "no local tsc (marker scan guards baseline)"})
+
+    # 3. both tests registered in scripts.test -- WHOLE-TOKEN match, not substring
+    # (LOW14: a bare `n in script` false-passes when one basename is a substring
+    # of the other, or of an unrelated token).
+    script = ""
+    pj = root / "package.json"
+    if pj.is_file():
+        try:
+            script = str((json.loads(pj.read_text()).get("scripts") or {}).get("test", ""))
+        except Exception:
+            script = ""
+    toks = script.split()
+    tok_names = {Path(t).name for t in toks}
+
+    def _registered(full):
+        return full in toks or Path(full).name in tok_names
+    missing = [f for f in (ours_test, theirs_test) if not _registered(f)]
+    leg("both-tests-registered", not missing,
+        f"missing from scripts.test: {missing}" if missing else "both present")
+
+    # 4. both tests green -- through the REPO's runner prefix (MED10), not a bare
+    # `node --test` that drops TZ/--experimental-strip-types/--import tsx.
+    tests_exist = (root / ours_test).is_file() and (root / theirs_test).is_file()
+    if tests_exist:
+        env_extra, prefix = _test_runner_prefix(script)
+        run_env = dict(os.environ, **env_extra)
+        run_env["DISPATCH_VERIFY_SANDBOX"] = "1"   # VERIFY-SANDBOX
+        p = _run(prefix + [ours_test, theirs_test], cwd=repo_root, text=True, env=run_env)
+        ok = p.returncode == 0
+        leg("both-tests-green", ok,
+            "green" if ok else (str(p.stdout) + str(p.stderr)).strip()[-400:] or "red")
+    else:
+        leg("both-tests-green", False, "one or both test files missing on disk")
+
+    # 5. npm test -- WARN-only, never fails the verify
+    if (root / "node_modules").is_dir() and pj.is_file():
+        p = _run(["npm", "test", "--silent"], cwd=repo_root, text=True,
+                 env=_SANDBOX_ENV)  # VERIFY-SANDBOX
+        legs.append({"name": "npm-test", "ok": True, "warn": p.returncode != 0,
+                     "detail": "warn: repo npm test red" if p.returncode
+                               else "green"})
+    else:
+        legs.append({"name": "npm-test", "ok": True, "skip": True,
+                     "detail": "no node_modules -- skipped (WARN-only leg)"})
+
+    passed = all(l["ok"] for l in legs)
+    return passed, legs
+
+
+def merge_verify_script(tool_path: str, target: str,
+                        ours_test: str, theirs_test: str) -> str:
+    """The verify.sh the merge-resolution dispatch would carry. It shells out to
+    THIS tool's --run-merge-verify so the contract is defined in exactly one
+    place (run_merge_verify) -- the model's verify cannot drift from the
+    bite-proof."""
+    return (
+        "#!/usr/bin/env bash\n"
+        "# merge-resolution verify -- both sides' behavioural tests must stay green,\n"
+        "# conflict markers gone, tsc clean. Contract lives in run_merge_verify().\n"
+        'cd "$(dirname "$0")" || exit 2\n'
+        f"exec python3 {shlex_quote(tool_path)} --run-merge-verify "
+        f"{shlex_quote(target)} --ours-test {shlex_quote(ours_test)} "
+        f"--theirs-test {shlex_quote(theirs_test)}\n")
+
+
+def shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
+def scaffold_argv(cwd: str, target: str, slug: str,
+                  ours_test: str, theirs_test: str) -> list[str]:
+    """The ollama-dispatch-scaffold invocation for ONE conflicted file (never a
+    blob -- multi-file = N of these). PRINTED, not run: the coordinator executes
+    it. TASK = resolve the 3-way conflict preserving BOTH behaviours; declared
+    scope = this one file."""
+    return [
+        "ollama-dispatch-scaffold", "--label", f"merge-{slug}",
+        "--repo", cwd, "--lang", "ts",
+        "--target", target, "--ts-runner", "node-test",
+        "--test-file", ours_test, "--test-file", theirs_test,
+        "--defect",
+        f"confirmed: 3-way MERGE CONFLICT in {target}; `git merge-file` reports "
+        f"conflict markers. main's side is pinned by {ours_test}, the branch's by "
+        f"{theirs_test}; both must stay green.",
+        "--property",
+        f"resolve the conflict in {target} preserving BOTH behaviours: the merged "
+        f"file must have NO conflict markers, type-check, and make BOTH {ours_test} "
+        f"and {theirs_test} pass. Edit ONLY {target}.",
+    ]
+
+
+def land_resolution(v: dict, target: str, resolved_bytes: bytes,
+                    tag: str = "merge", extra_blobs: dict | None = None) -> tuple[int, object]:
+    """Land a (model-produced, verify-green) resolution onto a NEW scratch branch
+    integrate/<slug>-<shortid>. Reuses _commit_blobs_onto -- the SAME plumbing as
+    --stage; no second stager. Writes ONLY the scratch branch: NEVER main, NEVER a
+    checkout, NEVER a push, NEVER a merge.
+
+    MED8: a resolution is NOT just the one target file -- the landed tree must
+    also carry the REMAINING clean files the resolution depends on (the branch's
+    behavioural test, the unioned package.json). Landing only `target` produces a
+    tree whose scripts.test lacks the branch's test and whose test file is absent
+    on disk -- i.e. the landed tree would FAIL the very verify that was green in
+    the dispatch worktree. `extra_blobs` (path -> bytes) composes those in.
+
+    In this build the ONLY caller is --self-test, with a MOCK resolution. A live
+    landing waits on the coordinator running the printed dispatch first."""
+    cwd = v["worktree"]
+    dref = v["default_ref"]
+    main_full = git(cwd, "rev-parse", dref)[1].strip()
+    branch = f"integrate/{tag}-{_slug(v)}-{v['head'][:8]}"
+    blob_map = {target: resolved_bytes, **(extra_blobs or {})}
+    landed_extra = sorted(k for k in (extra_blobs or {}))
+    msg = (f"integrate(merge): resolve conflict in {target} (code-only)\n\n"
+           f"Merge resolution landed onto {dref} @ {main_full[:12]} from a "
+           f"verify-green dispatch, composed with {landed_extra or 'no'} clean "
+           f"dependency file(s). Scratch branch only -- no merge, no push.")
+    rc, r = _commit_blobs_onto(cwd, main_full, blob_map, branch, msg)
+    if rc != 0:
+        return rc, r
+    return 0, {"landed": True, "target_branch": branch, "commit": r["commit"][:12],
+               "base": dref, "base_tip": main_full[:12],
+               "diff_files": r["diff_files"], "resolved_file": target,
+               "landed_files": sorted(blob_map)}
+
+
+def conflicted_baseline_commands(cwd: str, target: str, dref: str,
+                                 ours_test: str, theirs_test: str) -> list[str]:
+    """PRINT-ONLY guidance: the git plumbing to build the DESIGN's phase-4
+    baseline -- main's tree with a --diff3 CONFLICTED `target`, the union
+    package.json, and BOTH tests present -- so a human/coordinator can run the
+    merge-resolution dispatch by hand. Nothing here is executed."""
+    return [
+        f"# 1. cut a scratch tree at {dref}:",
+        f"git -C {shlex.quote(cwd)} worktree add /tmp/merge-baseline {dref}",
+        f"# 2. write the CONFLICTED {target} (diff3 markers) from the 3-way:",
+        f"git merge-file -p --diff3 <(git -C {shlex.quote(cwd)} show {dref}:{shlex.quote(target)}) \\",
+        f"    <(git -C {shlex.quote(cwd)} show $(git -C {shlex.quote(cwd)} merge-base {dref} HEAD):{shlex.quote(target)}) \\",
+        f"    <(git -C {shlex.quote(cwd)} show HEAD:{shlex.quote(target)}) > /tmp/merge-baseline/{target}",
+        f"# 3. copy BOTH behavioural tests in and UNION scripts.test to register",
+        f"#    {ours_test} AND {theirs_test} (see classify_pkg_json_trivial union).",
+        f"# 4. scaffold against THAT tree (baseline = conflicted tree, per design),",
+        f"#    NOT `--repo {shlex.quote(cwd)}` which cuts from the branch HEAD.",
+    ]
+
+
+def _merge_file_diff3(base: bytes | None, ours: bytes | None,
+                      theirs: bytes | None) -> bytes:
+    """The CONFLICTED target content: `git merge-file -p --diff3` of ours (dref),
+    base (merge-base), theirs (HEAD). Returns the merged bytes WITH conflict
+    markers where the two sides diverge (the diff3 form also carries the ||||||| base
+    section). Uses three temp files; touches no repo state."""
+    with tempfile.TemporaryDirectory(prefix="odi-mf-") as td:
+        op, bp, tp = (os.path.join(td, n) for n in ("ours", "base", "theirs"))
+        Path(op).write_bytes(ours or b"")
+        Path(bp).write_bytes(base or b"")
+        Path(tp).write_bytes(theirs or b"")
+        # merge-file <current=ours> <base> <other=theirs>; exit>0 == conflict, but
+        # stdout still holds the merged-with-markers content, which is what we want.
+        p = subprocess.run(["git", "merge-file", "-p", "--diff3",
+                            "-L", "ours", "-L", "base", "-L", "theirs", op, bp, tp],
+                           capture_output=True)
+        return p.stdout
+
+
+def _union_pkg_json(cwd: str, dref: str, mb: str | None,
+                    ours_test: str, theirs_test: str) -> bytes:
+    """The UNION package.json for a merge baseline: main's package.json with
+    scripts.test unioned so BOTH ours_test and theirs_test are registered (the
+    verify's both-tests-registered leg asserts both basenames literally). Reuses
+    the shipped classify_pkg_json_trivial resolver for the principled test-token
+    + new-script union where it applies, then GUARANTEES both test paths appear."""
+    ours_raw = show(cwd, dref, "package.json")
+    theirs_raw = show(cwd, "HEAD", "package.json")
+    base_raw = show(cwd, mb, "package.json") if mb else None
+    d = _pkg_scripts(ours_raw)
+    if not isinstance(d, dict):
+        d = {"name": "merge", "version": "0.0.0", "scripts": {}}
+    d = json.loads(json.dumps(d))                      # deep copy
+    scripts = d.get("scripts")
+    if not isinstance(scripts, dict):
+        scripts = {}
+        d["scripts"] = scripts
+    triv = classify_pkg_json_trivial(base_raw, ours_raw, theirs_raw)
+    if triv and triv.get("merged_test"):
+        scripts["test"] = triv["merged_test"]
+        st = (_pkg_scripts(theirs_raw) or {}).get("scripts", {}) or {}
+        for k in triv.get("new_scripts_added", []):
+            if k in st:
+                scripts[k] = st[k]
+    toks = (scripts.get("test") or "").split()
+    if not toks:
+        toks = ["node", "--test"]
+    for t in (ours_test, theirs_test):
+        if t not in toks:
+            toks.append(t)
+    scripts["test"] = " ".join(toks)
+    return (json.dumps(d, indent=2) + "\n").encode()
+
+
+def materialize_conflicted_baseline(cwd: str, target: str, dref: str,
+                                    ours_test: str, theirs_test: str
+                                    ) -> tuple[int, object]:
+    """Turn conflicted_baseline_commands' SPEC into a REAL git object: build (via
+    temp-index plumbing, NOT a working-tree checkout, NEVER touching main/HEAD) a
+    tree = the default ref's tree with:
+      * `target`  replaced by the `git merge-file -p --diff3` 3-way CONFLICTED
+        content (ours=dref, base=merge-base, theirs=HEAD) -- markers present so
+        the baseline FAILS the verify for free,
+      * BOTH behavioural test files present (ours_test from dref -- already on
+        main's tree -- and theirs_test from HEAD, composed in),
+      * `package.json` replaced by the UNION (both tests registered).
+    Writes it as a DANGLING commit on top of `dref` (no ref, no HEAD move) and
+    returns (0, {"baseline_ref": sha, "extra_blobs": {theirs_test: bytes,
+    "package.json": bytes}}). extra_blobs are the CLEAN dependency files
+    land_resolution composes with the resolved target later (MED8). Returns
+    (>=2, err_string) on any plumbing failure."""
+    mb = merge_base(cwd, dref, "HEAD")
+    base_t = show(cwd, mb, target) if mb else None
+    ours_t = show(cwd, dref, target)
+    theirs_t = show(cwd, "HEAD", target)
+    conflicted = _merge_file_diff3(base_t, ours_t, theirs_t)
+    if b"<<<<<<<" not in conflicted:
+        # No markers => not actually a conflict on this target; refuse rather than
+        # scaffold a baseline that would PASS the verify at launch (vacuous).
+        return 2, (f"materialize: {target} does not 3-way conflict (no markers) -- "
+                   "nothing to resolve. Refusing a vacuous baseline.")
+    pkg_bytes = _union_pkg_json(cwd, dref, mb, ours_test, theirs_test)
+    theirs_test_bytes = show(cwd, "HEAD", theirs_test)
+    ours_test_bytes = show(cwd, dref, ours_test)
+    if theirs_test_bytes is None:
+        return 2, f"materialize: branch-side test {theirs_test} not found at HEAD"
+    blob_map = {target: conflicted, "package.json": pkg_bytes,
+                theirs_test: theirs_test_bytes}
+    # ours_test should already be on main's tree; compose it defensively so the
+    # baseline is self-contained even if main's test lives elsewhere.
+    if ours_test_bytes is not None:
+        blob_map[ours_test] = ours_test_bytes
+    main_full = git(cwd, "rev-parse", dref)[1].strip()
+    msg = (f"materialize(merge-baseline): conflicted {target} + union package.json "
+           f"+ both tests, on top of {dref} @ {main_full[:12]}. Dangling commit -- "
+           "no ref, scaffold baseline only.")
+    rc, commit = _build_commit_onto(cwd, main_full, blob_map, msg)
+    if rc != 0:
+        return rc, commit
+    extra_blobs = {theirs_test: theirs_test_bytes, "package.json": pkg_bytes}
+    return 0, {"baseline_ref": commit, "extra_blobs": extra_blobs,
+               "target": target, "ours_test": ours_test, "theirs_test": theirs_test,
+               "base": dref, "base_tip": main_full}
+
+
+# The local model a merge-resolution dispatch is enqueued to. Memory: the
+# default dispatch model. Overridable via --model.
+DEFAULT_MERGE_MODEL = "qwen3.8:27b-q4_K_M"
+MERGE_MANIFEST = ".merge-dispatch.json"
+
+
+def _sibling_tool(name: str) -> str:
+    """Absolute path to a sibling ~/bin tool (ollama-dispatch-scaffold /
+    ollama-queue.py), resolved next to THIS file so a live run does not depend on
+    PATH."""
+    return str(Path(__file__).resolve().parent / name)
+
+
+def _tslug(target: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", target.lower()).strip("-")
+    return s or "target"
+
+
+def _merge_worktree_dest(label: str, dest_root: str | None) -> str:
+    if dest_root:
+        base = Path(dest_root)
+    else:                    # mirrors ollama-dispatch-scaffold._worktree_scratch_default
+        base = Path(os.environ.get("OLLAMA_DISPATCH_WORKTREES",
+                                   str(Path.home() / ".ollama-dispatch" / "worktrees")))
+    return str(base / f"wt-{label}")
+
+
+def enqueue_argv(worktree: str, label: str, model: str,
+                 verify: str = "bash verify.sh") -> list[str]:
+    """The EXACT `ollama-queue.py enqueue` argv for a merge-resolution dispatch.
+    Discovered from ollama-queue.py's `enqueue` subparser -- NOT invented:
+      --cwd  = the scaffolded, isolated worktree (scaffold cut it via `git
+               worktree add`, so it is an isolated worktree; --cwd is accepted
+               and passes _is_isolated_worktree, no --allow-unisolated needed).
+      --task-file = the worktree's TASK.md (required by the subparser).
+      --verify    = the shell command the worker runs (a string, per the queue's
+               _preflight_verify(shell=True)); our verify.sh shells to
+               --run-merge-verify so the contract is one copy.
+    """
+    return ["python3", _sibling_tool("ollama-queue.py"), "enqueue",
+            "--model", model, "--cwd", worktree,
+            "--task-file", str(Path(worktree) / "TASK.md"),
+            "--verify", verify, "--label", label]
+
+
+def _scaffold_argv_live(cwd: str, target: str, label: str, ours_test: str,
+                        theirs_test: str, baseline_ref: str, verify_file: str,
+                        dest: str) -> list[str]:
+    """The ollama-dispatch-scaffold argv that starts a merge-resolution dispatch
+    from a PRE-MATERIALISED conflicted baseline (--baseline-ref) with the caller's
+    verify (--verify-file) and the canned merge TASK (--task merge)."""
+    return [_sibling_tool("ollama-dispatch-scaffold"),
+            "--label", label, "--repo", cwd, "--lang", "ts",
+            "--ts-runner", "node-test", "--target", target,
+            "--test-file", ours_test, "--test-file", theirs_test,
+            "--baseline-ref", baseline_ref, "--verify-file", verify_file,
+            "--task", "merge", "--dest", dest]
+
+
+def merge_dispatch(v: dict, dry_run: bool = False, dest_root: str | None = None,
+                   model: str | None = None) -> tuple[int, dict]:
+    """PHASE 4 orchestrator -- runs the design's gated merge-dispatch loop FULLY
+    and AUTONOMOUSLY up to (but NOT including) the merge into the target branch.
+
+    For each SEMANTIC conflicted file that passes the bite-proof precondition it:
+      a. materialize_conflicted_baseline() -> a dangling baseline commit (main's
+         tree + diff3-conflicted target + union package.json + both tests),
+      b. ollama-dispatch-scaffold --baseline-ref <sha> --target <file>
+         --task merge --verify-file <merge verify.sh> --test-file <both>  (a
+         subprocess) -> an isolated dispatch worktree cut from that baseline,
+      c. ollama-dispatch-scaffold --seal-baseline <worktree>  -> clean launch tree,
+      d. build the ollama-queue.py enqueue argv and (unless dry_run) ENQUEUE it,
+      e. record a manifest in the worktree so --land-merge can compose the deps.
+    A file that FAILS the precondition STOPs to human merge and is NEVER
+    dispatched. The queue+gate then run resolve -> verify -> two-tier review on
+    their own; land happens later via --land-merge (coordinator-gated).
+
+    Returns (exit, plan):
+      exit 0  -> at least one file was dispatched (enqueued, or dry-run planned).
+      exit 3  -> STOP: NO file was dispatchable (every conflicted file failed the
+                 precondition, or an all-STOP mix) -> human merge.
+      exit 2  -> REFUSE: not conflict-semantic, scope inferred, classify error,
+                 or a materialize/scaffold plumbing failure.
+
+    dry_run: do steps a-c live but PRINT the enqueue argv instead of running it
+    (coordinator inspection + self-test). A real call enqueues live (step d)."""
+    if "error" in v:
+        return 2, {"refuse": f"classify error: {v['error']}"}
+    if v.get("scope_inferred"):
+        return 2, {"refuse": "scope is INFERRED (no recorded contract). A "
+                             "merge-dispatch must not run on a guessed boundary."}
+    overall = v["overall"]
+    if overall != "conflict-semantic":
+        return 2, {"refuse": f"verdict is {overall.upper()}, not CONFLICT-SEMANTIC. "
+                             "Merge-dispatch only handles semantic conflicts "
+                             "(dirty-scope/redundant/clean/conflict-trivial/"
+                             "empty-scope are all refused)."}
+    cwd = v["worktree"]
+    dref = v["default_ref"]
+    mb = merge_base(cwd, dref, "HEAD")
+    model = model or DEFAULT_MERGE_MODEL
+    slug = _slug(v)
+    semantic_files = [f["path"] for f in v["files"] if f.get("subclass") == "semantic"]
+    tool_path = str(Path(__file__).resolve())
+
+    files_plan = []
+    dispatched = 0
+    stopped = 0
+    for target in semantic_files:
+        gate = precondition_gate(cwd, dref, mb, target)
+        entry = {"target": target, "precondition": gate}
+        if not gate["ok"]:
+            entry["disposition"] = "STOP-human"
+            entry["baseline_by_hand"] = conflicted_baseline_commands(
+                cwd, target, dref,
+                gate.get("picked_ours") or "<ours-test>",
+                gate.get("picked_theirs") or "<theirs-test>")
+            stopped += 1
+            files_plan.append(entry)
+            continue
+        o, t = gate["picked_ours"], gate["picked_theirs"]
+
+        # (a) materialize the conflicted baseline (dangling commit, no ref).
+        rc_m, mat = materialize_conflicted_baseline(cwd, target, dref, o, t)
+        if rc_m != 0:
+            return 2, {"refuse": f"materialize failed for {target}: {mat}"}
+        baseline_ref = mat["baseline_ref"]
+
+        # write the merge verify.sh to a temp file for scaffold --verify-file.
+        verify_sh = merge_verify_script(tool_path, target, o, t)
+        vf = tempfile.NamedTemporaryFile(prefix="odi-verify-", suffix=".sh",
+                                         delete=False, mode="w")
+        vf.write(verify_sh)
+        vf.close()
+        label = f"merge-{slug}-{_tslug(target)}-{v['head'][:8]}"
+        dest = _merge_worktree_dest(label, dest_root)
+
+        # (b) scaffold the dispatch worktree from the baseline.
+        sargv = _scaffold_argv_live(cwd, target, label, o, t, baseline_ref, vf.name, dest)
+        sp = subprocess.run(["python3", *sargv], capture_output=True, text=True,
+                            timeout=_SUBPROC_TIMEOUT)
+        os.unlink(vf.name)
+        if sp.returncode != 0:
+            return 2, {"refuse": f"scaffold failed for {target}: "
+                                 f"{(sp.stderr or sp.stdout).strip()[-500:]}"}
+
+        # (c) seal the baseline (clean launch tree; harness tracked).
+        seal = subprocess.run(
+            ["python3", _sibling_tool("ollama-dispatch-scaffold"),
+             "--seal-baseline", dest],
+            capture_output=True, text=True, timeout=_SUBPROC_TIMEOUT)
+        if seal.returncode != 0:
+            return 2, {"refuse": f"seal-baseline failed for {target}: "
+                                 f"{(seal.stderr or seal.stdout).strip()[-500:]}"}
+
+        # (e) manifest: everything --land-merge needs to compose the resolution
+        # (the origin repo + scope + the clean dependency file paths).
+        extra_blob_paths = sorted(mat["extra_blobs"])
+        manifest = {
+            "origin_cwd": cwd, "default_ref": dref, "origin_head": v["head"],
+            "origin_branch": v["branch"], "slug": slug,
+            "target": target, "ours_test": o, "theirs_test": t,
+            "extra_blob_paths": extra_blob_paths, "baseline_ref": baseline_ref,
+            "base_tip": mat["base_tip"], "model": model, "label": label,
+        }
+        try:
+            (Path(dest) / MERGE_MANIFEST).write_text(json.dumps(manifest, indent=2))
+        except OSError as e:                       # non-fatal: land can be given the data
+            manifest["manifest_write_error"] = str(e)
+
+        # (d) enqueue argv -- live unless dry_run.
+        eargv = enqueue_argv(dest, label, model)
+        entry.update({"worktree": dest, "branch": f"dispatch/{label}",
+                      "baseline_ref": baseline_ref, "scaffold_argv": sargv,
+                      "enqueue_argv": eargv, "extra_blob_paths": extra_blob_paths,
+                      "manifest": MERGE_MANIFEST})
+        if dry_run:
+            entry["disposition"] = "DRY-RUN (would enqueue)"
+            entry["job_id"] = None
+        else:
+            pe = subprocess.run(eargv, capture_output=True, text=True,
+                               timeout=_SUBPROC_TIMEOUT)
+            if pe.returncode != 0:
+                return 2, {"refuse": f"enqueue failed for {target}: "
+                                     f"{(pe.stderr or pe.stdout).strip()[-500:]}"}
+            m = re.search(r"enqueued\s+(\w+)", pe.stdout)
+            entry["job_id"] = m.group(1) if m else None
+            entry["disposition"] = "ENQUEUED"
+        dispatched += 1
+        files_plan.append(entry)
+
+    plan = {"worktree": cwd, "branch": v["branch"], "default_ref": dref,
+            "n_conflicted": len(semantic_files), "n_dispatched": dispatched,
+            "n_stopped": stopped, "dry_run": dry_run, "model": model,
+            "files": files_plan}
+    if dispatched == 0:
+        plan["stop"] = True
+        plan["reason"] = ("STOP -> human merge. NO conflicted file was dispatchable "
+                          "(every one failed the bite-proof precondition -- a side "
+                          "lacks a NEW/CHANGED behavioural test that distinguishes "
+                          "it). Not worth a dispatch.")
+        return 3, plan
+    plan["stop"] = False
+    plan["reason"] = (
+        f"{dispatched} merge-resolution dispatch(es) "
+        f"{'PLANNED (dry-run)' if dry_run else 'ENQUEUED'}"
+        f"{f'; {stopped} file(s) STOPPED to human' if stopped else ''}. "
+        "The queue+gate now resolve -> verify -> two-tier review autonomously; "
+        "land the verify-green result with --land-merge <job-id> (coordinator "
+        "gates the final merge into the target).")
+    return 0, plan
+
+
+def _read_merge_manifest(worktree: str) -> dict | None:
+    try:
+        return json.loads((Path(worktree) / MERGE_MANIFEST).read_text())
+    except Exception:
+        return None
+
+
+def land_merge(manifest: dict, resolved_bytes: bytes, extra_blobs: dict,
+               verify_ok: bool, gate_verdict: str) -> tuple[int, object]:
+    """PHASE 4 landing (the "up to but NOT including merge" boundary). Given a
+    COMPLETED merge-resolution dispatch's manifest + the model's resolved target
+    bytes + the clean dependency blobs, land ONLY when the verify is GREEN and the
+    gate verdict is pass/concerns (NOT fail). Composes land_resolution() onto a
+    scratch integrate/* branch -- NEVER main, NEVER a push, NEVER a merge.
+
+    Returns (0, {..land..}) on a landed scratch branch, or (>=2, refuse_string)
+    when the resolution is red-verify / gate-fail (do NOT land -- human merge)."""
+    if not verify_ok:
+        return 2, ("REFUSE land-merge: verify is RED. A resolution whose verify "
+                   "does not pass proves nothing -- do NOT land. Human merge.")
+    gv = (gate_verdict or "").strip().lower()
+    if gv not in ("pass", "concerns"):
+        return 2, (f"REFUSE land-merge: gate verdict is {gate_verdict!r}, not "
+                   "pass/concerns. A FAILED/absent gate does not clear a landing. "
+                   "Human merge.")
+    # Reconstruct the minimal verdict land_resolution needs (origin repo + dref +
+    # head + branch, for the scratch branch name and the base ref it commits onto).
+    v_stub = {"worktree": manifest["origin_cwd"],
+              "default_ref": manifest["default_ref"],
+              "head": manifest["origin_head"],
+              "branch": manifest.get("origin_branch") or ""}
+    return land_resolution(v_stub, manifest["target"], resolved_bytes,
+                           tag="merge", extra_blobs=extra_blobs)
+
+
+def land_merge_from_worktree(worktree: str, verify_ok: bool, gate_verdict: str
+                             ) -> tuple[int, object]:
+    """--land-merge convenience: read the manifest + the model's finished bytes
+    from the resolution worktree, then land_merge(). The resolved target and the
+    composed dependency files are read from the FINISHED worktree (the model left
+    them there; the baseline seeded the deps)."""
+    manifest = _read_merge_manifest(worktree)
+    if not manifest:
+        return 2, (f"REFUSE land-merge: no {MERGE_MANIFEST} in {worktree} -- not a "
+                   "merge-dispatch worktree (or it was not scaffolded by phase-4).")
+    tpath = Path(worktree) / manifest["target"]
+    if not tpath.is_file():
+        return 2, f"REFUSE land-merge: resolved target missing in worktree: {tpath}"
+    resolved = tpath.read_bytes()
+    if b"<<<<<<<" in resolved:
+        return 2, (f"REFUSE land-merge: {manifest['target']} STILL carries conflict "
+                   "markers -- the resolution is unfinished. Human merge.")
+    extra_blobs = {}
+    for p in manifest.get("extra_blob_paths", []):
+        fp = Path(worktree) / p
+        if not fp.is_file():
+            return 2, f"REFUSE land-merge: dependency file missing in worktree: {fp}"
+        extra_blobs[p] = fp.read_bytes()
+    return land_merge(manifest, resolved, extra_blobs, verify_ok, gate_verdict)
+
+
+_QUEUE_STATE = Path.home() / "bin" / "ollama-queue-state.json"
+
+
+def _resolve_job_worktree(job_or_path: str) -> str | None:
+    """--land-merge accepts EITHER a worktree path (used directly) OR a queue
+    job-id, resolved to its worktree via ollama-queue-state.json. Returns the
+    worktree path or None."""
+    p = Path(job_or_path).expanduser()
+    if p.is_dir():
+        return str(p)
+    try:
+        state = json.loads(_QUEUE_STATE.read_text())
+    except Exception:
+        return None
+    jobs = state.get("jobs") or []
+    if isinstance(jobs, dict):          # the state file has carried both shapes
+        jobs = list(jobs.values())
+    jobs = [j for j in jobs if isinstance(j, dict)]
+    m = [j for j in jobs if j.get("id") == job_or_path] or \
+        [j for j in jobs if str(j.get("id", "")).startswith(job_or_path)]
+    if len(m) != 1:
+        return None
+    return m[0].get("worktree") or m[0].get("cwd")
+
+
+def land_merge_report(rc: int, r: object, worktree: str,
+                      verify_ok: bool, gate_verdict: str) -> str:
+    """The coordinator SIGN-OFF surface: the scratch branch, the diff it carries,
+    the verify + gate verdicts, and the EXACT merge command a coordinator runs --
+    which this tool NEVER runs itself."""
+    if rc != 0:
+        return f"REFUSE land-merge: {r}"
+    cwd = _read_merge_manifest(worktree) or {}
+    origin = cwd.get("origin_cwd", "<repo>")
+    dref = r.get("base", "<default-ref>")
+    br = r["target_branch"]
+    L = ["=" * 72,
+         "COORDINATOR SIGN-OFF -- merge resolution landed on a SCRATCH branch.",
+         "The final merge into the target branch is the coordinator's call; this",
+         "tool has NOT run it (no merge, no push, no main write).",
+         "=" * 72,
+         f"  scratch branch : {br}",
+         f"  commit         : {r['commit']}",
+         f"  base (target)  : {dref} @ {r.get('base_tip')}",
+         f"  resolved file  : {r.get('resolved_file')}",
+         f"  landed files   : {', '.join(r.get('landed_files', []))}",
+         f"  diff vs {dref}: {', '.join(r.get('diff_files', [])) or '(none)'}",
+         f"  verify         : {'GREEN' if verify_ok else 'RED'}",
+         f"  gate verdict   : {gate_verdict}",
+         "",
+         "  Review, then merge into the target yourself (NOT automated):",
+         f"    $ git -C {shlex.quote(origin)} log -p {br}",
+         f"    $ git -C {shlex.quote(origin)} diff {dref}..{br}",
+         f"    $ git -C {shlex.quote(origin)} checkout {dref.split('/')[-1]} && \\",
+         f"      git -C {shlex.quote(origin)} merge --ff-only {br}",
+         "=" * 72]
+    return "\n".join(L)
+
+
+def merge_dispatch_report(rc: int, plan: dict) -> str:
+    if "refuse" in plan:
+        return f"REFUSE merge-dispatch: {plan['refuse']}"
+    mode = "DRY-RUN -- scaffolded + sealed, NOT enqueued" if plan.get("dry_run") \
+        else "LIVE -- scaffolded + sealed + ENQUEUED"
+    L = [f"merge-dispatch ({mode}): {plan['worktree']}"]
+    L.append(f"  branch {plan['branch']} vs {plan['default_ref']}  model={plan.get('model')}")
+    L.append(f"  {plan['n_conflicted']} semantic-conflict file(s); "
+             f"{plan.get('n_dispatched', 0)} dispatched, {plan.get('n_stopped', 0)} stopped")
+    for e in plan["files"]:
+        g = e["precondition"]
+        if not g["ok"]:
+            L.append(f"  [STOP -> HUMAN] {e['target']}")
+            L.append(f"      {g['reason']}")
+            continue
+        L.append(f"  [{e.get('disposition', 'PLANNED')}] {e['target']}")
+        L.append(f"      ours={g['ours_tests']} theirs={g['theirs_tests']} "
+                 f"(bite-proven)")
+        L.append(f"      baseline-ref {e['baseline_ref'][:12]} (dangling; conflicted tree)")
+        L.append(f"      worktree {e['worktree']}")
+        L.append(f"      branch   {e['branch']}")
+        if e.get("job_id"):
+            L.append(f"      job      {e['job_id']}")
+        L.append(f"      enqueue: {' '.join(shlex.quote(x) for x in e['enqueue_argv'])}")
+    L.append(f"  ==> {plan.get('reason', '')}")
+    if not plan.get("stop"):
+        L.append("  NEXT: after the queue+gate finish GREEN, run "
+                 "`--land-merge <job-id>` to stage the scratch integrate/* branch; "
+                 "the coordinator does the final merge into the target.")
+    return "\n".join(L)
+
+
+def self_test() -> int:
+    """Synthetic proof: a redundant/merged worktree is recommended for prune (with
+    a reason), and a semantic-conflict worktree is NOT. Builds throwaway repos in
+    a temp dir; touches nothing outside it. Prints assertions + both verdicts."""
+    import shutil
+    td = tempfile.mkdtemp(prefix="odi-selftest-")
+    def g(cwd, *a):
+        p = subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True)
+        if p.returncode != 0 and a[:1] != ("merge-base",):
+            raise RuntimeError(f"git {' '.join(a)} failed: {p.stderr}")
+        return p.stdout
+    try:
+        origin = os.path.join(td, "origin.git")
+        work = os.path.join(td, "work")
+        subprocess.run(["git", "init", "--bare", "-b", "main", origin], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "clone", origin, work], check=True, capture_output=True)
+        for k, val in (("user.email", "t@t"), ("user.name", "t")):
+            g(work, "config", k, val)
+        foo = os.path.join(work, "foo.txt")
+        Path(foo).write_text("line1\nline2\nline3\n")
+        g(work, "add", "foo.txt"); g(work, "commit", "-m", "base")
+        g(work, "push", "origin", "main")
+
+        # --- Redundant case: branch's commit is merged into main and pushed. ---
+        red = os.path.join(td, "red")
+        g(work, "worktree", "add", "-b", "branch-red", red)
+        Path(os.path.join(red, "foo.txt")).write_text("line1\nline2\nEXTRA\n")
+        g(red, "add", "foo.txt"); g(red, "commit", "-m", "red work")
+        g(work, "merge", "--no-ff", "branch-red", "-m", "merge red")
+        g(work, "push", "origin", "main")
+
+        # --- Semantic case: branch and main edit the SAME line differently. ---
+        sem = os.path.join(td, "sem")
+        g(work, "worktree", "add", "-b", "branch-sem", sem, "origin/main~1")  # off base
+        Path(os.path.join(sem, "foo.txt")).write_text("line1\nSEM\nline3\n")
+        g(sem, "add", "foo.txt"); g(sem, "commit", "-m", "sem work")
+        # main diverges on the same line, pushed so origin/main carries it.
+        Path(foo).write_text("line1\nMAIN\nline3\n")
+        g(work, "add", "foo.txt"); g(work, "commit", "-m", "main edits line2")
+        g(work, "push", "origin", "main")
+        g(sem, "fetch", "origin")
+
+        rv = prune_recommendation(classify(red))
+        sv = prune_recommendation(classify(sem))
+        print(prune_report(rv)); print()
+        print(prune_report(sv)); print()
+
+        ok = True
+        def check(cond, msg):
+            nonlocal ok
+            print(f"  [{'PASS' if cond else 'FAIL'}] {msg}")
+            ok = ok and cond
+        print("assertions:")
+        check(rv["verdict"] == "redundant", "redundant/merged worktree classified redundant")
+        check(rv["prune"] is True, "redundant worktree RECOMMENDED for prune")
+        check(bool(rv.get("reason")), "prune recommendation carries a reason")
+        check("already on main" in rv["reason"], "reason states 'already on main'")
+        check(any("handoff-emit.py --acted" in c for c in rv["suggested_commands"]),
+              "ack command printed")
+        check(any("worktree remove" in c for c in rv["suggested_commands"]),
+              "worktree-remove command printed")
+        check(sv["verdict"] == "conflict-semantic", "diverging-edit worktree is conflict-semantic")
+        check(sv["prune"] is False, "semantic-conflict worktree NOT recommended for prune (kept)")
+        check("suggested_commands" not in sv, "no prune commands emitted for the kept case")
+
+        # --- SUPERSEDED: landed by commit-tree (no ancestry), then hardened on main
+        # (2026-09-24, the broker-guard 11). Own throwaway repo so the cases below
+        # keep seeing the origin/main they were written against.
+        o2 = os.path.join(td, "origin-sup.git"); w2 = os.path.join(td, "work-sup")
+        subprocess.run(["git", "init", "--bare", "-b", "main", o2], check=True, capture_output=True)
+        subprocess.run(["git", "clone", o2, w2], check=True, capture_output=True)
+        for k, val in (("user.email", "t@t"), ("user.name", "t")):
+            g(w2, "config", k, val)
+        f2 = os.path.join(w2, "foo.txt")
+        Path(f2).write_text("line1\nline2\nline3\n")
+        g(w2, "add", "foo.txt"); g(w2, "commit", "-m", "base"); g(w2, "push", "origin", "main")
+        # chain forks here and changes line3
+        land = os.path.join(td, "sup-land")
+        g(w2, "worktree", "add", "-b", "branch-land", land, "origin/main")
+        Path(os.path.join(land, "foo.txt")).write_text("line1\nline2\nLAND3\n")
+        g(land, "add", "foo.txt"); g(land, "commit", "-m", "land work")
+        # a sibling that forks at the same point but whose content NEVER reaches main
+        never = os.path.join(td, "sup-never")
+        g(w2, "worktree", "add", "-b", "branch-never", never, "origin/main")
+        Path(os.path.join(never, "foo.txt")).write_text("line1\nline2\nNEVER3\n")
+        g(never, "add", "foo.txt"); g(never, "commit", "-m", "never work")
+        # a sibling whose change main later ABSORBED as part of a bigger edit
+        sub = os.path.join(td, "sup-sub")
+        g(w2, "worktree", "add", "-b", "branch-sub", sub, "origin/main")
+        Path(os.path.join(sub, "foo.txt")).write_text("L1\nline2\nline3\n")
+        g(sub, "add", "foo.txt"); g(sub, "commit", "-m", "sub work")
+        # LANDING in commit-tree shape: main gets the branch's exact bytes as a fresh
+        # commit with NO ancestry to branch-land (what stage/land actually produce).
+        Path(f2).write_text("line1\nline2\nLAND3\n")
+        g(w2, "add", "foo.txt"); g(w2, "commit", "-m", "land branch-land content (commit-tree shape)")
+        landed_sha = g(w2, "rev-parse", "HEAD").strip()
+        # main then HARDENS the very line the chain changed, and absorbs sub's L1.
+        Path(f2).write_text("L1\nline2\nLAND3-HARDENED\n")
+        g(w2, "add", "foo.txt"); g(w2, "commit", "-m", "harden"); g(w2, "push", "origin", "main")
+        for wt_ in (land, never, sub):
+            g(wt_, "fetch", "origin")
+        lv = classify(land); lr = prune_recommendation(lv)
+        nv = classify(never)
+        subv = classify(sub)
+        anc_land = g(land, "merge-base", "origin/main", "HEAD").strip()
+        check(anc_land != landed_sha and lv["already_merged"] is False,
+              "superseded: precondition -- the landed chain is NOT an ancestor of main "
+              "(commit-tree landing leaves merge-base at the fork)")
+        check(lv["overall"] == "redundant",
+              "superseded: landed-then-hardened chain classifies REDUNDANT, not conflict-semantic")
+        lf = next(f for f in lv["files"] if f["path"] == "foo.txt")
+        check(lf["status"] == "superseded" and lf.get("landed_in") == landed_sha[:12],
+              "superseded: the file names the main commit that carried the branch's bytes")
+        check(lr["prune"] is True and "superseded" in lr["reason"] and landed_sha[:12] in lr["reason"],
+              "superseded: prune recommended with the landing commit in the reason")
+        check(nv["overall"] == "conflict-semantic",
+              "superseded REVERT-PROOF: a same-fork sibling whose bytes never reached main "
+              "is STILL conflict-semantic (history does not explain its divergence)")
+        check(landed_on_default(land, anc_land, "origin/main", "foo.txt", b"line1\nline2\nNEVER3\n") is None
+              and landed_on_default(land, anc_land, "origin/main", "foo.txt", b"line1\nline2\nLAND3\n") == landed_sha,
+              "landed_on_default: finds the exact-bytes commit and nothing else")
+        check(landed_on_default(land, None, "origin/main", "foo.txt", b"x") is None,
+              "landed_on_default: no merge-base -> None, never raises")
+        sf = next(f for f in subv["files"] if f["path"] == "foo.txt")
+        check(subv["overall"] == "redundant" and sf["status"] == "integrated",
+              "subsumed: a branch hunk main already absorbed inside a bigger edit is "
+              "INTEGRATED (3-way merge == main), not staged as a no-op 'clean'")
+
+        # --- UNCONVERGED: the chain never implemented an in-scope file (2026-09-25,
+        # bg-health). Reuses the w2 repo; hp.py is the file main implements, hp2.py
+        # the one main leaves alone, so both directions are exercised on one main.
+        STUB_HP = '"""Stub for hp.py -- implement per TASK.md."""\n'
+        STUB_HP2 = '"""Stub for hp2.py -- implement per TASK.md."""\n'
+        Path(os.path.join(w2, "hp.py")).write_text(STUB_HP)
+        Path(os.path.join(w2, "hp2.py")).write_text(STUB_HP2)
+        g(w2, "add", "hp.py", "hp2.py"); g(w2, "commit", "-m", "scaffold stubs")
+        g(w2, "push", "origin", "main")
+        # (a) chain edits hp.py but LEAVES the stub marker: partial convergence.
+        unc = os.path.join(td, "sup-unconv")
+        g(w2, "worktree", "add", "-b", "branch-unconv", unc, "origin/main")
+        Path(os.path.join(unc, "hp.py")).write_text(STUB_HP + "def a():\n    return 1\n")
+        g(unc, "add", "hp.py"); g(unc, "commit", "-m", "partial: a() only, stub left")
+        # (b) same shape on hp2.py, which main will NEVER implement.
+        par = os.path.join(td, "sup-partial")
+        g(w2, "worktree", "add", "-b", "branch-partial", par, "origin/main")
+        Path(os.path.join(par, "hp2.py")).write_text(STUB_HP2 + "def a():\n    return 1\n")
+        g(par, "add", "hp2.py"); g(par, "commit", "-m", "partial on an unimplemented file")
+        # (c) CONTROL: same file, same fork, genuinely diverging edit, NO stub marker.
+        div = os.path.join(td, "sup-diverged")
+        g(w2, "worktree", "add", "-b", "branch-div", div, "origin/main")
+        Path(os.path.join(div, "hp.py")).write_text("def a():\n    return 'BRANCH'\n")
+        g(div, "add", "hp.py"); g(div, "commit", "-m", "real diverging work, converged")
+        # main implements hp.py for real (stub gone) and hardens it; hp2.py untouched.
+        Path(os.path.join(w2, "hp.py")).write_text(
+            '"""Health."""\n\ndef a():\n    return 99\n\ndef b():\n    return 0\n')
+        g(w2, "add", "hp.py"); g(w2, "commit", "-m", "implement + harden hp.py")
+        g(w2, "push", "origin", "main")
+        for wt_ in (unc, par, div):
+            g(wt_, "fetch", "origin")
+        uv = classify(unc); ur = prune_recommendation(uv)
+        pv = classify(par)
+        dv = classify(div)
+        uf = next(f for f in uv["files"] if f["path"] == "hp.py")
+        check(uv["overall"] == "unconverged" and uf["status"] == "unconverged",
+              "unconverged: an in-scope file still carrying the scaffold stub is "
+              "UNCONVERGED, not conflict-semantic")
+        check("subclass" not in uf,
+              "unconverged: the file is not ALSO marked semantic (it must not look "
+              "like a merge candidate)")
+        check(uv["overall"] != "conflict-semantic",
+              "unconverged: NOT merge-dispatch eligible (that gate requires exactly "
+              "conflict-semantic, so there is nothing for a model to 'resolve')")
+        check(ur["prune"] is False and "scaffold stub" in ur["reason"]
+              and "hp.py" in ur["reason"],
+              "unconverged: kept (never pruned as redundant) and the reason names the file")
+        check(dv["overall"] == "conflict-semantic",
+              "unconverged REVERT-PROOF: the SAME file, SAME fork, SAME main, with real "
+              "converged work and no stub marker is STILL conflict-semantic -- the marker "
+              "is what fires, not 'the branch looks worse than main'")
+        pf = next(f for f in pv["files"] if f["path"] == "hp2.py")
+        check(pv["overall"] != "unconverged" and pf["status"] != "unconverged",
+              "unconverged: when MAIN carries the same stub, partial progress is real "
+              "work to keep -- we do not block a chain for improving on a stub")
+        check(still_scaffold_stub("hp.py", STUB_HP.encode(), None) is True
+              and still_scaffold_stub("other.py", STUB_HP.encode(), None) is False,
+              "still_scaffold_stub: matches only the marker naming THAT path")
+        check(still_scaffold_stub("hp.py", STUB_HP.encode(), STUB_HP.encode()) is False
+              and still_scaffold_stub("hp.py", None, None) is False,
+              "still_scaffold_stub: not fired when main has the same stub, and None-safe")
+
+        # --- DELIVERABLE 1: dirty in-scope (uncommitted fix) => dirty-scope, KEEP. ---
+        # THE CRITICAL BUG. Worker leaves the fix uncommitted (working-tree M,
+        # 0 commits ahead); at committed HEAD foo.txt == main. Must NOT be redundant.
+        dirty = os.path.join(td, "dirty")
+        g(work, "worktree", "add", "-b", "branch-dirty", dirty, "origin/main")
+        dmb = g(dirty, "merge-base", "origin/main", "HEAD").strip()
+        Path(os.path.join(dirty, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["foo.txt"], "baseline_commit": dmb}))
+        # uncommitted in-scope edit -- the real fix, left in the working tree.
+        Path(os.path.join(dirty, "foo.txt")).write_text("line1\nDIRTY-FIX\nline3\n")
+        dv = classify(dirty)
+        dp = prune_recommendation(dv)
+        print(prune_report(dp)); print()
+        check(dv["overall"] == "dirty-scope", "uncommitted in-scope edit classified dirty-scope")
+        check(bool(dv["dirty_scope_files"]), "dirty_scope_files populated in verdict")
+        check(dp["prune"] is False, "dirty-scope worktree NOT recommended for prune (kept)")
+        check("commit first" in dp["reason"], "dirty-scope reason says 'commit first'")
+        check("suggested_commands" not in dp, "no prune/branch -D commands for dirty-scope")
+        check(any("commit -m" in c for c in dp.get("commit_guidance", [])),
+              "git add/commit guidance printed for dirty-scope")
+        # revert-proof: committing the fix flips it OFF dirty-scope (guard bites only when dirty).
+        g(dirty, "add", "foo.txt"); g(dirty, "commit", "-m", "commit the fix")
+        check(classify(dirty)["overall"] != "dirty-scope",
+              "committing the in-scope fix clears dirty-scope (guard bites only while dirty)")
+
+        # --- DELIVERABLE 2: --stage a CLEAN dispatch (code + scaffold committed). ---
+        cln = os.path.join(td, "cln")
+        g(work, "worktree", "add", "-b", "branch-clean", cln, "origin/main")
+        cmb = g(cln, "merge-base", "origin/main", "HEAD").strip()
+        os.makedirs(os.path.join(cln, "src"))
+        Path(os.path.join(cln, "src", "app.js")).write_text("export const x = 1;\n")  # CODE
+        Path(os.path.join(cln, "TASK.md")).write_text("scaffold task\n")             # SCAFFOLD
+        Path(os.path.join(cln, "verify.sh")).write_text("#!/bin/sh\nexit 0\n")        # SCAFFOLD
+        g(cln, "add", "src/app.js", "TASK.md", "verify.sh")
+        g(cln, "commit", "-m", "clean dispatch: code + scaffold")
+        Path(os.path.join(cln, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["src/app.js"], "baseline_commit": cmb}))
+        cv = classify(cln)
+        main_before = g(work, "rev-parse", "origin/main").strip()
+        check(cv["overall"] == "clean", "code+scaffold dispatch classified clean")
+        src, sr = stage(cv)
+        print(stage_report(src, sr)); print()
+        check(src == 0 and isinstance(sr, dict) and sr.get("staged"), "--stage succeeded on clean")
+        check(sr["target_branch"].startswith("integrate/"), "scratch branch named integrate/<slug>-<id>")
+        check(sr["diff_files"] == ["src/app.js"], "staged branch diff vs main == code-only (src/app.js)")
+        check("TASK.md" not in sr["diff_files"] and "verify.sh" not in sr["diff_files"],
+              "NO scaffold files in the staged branch")
+        check(not sr["scaffold_leaked"], "scaffold-leak self-check clean")
+        main_after = g(work, "rev-parse", "origin/main").strip()
+        check(main_before == main_after, "main is NOT written by --stage")
+        # verify the staged content actually equals the branch's code version
+        staged_blob = subprocess.run(["git", "-C", cln, "show",
+                                      f"{sr['target_branch']}:src/app.js"],
+                                     capture_output=True, text=True).stdout
+        check(staged_blob == "export const x = 1;\n", "staged branch carries the branch's code change")
+
+        # --- DELIVERABLE 2 refusals ---
+        # (a) existing target branch => refuse (re-stage the same clean verdict).
+        rc2, r2 = stage(cv)
+        check(rc2 != 0 and "already exists" in str(r2), "re-stage refuses: target branch exists")
+        # (b) dirty-scope => refuse.
+        rc3, r3 = stage(dv)
+        check(rc3 != 0 and "DIRTY-SCOPE" in str(r3), "stage refuses a dirty-scope verdict")
+        # (c) inferred scope => refuse (worktree with NO contract).
+        inf = os.path.join(td, "inf")
+        g(work, "worktree", "add", "-b", "branch-inf", inf, "origin/main")
+        os.makedirs(os.path.join(inf, "lib"))
+        Path(os.path.join(inf, "lib", "y.js")).write_text("export const y = 2;\n")
+        g(inf, "add", "lib/y.js"); g(inf, "commit", "-m", "inferred-scope change")
+        iv = classify(inf)
+        check(iv["scope_inferred"] is True, "no-contract worktree has inferred scope")
+        rc4, r4 = stage(iv)
+        check(rc4 != 0 and "INFERRED" in str(r4), "stage refuses an inferred scope")
+
+        # ===================================================================
+        # PHASE 4 -- gated merge-dispatch for SEMANTIC conflicts.
+        # A SECOND synthetic repo: main (ours) and a branch (theirs) each edit
+        # the SAME function in src/calc.mjs a different way, each shipping its own
+        # behavioural test. That is the ONLY shape worth a merge-dispatch.
+        # ===================================================================
+        NEG_TEST = ("import { test } from 'node:test';\n"
+                    "import assert from 'node:assert';\n"
+                    "import { classify } from '../src/calc.mjs';\n"
+                    "test('neg', () => assert.strictEqual(classify(-1), 'neg'));\n")
+        ZERO_TEST = ("import { test } from 'node:test';\n"
+                     "import assert from 'node:assert';\n"
+                     "import { classify } from '../src/calc.mjs';\n"
+                     "test('zero', () => assert.strictEqual(classify(0), 'zero'));\n")
+        SVCA_TEST = ("import { test } from 'node:test';\n"
+                     "import assert from 'node:assert';\n"
+                     "import { svc } from '../src/svc.mjs';\n"
+                     "test('a', () => assert.strictEqual(svc('a'), 'A'));\n")
+        SVCB_TEST = ("import { test } from 'node:test';\n"
+                     "import assert from 'node:assert';\n"
+                     "import { svc } from '../src/svc.mjs';\n"
+                     "test('b', () => assert.strictEqual(svc('b'), 'B'));\n")
+        CALC_BASE = "export function classify(x) {\n  return 'base';\n}\n"
+        CALC_NEG = "export function classify(x) {\n  if (x < 0) return 'neg';\n  return 'base';\n}\n"
+        CALC_ZERO = "export function classify(x) {\n  if (x === 0) return 'zero';\n  return 'base';\n}\n"
+        CALC_UNION = ("export function classify(x) {\n  if (x < 0) return 'neg';\n"
+                      "  if (x === 0) return 'zero';\n  return 'base';\n}\n")
+        SVC_BASE = "export function svc(s) {\n  return s;\n}\n"
+        SVC_A = "export function svc(s) {\n  if (s === 'a') return 'A';\n  return s;\n}\n"
+        SVC_B = "export function svc(s) {\n  if (s === 'b') return 'B';\n  return s;\n}\n"
+
+        def pkg(test_script):
+            return json.dumps({"name": "m", "version": "0.0.0",
+                               "scripts": {"test": test_script}}, indent=2) + "\n"
+
+        o2 = os.path.join(td, "origin2.git")
+        w2 = os.path.join(td, "work2")
+        subprocess.run(["git", "init", "--bare", "-b", "main", o2], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "clone", o2, w2], check=True, capture_output=True)
+        for k, val in (("user.email", "t@t"), ("user.name", "t")):
+            g(w2, "config", k, val)
+        os.makedirs(os.path.join(w2, "src")); os.makedirs(os.path.join(w2, "test"))
+        Path(os.path.join(w2, "src", "calc.mjs")).write_text(CALC_BASE)
+        Path(os.path.join(w2, "src", "svc.mjs")).write_text(SVC_BASE)
+        Path(os.path.join(w2, "package.json")).write_text(pkg("node --test"))
+        g(w2, "add", "-A"); g(w2, "commit", "-m", "base"); g(w2, "push", "origin", "main")
+
+        # theirs (the dispatch branch), off base: zero-handling + svc 'b' + tests.
+        sem2 = os.path.join(td, "sem2")
+        g(w2, "worktree", "add", "-b", "branch-merge", sem2, "origin/main")
+        os.makedirs(os.path.join(sem2, "test"), exist_ok=True)
+        mb2 = g(sem2, "merge-base", "origin/main", "HEAD").strip()
+        Path(os.path.join(sem2, "src", "calc.mjs")).write_text(CALC_ZERO)
+        Path(os.path.join(sem2, "src", "svc.mjs")).write_text(SVC_B)
+        Path(os.path.join(sem2, "test", "zero.test.mjs")).write_text(ZERO_TEST)
+        Path(os.path.join(sem2, "test", "svcb.test.mjs")).write_text(SVCB_TEST)
+        Path(os.path.join(sem2, "package.json")).write_text(
+            pkg("node --test test/zero.test.mjs test/svcb.test.mjs"))
+        Path(os.path.join(sem2, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["src/calc.mjs", "src/svc.mjs"], "baseline_commit": mb2}))
+        g(sem2, "add", "src/calc.mjs", "src/svc.mjs", "test/zero.test.mjs",
+          "test/svcb.test.mjs", "package.json")
+        g(sem2, "commit", "-m", "branch: zero + svc b handling, both tested")
+
+        # ours (main advances by a sibling path): neg-handling + svc 'a' + tests.
+        Path(os.path.join(w2, "src", "calc.mjs")).write_text(CALC_NEG)
+        Path(os.path.join(w2, "src", "svc.mjs")).write_text(SVC_A)
+        Path(os.path.join(w2, "test", "neg.test.mjs")).write_text(NEG_TEST)
+        Path(os.path.join(w2, "test", "svca.test.mjs")).write_text(SVCA_TEST)
+        Path(os.path.join(w2, "package.json")).write_text(
+            pkg("node --test test/neg.test.mjs test/svca.test.mjs"))
+        g(w2, "add", "-A"); g(w2, "commit", "-m", "main: neg + svc a handling, both tested")
+        g(w2, "push", "origin", "main"); g(sem2, "fetch", "origin")
+
+        mv = classify(sem2)
+        print("\n--- PHASE 4: merge-dispatch ---")
+        print(human_report(mv)); print()
+        check(mv["overall"] == "conflict-semantic", "two diverging tested edits => conflict-semantic")
+        check(mv["scope_inferred"] is False, "merge-dispatch fixture has a PROVEN scope (state file)")
+
+        # -- precondition gate: BOTH sides carry a behavioural test importing calc.
+        mb2f = merge_base(sem2, mv["default_ref"], "HEAD")
+        pg = precondition_gate(sem2, mv["default_ref"], mb2f, "src/calc.mjs")
+        check(pg["ok"] is True, "precondition PASS when both sides have a behavioural test")
+        check("test/neg.test.mjs" in pg["ours_tests"], "ours-side behavioural test detected (neg)")
+        check("test/zero.test.mjs" in pg["theirs_tests"], "theirs-side behavioural test detected (zero)")
+
+        # ============ materialize_conflicted_baseline: assert BYTES ============
+        mb2fm = merge_base(sem2, mv["default_ref"], "HEAD")
+        rc_mat, mat = materialize_conflicted_baseline(
+            sem2, "src/calc.mjs", mv["default_ref"], "test/neg.test.mjs", "test/zero.test.mjs")
+        check(rc_mat == 0 and isinstance(mat, dict), "materialize_conflicted_baseline succeeds")
+        bref = mat["baseline_ref"]
+        # the baseline TREE (not just returned bytes): read each path back out of it.
+        mt_calc = show(sem2, bref, "src/calc.mjs") or b""
+        check(b"<<<<<<<" in mt_calc and b">>>>>>>" in mt_calc,
+              "materialized target carries git conflict markers (verify fails at baseline for free)")
+        check(b"|||||||" in mt_calc, "markers are DIFF3 form (||||||| base section present)")
+        check(b"'neg'" in mt_calc and b"'zero'" in mt_calc,
+              "materialized conflicted target interleaves BOTH sides (neg + zero)")
+        mt_pkg = show(sem2, bref, "package.json") or b""
+        pj = json.loads(mt_pkg.decode())
+        check("test/neg.test.mjs" in pj["scripts"]["test"]
+              and "test/zero.test.mjs" in pj["scripts"]["test"],
+              "materialized package.json is the UNION -- BOTH tests registered")
+        check(show(sem2, bref, "test/neg.test.mjs") == NEG_TEST.encode(),
+              "materialized tree carries ours-side behavioural test (neg)")
+        check(show(sem2, bref, "test/zero.test.mjs") == ZERO_TEST.encode(),
+              "materialized tree carries theirs-side behavioural test (zero)")
+        check(sorted(mat["extra_blobs"]) == ["package.json", "test/zero.test.mjs"],
+              "extra_blobs = clean deps (branch test + union package.json) for land composition")
+        # SAFETY: materialize wrote NO ref and did NOT move HEAD.
+        mm_before = g(w2, "rev-parse", "origin/main").strip()
+        check(git(sem2, "rev-parse", "--verify", "--quiet", f"refs/heads/{bref}")[0] != 0,
+              "materialize created a DANGLING commit -- no branch ref at the baseline sha")
+        # materialize the conflicted tree and run the verify: it must FAIL (markers).
+        with tempfile.TemporaryDirectory() as vmb:
+            check(_materialize(sem2, bref, vmb), "materialized baseline tree extractable")
+            p_mbase, _ = run_merge_verify(vmb, "src/calc.mjs", "test/neg.test.mjs", "test/zero.test.mjs")
+            check(p_mbase is False, "the materialized conflicted baseline FAILS the verify (markers)")
+
+        # ============ merge_dispatch --dry-run: EXECUTE a-b-c, print enqueue ====
+        md_dest = os.path.join(td, "merge-wts")
+        main_b = g(w2, "rev-parse", "origin/main").strip()
+        head_b = g(sem2, "rev-parse", "HEAD").strip()
+        o2_head_b = subprocess.run(["git", "-C", o2, "rev-parse", "main"],
+                                   capture_output=True, text=True).stdout.strip()
+        rc_md, plan = merge_dispatch(mv, dry_run=True, dest_root=md_dest)
+        print(merge_dispatch_report(rc_md, plan)); print()
+        check(rc_md == 0, "merge_dispatch --dry-run EXECUTES (exit 0) -- not a STOP")
+        check(plan["dry_run"] is True and plan["stop"] is False, "plan marked dry-run, not stop")
+        check(plan["n_conflicted"] == 2 and plan["n_dispatched"] == 2,
+              "2 conflicted files => 2 bounded single-file dispatches materialized")
+        check(plan["n_stopped"] == 0, "no file stopped (both bite-proven)")
+        targets = sorted(e["target"] for e in plan["files"])
+        check(targets == ["src/calc.mjs", "src/svc.mjs"], "one dispatch entry per conflicted file")
+        check(all(e["precondition"].get("bite_proven") for e in plan["files"]),
+              "each dispatched file is bite-proven (take-ours/take-theirs both FAIL)")
+        check(all(e.get("job_id") is None for e in plan["files"]),
+              "DRY-RUN performed NO live enqueue (no job id)")
+        check(all(e["disposition"].startswith("DRY-RUN") for e in plan["files"]),
+              "each entry disposition == DRY-RUN (would enqueue)")
+        # each scaffolded worktree exists and is cut from the materialized baseline.
+        _created_wts = []
+        for e in plan["files"]:
+            wtp = e["worktree"]; _created_wts.append((wtp, e["branch"]))
+            check(os.path.isdir(wtp), f"dispatch worktree created: {Path(wtp).name}")
+            # seal_baseline commits the authored harness on top, so HEAD advances
+            # PAST the baseline_ref -- assert the baseline is an ANCESTOR of HEAD
+            # (the worktree genuinely started from the materialized conflicted tree).
+            anc = subprocess.run(["git", "-C", wtp, "merge-base", "--is-ancestor",
+                                  e["baseline_ref"], "HEAD"], capture_output=True)
+            check(anc.returncode == 0,
+                  f"worktree cut from the materialized baseline ({Path(wtp).name})")
+            wt_calc = subprocess.run(["git", "-C", wtp, "show", f"HEAD:{e['target']}"],
+                                     capture_output=True, text=True).stdout
+            check("<<<<<<<" in wt_calc, f"worktree's {e['target']} carries the conflict markers")
+            # the emitted enqueue argv is the correct, discovered ollama-queue.py shape.
+            ea = e["enqueue_argv"]
+            check(ea[1].endswith("ollama-queue.py") and ea[2] == "enqueue",
+                  "enqueue argv invokes ollama-queue.py enqueue")
+            check("--cwd" in ea and ea[ea.index("--cwd") + 1] == wtp,
+                  "enqueue --cwd points at the scaffolded isolated worktree")
+            check("--task-file" in ea and ea[ea.index("--task-file") + 1].endswith("TASK.md"),
+                  "enqueue --task-file is the worktree TASK.md")
+            check("--verify" in ea and ea[ea.index("--verify") + 1] == "bash verify.sh",
+                  "enqueue --verify is 'bash verify.sh'")
+            # the worktree carries the land manifest.
+            check((Path(wtp) / MERGE_MANIFEST).is_file(),
+                  "dispatch worktree carries the .merge-dispatch.json land manifest")
+        # SAFETY INVARIANT: dry-run touched NO real target ref / HEAD.
+        check(g(w2, "rev-parse", "origin/main").strip() == main_b,
+              "SAFETY: --merge-dispatch --dry-run did NOT move origin/main")
+        check(g(sem2, "rev-parse", "HEAD").strip() == head_b,
+              "SAFETY: --merge-dispatch --dry-run did NOT move HEAD")
+        check(subprocess.run(["git", "-C", o2, "rev-parse", "main"], capture_output=True,
+              text=True).stdout.strip() == o2_head_b,
+              "SAFETY: --merge-dispatch --dry-run did NOT push (bare origin main unchanged)")
+        check(mm_before == main_b, "SAFETY: materialize+dry-run left origin/main untouched throughout")
+
+        # -- LAND a mock GREEN resolution from a dispatch worktree (--land-merge).
+        # Resolve the FIRST worktree's target to the correct union, mark verify
+        # green + gate pass, and land: ONLY a scratch integrate/* branch appears.
+        lm_wt, lm_branch = _created_wts[0][0], _created_wts[0][1]
+        lm_manifest = _read_merge_manifest(lm_wt)
+        lm_target = lm_manifest["target"]
+        # write the correct resolution into the worktree (model's job, mocked).
+        union_by_target = {"src/calc.mjs": CALC_UNION, "src/svc.mjs":
+                           "export function svc(s) {\n  if (s === 'a') return 'A';\n"
+                           "  if (s === 'b') return 'B';\n  return s;\n}\n"}
+        Path(os.path.join(lm_wt, lm_target)).write_text(union_by_target[lm_target])
+        land_main_b = g(w2, "rev-parse", "origin/main").strip()
+        land_o2_b = subprocess.run(["git", "-C", o2, "rev-parse", "main"],
+                                   capture_output=True, text=True).stdout.strip()
+        # RED verify => REFUSE (fail-safe), no branch written.
+        rc_red, r_red = land_merge_from_worktree(lm_wt, False, "pass")
+        check(rc_red == 2 and "RED" in str(r_red),
+              "--land-merge REFUSES a red-verify resolution (fail-safe)")
+        # gate FAIL => REFUSE even with green verify.
+        rc_gf, r_gf = land_merge_from_worktree(lm_wt, True, "fail")
+        check(rc_gf == 2 and "verdict" in str(r_gf).lower(),
+              "--land-merge REFUSES a gate-FAIL resolution")
+        # GREEN verify + gate pass => LAND on scratch integrate/* only.
+        rc_lm, r_lm = land_merge_from_worktree(lm_wt, True, "pass")
+        print(land_merge_report(rc_lm, r_lm, lm_wt, True, "pass")); print()
+        check(rc_lm == 0 and isinstance(r_lm, dict) and r_lm.get("landed"),
+              "--land-merge lands a green resolution")
+        check(r_lm["target_branch"].startswith("integrate/"),
+              "--land-merge writes ONLY a scratch integrate/* branch")
+        check(sorted(r_lm["diff_files"]) == sorted([lm_target] + lm_manifest["extra_blob_paths"]),
+              "landed branch diff == resolved target + composed deps (extra_blobs)")
+        check(g(w2, "rev-parse", "origin/main").strip() == land_main_b,
+              "SAFETY: --land-merge did NOT move origin/main")
+        check(subprocess.run(["git", "-C", o2, "rev-parse", "main"], capture_output=True,
+              text=True).stdout.strip() == land_o2_b,
+              "SAFETY: --land-merge did NOT push (bare origin main unchanged)")
+        # the landed tree passes the verify (loop closes on green).
+        with tempfile.TemporaryDirectory() as vlm:
+            check(_materialize(sem2, r_lm["target_branch"], vlm),
+                  "materialized the --land-merge scratch branch tree")
+            if lm_target == "src/calc.mjs":
+                p_lm, _ = run_merge_verify(vlm, "src/calc.mjs",
+                                           lm_manifest["ours_test"], lm_manifest["theirs_test"])
+                check(p_lm is True, "the --land-merge landed tree passes the verify")
+
+        # REVERT-PROOF the fail-safe: land_merge with verify_ok=True lands, but the
+        # SAME call with verify_ok=False must refuse (guard bites only when red).
+        rc_rp, r_rp = land_merge(lm_manifest, union_by_target[lm_target].encode(),
+                                 {}, False, "pass")
+        check(rc_rp == 2, "REVERT-PROOF: land_merge refuses whenever verify_ok is False")
+
+        # free the integrate/* branch this land-merge created so the later
+        # land_resolution MED8 block (same slug/head, tag merge) can recreate it.
+        if rc_lm == 0:
+            subprocess.run(["git", "-C", w2, "branch", "-D", r_lm["target_branch"]],
+                           capture_output=True)
+        # cleanup the scaffolded dispatch worktrees + their dispatch/* branches.
+        for wtp, brn in _created_wts:
+            subprocess.run(["git", "-C", w2, "worktree", "remove", "--force", wtp],
+                           capture_output=True)
+            subprocess.run(["git", "-C", w2, "branch", "-D", brn.split("/", 1)[-1]
+                            if brn.startswith("dispatch/") else brn], capture_output=True)
+            subprocess.run(["git", "-C", w2, "branch", "-D", brn], capture_output=True)
+        subprocess.run(["git", "-C", w2, "worktree", "prune"], capture_output=True)
+
+        # -- THE VERIFY BITES. Build scratch trees and run the exact contract.
+        def write_tree(dirp, calc, script):
+            os.makedirs(os.path.join(dirp, "src")); os.makedirs(os.path.join(dirp, "test"))
+            Path(os.path.join(dirp, "src", "calc.mjs")).write_text(calc)
+            Path(os.path.join(dirp, "test", "neg.test.mjs")).write_text(NEG_TEST)
+            Path(os.path.join(dirp, "test", "zero.test.mjs")).write_text(ZERO_TEST)
+            Path(os.path.join(dirp, "package.json")).write_text(pkg(script))
+            return dirp
+        OT, TT = "test/neg.test.mjs", "test/zero.test.mjs"
+        BOTH = "node --test test/neg.test.mjs test/zero.test.mjs"
+
+        # conflicted baseline (real merge-file markers) => FAIL (markers leg).
+        base_calc = show(sem2, mb2f, "src/calc.mjs")
+        ours_calc = show(sem2, mv["default_ref"], "src/calc.mjs")
+        theirs_calc = show(sem2, "HEAD", "src/calc.mjs")
+        st_c, merged_c = three_way(base_calc, ours_calc, theirs_calc)
+        check(st_c == "conflict", "baseline calc.mjs really has a 3-way conflict")
+        d_base = write_tree(os.path.join(td, "v_base"),
+                            merged_c.decode(), BOTH)
+        p_base, legs_base = run_merge_verify(d_base, "src/calc.mjs", OT, TT)
+        check(p_base is False, "verify FAILS on the conflicted baseline (markers present)")
+        check(any(l["name"] == "no-conflict-markers" and not l["ok"] for l in legs_base),
+              "  ...and it fails specifically on the conflict-marker leg")
+
+        # take-ours DROPS theirs' test => FAIL (registration leg).
+        d_to = write_tree(os.path.join(td, "v_takeours"), CALC_NEG,
+                          "node --test test/neg.test.mjs")   # zero test dropped
+        p_to, legs_to = run_merge_verify(d_to, "src/calc.mjs", OT, TT)
+        check(p_to is False, "verify FAILS on take-ours that drops theirs' test")
+        check(any(l["name"] == "both-tests-registered" and not l["ok"] for l in legs_to),
+              "  ...on the both-tests-registered leg (theirs' test not in scripts.test)")
+        # take-ours code but BOTH registered => FAIL at the RUN leg (zero test red).
+        d_to2 = write_tree(os.path.join(td, "v_takeours2"), CALC_NEG, BOTH)
+        p_to2, legs_to2 = run_merge_verify(d_to2, "src/calc.mjs", OT, TT)
+        check(p_to2 is False, "verify FAILS on take-ours even with both registered (run leg)")
+        check(any(l["name"] == "both-tests-green" and not l["ok"] for l in legs_to2),
+              "  ...on the both-tests-green leg (theirs' behaviour dropped)")
+
+        # take-theirs DROPS ours' test => FAIL.
+        d_tt = write_tree(os.path.join(td, "v_taketheirs"), CALC_ZERO,
+                          "node --test test/zero.test.mjs")  # neg test dropped
+        p_tt, legs_tt = run_merge_verify(d_tt, "src/calc.mjs", OT, TT)
+        check(p_tt is False, "verify FAILS on take-theirs that drops ours' test")
+        # take-theirs code, both registered => FAIL at run leg (neg test red).
+        d_tt2 = write_tree(os.path.join(td, "v_taketheirs2"), CALC_ZERO, BOTH)
+        p_tt2, legs_tt2 = run_merge_verify(d_tt2, "src/calc.mjs", OT, TT)
+        check(p_tt2 is False, "verify FAILS on take-theirs even with both registered (run leg)")
+
+        # correct UNION (the canned-correct mock resolution) => PASS.
+        d_un = write_tree(os.path.join(td, "v_union"), CALC_UNION, BOTH)
+        p_un, legs_un = run_merge_verify(d_un, "src/calc.mjs", OT, TT)
+        check(p_un is True, "verify PASSES on the correct UNION resolution")
+        check(all(l["ok"] for l in legs_un), "  ...every leg green on the union")
+
+        # -- land the mock resolution on a scratch integrate/* branch. NO main write.
+        main_before2 = g(w2, "rev-parse", "origin/main").strip()
+        origin_head_before = subprocess.run(["git", "-C", o2, "rev-parse", "main"],
+                                            capture_output=True, text=True).stdout.strip()
+
+        # MED8 revert-proof (masked-bug side): landing ONLY the target file (no
+        # dependency composition) yields a tree whose scripts.test lacks the
+        # branch's test and whose test file is absent -> the landed tree FAILS the
+        # very verify that was green in the dispatch worktree.
+        rc_bad, land_bad = land_resolution(mv, "src/calc.mjs", CALC_UNION.encode(),
+                                           tag="bad")
+        check(rc_bad == 0, "single-file (uncomposed) land creates a branch")
+        with tempfile.TemporaryDirectory() as vbad:
+            check(_materialize(sem2, land_bad["target_branch"], vbad),
+                  "materialised the uncomposed landed branch tree")
+            p_bad, _ = run_merge_verify(vbad, "src/calc.mjs", OT, TT)
+            check(p_bad is False,
+                  "MED8: uncomposed land (target ONLY) FAILS verify -- proves the "
+                  "bug the old hand-copied self-test masked")
+
+        # MED8 fix side: compose the resolution WITH the remaining clean files
+        # (branch's behavioural test + unioned package.json) so the landed tree is
+        # verify-complete.
+        extra = {"test/zero.test.mjs": ZERO_TEST.encode(), "package.json": pkg(BOTH).encode()}
+        rc_land, land = land_resolution(mv, "src/calc.mjs", CALC_UNION.encode(),
+                                        extra_blobs=extra)
+        print(f"LANDED merge resolution: {land.get('target_branch')} @ "
+              f"{land.get('commit')} (diff {land.get('diff_files')})"
+              if rc_land == 0 else f"land failed: {land}"); print()
+        check(rc_land == 0 and land.get("landed"), "resolution landed on a scratch branch")
+        check(land["target_branch"].startswith("integrate/"),
+              "landed on integrate/<slug>-<id>, never main")
+        check(sorted(land["diff_files"]) == ["package.json", "src/calc.mjs", "test/zero.test.mjs"],
+              "landed branch diff vs main == target + composed deps (MED8)")
+        main_after2 = g(w2, "rev-parse", "origin/main").strip()
+        origin_head_after = subprocess.run(["git", "-C", o2, "rev-parse", "main"],
+                                           capture_output=True, text=True).stdout.strip()
+        check(main_before2 == main_after2, "origin/main (remote-tracking) sha UNCHANGED by land")
+        check(origin_head_before == origin_head_after, "the actual main ref sha UNCHANGED (no push)")
+        # the COMPOSED landed branch's ACTUAL tree (materialised, not hand-copied)
+        # passes the verify (loop closes on green).
+        lb = land["target_branch"]
+        with tempfile.TemporaryDirectory() as vgood:
+            check(_materialize(sem2, lb, vgood), "materialised the composed landed branch tree")
+            p_land, _ = run_merge_verify(vgood, "src/calc.mjs", OT, TT)
+            check(p_land is True,
+                  "MED8: the COMPOSED landed tree passes the verify (target + deps)")
+
+        # -- STOP -> human: only ONE side carries a behavioural test.
+        sem3 = os.path.join(td, "sem3")
+        g(w2, "worktree", "add", "-b", "branch-onesided", sem3, "origin/main~1")  # off base
+        Path(os.path.join(sem3, "src", "calc.mjs")).write_text(CALC_ZERO)  # edits, no test
+        Path(os.path.join(sem3, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["src/calc.mjs"], "baseline_commit": mb2}))
+        g(sem3, "add", "src/calc.mjs", "package.json")
+        g(sem3, "commit", "-m", "branch: zero handling, NO test (structurally pinned)")
+        g(sem3, "fetch", "origin")
+        ov = classify(sem3)
+        check(ov["overall"] == "conflict-semantic", "one-sided branch still conflicts semantically")
+        pg3 = precondition_gate(sem3, ov["default_ref"],
+                                merge_base(sem3, ov["default_ref"], "HEAD"), "src/calc.mjs")
+        check(pg3["ok"] is False, "precondition FAILS when a side lacks a behavioural test")
+        check("theirs" in pg3["reason"] or "branch" in pg3["reason"],
+              "precondition names the structurally-pinned side")
+        rc_stop, plan_stop = merge_dispatch(ov)
+        print(merge_dispatch_report(rc_stop, plan_stop)); print()
+        check(rc_stop == 3 and plan_stop["stop"] is True,
+              "merge_dispatch STOPs (exit 3) => not worth a dispatch, human merge")
+
+        # -- REFUSALS: non-semantic verdict / inferred scope / clean => refuse (exit 2).
+        rc_r1, pr1 = merge_dispatch(classify(sem))    # inferred scope (no contract)
+        check(rc_r1 == 2 and "INFERRED" in pr1.get("refuse", "").upper(),
+              "merge_dispatch REFUSES an inferred scope")
+        rc_r2, pr2 = merge_dispatch(cv)               # clean verdict
+        check(rc_r2 == 2 and "CLEAN" in pr2.get("refuse", "").upper(),
+              "merge_dispatch REFUSES a non-semantic (clean) verdict")
+        rc_r3, pr3 = merge_dispatch(classify(red))    # redundant verdict
+        check(rc_r3 == 2, "merge_dispatch REFUSES a redundant verdict")
+
+        # ===================================================================
+        # GAP CASES added for the reviewer's findings (with revert-proofs).
+        # ===================================================================
+        print("\n--- GAP CASES ---")
+
+        # ---- HIGH1: multi-file scope, clean + no-change + merge-clean siblings.
+        # --stage must write ONLY the branch-changed files, keep main's newer
+        # no-change blob, and carry BOTH hunks on the merge-clean file.
+        o3 = os.path.join(td, "origin3.git"); w3 = os.path.join(td, "work3")
+        subprocess.run(["git", "init", "--bare", "-b", "main", o3], check=True, capture_output=True)
+        subprocess.run(["git", "clone", o3, w3], check=True, capture_output=True)
+        for k, val in (("user.email", "t@t"), ("user.name", "t")):
+            g(w3, "config", k, val)
+        Path(os.path.join(w3, "a.js")).write_text("a0\n")
+        Path(os.path.join(w3, "b.js")).write_text("b0\n")
+        Path(os.path.join(w3, "c.js")).write_text("L1\nL2\nL3\nL4\nL5\n")
+        g(w3, "add", "-A"); g(w3, "commit", "-m", "base"); g(w3, "push", "origin", "main")
+        h1 = os.path.join(td, "h1")
+        g(w3, "worktree", "add", "-b", "branch-h1", h1, "origin/main")
+        h1mb = g(h1, "merge-base", "origin/main", "HEAD").strip()
+        Path(os.path.join(h1, "a.js")).write_text("a1\n")                    # clean
+        Path(os.path.join(h1, "c.js")).write_text("BR1\nL2\nL3\nL4\nL5\n")   # top hunk
+        Path(os.path.join(h1, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["a.js", "b.js", "c.js"], "baseline_commit": h1mb}))
+        g(h1, "add", "a.js", "c.js"); g(h1, "commit", "-m", "branch: a + c(top)")
+        Path(os.path.join(w3, "b.js")).write_text("bMAIN\n")                 # main: newer b
+        Path(os.path.join(w3, "c.js")).write_text("L1\nL2\nL3\nL4\nMAIN5\n") # main: bottom hunk
+        g(w3, "add", "-A"); g(w3, "commit", "-m", "main: b + c(bottom)"); g(w3, "push", "origin", "main")
+        g(h1, "fetch", "origin")
+        hv = classify(h1)
+        st_map = {f["path"]: f["status"] for f in hv["files"]}
+        check(hv["overall"] == "clean", "HIGH1 multi-file (clean+no-change+merge-clean) => clean")
+        check(st_map == {"a.js": "clean", "b.js": "no-change", "c.js": "clean"},
+              "HIGH1 per-file: a clean, b no-change, c merge-clean")
+        rc_h, rh = stage(hv)
+        print(stage_report(rc_h, rh)); print()
+        check(rc_h == 0 and rh.get("staged"), "HIGH1 multi-file --stage succeeds")
+        check(rh["staged_files"] == ["a.js", "c.js"],
+              "HIGH1: staged ONLY branch-changed files (b.js no-change SKIPPED)")
+        lb3 = rh["target_branch"]
+        check(show(h1, lb3, "b.js") == b"bMAIN\n",
+              "HIGH1 REVERT-PROOF: no-change sibling keeps MAIN's newer blob "
+              "(old code wrote the branch's stale 'b0')")
+        staged_c = (show(h1, lb3, "c.js") or b"").decode()
+        check("BR1" in staged_c and "MAIN5" in staged_c,
+              "HIGH1 REVERT-PROOF: merge-clean sibling carries BOTH hunks "
+              "(old code wrote theirs-only, dropping MAIN5)")
+        check(show(h1, lb3, "a.js") == b"a1\n", "HIGH1: clean file carries the branch change")
+
+        # ---- HIGH5/MED6: an out-of-scope dirty file blocks a would-be prune.
+        Path(os.path.join(red, "untracked_out.txt")).write_text("scratch\n")
+        rv2 = classify(red)
+        check(rv2["overall"] == "dirty-tree",
+              "HIGH5/MED6: already-merged worktree + out-of-scope dirt => dirty-tree")
+        check(prune_recommendation(rv2)["prune"] is False,
+              "HIGH5/MED6: dirty-tree is NOT recommended for prune")
+        os.remove(os.path.join(red, "untracked_out.txt"))
+        check(classify(red)["overall"] == "redundant",
+              "HIGH5/MED6 REVERT-PROOF: removing the out-of-scope dirt flips back to redundant")
+
+        # ---- HIGH5: malformed / string / all-no-change scope.
+        badp = os.path.join(td, "badpath")
+        g(work, "worktree", "add", "-b", "branch-badpath", badp, "origin/main")
+        Path(os.path.join(badp, "foo.txt")).write_text("line1\nEDIT\nline3\n")
+        g(badp, "add", "foo.txt"); g(badp, "commit", "-m", "edit")
+        Path(os.path.join(badp, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["does/not/exist.js"], "baseline_commit": ""}))
+        bv = classify(badp)
+        check("error" in bv and "resolve at none" in bv["error"],
+              "HIGH5: scope path resolving nowhere => ERROR verdict (not false no-change)")
+        Path(os.path.join(badp, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": "foo.txt", "baseline_commit": ""}))
+        sv2 = classify(badp)
+        check("error" in sv2 and "list[str]" in sv2["error"],
+              "HIGH5: a string declared_scope is a contract ERROR (not 1-char paths)")
+        anc = os.path.join(td, "allnochange")
+        g(work, "worktree", "add", "-b", "branch-allnc", anc, "origin/main")
+        ancmb = g(anc, "merge-base", "origin/main", "HEAD").strip()
+        Path(os.path.join(anc, "bar.txt")).write_text("out-of-scope work\n")
+        Path(os.path.join(anc, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["foo.txt"], "baseline_commit": ancmb}))
+        g(anc, "add", "bar.txt"); g(anc, "commit", "-m", "branch: out-of-scope change only")
+        av = classify(anc)
+        check(av["overall"] == "empty-scope",
+              "HIGH5 REVERT-PROOF: all-no-change scope (real change out of scope) => "
+              "empty-scope, NOT redundant (old code called it redundant -> branch -D)")
+        check(prune_recommendation(av)["prune"] is False,
+              "HIGH5: all-no-change is KEEP (never prune -> never data loss)")
+
+        # ---- MED12: rename / delete of a scope file (never delete main's file).
+        rn = os.path.join(td, "rename")
+        g(work, "worktree", "add", "-b", "branch-rename", rn, "origin/main")
+        rnmb = g(rn, "merge-base", "origin/main", "HEAD").strip()
+        g(rn, "mv", "foo.txt", "foo2.txt")
+        Path(os.path.join(rn, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["foo.txt"], "baseline_commit": rnmb}))
+        g(rn, "commit", "-m", "branch: rename foo.txt -> foo2.txt")
+        rnv = classify(rn)
+        rn_st = {f["path"]: f["status"] for f in rnv["files"]}
+        check(rn_st.get("foo.txt") == "renamed",
+              "MED12: renamed scope file is status 'renamed' (not clean+None -> delete)")
+        check(rnv["overall"] == "needs-review", "MED12: rename => needs-review (human), not clean")
+        rc_rn, rr = stage(rnv)
+        check(rc_rn != 0, "MED12 REVERT-PROOF: --stage REFUSES the rename (no force-remove of main's file)")
+        check(prune_recommendation(rnv)["prune"] is False, "MED12: rename => KEEP")
+        dl = os.path.join(td, "delete")
+        g(work, "worktree", "add", "-b", "branch-delete", dl, "origin/main")
+        dlmb = g(dl, "merge-base", "origin/main", "HEAD").strip()
+        g(dl, "rm", "foo.txt")
+        Path(os.path.join(dl, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["foo.txt"], "baseline_commit": dlmb}))
+        g(dl, "commit", "-m", "branch: delete foo.txt")
+        dlv = classify(dl)
+        dl_st = {f["path"]: f["status"] for f in dlv["files"]}
+        check(dl_st.get("foo.txt") == "deleted", "MED12: deleted scope file is status 'deleted'")
+        check(dlv["overall"] == "needs-review", "MED12: deletion => needs-review (human)")
+
+        # ---- pkg-json conflict-trivial (independent test-token appends) + MED9.
+        o5 = os.path.join(td, "origin5.git"); w5 = os.path.join(td, "work5")
+        subprocess.run(["git", "init", "--bare", "-b", "main", o5], check=True, capture_output=True)
+        subprocess.run(["git", "clone", o5, w5], check=True, capture_output=True)
+        for k, val in (("user.email", "t@t"), ("user.name", "t")):
+            g(w5, "config", k, val)
+        os.makedirs(os.path.join(w5, "test"))
+        Path(os.path.join(w5, "package.json")).write_text(pkg("node --test test/base.test.mjs"))
+        Path(os.path.join(w5, "test", "base.test.mjs")).write_text(ZERO_TEST)
+        g(w5, "add", "-A"); g(w5, "commit", "-m", "base"); g(w5, "push", "origin", "main")
+        h5 = os.path.join(td, "h5")
+        g(w5, "worktree", "add", "-b", "branch-pkg", h5, "origin/main")
+        h5mb = g(h5, "merge-base", "origin/main", "HEAD").strip()
+        Path(os.path.join(h5, "package.json")).write_text(
+            pkg("node --test test/base.test.mjs test/branch.test.mjs"))
+        Path(os.path.join(h5, "test", "branch.test.mjs")).write_text(NEG_TEST)
+        Path(os.path.join(h5, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["package.json"], "baseline_commit": h5mb}))
+        g(h5, "add", "package.json", "test/branch.test.mjs"); g(h5, "commit", "-m", "branch:+test")
+        Path(os.path.join(w5, "package.json")).write_text(
+            pkg("node --test test/base.test.mjs test/main.test.mjs"))
+        Path(os.path.join(w5, "test", "main.test.mjs")).write_text(SVCA_TEST)
+        g(w5, "add", "-A"); g(w5, "commit", "-m", "main:+test"); g(w5, "push", "origin", "main")
+        g(h5, "fetch", "origin")
+        pv = classify(h5)
+        pk_st = {f["path"]: f["status"] for f in pv["files"]}
+        check(pk_st.get("package.json") == "conflict-trivial",
+              "pkg-json: two independent test-token appends => conflict-trivial")
+        check(pv["overall"] == "conflict-trivial", "pkg-json overall conflict-trivial")
+        pkres = [f["resolution"] for f in pv["files"] if f["path"] == "package.json"][0]
+        check(all(t in pkres["merged_test"] for t in
+                  ("test/base.test.mjs", "test/main.test.mjs", "test/branch.test.mjs")),
+              "pkg-json union keeps base + main + branch tokens (no regression)")
+        drop = classify_pkg_json_trivial(
+            pkg("t a.test.mjs b.test.mjs").encode(),
+            pkg("t a.test.mjs b.test.mjs c.test.mjs").encode(),
+            pkg("t a.test.mjs").encode())
+        check(drop is None, "MED9: a branch DROPPING a base test token is NOT a trivial union")
+        addbad = classify_pkg_json_trivial(
+            pkg("t a.test.mjs").encode(),
+            pkg("t a.test.mjs").encode(),
+            pkg("t a.test.mjs data.txt").encode())    # .txt is not a test ext
+        check(addbad is None, "MED9: appending a NON-test token is NOT a trivial union")
+
+        # ---- HIGH2: ours=[aa,bb] / theirs=[aa] gate must NOT StopIteration.
+        o6 = os.path.join(td, "origin6.git"); w6 = os.path.join(td, "work6")
+        subprocess.run(["git", "init", "--bare", "-b", "main", o6], check=True, capture_output=True)
+        subprocess.run(["git", "clone", o6, w6], check=True, capture_output=True)
+        for k, val in (("user.email", "t@t"), ("user.name", "t")):
+            g(w6, "config", k, val)
+        os.makedirs(os.path.join(w6, "src")); os.makedirs(os.path.join(w6, "test"))
+        Path(os.path.join(w6, "src", "calc.mjs")).write_text(CALC_BASE)
+        Path(os.path.join(w6, "package.json")).write_text(pkg("node --test"))
+        g(w6, "add", "-A"); g(w6, "commit", "-m", "base"); g(w6, "push", "origin", "main")
+        h6 = os.path.join(td, "h6")
+        g(w6, "worktree", "add", "-b", "branch-h2", h6, "origin/main")
+        os.makedirs(os.path.join(h6, "test"), exist_ok=True)
+        h6mb = g(h6, "merge-base", "origin/main", "HEAD").strip()
+        Path(os.path.join(h6, "src", "calc.mjs")).write_text(CALC_ZERO)
+        Path(os.path.join(h6, "test", "aa.test.mjs")).write_text(ZERO_TEST)
+        Path(os.path.join(h6, "package.json")).write_text(pkg("node --test test/aa.test.mjs"))
+        Path(os.path.join(h6, STATE_FILE)).write_text(json.dumps(
+            {"declared_scope": ["src/calc.mjs"], "baseline_commit": h6mb}))
+        g(h6, "add", "-A"); g(h6, "commit", "-m", "branch: aa(zero)")
+        Path(os.path.join(w6, "src", "calc.mjs")).write_text(CALC_NEG)
+        Path(os.path.join(w6, "test", "aa.test.mjs")).write_text(ZERO_TEST)  # SAME as branch
+        Path(os.path.join(w6, "test", "bb.test.mjs")).write_text(NEG_TEST)
+        Path(os.path.join(w6, "package.json")).write_text(
+            pkg("node --test test/aa.test.mjs test/bb.test.mjs"))
+        g(w6, "add", "-A"); g(w6, "commit", "-m", "main: aa+bb"); g(w6, "push", "origin", "main")
+        g(h6, "fetch", "origin")
+        h6v = classify(h6)
+        h6mbf = merge_base(h6, h6v["default_ref"], "HEAD")
+        try:
+            pg6 = precondition_gate(h6, h6v["default_ref"], h6mbf, "src/calc.mjs")
+            raised6 = False
+        except StopIteration:
+            pg6, raised6 = None, True
+        check(raised6 is False,
+              "HIGH2 REVERT-PROOF: ours=[aa,bb]/theirs=[aa] gate does NOT raise StopIteration "
+              "(old `next(t for t in theirs if t!=picked_ours)` crashed on this shape)")
+        check(isinstance(pg6, dict) and "ok" in pg6, "HIGH2: gate returns a well-formed dict")
+        check(sorted(pg6["ours_tests"]) == ["test/aa.test.mjs", "test/bb.test.mjs"],
+              "HIGH2: ours side registers TWO calc tests (A,B)")
+        check(pg6["theirs_tests"] == ["test/aa.test.mjs"], "HIGH2: theirs side registers ONE (A)")
+        if pg6.get("ok"):
+            check(pg6["picked_ours"] != pg6["picked_theirs"],
+                  "HIGH2: picked a DISTINCT pair (no crash on the shared single test)")
+
+        # --- CHAIN INTEGRATION (2026-09-23, Fable pass 2): a slice-plan chain
+        # worktree has NO recorded contract. Before --scope/--onto it classified as
+        # scope-INFERRED and --stage refused, so converged chains were only ever
+        # landed by hand. The slicer now passes the files its chain committed and
+        # its LOCAL default branch; the staged commit must sit exactly on that tip.
+        chain = os.path.join(td, "chain")
+        g(work, "worktree", "add", "-b", "slice/chain-x", chain, "main")
+        Path(os.path.join(chain, "foo.txt")).write_text(
+            Path(os.path.join(chain, "foo.txt")).read_text() + "CHAIN\n")
+        Path(os.path.join(chain, "TASK.md")).write_text("scaffold\n")
+        g(chain, "add", "foo.txt", "TASK.md"); g(chain, "commit", "-m", "slice s1")
+        cv_inf = classify(chain)
+        check(cv_inf.get("scope_inferred") is True,
+              "CHAIN: without --scope a chain worktree is scope-INFERRED (the old dead end)")
+        check(stage(cv_inf)[0] != 0, "CHAIN: --stage REFUSES the inferred scope")
+        cv = classify(chain, scope_override=["foo.txt"], onto="main")
+        check(cv.get("scope_inferred") is False and cv.get("contract_source") == "caller",
+              "CHAIN: --scope makes the scope a caller-declared contract (not inferred)")
+        check(cv.get("default_ref") == "main", "CHAIN: --onto classifies against the LOCAL branch")
+        check(cv.get("overall") == "clean", f"CHAIN: verdict is clean (got {cv.get('overall')!r})")
+        check("TASK.md" in (cv.get("scaffold_stripped") or []),
+              "CHAIN: the committed scaffold file is outside scope (stripped)")
+        rc_st, st_r = stage(cv)
+        check(rc_st == 0 and isinstance(st_r, dict) and st_r.get("staged"),
+              f"CHAIN: --stage writes the integrate/* branch ({st_r if rc_st else 'ok'})")
+        if rc_st == 0:
+            main_tip = g(work, "rev-parse", "main").strip()
+            par = g(work, "rev-parse", f"{st_r['target_branch']}^").strip()
+            check(par == main_tip, "CHAIN: the staged commit's parent IS the local main tip "
+                                   "(fast-forwardable)")
+            check(st_r["diff_files"] == ["foo.txt"], "CHAIN: only the in-scope file is in the diff")
+        check("error" in classify(chain, scope_override=["foo.txt"], onto="no-such-ref"),
+              "CHAIN: a bad --onto ref is an error verdict, not a silent fallback")
+        check("error" in classify(chain, scope_override=[""], onto="main"),
+              "CHAIN: an empty --scope path is an error verdict")
+
+        return 0 if ok else 1
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("worktree", nargs="*", help="dispatch worktree path(s)")
+    ap.add_argument("--json", action="store_true", help="machine-readable verdict")
+    ap.add_argument("--recommend-prune", action="store_true",
+                    help="PRINT-ONLY: recommend ack+prune for worktrees whose work "
+                         "already reached main (redundant); keep everything else. "
+                         "Never acks, deletes, prunes, merges, or pushes -- prints "
+                         "the by-hand commands only.")
+    ap.add_argument("--stage", action="store_true",
+                    help="PHASE 2: for a CLEAN verdict, stage the declared-scope "
+                         "code-only diff (scaffold stripped) onto a NEW scratch "
+                         "branch integrate/<slug>-<id>. Writes only that branch -- "
+                         "NEVER main, NEVER a push, NEVER a merge. Refuses on "
+                         "inferred scope, dirty-scope/conflict/redundant, or an "
+                         "existing target branch.")
+    ap.add_argument("--merge-dispatch", action="store_true",
+                    help="PHASE 4: for a CONFLICT-SEMANTIC verdict on a PROVEN "
+                         "scope, apply the bite-proof precondition (both sides "
+                         "carry a NEW/CHANGED behavioural test that genuinely "
+                         "distinguishes them, verified by take-ours/take-theirs "
+                         "trees both FAILING the union). For each file that passes: "
+                         "materialize a conflicted baseline (dangling commit), "
+                         "scaffold + seal an isolated dispatch worktree, and "
+                         "ENQUEUE a bounded merge-resolution job (add --dry-run to "
+                         "print the enqueue argv instead). A file whose side lacks "
+                         "such a test STOPs to human (exit 3 when none is "
+                         "dispatchable). NEVER writes/pushes main or the target "
+                         "branch; landing is a separate --land-merge step. Refuses "
+                         "(exit 2) any non-semantic verdict or an inferred scope.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="(with --merge-dispatch) materialize + scaffold + seal the "
+                         "merge-resolution dispatch(es) but PRINT the enqueue argv "
+                         "instead of running it. A real --merge-dispatch enqueues "
+                         "live. Never writes main/HEAD either way.")
+    ap.add_argument("--model", default=None,
+                    help=f"(with --merge-dispatch) the local model to enqueue the "
+                         f"resolution to (default {DEFAULT_MERGE_MODEL}).")
+    ap.add_argument("--land-merge", metavar="WORKTREE",
+                    help="PHASE 4 landing: given a COMPLETED merge-resolution "
+                         "dispatch worktree (verify GREEN, gate pass/concerns), "
+                         "read the model's resolved target + composed deps and "
+                         "land them onto a scratch integrate/* branch, then print "
+                         "the coordinator SIGN-OFF surface. Does NOT merge into the "
+                         "target branch (coordinator's final call). Refuses a "
+                         "red-verify / gate-fail resolution.")
+    ap.add_argument("--verify-ok", dest="verify_ok", action="store_true",
+                    help="(with --land-merge) assert the dispatch verify is GREEN. "
+                         "Landing refuses without it (fail-safe).")
+    ap.add_argument("--gate-verdict", default=None,
+                    help="(with --land-merge) the two-tier gate verdict "
+                         "(pass/concerns/fail). Landing refuses unless pass|concerns.")
+    ap.add_argument("--run-merge-verify", metavar="TARGET",
+                    help="INTERNAL: run the merge-resolution verify contract "
+                         "(run_merge_verify) against the CWD tree. Emitted "
+                         "verify.sh calls this so the model's verify and the "
+                         "bite-proof share one contract. Exit 0=PASS, 1=FAIL.")
+    ap.add_argument("--retire-check", metavar="WORKTREE",
+                    help="RETIRE LEVER for the conflict-semantic class: run this "
+                         "chain's OWN verify.sh against the default ref's CURRENT "
+                         "code, and against the fork point. Both legs must hold "
+                         "(GREEN on main, RED at the fork) before the chain is "
+                         "recorded as RETIRED -- main functionally satisfies it and "
+                         "the test proves it. Read-only w.r.t. the repo (a detached "
+                         "temp worktree); the only write is the proof recorded into "
+                         "the chain worktree's state file, which later --recommend-prune "
+                         "runs read instead of re-running the verify. Refuses a "
+                         "harness that is green at the fork point too (vacuous), and "
+                         "never copies refimpl.py/fix.patch into main's tree.")
+    ap.add_argument("--ours-test", help="(with --run-merge-verify) main-side test file")
+    ap.add_argument("--theirs-test", help="(with --run-merge-verify) branch-side test file")
+    # (LOW16) removed --dry-run: it was store_true/default=True and never read,
+    # implying a non-existent write-toggle while --stage/land_resolution write a
+    # scratch branch regardless. The write surface is documented per-mode instead.
+    ap.add_argument("--scope", action="append", metavar="PATH",
+                    help="declare the integration scope yourself (repeatable). For a "
+                         "worktree that carries no recorded contract -- a slice-plan "
+                         "CHAIN worktree -- this is how the caller proves the scope; "
+                         "it is recorded as source 'caller', not inferred, so --stage "
+                         "accepts it. Overrides any in-tree/ledger contract.")
+    ap.add_argument("--onto", metavar="REF",
+                    help="classify/stage against REF instead of the detected default "
+                         "ref (origin/HEAD). The slicer passes its LOCAL default branch "
+                         "so the staged commit fast-forwards onto it exactly.")
+    ap.add_argument("--self-test", action="store_true",
+                    help="run the synthetic recommender self-test and exit")
+    a = ap.parse_args()
+    if a.self_test:
+        return self_test()
+    if a.run_merge_verify:
+        if not (a.ours_test and a.theirs_test):
+            ap.error("--run-merge-verify requires --ours-test and --theirs-test")
+        passed, legs = run_merge_verify(os.getcwd(), a.run_merge_verify,
+                                        a.ours_test, a.theirs_test)
+        for lg in legs:
+            tag = "SKIP" if lg.get("skip") else ("WARN" if lg.get("warn")
+                  else ("PASS" if lg["ok"] else "FAIL"))
+            print(f"  [{tag}] {lg['name']}: {lg.get('detail', '')}")
+        print(f"==> merge-verify {'PASS' if passed else 'FAIL'}")
+        return 0 if passed else 1
+    if a.retire_check:
+        wt = a.retire_check
+        if git(wt, "rev-parse", "--is-inside-work-tree")[0] != 0:
+            print(f"REFUSE retire-check: not a git worktree: {wt}", file=sys.stderr)
+            return 2
+        head = git(wt, "rev-parse", "HEAD")[1].strip()
+        dref = a.onto or default_ref(wt)
+        if not dref:
+            print("REFUSE retire-check: no default ref resolved", file=sys.stderr)
+            return 2
+        mb = merge_base(wt, dref, "HEAD")
+        print(f"[retire-check] {wt}\n  branch head {head[:12]}  vs {dref} "
+              f"@ {git(wt, 'rev-parse', dref)[1].strip()[:12]}  fork {(mb or '?')[:12]}")
+        rec = prove_retired_on_default(wt, dref, mb, head)
+        print(f"  harness copied: {', '.join(rec['harness']) or '(none)'}")
+        print(f"  GREEN on {dref}: {rec['green_on_main']}   RED at fork: {rec['red_at_fork']}")
+        if a.json:
+            print(json.dumps(rec, indent=2))
+        if rec["retired"]:
+            write_retire_record(wt, rec)
+            print(f"==> RETIRED. {rec['reason']}\n"
+                  f"    Recorded in {os.path.join(wt, STATE_FILE)}; "
+                  f"--recommend-prune now reads it and reports verdict=retired "
+                  f"(ACTED + PRUNE) instead of re-escalating conflict-semantic.")
+            return 0
+        print(f"==> NOT retired. {rec['reason']}")
+        return 1
+    if a.land_merge:
+        wt = _resolve_job_worktree(a.land_merge)
+        if not wt:
+            print(f"REFUSE land-merge: could not resolve {a.land_merge!r} to a "
+                  "worktree (not an existing dir, and no unique queue job matches).",
+                  file=sys.stderr)
+            return 2
+        rc, r = land_merge_from_worktree(wt, a.verify_ok, a.gate_verdict or "")
+        if a.json:
+            print(json.dumps(_strip_bytes(r) if isinstance(r, dict)
+                             else {"refuse": r}, indent=2))
+        else:
+            print(land_merge_report(rc, r, wt, a.verify_ok, a.gate_verdict or ""))
+        return rc
+    if not a.worktree:
+        ap.error("at least one worktree path is required (or use --self-test)")
+    out = []
+    stage_exit = 0
+    for wt in a.worktree:
+        wt = str(Path(wt).expanduser())
+        v = classify(wt, scope_override=a.scope, onto=a.onto)
+        if a.merge_dispatch:
+            rc, plan = merge_dispatch(v, dry_run=a.dry_run, model=a.model)
+            stage_exit = stage_exit or rc
+            out.append(plan)
+            if not a.json:
+                print(merge_dispatch_report(rc, plan)); print()
+        elif a.stage:
+            rc, r = stage(v)
+            stage_exit = stage_exit or rc
+            out.append(r if isinstance(r, dict) else {"staged": False, "refuse": r})
+            if not a.json:
+                print(stage_report(rc, r)); print()
+        elif a.recommend_prune:
+            r = prune_recommendation(v)
+            out.append(r)
+            if not a.json:
+                print(prune_report(r)); print()
+        else:
+            out.append(v)
+            # (LOW15) an error verdict must not exit 0 -- it is a real failure the
+            # caller/CI needs to see in the exit code, not just in the text.
+            if "error" in v:
+                stage_exit = stage_exit or 1
+            if not a.json:
+                print(human_report(v)); print()
+    if a.json:
+        safe = [_strip_bytes(o) for o in out]
+        print(json.dumps(safe if len(safe) > 1 else safe[0], indent=2))
+    return stage_exit
+
+
+if __name__ == "__main__":
+    sys.exit(main())

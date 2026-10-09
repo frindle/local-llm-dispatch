@@ -1,0 +1,1693 @@
+#!/usr/bin/env python3
+"""diagnosis-run-harness -- run a diagnosis elicitation measurement, repeatably.
+
+WHAT IT DOES
+------------
+Turns "measure diagnosis pass-rate over N fixtures x K reps" into one command
+instead of hand-staging every case. Per case x rep:
+
+  1. stage a FRESH model arm (the fixture's HEAD-tree-only tree, copied so reps
+     cannot contaminate each other)
+  2. enqueue the job on studio with an IN-JOB PRECHECK as its verify (did the
+     model produce a repro that parses and actually fails on the buggy code?),
+     then GRADE in the harness afterwards against the full-history repo.
+     Grading cannot happen in the job: the grader needs the ANCHOR commit and
+     the arm is HEAD-tree-only by design, so in-job grading false-rejects every
+     job (measured -- see PRECHECK). No Claude either way; the grader is a
+     deterministic script.
+  3. record the job-id -> (case, rep) map to disk BEFORE waiting, so a killed
+     harness can still be reconciled
+  4. re-enqueue on a TRANSIENT ollama failure (500 / EOF), which is what killed
+     the last 20-job batch
+  5. ATTRIBUTE every non-accepted verdict (see below) and compile the bucket
+     table
+
+VERDICT ATTRIBUTION -- why REJECTED is not "the model was wrong"
+----------------------------------------------------------------
+The grader false-rejected CORRECT diagnoses three times in one day:
+
+  1. netmon / framework dispatch -- a Flask view reached via
+     client.get('/api/containers') is never NAMED by the test, so the AST check
+     said drives_symbol=false; a settrace probe showed containers() ran and
+     raised the reported error.
+  2. absolute --test path -- the grader wrote outside its temp clone and put the
+     original dir on sys.path[0], bypassing the anchor checkout, so
+     passes_at_anchor came back false on a correct diagnosis (fixed upstream in
+     54b0c23, but the SHAPE -- a harness defect presenting as a criterion
+     failure -- recurs).
+  3. FTPS symptom -- the described symptom (a climbing socket leak -> EMFILE)
+     was inferred from the fix's intent and never actually occurs. The model
+     correctly failed to reproduce a symptom that does not exist.
+
+Each read as model incapacity, which is the exact error this pipeline exists to
+prevent. But believing the model outright makes the measurement worthless. So a
+non-accepted verdict is CLASSIFIED, by `classify_verdict()`, into:
+
+  PASS              grader accepted AND the named cause is consistent with the
+                    fixture's truth (exact, or a definition the range changed)
+  WRONG             model-attributable, and only when TWO INDEPENDENT signals
+                    agree (a textual defect AND the behavioural measurement, or
+                    a MEASURED-real symptom the test provably does not fire on)
+  GRADER-TOO-TIGHT  the diagnosis is sound as far as this pipeline can tell and
+                    the grader still rejected it -> route to the grader's owner
+  ABSTAIN           the model said asserted=false
+  UNDECIDABLE       neither side is provable from the evidence -> human queue.
+                    This bucket is REAL and REACHABLE on purpose: a classifier
+                    that always decides misattributes silently.
+  HARNESS-ERROR     no verdict could be produced at all
+
+The partition of the grader's criteria by ATTRIBUTABILITY lives in the
+docstring of `classify_verdict()`; the rest of this file feeds it evidence.
+
+  diagnosis-run-harness --fixtures <dir>... --reps 3 --model qwen3.8:27b-q4_K_M
+  diagnosis-run-harness --fixtures <dir>... --dry-run     # stage + print, no enqueue
+  diagnosis-run-harness --reconcile runs/<id>             # compile from the job map
+  diagnosis-run-harness --self-check
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+QUEUE = Path.home() / "bin" / "ollama-queue.py"
+GRADER = Path.home() / "bin" / "diagnosis-check.py"
+STATE = Path.home() / "bin" / "ollama-queue-state.json"
+RUNS = Path.home() / "bin" / "diagnosis-runs"
+ARTIFACTS = {"__pycache__", ".venv", "node_modules", ".pytest_cache",
+             ".mypy_cache", ".ruff_cache", "build", "dist", ".tox"}
+
+# Studio only. Unraid CPU-spills the 27B, and --host auto would silently split
+# a measurement across boxes -- host is not neutral, so a split run measures
+# the hosts as much as the model.
+DEFAULT_HOST = "studio"
+DEFAULT_MODEL = "qwen3.8:27b-q4_K_M"
+
+# Failures that are the INFRASTRUCTURE, not the model. A batch of 20 died on
+# these; re-enqueue rather than scoring them.
+TRANSIENT = re.compile(
+    r"\b(500\b|502\b|503\b|EOF|connection reset|broken pipe|"
+    r"unexpected end of|read: connection|timeout waiting for)", re.I)
+
+PASS_B, WRONG_B, TIGHT_B, ABSTAIN_B, UNDECIDABLE_B, ERROR_B = (
+    "PASS", "WRONG", "GRADER-TOO-TIGHT", "ABSTAIN", "UNDECIDABLE",
+    "HARNESS-ERROR")
+# The pre-attribution name for the human-queue bucket. Kept as an alias so the
+# original self-check cases (and any results.json reader) keep working: the
+# bucket was renamed, not weakened -- REJECTED with no per-criterion evidence
+# still lands here.
+NEEDS_B = UNDECIDABLE_B
+BUCKETS = (PASS_B, WRONG_B, TIGHT_B, ABSTAIN_B, UNDECIDABLE_B, ERROR_B)
+
+# The grader's criteria, in its own order. Mirrored (not imported) so that a
+# rename in diagnosis-check.py breaks loudly here rather than silently making a
+# criterion invisible to attribution.
+CRITERIA = ("not_unconditional", "data_dependent", "drives_symbol",
+            "no_mock_on_target", "fails_at_head", "passes_at_anchor", "stable")
+# The two criteria that share one blind spot: both are established by AST
+# name-resolution or by a settrace frame, and both go dark on framework
+# dispatch, threads, subprocesses, and class-named symbols. False reject #1
+# failed exactly this pair.
+REACH_CRITERIA = {"drives_symbol", "data_dependent"}
+# How localize_claim()'s outcomes read in a note.
+LOC_PHRASE = {"exact": "the fixture's recorded cause",
+              "in-diff": "another definition the range changed",
+              "near-miss": "in the changed file but a definition the range did not touch",
+              "outside": "in a file the range never touched",
+              "missing": "not named (no diagnosis.json)"}
+# Statuses the queue uses for "the worker finished and --verify passed".
+# `done_unconverged` is real completed work whose loop did not stop tidily; the
+# first version of this harness waited only on `done`, so those jobs sat in
+# `pending` until the run timed out and were then recorded as HARNESS-ERROR.
+FINISHED = ("done", "done_unconverged")
+TERMINAL = FINISHED + ("failed", "cancelled")
+PROBE_TIMEOUT = 300
+
+
+def sh(cmd, cwd=None, timeout=None, env=None):
+    p = subprocess.run(cmd, cwd=cwd and str(cwd), capture_output=True,
+                       text=True, timeout=timeout, env=env)
+    return p.returncode, p.stdout, p.stderr
+
+
+def load_fixture(d: Path):
+    """A fixture dir emitted by diagnosis-fixture-scaffold."""
+    gt = d / "ground-truth.json"
+    if not gt.is_file():
+        return None, f"{d}: no ground-truth.json (not a scaffolded fixture)"
+    try:
+        meta = json.loads(gt.read_text())
+    except Exception as e:
+        return None, f"{d}: ground-truth.json unreadable: {e}"
+    if not (d / "arm").is_dir():
+        return None, f"{d}: no arm/ -- nothing to stage"
+    for k in ("true_file", "true_symbol", "anchor"):
+        if not meta.get(k):
+            return None, f"{d}: ground-truth.json missing {k}"
+    # A fixture that never passed its own gates must not silently enter a
+    # measurement: born-broken or a fake symptom makes the case ungradeable and
+    # the model's failure would read as incapacity.
+    if meta.get("passes_at_anchor_measured") is not True:
+        return None, (f"{d}: passes_at_anchor_measured is "
+                      f"{meta.get('passes_at_anchor_measured')!r}, not true -- "
+                      "the case is not known gradeable")
+    if meta.get("symptom_reproduces_at_head") is False:
+        return None, (f"{d}: symptom does not reproduce at head -- the model "
+                      "would be scored on a symptom that never happens")
+    meta["_dir"] = str(d)
+    meta["_name"] = meta.get("name") or d.name
+    return meta, None
+
+
+def stage_arm(fixture: dict, dest: Path):
+    """A FRESH copy per rep. Reps sharing one tree would let rep 2 start from
+    rep 1's edits, so every rep after the first measures something else."""
+    src = Path(fixture["_dir"]) / "arm"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest, ignore=shutil.ignore_patterns(*ARTIFACTS))
+    for d in sorted(dest.rglob("*"), reverse=True):
+        if d.is_dir() and d.name in ARTIFACTS:
+            shutil.rmtree(d, ignore_errors=True)
+    for name in ("symptom.md",):
+        s = Path(fixture["_dir"]) / name
+        if s.is_file():
+            shutil.copyfile(s, dest / name)
+    (dest / "precheck.py").write_text(PRECHECK.format(
+        test_rel=fixture.get("_test_rel", "t_repro.py"),
+        true_file=fixture["true_file"]))
+    return dest
+
+
+PRECHECK = r'''#!/usr/bin/env python3
+"""In-job verify: did the model produce a USABLE repro at all?
+
+NOT the grader. The grader needs the ANCHOR commit, and the model arm is
+HEAD-tree-only by design (single commit, no upstream history) so the model
+cannot read the fix out of `git log`. Those two requirements are in direct
+conflict: running the grader inside the arm reports passes_at_anchor=False for
+EVERY job, because the anchor sha simply is not there.
+
+Measured, not assumed: grading inside the arm gives
+`REJECTED / passes_at_anchor: False / failed: passes_at_anchor, stable` on a
+diagnosis that is correct. A whole run of that is a 0% pass rate that reads as
+total model incapacity.
+
+So the arm checks only what it CAN check locally, and the harness grades
+afterwards against the full-history repo. No Claude is involved either way --
+the grader is a deterministic script.
+"""
+import ast
+import pathlib
+import subprocess
+import sys
+
+TEST = pathlib.Path("{test_rel}")
+TARGET = pathlib.Path("{true_file}")
+fails = 0
+
+if not TEST.is_file():
+    print(f"  FAIL: no repro at {{TEST}} -- write your failing test there")
+    fails += 1
+else:
+    try:
+        ast.parse(TEST.read_text())
+        print(f"  ok: {{TEST}} parses")
+    except SyntaxError as e:
+        print(f"  FAIL: {{TEST}} does not parse: {{e}}")
+        fails += 1
+
+if not TARGET.is_file():
+    print(f"  FAIL: {{TARGET}} missing from the tree")
+    fails += 1
+
+if fails == 0:
+    p = subprocess.run([sys.executable, str(TEST)], capture_output=True,
+                       text=True)
+    out = (p.stdout + p.stderr).strip()
+    if p.returncode == 0:
+        print("  FAIL: the repro PASSES on the buggy code, so it does not")
+        print("        reproduce anything. It must FAIL here.")
+        fails += 1
+    elif "Traceback" in out and "AssertionError" not in out:
+        print("  FAIL: the repro CRASHED rather than failing an assertion:")
+        print("        " + (out.splitlines() or [""])[-1][:160])
+        fails += 1
+    else:
+        print(f"  ok: the repro fails on the buggy code (exit {{p.returncode}})")
+
+print(f"--- {{fails}} failed ---")
+if fails == 0:
+    print("VERIFY_OK")
+sys.exit(1 if fails else 0)
+'''
+
+
+def verify_cmd(fixture: dict, test_rel: str):
+    """The IN-JOB verify -- a precheck, deliberately NOT the grader.
+
+    See PRECHECK's docstring: the grader needs the anchor and the arm has no
+    history, so in-job grading false-rejects every job. Grading happens in the
+    harness afterwards, against the full-history repo.
+    """
+    return "python3 precheck.py"
+
+
+# ---- attribution evidence ---------------------------------------------------
+#
+# Everything in this section exists to give classify_verdict() something better
+# than the grader's booleans. Each helper answers ONE decidable question and
+# returns None when it cannot decide -- None must never collapse to a
+# rejection, which is the grader's own rule and the one it broke in false
+# reject #1.
+
+def load_diagnosis(arm: Path):
+    """The model's `diagnosis.json`: asserted flag + claimed file/symbol.
+
+    The first version of compile() took `asserted` from the GRADER's output,
+    which never contains that key -- so ABSTAIN was unreachable in a real run
+    and an honest abstain graded as HARNESS-ERROR ("no repro"). The flag lives
+    in the arm, written by the model; read it from there.
+    """
+    p = Path(arm) / "diagnosis.json"
+    if not p.is_file():
+        return None
+    try:
+        d = json.loads(p.read_text())
+    except Exception:
+        return {"asserted": None, "file": None, "symbol": None,
+                "explanation": None, "_unparseable": True}
+    rc = d.get("root_cause") or {}
+    if not isinstance(rc, dict):
+        rc = {}
+    sym = rc.get("symbol") or d.get("symbol")
+    if isinstance(sym, str):
+        # "containers()", "def containers", "app.api.containers",
+        # "Class.method" -> the bare name the fixture would record.
+        sym = re.sub(r"^\s*(def|class)\s+", "", sym).strip()
+        sym = sym.split("(")[0].strip().split(".")[-1] or None
+    return {"asserted": d.get("asserted"),
+            "file": rc.get("file") or d.get("file"),
+            "symbol": sym,
+            "explanation": rc.get("explanation") or d.get("explanation")}
+
+
+def _norm_rel(p) -> str:
+    return str(p or "").strip().replace("\\", "/").lstrip("./")
+
+
+def _same_file(a, b) -> bool:
+    """Path-suffix equality: the model may say `lib.py` for `pkg/lib.py`."""
+    a, b = _norm_rel(a), _norm_rel(b)
+    if not a or not b:
+        return False
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def _def_spans(src: str, symbol: str):
+    """(start, end) line spans of every def/class/module-level assignment named
+    `symbol`. Same notion of "definition" as the grader's, re-implemented
+    rather than imported: the grader is another session's live file and a
+    private-name import would couple this harness to its refactors."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    spans = []
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                and n.name == symbol:
+            lo = min([n.lineno] + [d.lineno for d in n.decorator_list])
+            spans.append((lo, n.end_lineno or n.lineno))
+    bodies = [tree.body] + [c.body for c in ast.walk(tree)
+                            if isinstance(c, ast.ClassDef)]
+    for body in bodies:
+        for n in body:
+            targets = (n.targets if isinstance(n, ast.Assign)
+                       else [n.target] if isinstance(n, ast.AnnAssign) else [])
+            for t in targets:
+                names = list(t.elts) if isinstance(t, (ast.Tuple, ast.List)) else [t]
+                if any(isinstance(nm, ast.Name) and nm.id == symbol for nm in names):
+                    spans.append((n.lineno, n.end_lineno or n.lineno))
+    return spans
+
+
+def _git_show(repo, ref, rel):
+    rc, out, _ = sh(["git", "-C", str(repo), "show", f"{ref}:{rel}"])
+    return out if rc == 0 else None
+
+
+def _hunks(repo, anchor, rel):
+    """[(old_lo, old_n, new_lo, new_n)] for anchor..HEAD of one file."""
+    rc, d, _ = sh(["git", "-C", str(repo), "diff", "-U0", anchor, "HEAD", "--", rel])
+    if rc != 0:
+        return None
+    return [(int(m.group(1)), int(m.group(2) or 1), int(m.group(3)),
+             int(m.group(4) or 1))
+            for m in re.finditer(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", d, re.M)]
+
+
+def _hit(lo, n, spans):
+    if n == 0:                       # pure insertion/deletion: no lines on this side
+        return False
+    hi = lo + n - 1
+    return any(not (hi < a or lo > b) for a, b in spans)
+
+
+def range_files(repo, anchor):
+    rc, out, _ = sh(["git", "-C", str(repo), "diff", "--name-only", f"{anchor}..HEAD"])
+    if rc != 0:
+        return None
+    return sorted({x for x in out.splitlines() if x.strip()})
+
+
+def regression_isolation(repo, anchor, true_file, true_symbol):
+    """Is the ONLY behavioural change in anchor..HEAD inside the true symbol?
+
+    This is the property that lets a head-vs-anchor flip stand in for "reach".
+    If the range touched one file and every hunk in it intersects the true
+    symbol's definition, then any test whose outcome flips across the range is
+    being flipped by that symbol -- whether or not AST or settrace could see
+    the call (framework dispatch, threads, subprocess, class-named symbols).
+    Manufactured fixtures are one-line/one-def and satisfy this; real-history
+    ones (netmon: api.py + a Jinja template) usually do not.
+
+    Returns {"isolated": True|False|None, "range_files": [...],
+             "true_symbol_touched": True|False|None, "reason": str}.
+    A third outcome matters: true_symbol_touched=False means the FIXTURE is
+    inconsistent (its named cause is not what the range changed) -- a staging
+    defect, never the model's.
+    """
+    files = range_files(repo, anchor)
+    out = {"isolated": None, "range_files": files, "true_symbol_touched": None,
+           "reason": ""}
+    if files is None:
+        out["reason"] = "git diff failed"
+        return out
+    if not any(_same_file(f, true_file) for f in files):
+        out.update(isolated=False, true_symbol_touched=False,
+                   reason=f"range did not touch {true_file} at all")
+        return out
+    rel = next(f for f in files if _same_file(f, true_file))
+    head_src, anc_src = _git_show(repo, "HEAD", rel), _git_show(repo, anchor, rel)
+    if head_src is None:
+        out["reason"] = "target unreadable at HEAD"
+        return out
+    head_spans = _def_spans(head_src, true_symbol)
+    anc_spans = _def_spans(anc_src, true_symbol) if anc_src is not None else []
+    if head_spans is None or anc_spans is None:
+        out["reason"] = "target does not parse as Python"
+        return out
+    hunks = _hunks(repo, anchor, rel)
+    if hunks is None:
+        out["reason"] = "git diff failed"
+        return out
+    inside = [h for h in hunks if _hit(h[0], h[1], anc_spans) or _hit(h[2], h[3], head_spans)]
+    out["true_symbol_touched"] = bool(inside) or (not anc_spans and bool(head_spans))
+    if not out["true_symbol_touched"]:
+        out.update(isolated=False,
+                   reason=f"anchor..HEAD did not change {true_symbol}'s definition")
+        return out
+    others = [f for f in files if f != rel]
+    outside = [h for h in hunks if h not in inside]
+    if others:
+        out.update(isolated=False, reason=f"range also touched {others}")
+    elif outside:
+        out.update(isolated=False,
+                   reason=f"{len(outside)} hunk(s) in {rel} outside {true_symbol}")
+    else:
+        out.update(isolated=True,
+                   reason=f"range touched only {true_symbol} in {rel}")
+    return out
+
+
+def localize_claim(repo, anchor, claim, true_file, true_symbol):
+    """Where does the model's named cause sit relative to the regression?
+
+    Deliberately NOT `file == true_file and symbol == true_symbol`:
+
+      exact      names the fixture's cause                     -> consistent
+      in-diff    names another definition the range changed   -> consistent
+                 (a multi-def commit; which changed def is "the" cause is not
+                 decidable here and is recorded as a residual)
+      near-miss  same changed file, but a definition the range did NOT touch
+                 -- a caller, wrapper, or view delegating to the changed helper.
+                 Equivalent entry point or manifestation site? Not decidable
+                 from names. Human.
+      outside    a file the range never touched. For a REGRESSION the cause is
+                 what changed; this names something else. Still not scored
+                 WRONG on its own -- only together with an unsound repro.
+      missing    no diagnosis.json / no symbol named
+
+    What is NOT decidable and is not attempted: whether the EXPLANATION gives
+    the right mechanism. "Right symbol, wrong mechanism" reaches `exact` here.
+    The closest mechanical proxy is the repro failing at BOTH ends (the
+    asserted behaviour was never true), which classify_verdict() uses -- but it
+    is ambiguous with an over-specified test, so it never scores WRONG alone
+    when the name is exact.
+    """
+    if not claim or not claim.get("symbol"):
+        return "missing"
+    cf, cs = claim.get("file") or "", claim["symbol"]
+    if cs == true_symbol and (not cf or _same_file(cf, true_file)):
+        return "exact"
+    files = range_files(repo, anchor) or []
+    hit = [f for f in files if _same_file(cf, f)] if cf else []
+    if not hit:
+        return "outside"
+    rel = hit[0]
+    head_src, anc_src = _git_show(repo, "HEAD", rel), _git_show(repo, anchor, rel)
+    if head_src is None:
+        return "near-miss"
+    hs = _def_spans(head_src, cs)
+    if hs is None:
+        return "near-miss"
+    if not hs:
+        return "near-miss"                 # named a symbol not defined there
+    if anc_src is None:
+        return "in-diff"                   # whole file is new in the range
+    as_ = _def_spans(anc_src, cs) or []
+    if not as_:
+        return "in-diff"                   # symbol is new in the range
+    hunks = _hunks(repo, anchor, rel) or []
+    if any(_hit(h[0], h[1], as_) or _hit(h[2], h[3], hs) for h in hunks):
+        return "in-diff"
+    return "near-miss"
+
+
+def probe_run(work: Path, test_rel: str):
+    """Run the model's test ONCE and say HOW it ended, not just whether.
+
+    The grader records a return code. Attribution needs the failure KIND:
+      pass       exit 0
+      assertion  AssertionError / unittest "failures=" / a deliberate non-zero
+                 exit with no traceback -- the test RAN and disagreed
+      crash      a traceback that is not an assertion (ImportError,
+                 FileNotFoundError, NameError...) -- the test never got to say
+                 anything about the bug
+      timeout
+    At the anchor this is the difference between "asserts something that was
+    never true" (model) and "could not run pre-bug" (environment).
+    """
+    try:
+        rc, out, err = sh([sys.executable, test_rel], cwd=work, timeout=PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"kind": "timeout", "rc": None, "tail": ""}
+    text = (out + "\n" + err).strip()
+    tail = (text.splitlines() or [""])[-1][:200]
+    if rc == 0:
+        kind = "pass"
+    elif "AssertionError" in text or re.search(r"FAILED \(failures=", text):
+        kind = "assertion"
+    elif "Traceback" in text or re.search(r"FAILED \(errors=", text):
+        kind = "crash"
+    else:
+        kind = "assertion"          # deliberate non-zero exit without a traceback
+    return {"kind": kind, "rc": rc, "tail": tail}
+
+
+def carry_model_files(arm: Path, fixture_arm, work: Path, exclude: set):
+    """Copy files the MODEL created into the grader clone.
+
+    The task explicitly allows "any fixture files your test needs". The grader
+    clone used to receive only t_repro.py, so a test reading a data file the
+    model wrote crashed with FileNotFoundError. Carrying them fixes the HEAD
+    run and this harness's direct probes. It does NOT fix the grader's ANCHOR
+    run: run_test() in diagnosis-check.py makes its own `git clone` and copies
+    in only the test file, so untracked carried files never reach it and such
+    a repro still grades passes_at_anchor=false (measured by --self-check,
+    2026-09-03; the absolute-path shape one level down). That residual is the
+    grader owner's to close; until then attribution catches it as
+    GRADER-TOO-TIGHT via the direct anchor probe. Only NEW files are carried
+    (present in the arm, absent from the fixture's pristine arm/ and from the
+    clone), so a model that edited application source despite the rules cannot
+    smuggle the edit into grading.
+    """
+    carried = []
+    fixture_arm = Path(fixture_arm) if fixture_arm else None
+    for p in sorted(Path(arm).rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(arm)
+        if set(rel.parts) & ARTIFACTS or rel.parts[0] == ".git":
+            continue
+        if str(rel) in exclude or rel.name in exclude:
+            continue
+        if fixture_arm and (fixture_arm / rel).exists():
+            continue
+        if (work / rel).exists():
+            continue
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(p, work / rel)
+        carried.append(str(rel))
+    return carried
+
+
+def run_grader(work: Path, test_rel: str, symbol: str, anchor: str, target_file: str):
+    rc, out, err = sh([sys.executable, str(GRADER), "--repo", str(work),
+                       "--test", test_rel, "--symbol", symbol,
+                       "--anchor", anchor, "--target-file", target_file, "--json"],
+                      timeout=900)
+    try:
+        return json.loads(out), None
+    except Exception:
+        return None, (err or out).strip()[-150:]
+
+
+def grade_job(rec: dict, test_rel: str, fixture_arm=None):
+    """Grade a finished job against the FULL-HISTORY repo, and gather the
+    attribution evidence the grader cannot give.
+
+    The model's repro is carried into a temp clone of the source repo -- which
+    is where the anchor lives. The source repo is never exposed to the arm, so
+    its history cannot leak the fix; `precheck.py` deliberately does not name it.
+
+    Returns (grader_dict | None, evidence, err | None). The grader dict is the
+    grader's FULL json (every per-criterion boolean, `drives_symbol_via`,
+    `symbol_changed_in_range`, ...), not three fields of it -- attribution
+    needs the whole thing. Evidence adds what only the harness can measure:
+    where the claim sits, whether the range is isolated, how the test ended
+    when run directly at HEAD and at the anchor, which files were carried.
+    """
+    arm = Path(rec["arm"])
+    test = arm / test_rel
+    if not test.is_file():
+        return None, {}, f"no repro at {test_rel}"
+    src = Path(rec.get("source_repo") or "")
+    if not (src / ".git").exists():
+        return None, {}, f"source repo missing: {src}"
+    tmp = Path(tempfile.mkdtemp(prefix="drh-grade-"))
+    try:
+        rc, _, err = sh(["git", "clone", "-q", str(src), str(tmp / "g")])
+        if rc != 0:
+            return None, {}, f"clone failed: {err.strip()[-150:]}"
+        work = tmp / "g"
+        shutil.copyfile(test, work / test_rel)
+        ev = {"carried_files": carry_model_files(
+            arm, fixture_arm, work,
+            exclude={test_rel, "diagnosis.json", "precheck.py", "symptom.md"})}
+        d, gerr = run_grader(work, test_rel, rec["true_symbol"], rec["anchor"],
+                             rec["true_file"])
+        if d is None:
+            return None, ev, gerr
+        claim = load_diagnosis(arm)
+        ev["localization"] = localize_claim(work, rec["anchor"], claim,
+                                            rec["true_file"], rec["true_symbol"])
+        ev["isolation"] = regression_isolation(work, rec["anchor"], rec["true_file"],
+                                               rec["true_symbol"])
+        # Direct probes only when there is something to attribute. They cost
+        # two test runs; the grader already ran fourteen.
+        if not str(d.get("verdict", "")).startswith("ACCEPTED"):
+            ev["head_probe"] = probe_run(work, test_rel)
+            rc, _, err = sh(["git", "-C", str(work), "checkout", "-q", rec["anchor"]])
+            ev["anchor_probe"] = (probe_run(work, test_rel) if rc == 0 else
+                                  {"kind": None, "rc": None, "tail": err.strip()[-200:]})
+        return d, ev, None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def fixture_control(gt: dict, rec: dict):
+    """Grade the fixture's KNOWN-GOOD test through the SAME grader, now.
+
+    `passes_at_anchor_measured` was recorded at staging by running the true
+    test at the anchor directly. It says the ANCHOR IS SOUND. It does not, by
+    itself, contradict `passes_at_anchor=false` on the MODEL's test -- those
+    are different tests (t_both_ends fails at the anchor while the true test
+    passes, legitimately). What turns it into a contradiction is running the
+    true test through the grader's own code path: if THAT comes back false,
+    the grader or its environment is the variable and the model is not. This
+    is exactly what would have caught false reject #2 (absolute --test path)
+    mechanically -- every test, including the good one, came back false.
+
+    Returns the grader dict, or None when the fixture does not record which
+    file is its true test (older scaffold output).
+    """
+    name = gt.get("true_test")
+    fdir = Path(rec.get("fixture_dir") or gt.get("_dir") or "")
+    src = Path(rec.get("source_repo") or gt.get("source_repo") or "")
+    if not name or not (fdir / name).is_file() or not (src / ".git").exists():
+        return None
+    tmp = Path(tempfile.mkdtemp(prefix="drh-control-"))
+    try:
+        rc, _, _ = sh(["git", "clone", "-q", str(src), str(tmp / "g")])
+        if rc != 0:
+            return None
+        shutil.copyfile(fdir / name, tmp / "g" / name)
+        d, _ = run_grader(tmp / "g", name, rec["true_symbol"], rec["anchor"],
+                          rec["true_file"])
+        return d
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def classify_verdict(verdict, why, asserted, grader=None, gt=None, claim=None,
+                     evidence=None):
+    """Attribute a verdict. Returns (bucket, note).
+
+    The original three-argument form still works and is deliberately
+    conservative: with no per-criterion evidence a REJECTED can only go to
+    UNDECIDABLE. The keyword arguments are what make attribution possible:
+
+      grader    the grader's full json (per-criterion booleans and extras)
+      gt        the fixture's ground-truth.json (passes_at_anchor_measured,
+                symptom_reproduces_at_head, true_file, true_symbol)
+      claim     load_diagnosis() -- the model's named file/symbol
+      evidence  grade_job()'s evidence: localization, isolation, head_probe,
+                anchor_probe, and fixture_control()'s result under "control"
+
+    PARTITION OF THE GRADER'S CRITERIA BY ATTRIBUTABILITY
+    -----------------------------------------------------
+    "Model-attributable" means: given what the fixture already MEASURED, no
+    grader or harness defect could have produced this failure. Almost no
+    criterion is model-attributable ALONE; WRONG needs two independent signals.
+
+    not_unconditional=false   TEXTUAL heuristic (assert False / raise with no
+        calls in a function body). Model-attributable ONLY when the test also
+        fails at the anchor: an unconditional failure fails everywhere, so a
+        test that PASSES at the anchor cannot be one -- the heuristic misfired
+        (a `raise` inside a fake-server handler or helper with no calls, which
+        is how the FTPS-style repro is built). Flip present -> GRADER-TOO-TIGHT.
+
+    no_mock_on_target=false   TEXTUAL, substring-matched (`"get"` matches
+        `patch("requests.get")`). Model-attributable only without a flip. With
+        a flip it is a substring false-positive or a spy (`wraps=`) that let the
+        real body run -- not decidable from here -> UNDECIDABLE.
+
+    fails_at_head=false       The test passes on the buggy code. Model-
+        attributable ONLY IF the symptom is MEASURED real
+        (symptom_reproduces_at_head=True) AND a direct run agrees the test
+        passes at HEAD. If the symptom was waived (None), the model may have
+        correctly failed to reproduce a symptom that does not exist -- false
+        reject #3 -> UNDECIDABLE, never WRONG. Note the grader records a
+        TIMEOUT as fails_at_head=false too; the direct probe separates that.
+
+    passes_at_anchor=false    NOT model-attributable by itself, even though the
+        fixture measured the anchor sound: that measurement was of the TRUE
+        test. Three things split it:
+          control   the true test through the same grader, now. False ->
+                    the grader/harness is the variable (false reject #2) ->
+                    GRADER-TOO-TIGHT.
+          probe     the model's test run directly at the anchor:
+                    pass      -> grader contradicted by measurement -> TOO-TIGHT
+                    assertion -> the test ran pre-bug and disagreed: it asserts
+                                 something that was never true. WRONG only in an
+                                 isolated range AND when the name is not exact
+                                 (exact name + both-ends = over-specified test
+                                 or wrong mechanism, not decidable -> human).
+                    crash     -> could not run pre-bug (import/file/name error).
+                                 Says nothing about the bug -> UNDECIDABLE.
+          stable    false -> flaky across 7 runs -> UNDECIDABLE.
+
+    drives_symbol=false, data_dependent=false   The REACH pair, one blind spot
+        (AST + settrace: framework dispatch, threads, subprocess, class-named
+        symbols). `drives_symbol_via: "execution"` is a legitimate
+        establishment, never a downgrade -- treating it as suspect is what
+        produced false reject #1. When these are the ONLY failures and the test
+        flips head-vs-anchor:
+          isolated range           -> the flip can only come from the true
+                                      symbol: reach is PROVEN by measurement,
+                                      the grader just could not see it
+                                      -> GRADER-TOO-TIGHT
+          symbol_changed_in_range   -> the grader treated an UNDECIDABLE
+             is None (key present)    fault-path as a rejection, against its
+                                      own rule -> GRADER-TOO-TIGHT
+          loose range, exact name  -> reach inferred, not proven; the same
+                                      residual as ACCEPTED_LOOSE_ANCHOR, which
+                                      this harness scores PASS -> TOO-TIGHT,
+                                      note says so
+          loose range, other name  -> UNDECIDABLE
+          true symbol untouched    -> the FIXTURE is inconsistent -> UNDECIDABLE
+                                      (a staging defect, not the model's)
+
+    stable=false alone        UNDECIDABLE (flaky test; whose fault is not
+        decidable without the runs).
+
+    ACCEPTED*                 The grader was run against the TRUE symbol, so an
+        accept proves the test exercises the true cause -- not that the model
+        NAMED it. exact / in-diff -> PASS. near-miss / outside / missing ->
+        UNDECIDABLE: the repro is sound, the naming is not what the range
+        changed; equivalent entry point vs manifestation site is a human read.
+
+    CAUSE_NOT_CALLABLE        the grader already says "route a human".
+
+    UNDECIDABLE is reachable by design. Every "else" here lands in it.
+    """
+    g = grader or {}
+    gt = gt or {}
+    ev = evidence or {}
+    claim = claim or {}
+    if asserted is False:
+        return ABSTAIN_B, "model declined to diagnose"
+    if verdict is None:
+        return ERROR_B, "no verdict recorded"
+    v = str(verdict)
+    loc = ev.get("localization")
+    iso = ev.get("isolation") or {}
+    isolated = iso.get("isolated")
+    named = f"{claim.get('file')}:{claim.get('symbol')}"
+    truth = f"{gt.get('true_file')}:{gt.get('true_symbol')}"
+
+    if v.startswith("ACCEPTED"):
+        note = "" if v == "ACCEPTED" else f"qualified: {v}"
+        if loc in (None, "exact", "in-diff"):
+            if loc == "in-diff":
+                note = (note + "; " if note else "") + (
+                    f"named {named}, a definition the range changed but not "
+                    f"the recorded {truth} -- multi-def range residual")
+            return PASS_B, note
+        if loc == "missing":
+            return UNDECIDABLE_B, ("repro accepted but no root cause was named "
+                                   "(diagnosis.json missing/empty): only half the "
+                                   "deliverable was checked")
+        return UNDECIDABLE_B, (f"repro accepted (flips head/anchor on {truth}) but "
+                               f"the named cause {named} is {LOC_PHRASE.get(loc, loc)} "
+                               f"-- equivalent entry point or manifestation site: a "
+                               f"human decides")
+    if v == "CAUSE_NOT_CALLABLE":
+        return UNDECIDABLE_B, f"grader routes a human: {(why or '')[:160]}"
+    if v == "ANCHOR_UNAVAILABLE":
+        return ERROR_B, "grader saw no anchor although the harness always supplies one"
+    if v != "REJECTED" or not g:
+        # Legacy path (no per-criterion evidence) and unknown verdict strings.
+        return UNDECIDABLE_B, (why or "")[:200]
+
+    failed = [k for k in CRITERIA if g.get(k) is False]
+    fh, pa, st = g.get("fails_at_head"), g.get("passes_at_anchor"), g.get("stable")
+    flips = fh is True and pa is True and st is True
+    symptom_real = gt.get("symptom_reproduces_at_head") is True
+    hp = ev.get("head_probe") or {}
+    ap = ev.get("anchor_probe") or {}
+    control = ev.get("control")
+
+    # -- textual defects: decidable only together with the behavioural read --
+    if "not_unconditional" in failed:
+        if pa is False:
+            return WRONG_B, ("assert-False-shaped test that also fails at the anchor: "
+                             "textual and behavioural signals agree")
+        if flips:
+            return TIGHT_B, ("not_unconditional=false, yet the test PASSES at the "
+                             "anchor -- an unconditional failure cannot; the textual "
+                             "heuristic misfired (a raise inside a helper/fake with "
+                             "no calls)")
+    if "no_mock_on_target" in failed:
+        if not flips:
+            return WRONG_B, ("test mocks the accused symbol and does not discriminate "
+                             "head/anchor")
+        return UNDECIDABLE_B, ("mock-on-target flagged (substring match) yet the test "
+                               "flips head/anchor -- a substring false-positive or a "
+                               "spy wrap; human decides")
+
+    # -- criterion 1 -------------------------------------------------------
+    if fh is False:
+        if not symptom_real:
+            return UNDECIDABLE_B, ("test does not fail at HEAD and the symptom was "
+                                   "never MEASURED real (waived at staging): the "
+                                   "model may have correctly failed to reproduce a "
+                                   "symptom that does not occur (FTPS shape)")
+        if hp.get("kind") == "pass":
+            return WRONG_B, ("test passes on the buggy code, confirmed by a direct "
+                             "run; the symptom is measured real, so the test does not "
+                             "reproduce it")
+        if hp.get("kind") in ("timeout", "crash"):
+            return UNDECIDABLE_B, (f"grader saw no failure at HEAD but the direct run "
+                                   f"{hp.get('kind')}ed ({hp.get('tail', '')[:100]}): "
+                                   f"environment discrepancy, not a model reading")
+        return UNDECIDABLE_B, "fails_at_head=false and no direct probe to confirm it"
+
+    # -- criterion 2 -------------------------------------------------------
+    if pa is False:
+        if control is not None and control.get("passes_at_anchor") is False:
+            return TIGHT_B, ("grader reports passes_at_anchor=false for the fixture's "
+                             "KNOWN-GOOD test, which passed at the anchor when staged: "
+                             "the grader/harness is the variable, not the model "
+                             "(absolute --test shape)")
+        kind = ap.get("kind")
+        if kind == "pass":
+            return TIGHT_B, ("the model's test PASSES at the anchor when run directly; "
+                             "the grader says it does not")
+        if kind == "assertion":
+            if loc == "exact":
+                return UNDECIDABLE_B, (f"named the true cause {truth} but the repro also "
+                                       f"fails pre-bug ({ap.get('tail', '')[:90]}): "
+                                       f"over-specified test or wrong mechanism -- a "
+                                       f"human reads the explanation")
+            if isolated is True or g.get("anchor_tight") is True:
+                return WRONG_B, (f"fails at BOTH ends by assertion in an isolated range "
+                                 f"and names {named}, not {truth}: asserts behaviour "
+                                 f"that was never true (t_both_ends shape)")
+            return UNDECIDABLE_B, ("fails at both ends, but the range is loose "
+                                   f"({iso.get('reason', 'unknown')}): an unrelated "
+                                   "change may be flipping the anchor run")
+        if kind == "crash":
+            return UNDECIDABLE_B, (f"test could not RUN at the anchor "
+                                   f"({ap.get('tail', '')[:120]}): says nothing about "
+                                   f"the bug; check env parity / carried files")
+        if st is False:
+            return UNDECIDABLE_B, "flaky: the grader's 7 anchor runs disagreed"
+        return UNDECIDABLE_B, (f"passes_at_anchor=false with no direct probe "
+                               f"({kind or 'none'}); control "
+                               f"{'unavailable' if control is None else 'passed'}")
+    if st is False:
+        return UNDECIDABLE_B, "flaky: the grader's 7 runs disagreed"
+
+    # -- criteria 3/4: the reach pair -------------------------------------
+    if failed and set(failed) <= REACH_CRITERIA and flips:
+        if iso.get("true_symbol_touched") is False:
+            return UNDECIDABLE_B, (f"FIXTURE inconsistency: anchor..HEAD did not change "
+                                   f"{gt.get('true_symbol')}'s definition "
+                                   f"({iso.get('reason', '')}); the reach failure is "
+                                   f"the fixture's, not the model's")
+        if "symbol_changed_in_range" in g and g["symbol_changed_in_range"] is None:
+            return TIGHT_B, ("fault-path check returned None (undecidable) and the "
+                             "grader rejected on it -- an un-run check reported as a "
+                             "failure, against its own rule")
+        if isolated is True:
+            return TIGHT_B, (f"reach blind spot: the range changed only "
+                             f"{gt.get('true_symbol')} and the test flips across it, so "
+                             f"it exercises the true symbol whether or not AST/settrace "
+                             f"could see the call (framework dispatch, threads, "
+                             f"subprocess, class-named symbol); via="
+                             f"{g.get('drives_symbol_via')}")
+        if loc == "exact":
+            return TIGHT_B, (f"reach unseen by AST/settrace but the model named {truth} "
+                             f"exactly and the test flips head/anchor; range is loose "
+                             f"({iso.get('reason', 'unknown')}) so reach is inferred, "
+                             f"not proven -- the same residual as ACCEPTED_LOOSE_ANCHOR")
+        return UNDECIDABLE_B, (f"reach unproven: loose range "
+                               f"({iso.get('reason', 'unknown')}) and the named cause "
+                               f"{named} is {LOC_PHRASE.get(loc, loc or 'unknown')}")
+
+    return UNDECIDABLE_B, f"no rule decides this: {(why or '')[:160]}"
+
+
+def classify_unfinished(status, asserted, log_tail=""):
+    """A job the queue did not finish (failed / timeout / cancelled / paused).
+
+    An abstain that never wrote a test looks, to the grader, like "no repro";
+    it is an ABSTAIN. A transient infrastructure failure that exhausted its
+    retries is an ERROR. Everything else -- the model ran out of iterations
+    without a verified repro -- is neither provably incapacity (the arm's
+    environment is a suspect) nor a harness error: UNDECIDABLE, with the
+    precheck's last verdict in the note so the human sees why verify never
+    passed.
+    """
+    if asserted is False:
+        return ABSTAIN_B, "model declined to diagnose"
+    if status in ("timeout", "cancelled", "paused"):
+        return ERROR_B, status
+    if TRANSIENT.search(log_tail or ""):
+        return ERROR_B, f"{status}: transient ({TRANSIENT.search(log_tail).group(0)})"
+    fails = [l.strip() for l in (log_tail or "").splitlines() if "FAIL:" in l]
+    return UNDECIDABLE_B, (f"job {status} without a verified repro"
+                           + (f": {fails[-1][:140]}" if fails else ""))
+
+
+class Harness:
+    def __init__(self, a):
+        self.a = a
+        self.run_dir = Path(a.run_dir) if a.run_dir else (
+            RUNS / time.strftime("%Y%m%dT%H%M%S"))
+        self.jobs: list[dict] = []
+        self._controls: dict = {}
+
+    def job_map_path(self):
+        return self.run_dir / "job-map.json"
+
+    def save_map(self):
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.job_map_path().write_text(json.dumps({
+            "model": self.a.model, "host": self.a.host,
+            "reps": self.a.reps, "jobs": self.jobs}, indent=2) + "\n")
+
+    def enqueue(self, fixture, rep, arm: Path):
+        label = f"dx-{fixture['_name']}-r{rep}"
+        cmd = [sys.executable, str(QUEUE), "enqueue",
+               "--model", self.a.model, "--host", self.a.host,
+               "--cwd", str(arm), "--task-file", str(arm / "symptom.md"),
+               "--task-kind", "coding", "--num-ctx", str(self.a.num_ctx),
+               "--verify", verify_cmd(fixture, self.a.test_rel),
+               "--max-iters", str(self.a.max_iters), "--label", label]
+        if self.a.dry_run:
+            print("    DRY-RUN " + " ".join(cmd[2:]))
+            return f"dryrun-{fixture['_name']}-{rep}", None
+        rc, out, err = sh(cmd)
+        if rc != 0:
+            return None, f"enqueue failed: {err.strip()[-200:]}"
+        m = re.search(r"\b([0-9a-f]{12})\b", out) or re.search(r"\b([0-9a-f]{8,})\b", out)
+        return (m.group(1) if m else None,
+                None if m else f"no job id in: {out.strip()[:150]}")
+
+    def run(self):
+        fixtures, errs = [], []
+        for d in self.a.fixtures:
+            f, e = load_fixture(Path(d).expanduser().resolve())
+            (errs if e else fixtures).append(e or f)
+        for e in errs:
+            print(f"  SKIP {e}")
+        if not fixtures:
+            print("no usable fixtures")
+            return 2
+        print(f"\n{len(fixtures)} fixture(s) x {self.a.reps} rep(s) "
+              f"-> {len(fixtures) * self.a.reps} job(s) on {self.a.host}")
+        print(f"run dir: {self.run_dir}")
+        for f in fixtures:
+            for rep in range(1, self.a.reps + 1):
+                f["_test_rel"] = self.a.test_rel
+                arm = self.run_dir / "arms" / f"{f['_name']}-r{rep}"
+                arm.parent.mkdir(parents=True, exist_ok=True)
+                stage_arm(f, arm)
+                jid, err = self.enqueue(f, rep, arm)
+                self.jobs.append({
+                    "case": f["_name"], "rep": rep, "job_id": jid,
+                    "arm": str(arm), "fixture_dir": f["_dir"],
+                    "true_file": f["true_file"], "true_symbol": f["true_symbol"],
+                    "anchor": f["anchor"], "attempts": 1,
+                    "source_repo": f.get("source_repo"),
+                    "error": err, "status": "enqueued" if jid else "failed"})
+                # Saved after EVERY enqueue, not at the end: a harness killed
+                # mid-batch (quota, reboot) must still leave a reconcilable map.
+                self.save_map()
+                print(f"  {f['_name']} rep{rep}: {jid or 'FAILED: ' + str(err)}")
+        if self.a.dry_run:
+            print("\ndry run -- nothing enqueued")
+            return 0
+        return self.wait_and_compile()
+
+    def job_row(self, jid):
+        try:
+            d = json.loads(STATE.read_text())
+            return next((j for j in (d.get("jobs") or [])
+                         if str(j.get("id")).startswith(jid)), None)
+        except Exception:
+            return None
+
+    def wait_and_compile(self):
+        deadline = time.time() + self.a.timeout
+        pending = {j["job_id"] for j in self.jobs if j["job_id"]}
+        while pending and time.time() < deadline:
+            time.sleep(20)
+            for jid in list(pending):
+                row = self.job_row(jid)
+                if not row or row.get("status") not in TERMINAL:
+                    continue
+                pending.discard(jid)
+                rec = next(j for j in self.jobs if j["job_id"] == jid)
+                rec["status"] = row.get("status")
+                rec["exit_code"] = row.get("exit_code")
+                rec["log_path"] = row.get("log_path")
+                if row.get("status") not in FINISHED and self.retry(rec, row):
+                    pending.add(rec["job_id"])
+                self.save_map()
+        for j in self.jobs:
+            if j["job_id"] in pending:
+                j["status"] = "timeout"
+        self.save_map()
+        return self.compile()
+
+    def retry(self, rec, row):
+        """Re-enqueue only a TRANSIENT infrastructure failure."""
+        if rec["attempts"] >= self.a.max_attempts:
+            return False
+        log = row.get("log_path") or ""
+        tail = ""
+        if log and Path(log).is_file():
+            tail = Path(log).read_text(errors="replace")[-2000:]
+        if not TRANSIENT.search(tail):
+            return False
+        fixture = {"_name": rec["case"], "true_symbol": rec["true_symbol"],
+                   "true_file": rec["true_file"], "anchor": rec["anchor"],
+                   "_dir": rec["fixture_dir"]}
+        arm = Path(rec["arm"])
+        stage_arm(fixture, arm)
+        jid, err = self.enqueue(fixture, rec["rep"], arm)
+        if not jid:
+            return False
+        print(f"  retry {rec['case']} rep{rec['rep']}: transient -> {jid}")
+        rec["job_id"] = jid
+        rec["attempts"] += 1
+        rec["status"] = "enqueued"
+        rec["retried_for"] = TRANSIENT.search(tail).group(0)
+        return True
+
+    def result_of(self, rec):
+        log = rec.get("log_path") or ""
+        if not log or not Path(log).is_file():
+            return None, None, None
+        text = Path(log).read_text(errors="replace")
+        blob = None
+        for m in re.finditer(r"\{[^{}]*\"verdict\"[^{}]*\}", text):
+            blob = m.group(0)
+        if blob:
+            try:
+                d = json.loads(blob)
+                return d.get("verdict"), d.get("why"), d.get("asserted")
+            except Exception:
+                pass
+        return None, None, None
+
+    def ground_truth(self, rec):
+        """Read the fixture's ground-truth.json, not the job map's copy of it:
+        the map carries only what staging needed (file/symbol/anchor), and
+        attribution needs the measured flags too."""
+        p = Path(rec.get("fixture_dir") or "") / "ground-truth.json"
+        gt = {}
+        if p.is_file():
+            try:
+                gt = json.loads(p.read_text())
+            except Exception:
+                gt = {}
+        for k in ("true_file", "true_symbol", "anchor", "source_repo"):
+            gt.setdefault(k, rec.get(k))
+        gt["_dir"] = rec.get("fixture_dir")
+        return gt
+
+    def control_for(self, gt, rec):
+        key = rec.get("fixture_dir") or gt.get("_dir")
+        if key not in self._controls:
+            self._controls[key] = fixture_control(gt, rec)
+        return self._controls[key]
+
+    def compile(self):
+        rows = []
+        for rec in self.jobs:
+            gt = self.ground_truth(rec)
+            claim = load_diagnosis(Path(rec["arm"])) if rec.get("arm") else None
+            asserted = claim.get("asserted") if claim else None
+            grader, ev, gerr = None, {}, None
+            verdict = why = None
+            if rec.get("status") in FINISHED:
+                grader, ev, gerr = grade_job(
+                    rec, self.a.test_rel,
+                    fixture_arm=Path(rec["fixture_dir"]) / "arm" if rec.get("fixture_dir") else None)
+                if grader:
+                    verdict, why = grader.get("verdict"), grader.get("why")
+                    if verdict == "REJECTED" and (
+                            grader.get("passes_at_anchor") is False
+                            or grader.get("stable") is False):
+                        ev["control"] = self.control_for(gt, rec)
+            if rec.get("status") not in FINISHED:
+                tail = ""
+                lp = rec.get("log_path") or ""
+                if lp and Path(lp).is_file():
+                    tail = Path(lp).read_text(errors="replace")[-3000:]
+                bucket, note = classify_unfinished(rec.get("status") or "unknown",
+                                                   asserted, tail)
+            elif grader is None:
+                if asserted is False:
+                    bucket, note = ABSTAIN_B, "model declined to diagnose"
+                else:
+                    bucket, note = ERROR_B, gerr or "no verdict"
+            else:
+                bucket, note = classify_verdict(verdict, why, asserted, grader=grader,
+                                                gt=gt, claim=claim, evidence=ev)
+            rows.append({**rec, "verdict": verdict, "why": why, "bucket": bucket,
+                         "note": note, "claim": claim, "grader": grader,
+                         "evidence": {k: v for k, v in ev.items() if k != "control"},
+                         "control_passes_at_anchor": (
+                             (ev.get("control") or {}).get("passes_at_anchor")
+                             if ev.get("control") is not None else None)})
+        (self.run_dir / "results.json").write_text(
+            json.dumps(rows, indent=2, default=str) + "\n")
+
+        by_case: dict = {}
+        for r in rows:
+            by_case.setdefault(r["case"], []).append(r)
+        hdr = (f"{'case':<26} {'PASS':>5} {'WRONG':>5} {'TIGHT':>5} {'ABST':>5} "
+               f"{'UNDEC':>5} {'ERR':>4}  rate")
+        print("\n" + "=" * len(hdr))
+        print(hdr)
+        print("-" * len(hdr))
+        tot = {b: 0 for b in BUCKETS}
+
+        def line(label, c):
+            # Rate is over DECIDED cases only: PASS / (PASS + WRONG). TIGHT,
+            # UNDECIDABLE, ABSTAIN and ERROR are excluded from the denominator
+            # because none of them is a model failure that has been shown.
+            scored = c[PASS_B] + c[WRONG_B]
+            rate = f"{c[PASS_B] / scored * 100:.0f}%" if scored else "n/a"
+            print(f"{label:<26} {c[PASS_B]:>5} {c[WRONG_B]:>5} {c[TIGHT_B]:>5} "
+                  f"{c[ABSTAIN_B]:>5} {c[UNDECIDABLE_B]:>5} {c[ERROR_B]:>4}  {rate}")
+
+        for case, rs in sorted(by_case.items()):
+            c = {b: sum(1 for r in rs if r["bucket"] == b) for b in BUCKETS}
+            for b in BUCKETS:
+                tot[b] += c[b]
+            line(case, c)
+        print("-" * len(hdr))
+        line("TOTAL", tot)
+        print("=" * len(hdr))
+        n = sum(tot.values())
+        decided = tot[PASS_B] + tot[WRONG_B]
+        if n:
+            print(f"\nrate is over {decided} decided job(s) of {n} "
+                  f"({decided / n * 100:.0f}% decided).")
+        if tot[TIGHT_B]:
+            print(f"\n{tot[TIGHT_B]} GRADER-TOO-TIGHT: the diagnosis is sound as far as "
+                  "this pipeline can tell and the grader rejected it.")
+            print("Route these to the grader's owner with the `note` in results.json; "
+                  "they are NOT model failures.")
+            for r in rows:
+                if r["bucket"] == TIGHT_B:
+                    print(f"  - {r['case']} rep{r['rep']}: {r['note'][:110]}")
+        if tot[UNDECIDABLE_B]:
+            print(f"\n{tot[UNDECIDABLE_B]} UNDECIDABLE: neither the model nor the grader "
+                  "is provably at fault from the evidence.")
+            print("A human must look; the `note` says which question is open. These are "
+                  "deliberately NOT folded into WRONG.")
+            for r in rows:
+                if r["bucket"] == UNDECIDABLE_B:
+                    print(f"  - {r['case']} rep{r['rep']}: {r['note'][:110]}")
+        print(f"\nrun dir: {self.run_dir}")
+        return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--fixtures", nargs="*", default=[])
+    ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--host", default=DEFAULT_HOST)
+    ap.add_argument("--num-ctx", type=int, default=32768)
+    ap.add_argument("--max-iters", type=int, default=30)
+    ap.add_argument("--max-attempts", type=int, default=3)
+    ap.add_argument("--timeout", type=int, default=7200)
+    ap.add_argument("--test-rel", default="t_repro.py",
+                    help="path the model must write its repro to, "
+                         "REPO-RELATIVE (an absolute path bypasses the "
+                         "grader's anchor checkout)")
+    ap.add_argument("--run-dir")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--reconcile", help="compile from an existing run dir")
+    ap.add_argument("--self-check", action="store_true")
+    a = ap.parse_args()
+    if a.self_check:
+        return self_check()
+    if a.host == "auto":
+        ap.error("--host auto is refused: host is not neutral, so a split run "
+                 "measures the hosts as much as the model. Pin one.")
+    if a.reconcile:
+        rd = Path(a.reconcile).expanduser()
+        h = Harness(a)
+        h.run_dir = rd
+        data = json.loads((rd / "job-map.json").read_text())
+        h.jobs = data["jobs"]
+        for j in h.jobs:
+            row = h.job_row(j["job_id"]) if j.get("job_id") else None
+            if row:
+                j["status"] = row.get("status")
+                j["log_path"] = row.get("log_path")
+        return h.compile()
+    if not a.fixtures:
+        ap.error("--fixtures is required")
+    return Harness(a).run()
+
+
+# ---------------------------------------------------------------------------
+# Self-check
+# ---------------------------------------------------------------------------
+def _git_repo(root: Path, anchor_files: dict, head_files: dict):
+    """Two-commit repo: anchor tree, then head tree. Returns the anchor sha."""
+    root.mkdir(parents=True, exist_ok=True)
+    sh(["git", "init", "-q", "-b", "main"], cwd=root)
+    sh(["git", "config", "user.email", "x@x"], cwd=root)
+    sh(["git", "config", "user.name", "x"], cwd=root)
+    for name, body in anchor_files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(body)
+    sh(["git", "add", "-A"], cwd=root)
+    sh(["git", "commit", "-qm", "anchor"], cwd=root)
+    _, anchor, _ = sh(["git", "rev-parse", "HEAD"], cwd=root)
+    for name, body in head_files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(body)
+    sh(["git", "add", "-A"], cwd=root)
+    sh(["git", "commit", "-qm", "bug"], cwd=root)
+    return anchor.strip()
+
+
+# The grader's output for false reject #1 as it stood BEFORE the execution
+# fallback landed (92dc2e1): AST said the Flask view was never driven, every
+# behavioural criterion held, and the range was loose (api.py + a Jinja
+# template). No `symbol_executed`/`drives_symbol_via` keys existed yet.
+NETMON_PREFIX_GRADER = {
+    "verdict": "REJECTED", "why": "failed: data_dependent, drives_symbol",
+    "not_unconditional": True, "data_dependent": False, "drives_symbol": False,
+    "drives_symbol_via": None, "no_mock_on_target": True, "fails_at_head": True,
+    "passes_at_anchor": True, "stable": True, "anchor_tight": False,
+    "anchor_commits_in_range": 1, "ast_supported": True,
+}
+# False reject #2: the absolute --test path bypassed the anchor checkout, so
+# the HEAD module was imported "at the anchor" and the test failed there.
+# Every other criterion held. The same defect hits the fixture's own true test
+# through the same grader -- that is the control's job to notice.
+ABSPATH_GRADER = {
+    "verdict": "REJECTED", "why": "failed: passes_at_anchor",
+    "not_unconditional": True, "data_dependent": True, "drives_symbol": True,
+    "drives_symbol_via": "ast", "no_mock_on_target": True, "fails_at_head": True,
+    "passes_at_anchor": False, "stable": True, "anchor_tight": True,
+    "symbol_changed_in_range": True, "ast_supported": True,
+}
+# False reject #3: the FTPS symptom (climbing socket count -> EMFILE) was
+# inferred from the fix's intent and never occurs. A test asserting it passes
+# on the buggy code. The fixture had no symptom demo (waived -> None).
+FTPS_GRADER = {
+    "verdict": "REJECTED", "why": "failed: fails_at_head, data_dependent",
+    "not_unconditional": True, "data_dependent": False, "drives_symbol": True,
+    "drives_symbol_via": "ast", "no_mock_on_target": True, "fails_at_head": False,
+    "passes_at_anchor": True, "stable": True, "anchor_tight": True,
+    "symbol_changed_in_range": True, "ast_supported": True,
+}
+GT_OK = {"true_file": "lib.py", "true_symbol": "discount",
+         "passes_at_anchor_measured": True, "symptom_reproduces_at_head": True}
+ISO_T = {"isolated": True, "true_symbol_touched": True, "range_files": ["lib.py"],
+         "reason": "range touched only discount in lib.py"}
+ISO_F = {"isolated": False, "true_symbol_touched": True,
+         "range_files": ["app/api.py", "app/templates/index.html"],
+         "reason": "range also touched ['app/templates/index.html']"}
+
+
+def self_check():
+    """Prove the parts that do not need a queue: fixture gating, staging
+    isolation, transient classification, verdict bucketing, attribution, the
+    evidence helpers, and the map."""
+    import types
+    tmp = Path(tempfile.mkdtemp(prefix="drh-self-"))
+    cases, failures = [], []
+
+    def case(name, ok, why=""):
+        cases.append((name, ok, why))
+        if not ok:
+            failures.append(name)
+
+    # --- fixture gating -------------------------------------------------
+    def mkfix(name, **over):
+        d = tmp / name
+        (d / "arm").mkdir(parents=True, exist_ok=True)
+        (d / "arm" / "lib.py").write_text("x = 1\n")
+        (d / "arm" / "__pycache__").mkdir(exist_ok=True)
+        (d / "arm" / "__pycache__" / "j.pyc").write_text("junk")
+        (d / "symptom.md").write_text("something is wrong\n")
+        meta = {"name": name, "true_file": "lib.py", "true_symbol": "f",
+                "anchor": "abc123", "passes_at_anchor_measured": True,
+                "symptom_reproduces_at_head": True}
+        meta.update(over)
+        (d / "ground-truth.json").write_text(json.dumps(meta))
+        return d
+
+    f, e = load_fixture(mkfix("good"))
+    case("accepts a gated fixture", f is not None and e is None, str(e))
+
+    f, e = load_fixture(mkfix("ungraded", passes_at_anchor_measured=None))
+    case("refuses passes_at_anchor=None", f is None and "not known gradeable" in (e or ""),
+         "an ungated case would score the model on an ungradeable fixture")
+
+    f, e = load_fixture(mkfix("fakesymptom", symptom_reproduces_at_head=False))
+    case("refuses a symptom that never occurs",
+         f is None and "never happens" in (e or ""),
+         "the model would be scored on a symptom that cannot be reproduced")
+
+    # --- staging isolation ----------------------------------------------
+    fx, _ = load_fixture(mkfix("iso"))
+    a1 = stage_arm(fx, tmp / "arm1")
+    a2 = stage_arm(fx, tmp / "arm2")
+    (a1 / "lib.py").write_text("CONTAMINATED\n")
+    case("reps are isolated", (a2 / "lib.py").read_text() == "x = 1\n",
+         "rep 2 saw rep 1's edits")
+    case("artifacts stripped from the arm", not (a1 / "__pycache__").exists(),
+         "__pycache__ shipped into the model arm")
+
+    # --- transient detection --------------------------------------------
+    for txt, want, why in (
+            ("ollama returned 500", True, "500 is transient"),
+            ("unexpected EOF reading response", True, "EOF is transient"),
+            ("AssertionError: discount wrong", False,
+             "a real test failure must NOT be retried away"),
+            ("VERIFY_OK", False, "a pass must not be retried")):
+        got = bool(TRANSIENT.search(txt))
+        case(f"transient: {txt[:28]!r}", got == want, why)
+
+    # --- verdict bucketing ----------------------------------------------
+    for verdict, why_s, asserted, want in (
+            ("ACCEPTED", "", True, PASS_B),
+            ("ACCEPTED_LOOSE_ANCHOR", "", True, PASS_B),
+            ("REJECTED", "failed: passes_at_anchor", True, NEEDS_B),
+            (None, "", False, ABSTAIN_B),
+            (None, "", None, ERROR_B)):
+        got, _ = classify_verdict(verdict, why_s, asserted)
+        case(f"bucket {verdict}/{asserted}", got == want,
+             f"got {got}, want {want}")
+
+    # the load-bearing one
+    got, _ = classify_verdict("REJECTED", "failed: drives_symbol", True)
+    case("REJECTED is NOT scored as model-wrong", got == NEEDS_B,
+         "the grader false-rejected correct diagnoses 3x in one day; scoring "
+         "REJECTED as failure understates the model")
+
+    # --- attribution: the three real false rejects must not be WRONG -----
+    claim_exact = {"asserted": True, "file": "app/api.py", "symbol": "containers"}
+    gt_netmon = {"true_file": "app/api.py", "true_symbol": "containers",
+                 "passes_at_anchor_measured": True, "symptom_reproduces_at_head": True}
+    got, note = classify_verdict("REJECTED", NETMON_PREFIX_GRADER["why"], True,
+                                 grader=NETMON_PREFIX_GRADER, gt=gt_netmon,
+                                 claim=claim_exact,
+                                 evidence={"localization": "exact", "isolation": ISO_F})
+    case("FALSE REJECT #1 (netmon framework dispatch) is not WRONG",
+         got == TIGHT_B, f"got {got}: {note}")
+
+    got, note = classify_verdict(
+        "REJECTED", ABSPATH_GRADER["why"], True, grader=ABSPATH_GRADER, gt=GT_OK,
+        claim={"asserted": True, "file": "lib.py", "symbol": "discount"},
+        evidence={"localization": "exact", "isolation": ISO_T,
+                  "anchor_probe": {"kind": "assertion", "tail": "AssertionError"},
+                  "control": {"verdict": "REJECTED", "passes_at_anchor": False}})
+    case("FALSE REJECT #2 (absolute --test) is not WRONG: control catches it",
+         got == TIGHT_B, f"got {got}: {note}")
+    # ...and even WITHOUT a control, a direct anchor run that passes is enough
+    got, note = classify_verdict(
+        "REJECTED", ABSPATH_GRADER["why"], True, grader=ABSPATH_GRADER, gt=GT_OK,
+        claim={"asserted": True, "file": "lib.py", "symbol": "discount"},
+        evidence={"localization": "exact", "isolation": ISO_T,
+                  "anchor_probe": {"kind": "pass", "tail": ""}})
+    case("FALSE REJECT #2 variant: direct anchor run passes -> grader contradicted",
+         got == TIGHT_B, f"got {got}: {note}")
+
+    gt_ftps = {"true_file": "media_share.py", "true_symbol": "_upload_ftps",
+               "passes_at_anchor_measured": True, "symptom_reproduces_at_head": None}
+    got, note = classify_verdict(
+        "REJECTED", FTPS_GRADER["why"], True, grader=FTPS_GRADER, gt=gt_ftps,
+        claim={"asserted": True, "file": "media_share.py", "symbol": "_upload_ftps"},
+        evidence={"localization": "exact", "isolation": ISO_T,
+                  "head_probe": {"kind": "pass", "tail": ""}})
+    case("FALSE REJECT #3 (FTPS unreal symptom, waived) is not WRONG",
+         got == UNDECIDABLE_B, f"got {got}: {note}")
+    got, note = classify_verdict("REJECTED", "failed: fails_at_head", False,
+                                 grader=FTPS_GRADER, gt=gt_ftps)
+    case("FALSE REJECT #3 variant: an abstain stays ABSTAIN whatever the grader says",
+         got == ABSTAIN_B, f"got {got}")
+
+    # --- attribution: WRONG must still be reachable (no over-correction) --
+    assert_false = {**ABSPATH_GRADER, "why": "failed: not_unconditional, data_dependent, "
+                    "drives_symbol, passes_at_anchor", "not_unconditional": False,
+                    "data_dependent": False, "drives_symbol": False,
+                    "passes_at_anchor": False}
+    got, note = classify_verdict("REJECTED", assert_false["why"], True,
+                                 grader=assert_false, gt=GT_OK,
+                                 claim={"asserted": True, "file": "lib.py", "symbol": "discount"},
+                                 evidence={"localization": "exact", "isolation": ISO_T,
+                                           "anchor_probe": {"kind": "assertion", "tail": ""},
+                                           "control": {"passes_at_anchor": True}})
+    case("assert-False shape (fails both ends) IS WRONG", got == WRONG_B, f"got {got}: {note}")
+
+    sibling = {**FTPS_GRADER, "why": "failed: fails_at_head"}
+    got, note = classify_verdict("REJECTED", sibling["why"], True, grader=sibling, gt=GT_OK,
+                                 claim={"asserted": True, "file": "lib.py", "symbol": "parse_camera_angle"},
+                                 evidence={"localization": "near-miss", "isolation": ISO_T,
+                                           "head_probe": {"kind": "pass", "tail": ""}})
+    case("innocent-sibling test (passes on buggy code, symptom MEASURED real) IS WRONG",
+         got == WRONG_B, f"got {got}: {note}")
+    got, note = classify_verdict("REJECTED", sibling["why"], True, grader=sibling, gt=GT_OK,
+                                 claim={"asserted": True, "file": "lib.py", "symbol": "parse_camera_angle"},
+                                 evidence={"localization": "near-miss", "isolation": ISO_T,
+                                           "head_probe": {"kind": "crash", "tail": "ModuleNotFoundError: flask"}})
+    case("...but not when the direct HEAD run crashed (env discrepancy)",
+         got == UNDECIDABLE_B, f"got {got}: {note}")
+
+    got, note = classify_verdict("REJECTED", ABSPATH_GRADER["why"], True,
+                                 grader=ABSPATH_GRADER, gt=GT_OK,
+                                 claim={"asserted": True, "file": "lib.py", "symbol": "helper"},
+                                 evidence={"localization": "near-miss", "isolation": ISO_T,
+                                           "anchor_probe": {"kind": "assertion", "tail": "AssertionError: never true"},
+                                           "control": {"passes_at_anchor": True}})
+    case("fails-both-ends by assertion, isolated, wrong name IS WRONG (t_both_ends)",
+         got == WRONG_B, f"got {got}: {note}")
+    got, note = classify_verdict("REJECTED", ABSPATH_GRADER["why"], True,
+                                 grader=ABSPATH_GRADER, gt=GT_OK,
+                                 claim={"asserted": True, "file": "lib.py", "symbol": "discount"},
+                                 evidence={"localization": "exact", "isolation": ISO_T,
+                                           "anchor_probe": {"kind": "assertion", "tail": "AssertionError"},
+                                           "control": {"passes_at_anchor": True}})
+    case("fails-both-ends with the EXACT name is UNDECIDABLE (over-specified vs wrong mechanism)",
+         got == UNDECIDABLE_B, f"got {got}: {note}")
+    got, note = classify_verdict("REJECTED", ABSPATH_GRADER["why"], True,
+                                 grader=ABSPATH_GRADER, gt=GT_OK,
+                                 claim={"asserted": True, "file": "lib.py", "symbol": "helper"},
+                                 evidence={"localization": "near-miss", "isolation": ISO_T,
+                                           "anchor_probe": {"kind": "crash", "tail": "FileNotFoundError: data.json"},
+                                           "control": {"passes_at_anchor": True}})
+    case("crash at the anchor is UNDECIDABLE, never WRONG", got == UNDECIDABLE_B,
+         f"got {got}: {note}")
+
+    mocked = {**ABSPATH_GRADER, "why": "failed: no_mock_on_target, passes_at_anchor",
+              "no_mock_on_target": False}
+    got, note = classify_verdict("REJECTED", mocked["why"], True, grader=mocked, gt=GT_OK,
+                                 evidence={"localization": "exact", "isolation": ISO_T,
+                                           "anchor_probe": {"kind": "assertion", "tail": ""}})
+    case("mock-on-target without a flip IS WRONG", got == WRONG_B, f"got {got}: {note}")
+    mocked_flip = {**mocked, "why": "failed: no_mock_on_target", "passes_at_anchor": True}
+    got, note = classify_verdict("REJECTED", mocked_flip["why"], True, grader=mocked_flip,
+                                 gt=GT_OK, evidence={"localization": "exact", "isolation": ISO_T})
+    case("mock-on-target WITH a flip is UNDECIDABLE (substring/spy)", got == UNDECIDABLE_B,
+         f"got {got}: {note}")
+    uncond_flip = {**ABSPATH_GRADER, "why": "failed: not_unconditional",
+                   "not_unconditional": False, "passes_at_anchor": True}
+    got, note = classify_verdict("REJECTED", uncond_flip["why"], True, grader=uncond_flip,
+                                 gt=GT_OK, evidence={"localization": "exact", "isolation": ISO_T})
+    case("not_unconditional=false yet passes at the anchor -> heuristic misfired -> TOO-TIGHT",
+         got == TIGHT_B, f"got {got}: {note}")
+
+    # --- attribution: the reach pair ------------------------------------
+    reach = {**NETMON_PREFIX_GRADER, "anchor_tight": True, "symbol_changed_in_range": True,
+             "symbol_executed": False}
+    got, note = classify_verdict("REJECTED", reach["why"], True, grader=reach, gt=GT_OK,
+                                 claim={"asserted": True, "file": "lib.py", "symbol": "wrapper"},
+                                 evidence={"localization": "near-miss", "isolation": ISO_T})
+    case("reach-only failure in an ISOLATED range is TOO-TIGHT even with a near-miss name",
+         got == TIGHT_B, f"got {got}: {note}")
+    got, note = classify_verdict("REJECTED", reach["why"], True, grader=reach, gt=GT_OK,
+                                 claim={"asserted": True, "file": "other.py", "symbol": "x"},
+                                 evidence={"localization": "outside", "isolation": ISO_F})
+    case("reach-only failure, LOOSE range, other name is UNDECIDABLE", got == UNDECIDABLE_B,
+         f"got {got}: {note}")
+    got, note = classify_verdict("REJECTED", reach["why"], True,
+                                 grader={**reach, "symbol_changed_in_range": None}, gt=GT_OK,
+                                 evidence={"localization": "outside", "isolation": ISO_F})
+    case("fault-path None treated as a rejection -> TOO-TIGHT", got == TIGHT_B,
+         f"got {got}: {note}")
+    got, note = classify_verdict("REJECTED", reach["why"], True, grader=reach, gt=GT_OK,
+                                 evidence={"localization": "exact",
+                                           "isolation": {**ISO_F, "true_symbol_touched": False,
+                                                         "reason": "anchor..HEAD did not change discount"}})
+    case("true symbol untouched by the range -> FIXTURE inconsistency -> UNDECIDABLE",
+         got == UNDECIDABLE_B and "FIXTURE" in note, f"got {got}: {note}")
+
+    # --- attribution: ACCEPTED is checked against the NAMED cause --------
+    for loc, want in (("exact", PASS_B), ("in-diff", PASS_B), ("near-miss", UNDECIDABLE_B),
+                      ("outside", UNDECIDABLE_B), ("missing", UNDECIDABLE_B)):
+        got, note = classify_verdict("ACCEPTED", "", True, grader={"verdict": "ACCEPTED"},
+                                     gt=GT_OK, claim={"symbol": "x", "file": "y.py"},
+                                     evidence={"localization": loc, "isolation": ISO_T})
+        case(f"ACCEPTED with claim {loc} -> {want}", got == want, f"got {got}: {note}")
+    got, _ = classify_verdict("CAUSE_NOT_CALLABLE", "route a human", True,
+                              grader={"verdict": "CAUSE_NOT_CALLABLE"}, gt=GT_OK)
+    case("CAUSE_NOT_CALLABLE goes to the human queue", got == UNDECIDABLE_B, f"got {got}")
+
+    # --- unfinished jobs -------------------------------------------------
+    got, _ = classify_unfinished("failed", False, "  FAIL: no repro at t_repro.py")
+    case("failed job with asserted=false is ABSTAIN, not error", got == ABSTAIN_B, got)
+    got, _ = classify_unfinished("failed", True, "ollama returned 500 EOF")
+    case("failed job on a transient tail is HARNESS-ERROR", got == ERROR_B, got)
+    got, note = classify_unfinished("failed", True,
+                                    "  FAIL: the repro PASSES on the buggy code\n--- 1 failed ---")
+    case("failed job without a verified repro is UNDECIDABLE with the precheck reason",
+         got == UNDECIDABLE_B and "PASSES" in note, f"{got}: {note}")
+
+    # --- evidence helpers on a REAL two-commit repo ----------------------
+    ANCHOR_LIB = ("def helper(x):\n    return x\n\n"
+                  "def discount(price, pct):\n    return price * (1 - pct / 100)\n")
+    HEAD_LIB = ANCHOR_LIB.replace("pct / 100", "pct")
+    r1 = tmp / "repo-iso"
+    an1 = _git_repo(r1, {"lib.py": ANCHOR_LIB}, {"lib.py": HEAD_LIB})
+    iso = regression_isolation(r1, an1, "lib.py", "discount")
+    case("isolation: one-def change is isolated", iso["isolated"] is True
+         and iso["true_symbol_touched"] is True, json.dumps(iso))
+    iso = regression_isolation(r1, an1, "lib.py", "helper")
+    case("isolation: naming the untouched def as truth is caught (fixture inconsistency)",
+         iso["true_symbol_touched"] is False, json.dumps(iso))
+    for cl, want in (({"symbol": "discount", "file": "lib.py"}, "exact"),
+                     ({"symbol": "discount", "file": "./lib.py"}, "exact"),
+                     ({"symbol": "helper", "file": "lib.py"}, "near-miss"),
+                     ({"symbol": "x", "file": "other.py"}, "outside"),
+                     (None, "missing")):
+        got = localize_claim(r1, an1, cl, "lib.py", "discount")
+        case(f"localize {cl and cl['symbol']}/{cl and cl['file']} -> {want}", got == want, got)
+    r2 = tmp / "repo-loose"
+    an2 = _git_repo(r2, {"lib.py": ANCHOR_LIB, "other.py": "A = 1\n"},
+                    {"lib.py": HEAD_LIB.replace("return x", "return x + 0"), "other.py": "A = 2\n"})
+    iso = regression_isolation(r2, an2, "lib.py", "discount")
+    case("isolation: multi-file / multi-def range is NOT isolated", iso["isolated"] is False,
+         json.dumps(iso))
+    case("localize: another CHANGED def is in-diff",
+         localize_claim(r2, an2, {"symbol": "helper", "file": "lib.py"}, "lib.py", "discount") == "in-diff")
+
+    # --- probe kinds -----------------------------------------------------
+    pr = tmp / "probe"
+    pr.mkdir(exist_ok=True)
+    for body, want in (("print('ok')\n", "pass"),
+                       ("assert 1 == 2\n", "assertion"),
+                       ("import nosuchmodule_xyz\n", "crash"),
+                       ("import sys\nprint('bad')\nsys.exit(1)\n", "assertion")):
+        (pr / "t.py").write_text(body)
+        got = probe_run(pr, "t.py")
+        case(f"probe kind {want} for {body.strip()[:24]!r}", got["kind"] == want, json.dumps(got))
+
+    # --- diagnosis.json reading ------------------------------------------
+    dj = tmp / "dj"
+    dj.mkdir(exist_ok=True)
+    (dj / "diagnosis.json").write_text(json.dumps({
+        "asserted": True, "root_cause": {"file": "app/api.py", "symbol": "app.api.containers()",
+                                         "explanation": "x"}}))
+    d = load_diagnosis(dj)
+    case("diagnosis.json: dotted/called symbol normalised", d["symbol"] == "containers"
+         and d["file"] == "app/api.py" and d["asserted"] is True, json.dumps(d))
+    case("diagnosis.json absent -> None (not a crash)", load_diagnosis(tmp / "nowhere") is None)
+
+    # --- end-to-end grade_job on a mini fixture (needs the grader) ------
+    if GRADER.is_file():
+        fixd = tmp / "fixture-e2e"
+        (fixd / "arm").mkdir(parents=True)
+        (fixd / "arm" / "lib.py").write_text(HEAD_LIB)
+        (fixd / "t_good.py").write_text("from lib import discount\nassert discount(100, 10) == 90\n")
+        gt_e2e = {"name": "e2e", "true_file": "lib.py", "true_symbol": "discount", "anchor": an1,
+                  "source_repo": str(r1), "true_test": "t_good.py",
+                  "passes_at_anchor_measured": True, "symptom_reproduces_at_head": True}
+        (fixd / "ground-truth.json").write_text(json.dumps(gt_e2e))
+        # a model arm whose test reads a fixture file the model created
+        arm = tmp / "arm-e2e"
+        shutil.copytree(fixd / "arm", arm)
+        (arm / "cases.json").write_text(json.dumps([[100, 10, 90]]))
+        (arm / "t_repro.py").write_text(
+            "import json\nfrom lib import discount\n"
+            "for p, pct, want in json.load(open('cases.json')):\n"
+            "    assert discount(p, pct) == want, discount(p, pct)\n")
+        (arm / "diagnosis.json").write_text(json.dumps(
+            {"asserted": True, "root_cause": {"file": "lib.py", "symbol": "discount"}}))
+        rec = {"arm": str(arm), "source_repo": str(r1), "true_file": "lib.py",
+               "true_symbol": "discount", "anchor": an1, "fixture_dir": str(fixd)}
+        g, ev, err = grade_job(rec, "t_repro.py", fixture_arm=fixd / "arm")
+        case("e2e: model-created fixture file is carried into the grader clone",
+             "cases.json" in (ev.get("carried_files") or []), json.dumps(ev.get("carried_files")))
+        case("e2e: localization exact, isolation isolated",
+             ev.get("localization") == "exact" and (ev.get("isolation") or {}).get("isolated") is True,
+             json.dumps({k: ev.get(k) for k in ("localization", "isolation")}))
+        # KNOWN GRADER GAP (found by this very check, 2026-09-03): the grader's
+        # run_test() makes its OWN `git clone` for the anchor run and copies in
+        # only the test file, so a carried fixture file never reaches the anchor
+        # clone -- the test crashes there and grades passes_at_anchor=false.
+        # A sound repro is false-rejected for a staging reason: the absolute-
+        # path shape again, one level down. The harness cannot fix it without
+        # editing the grader (another session's file), so two things are pinned:
+        #   (a) attribution must catch it as GRADER-TOO-TIGHT, never WRONG;
+        #   (b) the grader's CURRENT behaviour, so that when its owner closes
+        #       the gap this case fails and the note gets retired on purpose.
+        case("e2e: grader currently REJECTS a fixture-file repro on passes_at_anchor "
+             "(if this fails, the grader gap is CLOSED -- retire the note)",
+             g is not None and g.get("verdict") == "REJECTED"
+             and g.get("passes_at_anchor") is False,
+             f"{err or (g or {}).get('verdict')}: {(g or {}).get('why')}")
+        if g is not None:
+            b, n = classify_verdict(g.get("verdict"), g.get("why"), True, grader=g, gt=gt_e2e,
+                                    claim=load_diagnosis(arm), evidence=ev)
+            case("e2e: ...and attribution classifies that false reject GRADER-TOO-TIGHT",
+                 b == TIGHT_B, f"{b}: {n}")
+        # the same sound repro WITHOUT a fixture-file dependency: the clean PASS path
+        (arm / "t_repro.py").write_text("from lib import discount\nassert discount(100, 10) == 90\n")
+        g, ev, err = grade_job(rec, "t_repro.py", fixture_arm=fixd / "arm")
+        case("e2e: grader ACCEPTS a sound self-contained repro",
+             g is not None and str(g.get("verdict", "")).startswith("ACCEPTED"),
+             f"{err or (g or {}).get('verdict')}: {(g or {}).get('why')}")
+        if g is not None:
+            b, n = classify_verdict(g.get("verdict"), g.get("why"), True, grader=g, gt=gt_e2e,
+                                    claim=load_diagnosis(arm), evidence=ev)
+            case("e2e: classifies PASS", b == PASS_B, f"{b}: {n}")
+        ctl = fixture_control(gt_e2e, rec)
+        case("e2e: control (true test through the grader) passes at the anchor",
+             ctl is not None and ctl.get("passes_at_anchor") is True,
+             json.dumps(ctl and {k: ctl.get(k) for k in ("verdict", "passes_at_anchor")}))
+        # a wrong-mechanism repro: fails at BOTH ends, names a bystander
+        (arm / "t_repro.py").write_text("from lib import discount\nassert discount(100, 10) == 999\n")
+        (arm / "diagnosis.json").write_text(json.dumps(
+            {"asserted": True, "root_cause": {"file": "lib.py", "symbol": "helper"}}))
+        g, ev, err = grade_job(rec, "t_repro.py", fixture_arm=fixd / "arm")
+        if g is not None:
+            ev["control"] = ctl
+            b, n = classify_verdict(g.get("verdict"), g.get("why"), True, grader=g, gt=gt_e2e,
+                                    claim=load_diagnosis(arm), evidence=ev)
+            case("e2e: both-ends repro naming a bystander classifies WRONG",
+                 b == WRONG_B, f"{b}: {n} | probe={ev.get('anchor_probe')}")
+        else:
+            case("e2e: both-ends repro graded", False, str(err))
+    else:
+        case("e2e skipped: grader not installed", True)
+
+    # --- in-job verify is a PRECHECK, not the grader --------------------
+    vc = verify_cmd({"true_symbol": "f", "anchor": "abc", "true_file": "lib.py"},
+                    "t_repro.py")
+    case("in-job verify is the precheck", vc.strip() == "python3 precheck.py",
+         f"got {vc!r}")
+    case("in-job verify does NOT invoke the grader", str(GRADER) not in vc,
+         "grading in the arm reports passes_at_anchor=False for EVERY job -- "
+         "the anchor is absent from a HEAD-tree-only arm, so a whole run reads "
+         "as 0% and looks like total model incapacity")
+    case("the arm never names the source repo",
+         "source_repo" not in PRECHECK and "--repo" not in PRECHECK,
+         "the precheck must not hand the model a path whose git log holds the fix")
+
+    # --- the precheck itself discriminates ------------------------------
+    pre = tmp / "pre"
+    pre.mkdir(exist_ok=True)
+    (pre / "lib.py").write_text("def f():\n    return 1\n")
+    (pre / "precheck.py").write_text(
+        PRECHECK.format(test_rel="t_repro.py", true_file="lib.py"))
+    for name, body, want_ok in (
+            ("no repro at all", None, False),
+            ("repro that PASSES on buggy code",
+             "from lib import f\nassert f() == 1\n", False),
+            ("repro that CRASHES",
+             "import nosuchmodule\n", False),
+            ("repro that fails an assertion",
+             "from lib import f\nassert f() == 2\n", True)):
+        tp = pre / "t_repro.py"
+        if body is None:
+            tp.unlink(missing_ok=True)
+        else:
+            tp.write_text(body)
+        rc, out, err = sh([sys.executable, "precheck.py"], cwd=pre)
+        case(f"precheck: {name}", (rc == 0) == want_ok,
+             f"exit {rc}, wanted {'0' if want_ok else 'non-zero'}: "
+             f"{(out or err).strip().splitlines()[-2:]}")
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    for name, ok, why in cases:
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}" + (f"   -- {why}" if not ok else ""))
+    print(f"\n--- {len(failures)} of {len(cases)} failed ---")
+    if failures:
+        print("FAILED: " + ", ".join(failures))
+        return 1
+    print("SELF_CHECK_OK: gating, isolation, retry, bucketing and attribution all "
+          "discriminate")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

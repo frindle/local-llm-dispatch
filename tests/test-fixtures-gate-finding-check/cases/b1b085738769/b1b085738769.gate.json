@@ -1,0 +1,162 @@
+{
+ "verdict": "concerns",
+ "issues": [
+  {
+   "severity": "medium",
+   "file": "dashboard_chat.py",
+   "line": 0,
+   "what": "The collect_job_results function modifies the session object in memory but fails to persist the upda",
+   "source": "review",
+   "category": "code",
+   "uncertain": true,
+   "reviewer_severity": "high"
+  }
+ ],
+ "counts": {
+  "code_high": 0,
+  "code": 1,
+  "input": 0,
+  "total": 1
+ },
+ "not_checked": [],
+ "review_verdict": "PASS WITH CAVEATS",
+ "verify_exit_reported": 0,
+ "verify_quality_exit": 0,
+ "diff_source": "git diff HEAD",
+ "launch_baseline": {
+  "head": "0bba823c03f5f2247e701389b3fe8b81a908f5df",
+  "dirty": 0
+ },
+ "baseline_at": "launch",
+ "verify_relevance": {
+  "verdict": "low",
+  "score": 0.909,
+  "threshold": 0.8,
+  "mutant_score": 0.95,
+  "site_score": 0.909,
+  "site_coverage": 0.909,
+  "killed": 38,
+  "survived": 2,
+  "evidence_mutants": 40,
+  "generated": 61,
+  "literal_breaking": 2,
+  "crash_kills": 0,
+  "truncated": true,
+  "untried_sites": [],
+  "unexercised_sites": [
+   "dashboard_chat.py:409",
+   "dashboard_chat.py:410"
+  ],
+  "reason": "2 changed site(s) are UNEXERCISED -- every mutant on dashboard_chat.py:409, dashboard_chat.py:410 survived, so the verify never runs that path (killed 38/40 elsewhere)",
+  "seconds": 4.36,
+  "survivors": [
+   {
+    "file": "dashboard_chat.py",
+    "line": 409,
+    "class": "stmt-delete",
+    "mutation": "delete `try:`",
+    "snippet": "pass"
+   },
+   {
+    "file": "dashboard_chat.py",
+    "line": 410,
+    "class": "stmt-delete",
+    "mutation": "delete `validate_session_id(session_id)`",
+    "snippet": "pass"
+   }
+  ],
+  "source": "gate-applied",
+  "verify": "bash verify.sh"
+ },
+ "review_tier": "pregate",
+ "review_model": "qwen3:14b",
+ "review_host": "unraid",
+ "review": "done",
+ "review_label": "gate-b1b085738769",
+ "review_dir": "/Users/user/bin/ollama-queue-logs/b1b085738769-review",
+ "job_id": "b1b085738769",
+ "ts": "2026-10-04T21:20:56Z",
+ "advisory": true,
+ "job_status": "done",
+ "job_label": "chat-fixes3-s2-collect-results",
+ "job_model": "qwen3.6-35b-a3b-vl-mtp-mxfp8",
+ "job_cwd": "/Users/user/.ollama-dispatch/worktrees/wt-slice-chat-fixes3-s2-collect-results",
+ "job_host": "studio",
+ "job_verify": "bash verify.sh",
+ "job_exit_code": 0,
+ "verify_failed_at_baseline": true,
+ "job_preflight": "preflight-verify-ok (baseline fails as designed)",
+ "scored_arm": false,
+ "task_intent": "TASK: chat-fixes3-s2-collect-results",
+ "signoff_required": false,
+ "signoff_reviewer": "",
+ "signoff_verdict": null,
+ "pregate_verdict": "fail",
+ "pregate_review_verdict": "FAIL",
+ "regate": "done",
+ "regate_label": "regate-b1b085738769",
+ "gate_authority": "studio-27b-regate",
+ "auto_fix_class": "undecidable",
+ "auto_fix_action": "escalate",
+ "auto_fix_reasons": [
+  "verdict=concerns; findings from review are not a decidable, model-actionable failure"
+ ],
+ "auto_fix_round": 0,
+ "auto_fix_root": "b1b085738769",
+ "auto_fix_mode": "live",
+ "models_tried": [
+  "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+ ],
+ "auto_fix_history": "repair history: r0=1 finding(s) [review]; models tried: qwen3.6-35b-a3b-vl-mtp-mxfp8",
+ "auto_fix_escalate_category": "other",
+ "auto_fix_escalate_cmd": [
+  "python3",
+  "/Users/user/bin/ollama-queue.py",
+  "escalate",
+  "b1b085738769",
+  "--reason",
+  "verdict=concerns; findings from review are not a decidable, model-actionable failure | repair history: r0=1 finding(s) [review]; models tried: qwen3.6-35b-a3b-vl-mtp-mxfp8",
+  "--category",
+  "other",
+  "--coordinator-model",
+  "auto-fix-ladder",
+  "--gate-output",
+  "/Users/user/bin/ollama-queue-logs/b1b085738769.gate.json"
+ ],
+ "auto_fix_escalated": true,
+ "auto_fix_escalate_status": "parked-needs_opus",
+ "auto_pipeline_stage": "code",
+ "auto_pipeline_action": "none",
+ "auto_pipeline_policy": null,
+ "auto_pipeline_reasons": [
+  "coding job not a clean terminal PASS; nothing to apply"
+ ],
+ "auto_pipeline_mode": "shadow",
+ "slice_autofeed": {
+  "action": "redispatch",
+  "reason": "slice job of plan 'chat-fixes3' reached RED verdict 'concerns' (verify not green) -- re-dispatching the owning plan so its bounded retry / needs_opus escalation runs instead of parking the slice dead"
+ },
+ "runstatus_janitor_mode": "shadow",
+ "runstatus_janitor": {
+  "self": {
+   "action": "surface",
+   "category": "live",
+   "reason": "status 'needs_opus' is not terminal (live/active chain)"
+  },
+  "superseded": [
+   {
+    "id": "5b9c49200a1b",
+    "label": "auto-author-chat-fixes3-s2-collect-results"
+   },
+   {
+    "id": "c34397dec6d6",
+    "label": "auto-refine-chat-fixes3-s2-collect-results-r1"
+   },
+   {
+    "id": "9251fec98c72",
+    "label": "auto-author-chat-fixes3-s2-collect-results"
+   }
+  ]
+ },
+ "runstatus_janitor_done": true
+}

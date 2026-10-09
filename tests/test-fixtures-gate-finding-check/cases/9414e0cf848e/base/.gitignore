@@ -1,0 +1,13 @@
+credentials/*.yml
+credentials/*.yaml
+!credentials/*.example
+output/*.json
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+*.log
+.DS_Store
+data/
+
+.memsearch/

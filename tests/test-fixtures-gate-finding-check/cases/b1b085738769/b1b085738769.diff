@@ -1,0 +1,49 @@
+diff --git a/dashboard_chat.py b/dashboard_chat.py
+index fb62dea..a69dd1c 100644
+--- a/dashboard_chat.py
++++ b/dashboard_chat.py
+@@ -401,6 +401,36 @@ def start_direct(session_id, message_index):
+     threading.Thread(target=job, args=(session_id, message_index), daemon=True).start()
+ 
+ 
++def collect_job_results(base_dir: str, session_id: str) -> int:
++    """Check for completed job ANSWER.md files and update queued assistant messages.
++
++    Returns the number of messages updated (0 if none or session missing/invalid).
++    """
++    try:
++        validate_session_id(session_id)
++    except ValueError:
++        return 0
++    try:
++        session = read_session(base_dir, session_id)
++    except (ValueError, FileNotFoundError):
++        return 0
++    messages = session.get("messages", [])
++    updated = 0
++    for i, msg in enumerate(messages):
++        if msg.get("role") == "assistant" and msg.get("status") == "queued":
++            job_dir = Path(base_dir) / "jobs" / f"{session_id}-{i}"
++            answer_file = job_dir / "ANSWER.md"
++            if answer_file.exists():
++                text = answer_file.read_text()
++                if text:
++                    msg["content"] = text
++                    msg["status"] = "done"
++                    updated += 1
++    if updated > 0:
++        write_session(base_dir, session_id, session)
++    return updated
++
++
+ def handle(method: str, path: str, query: dict, body_bytes: bytes) -> tuple[int, dict, bytes]:
+     """Server-independent routing for chat endpoints.
+ 
+@@ -580,6 +610,7 @@ def handle(method: str, path: str, query: dict, body_bytes: bytes) -> tuple[int,
+             # GET /api/chat/sessions/<id>
+             if method == "GET":
+                 try:
++                    collect_job_results(base_dir, session_id)
+                     session = read_session(base_dir, session_id)
+                     return (200, {"Content-Type": "application/json"}, json.dumps(session).encode())
+                 except (ValueError, FileNotFoundError) as e:

@@ -1,0 +1,61 @@
+{
+  "mode": "review",
+  "model": "qwen3.6-35b-a3b-vl-mtp-mxfp8",
+  "num_ctx": 65536,
+  "target": "lib/rivian.ts",
+  "intent": "# TASK: ev-service-screen-1-rivian-service-s4-normalize-snapshot\n## Confirmed defect (observed, not suspected)\n\nRivian's service data is available via `fetchRivianServiceState` but is dormant\n(gated behind `RIVIAN_SERVICE_MODE=1`) and returns raw, un-normalized data\n(`RivianServiceState` with `threads`, `lineItems`, `timing` arrays). There is no\nnormalized snapshot type that the UI can consume with the correct field mappings\n(`inService`, `apptNumber`, `requests` with status categories, `completedAt`,\n`dropoffStartIso`, etc.). The UI layer has no way to derive a clean \"in service\"\nboolean, appointment number, or request status list from the raw data without\nre-implementing the same logic in every caller.\n## Entry point\n\nlib/rivian.ts (append after existing `pickActiveWorkOrder`)\n## Required change\n\nExport type RivianServiceSnapshot = { inService: boolean; apptNumber: string | null; workOrderType: string | null; serviceCenterName: string | null; statusText: string | null; requests: { label: string; status: 'active' | 'queued' | 'done' }[]; done: number; total: number; completedAt: string | null; dropoffStartIso: string | null; estReady: null; fetchedAt: string }. Export function normalizeRivianServiceState(input: { threads: unknown; requests: unknown; workOrder: unknown; serviceCenterName?: string | null; statusText?: string | null; now?: Date }): RivianServiceSnapshot. Rules: active = pickActiveWorkOrder(input.threads). completedAt = String(workOrder.completedAt) when workOrder is an object with a non-null completedAt, else null. inService = active !== null && completedAt === null. apptNumber = formatApptNumber(active?.workOrderId) (null when no active). requests = (Array.isArray(input.requests) ? input.requests : []) filtered to objects whose String(title).trim() is non-empty, mapped to { label: title trimmed, status: mapServiceRequestStatus(item.status) }, original order preserved. total = requests.length; done = count of status 'done'. dropoffStartIso = workOrder.appointmentStartAtIso as string or null. serviceCenterName/statusText pass through from input (null default) -- there is no confirmed Rivian field for either; do not invent field names. estReady is ALWAYS null (Rivian exposes no ETA). fetchedAt = (input.now ?? new Date()).toISOString(). When inService is false, still return requests/done/total (empty arrays are fine).\n\nBehaviour that must NOT change:\n- `pickActiveWorkOrder` still works (existing export, unchanged)\n- `formatApptNumber` still works (existing export, unchanged)\n- `mapServiceRequestStatus` still works (existing export, unchanged)\n- All existing exports (`fetchRivianServiceState`, `fetchRivianServiceThreads`,\n  `fetchRivianServiceLineItems`, `fetchRivianWorkOrderTiming`, etc.) remain\n  intact and functional\n- `rivianServiceModeEnabled()` gate remains unchanged\n## Must contain\n\n- `normalizeRivianServiceState`\n- `RivianServiceSnapshot`\n- `inService: boolean`\n- `apptNumber: string | null`\n- `workOrderType: string | null`\n- `serviceCenterName: string | null`\n- `statusText: string | null`\n- `requests: { label: string; status: 'active' | 'queued' | 'done' }[]`\n- `done: number`\n- `total: number`\n- `completedAt: string | null`\n- `dropoffStartIso: string | null`\n- `estReady: null`\n- `fetchedAt: string`\n- `pickActiveWorkOrder`\n- `formatApptNumber`\n- `mapServiceRequestStatus`\n\n(The gate holds the reference impl against this list. If the verify goes green\nwhile one of these is absent from the changed files, the verify does not\nenforce the spec -- that is a benign verify, caught mechanically.)\n\n(A bare bullet checks the default target. To PIN a literal to a specific file --\nuseful when a fix spans a helper file and the route/wiring that calls it --\nprefix the bullet with `in <path>:`, e.g.\n`- in app/api/x/route.ts: ` followed by a backtick-quoted token. Then that\ntoken is required in THAT file, not the target.)\n## Loop instruction\n\nRun `bash verify.sh` after every edit and keep editing until it prints\n`VERIFY_OK`.\n\n[2 section(s) omitted to fit the review window]",
+  "findings": [
+    {
+      "hunk": 1,
+      "path": "lib/rivian.ts",
+      "quote": "const active = pickActiveWorkOrder(input.threads);",
+      "severity": "high",
+      "claim": "normalizeRivianServiceState does not validate that input.threads is an array before passing it to pickActiveWorkOrder, causing a runtime TypeError if threads is null, undefined, or a non-array object.",
+      "failure_scenario": "A user has no active work order and the API returns `threads: null` (or `undefined`). The call to `pickActiveWorkOrder(null)` executes `for (const thread of threads)` which throws `TypeError: threads is not iterable`. The UI receives an unhandled exception instead of a valid snapshot with `inService: false` and empty requests, potentially crashing the service status view.",
+      "verdict": "UNSURE",
+      "downgraded_from": "NOT_A_DEFECT",
+      "verdict_reason": "The finding claims that `pickActiveWorkOrder(input.threads)` throws a TypeError when `input.threads` is null/undefined/non-array. However, the diff hunk only shows the NEW code (`normalizeRivianServiceState`) and the end of `pickActiveWorkOrder`. It does NOT show the implementation of `pickActiveWorkOrder`. The finding assumes `pickActiveWorkOrder` is naive and iterates directly over its argument without validation. If `pickActiveWorkOrder` (the existing function) already handles null/undefined/non-array inputs gracefully (e.g., by returning null or an empty array), then the claim is false. Without seeing `pickActiveWorkOrder`'s implementation, we cannot confirm the defect. However, looking at the context, `pickActiveWorkOrder` is an existing export. The finding is about a NEW function calling an EXISTING one. The risk is entirely dependent on the existing function's robustness. If the existing function is robust, there is no defect. If it is not, the defect exists in the existing function, not this change (though this change exposes it). The finding states 'causing a runtime TypeError... if threads is null'. This implies the change *introduces* the defect. If `pickActiveWorkOrder` already crashed on null, the change didn't introduce the crash, it just called it. But more likely, `pickActiveWorkOrder` handles nulls. Let's look at the variable `active`. It is used as `active !== null`. This suggests `pickActiveWorkOrder` returns null on failure. If it threw, `active` wouldn't be assigned. The fact that the code checks `active !== null` strongly implies `pickActiveWorkOrder` is designed to return null for invalid inputs, not throw. Therefore, the claim that it throws is likely incorrect based on the usage pattern of the return value.",
+      "concrete_trigger": "",
+      "probe": "Assume `pickActiveWorkOrder` behaves according to its usage in `normalizeRivianServiceState`: it returns `null` when no active work order is found or input is invalid. If `input.threads` is `null`, `undefined`, or a non-array, `pickActiveWorkOrder` returns `null`. Then `active` is `null`. `completedAt` is `null`. `inService` is `false`. `apptNumber` is `null`. The function returns a valid snapshot. The finding claims a TypeError is thrown. This contradicts the defensive coding style of the rest of the function (checking `input.workOrder != null`, etc.). If `pickActiveWorkOrder` threw, the error would propagate, but the existence of the `active !== null` check suggests it doesn't throw. Without the source of `pickActiveWorkOrder`, we rely on the usage. The usage `const active = pickActiveWorkOrder(input.threads);` followed by `if (active !== null ...)` is the standard pattern for a function that returns null on failure rather than throwing. Thus, the finding's claim that it throws is likely false.",
+      "probe_shows_difference": false
+    }
+  ],
+  "causes": [],
+  "stats": {
+    "quote_rejected": 0,
+    "no_failure_scenario": 0,
+    "review_parse_fail": 0,
+    "verify_parse_fail": 0,
+    "diagnose_parse_fail": 0,
+    "unfalsifiable": 0,
+    "probe_unsound": 1,
+    "verdict_unsure": 1,
+    "high_severity_rescued": 1
+  },
+  "model_calls": 2,
+  "elapsed_s": 112.9,
+  "darkbloom_stats": {
+    "calls": 2,
+    "prompt_tokens": 6426,
+    "completion_tokens": 848,
+    "seconds": 13.93,
+    "schema_422": 1,
+    "schema_dropped": 0,
+    "schema_rungs": {
+      "relaxed": 1,
+      "strict": 1
+    },
+    "schema_violations": [
+      {
+        "rung": "relaxed",
+        "schema_keys": [
+          "findings"
+        ],
+        "violation": "none -- output validates locally",
+        "finish_reason": "stop",
+        "out_head": "{\n  \"findings\": [\n    {\n      \"quote\": \"  const active = pickActiveWorkOrder(input.threads);\",\n     "
+      }
+    ],
+    "tok_s": 60.9
+  }
+}

@@ -1,0 +1,25 @@
+services:
+  award-search:
+    build: .
+    networks:
+      - award-net
+    volumes:
+      - ./credentials:/app/credentials:ro
+    environment:
+      - SEATS_AERO_API_KEY=${SEATS_AERO_API_KEY:-}
+      - AWARDWALLET_API_KEY=${AWARDWALLET_API_KEY:-}
+      - AWARDWALLET_USER_ID=${AWARDWALLET_USER_ID:-}
+      - SERPAPI_API_KEY=${SERPAPI_API_KEY:-}
+      - PUSHOVER_APP_TOKEN=${PUSHOVER_APP_TOKEN:-}
+      - PUSHOVER_USER_KEY=${PUSHOVER_USER_KEY:-}
+    restart: unless-stopped
+
+networks:
+  award-net:
+    driver: macvlan
+    driver_opts:
+      parent: br0
+    ipam:
+      config:
+        - subnet: 198.51.100.137/20
+          gateway: 198.51.100.110

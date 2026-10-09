@@ -1,0 +1,163 @@
+{
+ "verdict": "fail",
+ "issues": [
+  {
+   "severity": "high",
+   "file": "broker_guard/brokers.py",
+   "line": 30,
+   "what": "The code assumes `out[\"id\"]` is a string and calls `.lower()` on it, but the contract explicitly sta",
+   "source": "review",
+   "category": "code"
+  },
+  {
+   "severity": "medium",
+   "file": "broker_guard/brokers.py",
+   "line": 19,
+   "what": "The guard `elif rid not in seen:` was deleted, making `raise ValueError(` unconditional. The fall-th",
+   "source": "review",
+   "category": "code"
+  }
+ ],
+ "counts": {
+  "code_high": 1,
+  "code": 2,
+  "input": 0,
+  "total": 2
+ },
+ "not_checked": [],
+ "review_verdict": "FAIL",
+ "verify_exit_reported": 0,
+ "verify_quality_exit": 0,
+ "diff_source": "git diff HEAD",
+ "launch_baseline": {
+  "head": "e39d44d732b2b3f5ed6daac5d1e6ffff43541019",
+  "dirty": 0
+ },
+ "verify_relevance": {
+  "verdict": "relevant",
+  "score": 1.0,
+  "threshold": 0.8,
+  "mutant_score": 1.0,
+  "site_score": 1.0,
+  "site_coverage": 1.0,
+  "killed": 25,
+  "survived": 0,
+  "evidence_mutants": 25,
+  "generated": 31,
+  "literal_breaking": 6,
+  "crash_kills": 0,
+  "truncated": false,
+  "untried_sites": [],
+  "unexercised_sites": [],
+  "reason": "verify killed 25/25 property-breaking mutants of the reference impl",
+  "seconds": 1.81,
+  "survivors": [],
+  "source": "gate-applied",
+  "verify": "bash verify.sh"
+ },
+ "review_tier": "pregate",
+ "review_model": "qwen3:14b",
+ "review_host": "unraid",
+ "review": "done",
+ "review_label": "gate-813d71882974",
+ "review_dir": "/Users/user/bin/ollama-queue-logs/813d71882974-review",
+ "job_id": "813d71882974",
+ "ts": "2026-09-19T05:51:00Z",
+ "advisory": true,
+ "job_status": "done",
+ "job_label": "bg-brokers-s1-load-s1-url-else-valueerror-norm",
+ "job_model": "qwen3.8:27b-q4_K_M",
+ "job_cwd": "/Users/user/.ollama-dispatch/worktrees/wt-slice-bg-brokers-s1-load-s1-url-else-valueerror-norm",
+ "job_host": "studio",
+ "job_verify": "bash verify.sh",
+ "job_exit_code": 0,
+ "verify_failed_at_baseline": true,
+ "job_preflight": "preflight-verify-ok (baseline fails as designed)",
+ "scored_arm": false,
+ "task_intent": "TASK: bg-brokers-s1-load-s1-url-else-valueerror-norm",
+ "signoff_required": false,
+ "signoff_reviewer": "",
+ "signoff_verdict": null,
+ "pregate_verdict": "concerns",
+ "pregate_review_verdict": "FAIL",
+ "regate": "done",
+ "regate_label": "regate-813d71882974",
+ "gate_authority": "studio-27b-regate",
+ "auto_fix_class": "reviewer-code-high",
+ "auto_fix_action": "escalate",
+ "auto_fix_reasons": [
+  "reviewer flagged a code high with no red verify (false-FAIL class); GATE_AUTOFIX_TRUST_REVIEWER off"
+ ],
+ "auto_fix_round": 0,
+ "auto_fix_root": "813d71882974",
+ "auto_fix_mode": "live",
+ "models_tried": [
+  "qwen3.8:27b-q4_K_M"
+ ],
+ "auto_fix_history": "repair history: r0=2 finding(s) [review]; models tried: qwen3.8:27b-q4_K_M",
+ "auto_fix_escalate_category": "other",
+ "auto_fix_escalate_cmd": [
+  "python3",
+  "/Users/user/bin/ollama-queue.py",
+  "escalate",
+  "813d71882974",
+  "--reason",
+  "reviewer flagged a code high with no red verify (false-FAIL class); GATE_AUTOFIX_TRUST_REVIEWER off | repair history: r0=2 finding(s) [review]; models tried: qwen3.8:27b-q4_K_M",
+  "--category",
+  "other",
+  "--coordinator-model",
+  "auto-fix-ladder",
+  "--gate-output",
+  "/Users/user/bin/ollama-queue-logs/813d71882974.gate.json"
+ ],
+ "auto_fix_escalated": true,
+ "auto_fix_escalate_status": "parked-needs_opus",
+ "escalation_triage": {
+  "action": "park",
+  "class": "not-a-proven-intended-removal",
+  "reasons": [
+   "flagged literal is NOT a line this diff removed -- it is live/added code: 'out[\"id\"] = out[\"id\"].lower()'"
+  ],
+  "citations": [
+   {
+    "quote": "out[\"id\"] = out[\"id\"].lower()",
+    "removed": false,
+    "readded": true,
+    "contract_cite_chars": 8,
+    "cites_contract": false
+   }
+  ]
+ },
+ "escalation_triage_mode": "shadow",
+ "escalation_triage_done": true,
+ "auto_pipeline_stage": "code",
+ "auto_pipeline_action": "none",
+ "auto_pipeline_policy": null,
+ "auto_pipeline_reasons": [
+  "coding job not a clean terminal PASS; nothing to apply"
+ ],
+ "auto_pipeline_mode": "shadow",
+ "slice_autofeed": {
+  "action": "skip",
+  "reason": "verdict 'fail' is not advanceable (needs one of pass, skipped)"
+ },
+ "runstatus_janitor_mode": "shadow",
+ "runstatus_janitor": {
+  "self": {
+   "action": "surface",
+   "category": "live",
+   "reason": "status 'needs_opus' is not terminal (live/active chain)"
+  },
+  "superseded": [
+   {
+    "id": "d08d403ac6ed",
+    "label": "auto-author-bg-brokers-s1-load-s1-url-else-valueerror-norm"
+   },
+   {
+    "id": "dba4899f42ac",
+    "label": "auto-author-bg-brokers-s1-load-s1-url-else-valueerror-norm"
+   }
+  ]
+ },
+ "runstatus_janitor_done": true
+}

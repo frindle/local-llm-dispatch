@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+"""ollama-dispatch-manual -- hand the dispatch pipeline raw material, not a form.
+
+Pick a repo, then paste an error, describe what's wrong / what you want, or give a
+screenshot path. A short qwen scoping call (via ollama-queue.py) turns that into
+the --target / --intent / --interface / --label / --lang that ollama-dispatch-auto
+needs; if it can't do so confidently it asks you ONE specific question and tries
+again. You confirm or edit the draft before the real dispatch runs.
+"""
+
+import argparse
+import base64
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+SELF = os.path.abspath(__file__)
+HOME = Path.home()
+AUTO = HOME / "bin" / "ollama-dispatch-auto"
+QUEUE = str(HOME / "bin" / "ollama-queue.py")
+QUEUE_STATE = HOME / "bin" / "ollama-queue-state.json"
+LOG_DIR = HOME / "bin" / "ollama-queue-logs"
+SCRATCH_ROOT = Path(tempfile.gettempdir()) / "ollama-dispatch-manual"
+
+DEFAULT_MODEL = "qwen3.8:27b-q4_K_M"
+DEFAULT_HOST = "auto"
+def _default_ollama_host():
+    # Studio no longer runs Ollama (dispatch moved to Darkbloom, 2026-10-01); the only
+    # Ollama left is Unraid's, from the live hosts table.
+    try:
+        return json.load(open(os.path.expanduser("~/.ollama-dispatch/hosts.json")))["hosts"]["unraid"]["url"]
+    except Exception:
+        return "http://localhost:11434"
+
+
+OLLAMA_LOCAL = os.environ.get("OLLAMA_HOST", _default_ollama_host())
+if not OLLAMA_LOCAL.startswith("http"):
+    OLLAMA_LOCAL = "http://" + OLLAMA_LOCAL
+
+SOURCE_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs",
+               ".sh", ".rb", ".swift", ".java", ".kt", ".c", ".h", ".cpp", ".hpp",
+               ".cs", ".php", ".lua", ".sql", ".html", ".css", ".vue", ".svelte"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+LANGS = {"python", "ts", "js"}
+EXT_LANG = {".py": "python", ".ts": "ts", ".tsx": "ts", ".js": "js", ".jsx": "js",
+            ".mjs": "js", ".cjs": "js"}
+STOPWORDS = {"a", "an", "the", "to", "of", "in", "on", "for", "and", "or", "is",
+             "it", "be", "so", "that", "this", "with", "when", "i", "we", "my",
+             "add", "fix", "make", "should", "not", "does", "but", "at", "from"}
+MAX_FILES_IN_PROMPT = 400
+END_MARK = "."
+
+# Advanced ollama-dispatch-auto flags offered only if you ask for them.
+ADVANCED = [
+    ("--dest", True, "worktree location"),
+    ("--model", True, "authoring model tag"),
+    ("--host", True, "ollama host"),
+    ("--num-ctx", True, "context window (default computed)"),
+    ("--bundle", True, "queue bundle tag"),
+    ("--max-rounds", True, "preflight<->refine rounds"),
+    ("--max-tokens", True, "per-turn output token cap"),
+    ("--require", True, "extra Must-contain literal (comma-separate several)"),
+    ("--force", False, "overwrite an existing dir"),
+    ("--no-auto-slice", False, "disable auto-slicing"),
+    ("--auto-slice", False, "force auto-slicing"),
+]
+
+
+class Abort(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# tiny I/O helpers
+# --------------------------------------------------------------------------
+def ask(prompt, default=None):
+    suffix = f" [{default}]" if default else ""
+    try:
+        val = input(f"{prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise Abort
+    return val or (default or "")
+
+
+def ask_multiline(prompt):
+    """Read until a line that is just '.' (or EOF). Ctrl-C aborts."""
+    print(f"{prompt}")
+    print(f"  (paste freely; finish with a line containing only '{END_MARK}')")
+    lines = []
+    try:
+        while True:
+            line = input()
+            if line.strip() == END_MARK:
+                break
+            lines.append(line)
+    except EOFError:
+        if not lines:
+            raise Abort
+    except KeyboardInterrupt:
+        raise Abort
+    return "\n".join(lines).strip()
+
+
+def hr():
+    print("-" * min(shutil.get_terminal_size((80, 20)).columns, 80))
+
+
+def capture(cmd, cwd=None, timeout=None):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+def slugify(s, n=40):
+    s = re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")
+    return s[:n].rstrip("-") or "job"
+
+
+def _tokens(s):
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+    return {t for t in re.findall(r"[a-z0-9]+", s.lower()) if t not in STOPWORDS}
+
+
+# --------------------------------------------------------------------------
+# repo
+# --------------------------------------------------------------------------
+def is_git_repo(path):
+    try:
+        return capture(["git", "-C", str(path), "rev-parse", "--git-dir"])[0] == 0
+    except OSError:
+        return False
+
+
+def ask_repo(pre):
+    if pre.repo:
+        p = Path(pre.repo).expanduser()
+        if not is_git_repo(p):
+            raise SystemExit(f"--repo {pre.repo}: not an existing git repo")
+        return str(p.resolve())
+    while True:
+        p = ask("Which repo? (path to the project you're working in)")
+        if not p:
+            print("  -> required")
+            continue
+        path = Path(p).expanduser()
+        if not path.is_dir():
+            print(f"  -> {path} does not exist or is not a directory")
+            continue
+        if not is_git_repo(path):
+            print(f"  -> {path} is not a git repo")
+            continue
+        return str(path.resolve())
+
+
+def tracked_source_files(repo):
+    rc, out, _ = capture(["git", "-C", repo, "ls-files", "-z"])
+    if rc != 0:
+        return []
+    return sorted(f for f in out.split("\0") if f and Path(f).suffix.lower() in SOURCE_EXTS)
+
+
+def files_for_prompt(files, material):
+    """All tracked source files if the repo is modest; otherwise the ones that
+    overlap the material's keywords plus a directory summary."""
+    if len(files) <= MAX_FILES_IN_PROMPT:
+        return files, None
+    want = _tokens(material)
+    scored = sorted(((len(want & _tokens(f)), f) for f in files), key=lambda x: (-x[0], x[1]))
+    keep = [f for s, f in scored if s > 0][:MAX_FILES_IN_PROMPT]
+    dirs = sorted({str(Path(f).parent) for f in files})
+    return keep, dirs
+
+
+# --------------------------------------------------------------------------
+# screenshots -> text (vision model, direct local Ollama call)
+# --------------------------------------------------------------------------
+# NOTE: the queue worker has no image channel, so this is the one GPU call in
+# the pipeline that does NOT go through ollama-queue.py. It is a single short
+# describe() against the LOCAL Ollama and runs before anything is enqueued.
+def find_vision_model(pref):
+    if pref and pref.lower() == "none":
+        return None
+    if pref and pref.lower() != "auto":
+        return pref
+    rc, out, _ = capture(["ollama", "list"])
+    if rc != 0:
+        return None
+    names = [ln.split()[0] for ln in out.splitlines()[1:] if ln.strip()]
+    vis = [n for n in names if re.search(r"vl|llava|vision|minicpm-v|moondream", n, re.I)]
+    vis.sort(key=lambda n: (0 if "qwen3-vl" in n else 1, n))
+    return vis[0] if vis else None
+
+
+def describe_image(path, model):
+    b64 = base64.b64encode(Path(path).read_bytes()).decode()
+    body = json.dumps({
+        "model": model, "stream": False,
+        "messages": [{"role": "user", "images": [b64], "content":
+                      "This is a screenshot from a developer. Transcribe any error "
+                      "messages, stack traces, log lines or UI text VERBATIM, then "
+                      "describe in 2-3 sentences what the screen shows and what looks "
+                      "wrong. No speculation about causes."}],
+    }).encode()
+    req = urllib.request.Request(f"{OLLAMA_LOCAL}/api/chat", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.load(r)["message"]["content"].strip()
+
+
+def ingest_raw(raw, transcript, vision_model):
+    """Split the owner's paste into text + screenshot paths; describe the images."""
+    text_lines, images = [], []
+    for ln in raw.splitlines():
+        cand = Path(ln.strip().strip("'\"")).expanduser()
+        if ln.strip() and cand.suffix.lower() in IMAGE_EXTS and cand.is_file():
+            images.append(cand)
+        else:
+            text_lines.append(ln)
+    text = "\n".join(text_lines).strip()
+    if text:
+        transcript.append(("USER", text))
+    for img in images:
+        if not vision_model:
+            print(f"\nI can't read images yet -- no vision-capable model is installed "
+                  f"locally (ollama list). ({img.name})")
+            desc = ask_multiline("Can you describe what's in the screenshot?")
+            if desc:
+                transcript.append(("USER", f"[describing screenshot {img.name}] {desc}"))
+            continue
+        print(f"  reading {img.name} with {vision_model} ...")
+        try:
+            desc = describe_image(img, vision_model)
+        except Exception as e:  # noqa: BLE001
+            print(f"  vision call failed ({e}).")
+            desc = ask_multiline("Can you describe what's in the screenshot instead?")
+            transcript.append(("USER", f"[describing screenshot {img.name}] {desc}"))
+            continue
+        print("  screenshot says:")
+        for ln in desc.splitlines()[:12]:
+            print(f"    {ln}")
+        transcript.append(("SCREENSHOT " + img.name, desc))
+
+
+# --------------------------------------------------------------------------
+# the scoping call
+# --------------------------------------------------------------------------
+SCOPE_SHAPE = """{
+  "confident": true,
+  "question": null,
+  "target": "<relative path from the list, or a NEW path inside an existing dir>",
+  "new_file": false,
+  "intent": "<ONE line: the observable behaviour that must hold after the change>",
+  "interface": "<optional: routes / function signatures / libraries involved, or ''>",
+  "label": "<kebab-case, <= 40 chars>",
+  "lang": "<python | ts | js>"
+}"""
+
+
+def build_scope_prompt(repo, transcript, files, dirs):
+    convo = "\n\n".join(f"### {who}\n{txt}" for who, txt in transcript)
+    flist = "\n".join(files) if files else "(no tracked source files)"
+    dirsec = ""
+    if dirs:
+        dirsec = ("\nThe repo is large; only files whose names overlap the request are "
+                  "listed above. All source directories:\n" + "\n".join(dirs) + "\n")
+    return f"""\
+# TASK: scope a developer's raw report into ONE dispatchable coding job
+
+You are writing `scope.json` in THIS directory -- nothing else. You are NOT in
+the repo and must not try to edit it. Your job is to read what the developer
+pasted (errors, descriptions, screenshot transcriptions, answers to earlier
+questions) and decide the single file to change and the one-line property the
+change must satisfy. That property becomes the goal an automated test harness
+pins, so it must be concrete and observable ("GET /health returns 200 with
+{{"ok": true}}"), not a vague wish ("make it work").
+
+## What the developer gave you (in order)
+{convo}
+
+## The repo
+path: {repo}
+tracked source files:
+{flist}
+{dirsec}
+## Output: write scope.json with EXACTLY this shape
+{SCOPE_SHAPE}
+
+Rules:
+  * "target" MUST be one of the listed files, OR set "new_file": true and give a
+    path inside a directory that already appears in the list.
+  * "intent" is one sentence, >= 20 chars, plain English, states the behaviour
+    to pin. Do not restate the error; state what should be TRUE afterwards.
+  * If you cannot confidently pick ONE target file, or the request is too vague
+    or bundles several unrelated changes, DO NOT GUESS: write
+    {{"confident": false, "question": "<one narrow question whose answer would let
+    you decide>"}} and leave the other fields out or null. Ask about the single
+    most blocking unknown; do not ask a list.
+  * Only ask a question if the answer is genuinely needed -- if the paste already
+    names the file and the failure, be confident.
+
+## Self-check before you finish
+Run `bash verify.sh` here. It validates scope.json against the rules above and
+prints every defect. Fix scope.json until it prints GATE: CLEAN.
+"""
+
+
+def gate(scope_path, files_path):
+    """Deterministic structural check of scope.json. Prints defects; rc 1 if any."""
+    defects = []
+    try:
+        d = json.loads(Path(scope_path).read_text())
+        if not isinstance(d, dict):
+            raise ValueError("top level is not an object")
+    except Exception as e:  # noqa: BLE001
+        print(f"  - [BAD_JSON] {scope_path} is not a JSON object ({e}). Write ONLY the JSON.")
+        return 1
+    files = set(Path(files_path).read_text().splitlines()) if Path(files_path).is_file() else set()
+    conf = d.get("confident")
+    if not isinstance(conf, bool):
+        defects.append(("NO_CONFIDENT", '"confident" must be true or false'))
+    if conf is False:
+        q = d.get("question")
+        if not isinstance(q, str) or len(q.strip()) < 10:
+            defects.append(("NO_QUESTION", 'confident=false requires a specific "question"'))
+    elif conf is True:
+        t = d.get("target")
+        if not isinstance(t, str) or not t.strip():
+            defects.append(("NO_TARGET", '"target" is required when confident'))
+        else:
+            if Path(t).is_absolute() or t.startswith("../"):
+                defects.append(("ABS_TARGET", f'"target" {t!r} must be relative to the repo'))
+            elif t not in files and files:
+                if not d.get("new_file"):
+                    defects.append(("UNKNOWN_TARGET",
+                                    f'"target" {t!r} is not a tracked file; if it is new, set "new_file": true'))
+                else:
+                    parent = str(Path(t).parent)
+                    dirs = {str(Path(f).parent) for f in files}
+                    if parent not in dirs:
+                        defects.append(("NEW_FILE_ORPHAN_DIR",
+                                        f'new file {t!r} is not inside an existing source dir'))
+        it = d.get("intent")
+        if not isinstance(it, str) or len(it.strip()) < 20:
+            defects.append(("THIN_INTENT", '"intent" must be one sentence of >= 20 chars'))
+        elif "\n" in it.strip():
+            defects.append(("MULTILINE_INTENT", '"intent" must be ONE line'))
+        lg = d.get("lang")
+        if lg is not None and lg not in LANGS:
+            defects.append(("BAD_LANG", f'"lang" must be one of {sorted(LANGS)} or null'))
+        lb = d.get("label")
+        if lb is not None and not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,39}", str(lb)):
+            defects.append(("BAD_LABEL", '"label" must be kebab-case, <= 40 chars, or null'))
+    for c, m in defects:
+        print(f"  - [{c}] {m}")
+    if defects:
+        return 1
+    print("GATE: CLEAN")
+    return 0
+
+
+def job_row(job):
+    try:
+        d = json.loads(QUEUE_STATE.read_text())
+        return next((j for j in (d.get("jobs") or []) if str(j.get("id")).startswith(job)), None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sidecar_status(job):
+    for base in (LOG_DIR, LOG_DIR / "archive"):
+        for p in [base / f"{job}.done.json"] + \
+                 [Path(x) for x in sorted(glob.glob(str(base / f"*{job}*.done.json")))]:
+            if p.is_file():
+                try:
+                    st = str(json.loads(p.read_text()).get("status") or "done")
+                except Exception:  # noqa: BLE001
+                    continue
+                return "done" if st == "done" else "failed"
+    return None
+
+
+def run_scoping(scratch, prompt, label, a):
+    """One scoping round through the queue (or --scoper-cmd). Returns (ok, why)."""
+    tf = scratch / "SCOPE-TASK.md"
+    tf.write_text(prompt)
+    (scratch / "verify.sh").write_text(
+        "#!/usr/bin/env bash\nexec python3 " + shlex.quote(SELF) +
+        " --gate scope.json --files files.txt\n")
+    (scratch / "verify.sh").chmod(0o755)
+    sj = scratch / "scope.json"
+    if sj.exists():
+        sj.unlink()
+
+    if a.scoper_cmd:
+        rc, out, err = capture(["bash", "-lc", a.scoper_cmd], cwd=str(scratch), timeout=600)
+        return (rc == 0, f"--scoper-cmd exited {rc}: {(err or out).strip()[-400:]}")
+
+    cmd = [sys.executable, QUEUE, "enqueue", "--model", a.model, "--host", a.host,
+           "--cwd", str(scratch), "--allow-unisolated", "--task-file", str(tf),
+           "--task-kind", "coding", "--verify", "bash verify.sh",
+           "--max-iters", "6", "--chat-timeout", "1200", "--label", label]
+    rc, out, err = capture(cmd)
+    if rc != 0 and "enqueued " not in (out or ""):
+        return False, f"enqueue failed (rc={rc}): {(err or out).strip()[-500:]}"
+    m = re.search(r"\benqueued\s+([0-9a-f]{8,})\b", out or "") or \
+        re.search(r"\b([0-9a-f]{12})\b", out or "")
+    if not m:
+        return False, f"could not read a job id from: {(out or '').strip()[:300]}"
+    job = m.group(1)
+    print(f"  queued scoping job {job} ({label}); waiting (Ctrl-C to cancel) ...")
+    gone_since, last = None, None
+    while True:
+        time.sleep(10)
+        row = job_row(job)
+        if not row:
+            side = sidecar_status(job)
+            if side == "done":
+                return True, f"job {job} done"
+            if side == "failed":
+                return False, f"job {job} failed"
+            gone_since = gone_since or time.time()
+            if time.time() - gone_since > 300:
+                return False, f"job {job} vanished from the queue without a terminal state"
+            continue
+        gone_since = None
+        st = row.get("status")
+        if st != last:
+            print(f"  {job}: {st}")
+            last = st
+        if st == "done":
+            return True, f"job {job} done"
+        if st in ("failed", "cancelled", "error", "blocked"):
+            return False, f"job {job} {st} (exit {row.get('exit_code')})"
+
+
+def read_scope(scratch, files):
+    sj = scratch / "scope.json"
+    if not sj.is_file():
+        return None
+    try:
+        d = json.loads(sj.read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    return d if isinstance(d, dict) else None
+
+
+# --------------------------------------------------------------------------
+# the conversation loop
+# --------------------------------------------------------------------------
+def show_draft(d):
+    hr()
+    print("Draft dispatch:")
+    print(f"  target:    {d.get('target')}{'   (new file)' if d.get('new_file') else ''}")
+    print(f"  intent:    {d.get('intent')}")
+    print(f"  interface: {d.get('interface') or '(none)'}")
+    print(f"  label:     {d.get('label') or '(auto)'}")
+    print(f"  lang:      {d.get('lang') or '(auto)'}")
+    hr()
+
+
+def edit_draft(d):
+    print("Edit -- blank keeps the drafted value.")
+    for k in ("target", "intent", "interface", "label", "lang"):
+        v = ask(f"  {k}", d.get(k) or None)
+        d[k] = v
+    return d
+
+
+def scope_loop(repo, a):
+    files = tracked_source_files(repo)
+    transcript = []
+    vision_model = find_vision_model(a.vision_model)
+    scratch = SCRATCH_ROOT / f"{slugify(Path(repo).name)}-{int(time.time())}"
+    scratch.mkdir(parents=True, exist_ok=True)
+
+    print()
+    raw = ask_multiline("What's wrong / what do you want? Paste the error, describe it, "
+                        "or give a screenshot path (one per line).")
+    ingest_raw(raw, transcript, vision_model)
+    rnd = 0
+    while True:
+        if not transcript:
+            raw = ask_multiline("I need something to go on -- an error, a description, or a screenshot.")
+            ingest_raw(raw, transcript, vision_model)
+            continue
+        rnd += 1
+        material = "\n".join(t for _, t in transcript)
+        flist, dirs = files_for_prompt(files, material)
+        (scratch / "files.txt").write_text("\n".join(files))
+        prompt = build_scope_prompt(repo, transcript, flist, dirs)
+        label = f"scope-{slugify(Path(repo).name, 20)}-r{rnd}"
+        print(f"\nScoping (round {rnd}) ...")
+        ok, why = run_scoping(scratch, prompt, label, a)
+        d = read_scope(scratch, files)
+        if not ok or d is None:
+            print(f"  scoping did not produce a usable scope.json ({why}).")
+            more = ask_multiline("Anything you can add to narrow it down? (blank line + '.' to retry as-is)")
+            if more:
+                ingest_raw(more, transcript, vision_model)
+            continue
+
+        if d.get("confident") is not True:
+            q = (d.get("question") or "I need one more detail.").strip()
+            print()
+            print(f"Question: {q}")
+            ans = ask_multiline("Your answer (or a screenshot path)")
+            transcript.append(("ASSISTANT QUESTION", q))
+            ingest_raw(ans, transcript, vision_model)
+            continue
+
+        # confident draft
+        show_draft(d)
+        while True:
+            c = ask("Use this?  y = yes, e = edit fields, r = reject and tell it why, "
+                    "n = cancel", "y").lower()
+            if c.startswith("y"):
+                return d
+            if c.startswith("e"):
+                return edit_draft(d)
+            if c.startswith("r"):
+                why = ask_multiline("What's off about the draft?")
+                transcript.append(("ASSISTANT DRAFT (REJECTED)", json.dumps(d, indent=2)))
+                transcript.append(("USER", f"That draft is wrong: {why}"))
+                break
+            if c.startswith("n"):
+                raise Abort
+            print("  -> y, e, r or n")
+
+
+# --------------------------------------------------------------------------
+# overlap with jobs already in the queue
+# --------------------------------------------------------------------------
+ACTIVE = {"pending", "queued", "running", "scheduled", "held"}
+
+
+def repo_worktrees(repo):
+    """The repo root plus every linked worktree path (where queued jobs run)."""
+    roots = {str(Path(repo).resolve())}
+    rc, out, _ = capture(["git", "-C", repo, "worktree", "list", "--porcelain"])
+    if rc == 0:
+        for ln in out.splitlines():
+            if ln.startswith("worktree "):
+                roots.add(str(Path(ln[9:].strip()).resolve()))
+    return roots
+
+
+def _under(path, roots):
+    try:
+        p = str(Path(path).resolve())
+    except Exception:  # noqa: BLE001
+        return False
+    return any(p == r or p.startswith(r + os.sep) for r in roots)
+
+
+def _job_task_text(job):
+    for cand in (job.get("task_file"), job.get("cwd")):
+        if not cand:
+            continue
+        p = Path(cand)
+        for f in ([p] if p.is_file() else [p / "TASK.md", p / "SCOPE-TASK.md", p / "PLAN-TASK.md"]):
+            if f.is_file():
+                try:
+                    return f.read_text(errors="replace")[:20000]
+                except OSError:
+                    pass
+    return ""
+
+
+def overlapping_jobs(repo, target):
+    """Active queue jobs running in this repo's worktrees that mention the same
+    target file (in their TASK text or label). Reads the queue state file the
+    same way ollama-dispatch-plan does; ODM_QUEUE_STATE overrides it for tests."""
+    state = Path(os.environ.get("ODM_QUEUE_STATE") or QUEUE_STATE)
+    try:
+        jobs = json.loads(state.read_text()).get("jobs") or []
+    except Exception:  # noqa: BLE001
+        return []
+    roots = repo_worktrees(repo)
+    stem = slugify(Path(target).stem) if target else ""
+    hits = []
+    for j in jobs:
+        if str(j.get("status")) not in ACTIVE:
+            continue
+        if not _under(j.get("cwd") or "", roots):
+            continue
+        label = str(j.get("label") or "")
+        same_target = bool(target) and (target in _job_task_text(j)
+                                         or (stem and stem in slugify(label, 200)))
+        if same_target:
+            hits.append((str(j.get("id"))[:12], label, str(j.get("status"))))
+    return hits
+
+
+def warn_overlap(repo, target):
+    hits = overlapping_jobs(repo, target)
+    if not hits:
+        return
+    print()
+    print(f"Note: {len(hits)} job(s) already in the queue against {target} in this repo:")
+    for jid, label, st in hits:
+        print(f"  {jid}  {label}  [{st}]")
+    print("Dispatching now would run alongside them (possible duplicate work).")
+
+
+# --------------------------------------------------------------------------
+def assemble(repo, d):
+    target = (d.get("target") or "").strip()
+    lang = d.get("lang") or EXT_LANG.get(Path(target).suffix.lower()) or None
+    cmd = [str(AUTO), "--repo", repo, "--intent", d["intent"].strip()]
+    if target:
+        cmd += ["--target", target]
+    if (d.get("interface") or "").strip():
+        cmd += ["--interface", d["interface"].strip()]
+    if (d.get("label") or "").strip():
+        cmd += ["--label", d["label"].strip()]
+    if lang and lang != "python":
+        cmd += ["--lang", lang]
+    return cmd
+
+
+def ask_advanced(cmd):
+    print("\nAdvanced flags -- blank keeps ollama-dispatch-auto's default.")
+    for flag, takes_value, hint in ADVANCED:
+        if takes_value:
+            v = ask(f"  {flag}  ({hint})")
+            if not v:
+                continue
+            if flag == "--require":
+                for lit in [x.strip() for x in v.split(",") if x.strip()]:
+                    cmd += [flag, lit]
+            else:
+                cmd += [flag, v]
+        elif ask(f"  {flag}  ({hint}) (y/n)", "n").lower().startswith("y"):
+            cmd.append(flag)
+    return cmd
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ollama-dispatch-manual",
+        description=("Give it a repo plus raw material (error text, a description, "
+                     "or a screenshot path); a short qwen scoping call drafts the "
+                     "dispatch fields, asks you specifics if it needs them, and "
+                     "you confirm before ollama-dispatch-auto runs."))
+    ap.add_argument("--repo", help="git repo to work in (skips the prompt)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="do everything except run ollama-dispatch-auto")
+    ap.add_argument("--yes", "-y", action="store_true", help="skip the final confirm")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="scoping model")
+    ap.add_argument("--host", default=DEFAULT_HOST, help="scoping host (ollama-queue.py --host)")
+    ap.add_argument("--vision-model", default="auto",
+                    help="model for screenshots: auto (pick from ollama list), a tag, or none")
+    ap.add_argument("--scoper-cmd", help="TESTING: run this in the scratch dir instead of "
+                                         "enqueuing the scoping job (must write scope.json)")
+    ap.add_argument("--gate", metavar="SCOPE_JSON", help=argparse.SUPPRESS)
+    ap.add_argument("--files", metavar="FILES_TXT", help=argparse.SUPPRESS)
+    pre = ap.parse_args()
+
+    if pre.gate:
+        return gate(pre.gate, pre.files or "files.txt")
+    if not AUTO.exists():
+        raise SystemExit(f"{AUTO} not found")
+
+    try:
+        hr()
+        print("ollama-dispatch-manual  --  Ctrl-C at any prompt cancels; nothing is dispatched.")
+        hr()
+        repo = ask_repo(pre)
+        draft = scope_loop(repo, pre)
+        cmd = assemble(repo, draft)
+        overlap = overlapping_jobs(repo, (draft.get("target") or "").strip())
+        while True:
+            print()
+            hr()
+            print("Command:")
+            print("  " + shlex.join(cmd))
+            hr()
+            if overlap:
+                print(f"Note: {len(overlap)} job(s) already pending/running against "
+                      f"{draft.get('target')} in this repo:")
+                for jid, label, st in overlap:
+                    print(f"  {jid}  {label}  [{st}]")
+            if pre.yes:
+                choice = "y"
+            else:
+                verb = "print only" if pre.dry_run else "run"
+                lead = "Dispatch anyway?" if overlap else "Run it?"
+                choice = ask(f"{lead}  y = {verb}, n = cancel, e = advanced flags",
+                             "n" if overlap else "y").lower()
+            if choice.startswith("y"):
+                if pre.dry_run:
+                    print("(dry-run: not executing)")
+                    return 0
+                break
+            if choice.startswith("e"):
+                cmd = ask_advanced(cmd)
+                continue
+            raise Abort
+    except Abort:
+        print("\nCancelled -- nothing dispatched.")
+        return 130
+
+    print()
+    try:
+        r = subprocess.run(cmd)
+    except KeyboardInterrupt:
+        print("\nInterrupted while ollama-dispatch-auto was running.")
+        return 130
+    if r.returncode != 0:
+        print(f"\nollama-dispatch-auto exited {r.returncode} (see its output above).")
+    return r.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

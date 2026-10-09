@@ -1,0 +1,2157 @@
+#!/usr/bin/env python3
+"""ollama-dispatch-plan -- QWEN-DRIVEN slice-PLAN generator for the dispatch pipeline.
+
+WHY
+---
+`ollama-dispatch-slice` deterministically EXECUTES a slice plan (chain worktree,
+per-slice ollama-dispatch-auto authoring, per-slice adversarial gate, commit
+forward). The one step still done by hand was writing that plan: decomposing an
+omnibus intent into per-PROPERTY slices with real must_contain literals, a
+verify_shape hint, and depends_on wiring. That decomposition is the highest-
+leverage judgement in the whole pipeline -- and it was the last human step.
+
+This tool moves it onto the local model (qwen via ollama-queue.py) WITH a
+deterministic structural gate, so a bad decomposition cannot silently produce a
+plan that the slicer then burns GPU-hours executing into junk.
+
+The regex-based `omnibus_slice.py` auto-slicer already existed and its output is
+visibly poor (slices titled "adapter_cls)" whose intent is a sentence fragment).
+This replaces guessing-by-regex with a model that reads the whole omnibus, and
+then REFUSES its output unless it is structurally sound.
+
+PIPELINE
+--------
+  --generate   qwen writes slices[]  ->  STRUCTURAL GATE  -> (defects? re-prompt
+               with the SPECIFIC defects, bounded by --max-rounds) -> clean plan
+               -> written to ~/.ollama-dispatch/slice-plans/<label>.slices.json
+               -> STOP for a human plan review (the one judgement kept).
+  then:        ollama-dispatch-slice <plan> --execute        (unchanged tool)
+
+The gate is the same code in three places -- the in-job `verify.sh` (so the
+worker iterates against it inside the dispatch), the outer round loop (so a job
+that "converged" on a bad plan still gets re-prompted), and `--gate` /
+`--self-test` (so it is directly testable). One implementation, one bite.
+
+USAGE
+-----
+  ollama-dispatch-plan --generate --repo <path> --target <file> \
+      --intent "<the whole omnibus in one line>" --lang python|ts|js|swift \
+      [--label <name>] [--model qwen3.6-35b-a3b-vl-mtp-mxfp8] [--host studio] \
+      [--max-rounds 4] [--auto-confirm-plan] [--then-execute]
+
+  ollama-dispatch-plan --gate <plan.json> [--expect-target F --expect-lang L ...]
+  ollama-dispatch-plan --self-test
+
+NOTES
+-----
+* ALL model calls go through ollama-queue.py, enqueued at the BACK (no --front,
+  no preempt): the qwen auto-author queue keeps precedence.
+* This tool NEVER runs `--execute` on a freshly generated plan unless you pass
+  BOTH --auto-confirm-plan and --then-execute. Generating is cheap; executing a
+  bad decomposition is not.
+"""
+import argparse
+import glob
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SELF = os.path.abspath(__file__)
+HOME = Path.home()
+QUEUE = str(HOME / "bin" / "ollama-queue.py")
+QUEUE_STATE = HOME / "bin" / "ollama-queue-state.json"
+LOG_DIR = HOME / "bin" / "ollama-queue-logs"
+SLICER = str(HOME / "bin" / "ollama-dispatch-slice")
+PLAN_DIR = HOME / ".ollama-dispatch" / "slice-plans"
+GEN_ROOT = HOME / ".ollama-dispatch" / "plan-gen"
+
+LANGS = ("python", "ts", "js", "swift", "bash", "csharp")
+
+
+def die(msg, code=2):
+    print("ERROR: " + str(msg), file=sys.stderr)
+    sys.exit(code)
+
+
+def q(s):
+    return shlex.quote(str(s))
+
+
+def capture(cmd, cwd=None, timeout=None):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+# ==========================================================================
+# THE STRUCTURAL GATE
+# ==========================================================================
+# Deterministic. Every defect is a (CODE, human sentence) pair: the CODE makes
+# the self-test assertable, the sentence is what gets fed back to the model on a
+# re-prompt. A gate whose failure message is vague produces a re-draft that fixes
+# nothing, so every message names the slice id and what specifically is wrong.
+
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+# Definition keywords across the four supported languages.
+_DEF_RE = re.compile(
+    r"\b(?:def|function|func|class|struct|interface)\s+([A-Za-z_$][\w$]*)")
+# A mentioned call/definition signature: name(...) with a >=3-char name.
+_SIG_RE = re.compile(r"\b([A-Za-z_$][\w$]{2,})\s*\(")
+# Words that announce a SECOND, separate change inside one slice.
+_ALSO_RE = re.compile(
+    r"\b(also|additionally|separately|in addition|as well as|furthermore|"
+    r"and then also|plus also|unrelated)\b", re.I)
+
+# Leading declaration keywords stripped off a must_contain literal before
+# checking it against the intent ("def build_queries" -> "build_queries": the
+# intent legitimately says "build_queries(...)" without the `def`).
+_LIT_PREFIX_RE = re.compile(
+    r"^\s*(?:def|function|func|class|struct|interface|const|let|var|async|"
+    r"public|private|export|return|import|from)\s+", re.I)
+
+
+def _norm(s):
+    """Lowercase, strip everything that is not a letter or digit. Comparing the
+    normalized forms makes the literal/intent check robust to punctuation,
+    spacing and quote style without becoming a substring free-for-all."""
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+
+_CODE_CHARS = set("()[]{}.=<>!?:;,'\"`_$/\\+-*&|%#@")
+
+
+# Keyword / operator words of the supported languages. A literal containing ANY of
+# them can be real code ('async def', 'else if', 'not in', 'return null',
+# 'export default', 'raise valueerror') -- never call it prose (coordinator review
+# 2026-10-03: the first cut rejected all nine).
+_CODE_KEYWORDS = frozenset("""
+    def async await class function func struct interface return raise throw try
+    except catch finally if else elif for while in is not and or none null true false
+    new const let var import from export default yield lambda with as pass break
+    continue switch case type
+""".split())
+
+
+def _prose_literal(lit, target_code=None):
+    """PURE. A must_contain literal of >=2 plain words with no code character
+    ("smallest id", "drop all unendorsed", "fall back") can only ever appear in
+    code as a COMMENT -- a vacuous gate (2026-10-03, replay-endorse s3). NOT prose:
+    a single word; anything carrying code punctuation / camelCase; any literal with
+    a keyword/operator word (_CODE_KEYWORDS); a literal present as CODE (outside
+    comments) in the baseline target `target_code` (already comment-stripped)."""
+    t = str(lit).strip()
+    words = t.split()
+    if len(words) < 2 or any(c in _CODE_CHARS for c in t):
+        return False
+    if not all(re.fullmatch(r"[a-z][a-z0-9]*", w) for w in words):
+        return False
+    if any(w in _CODE_KEYWORDS for w in words):
+        return False
+    if target_code and re.search(r"(?<![\w$])%s(?![\w$])" % r"\s+".join(map(re.escape, words)),
+                                 target_code, re.I):
+        return False
+    return True
+
+
+def _ident_parts(ident):
+    """camelCase / snake_case / PascalCase identifier -> lowercase word parts."""
+    t = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(ident))
+    return [w.lower() for w in re.split(r"[^A-Za-z0-9]+", t) if w]
+
+
+def _identifier_from_intent(lit, text):
+    """PURE. True when `lit` is ONE code identifier (camel/snake, >=2 parts) whose
+    every word part is a whole word of the intent -- e.g. `isEndorsed` / 
+    `reservation_tracking` for an intent about "endorsed" links and the
+    "reservation's tracking number". The intent INTRODUCES it in prose; the literal
+    names the code form. Still tied to the intent (no part may be invented), and
+    the VACUOUS_MUST_CONTAIN baseline check below applies to it unchanged."""
+    core = _LIT_PREFIX_RE.sub("", str(lit)).strip().rstrip("(").strip()
+    if not re.fullmatch(r"[A-Za-z_$][\w$]*", core):
+        return False
+    parts = _ident_parts(core)
+    if len(parts) < 2:
+        return False
+    words = set(re.findall(r"[a-z0-9]+", str(text).lower()))
+    stems = {w[:-1] if w.endswith("s") and len(w) > 3 else w for w in words}
+    return all(p in words or p in stems or (p.endswith("s") and p[:-1] in stems)
+               for p in parts)
+
+
+_POSSESSIVE_RE = re.compile(r"\b([A-Za-z][A-Za-z]{2,})['\u2019]s\s+`?([A-Za-z_$][\w$]*)`?")
+_TYPE_DECL_RE = re.compile(r"\b(?:interface|type|class|struct|enum)\s+([A-Za-z_$][\w$]*)")
+_PRONOUN_OWNERS = {"its", "it", "one", "each", "every", "this", "that", "the", "other",
+                   "today", "user", "users"}
+
+
+def _sing(w):
+    w = w.lower()
+    return w[:-1] if w.endswith("s") and len(w) > 3 else w
+
+
+def missing_datum_defects(texts, target_src, introduced_text=""):
+    """PURE. [(owner, field)] the intent READS as `<owner>'s <field>` (a code-form
+    field: camelCase/snake_case, or a name in the target) where NOTHING in the
+    target carries that datum:
+      * no type/interface/class in the target is named for <owner>
+        (BfmrLinkLike covers "the link's trackingNumber"), and
+      * no identifier in the target, or in any code token of the plan's own intents
+        (`introduced_text`), joins <owner> with a word of <field>
+        (reservationTracking / reservation_tracking_number), and
+      * no dotted `<owner>.<field>` access in the target.
+    replay-endorse (2026-10-03): "its reservation's trackingNumber" -- BfmrLinkLike
+    is {id, reservationId, trackingNumber}; the datum never reaches the function, so
+    s3/s4c/s5 were unimplementable and 15 author jobs looped on it.
+    HONEST LIMIT: only the possessive / dotted form is detected; a datum named in
+    free prose ("the number the reservation reports") is not."""
+    if not target_src:
+        return []
+    types_ = {p for t in _TYPE_DECL_RE.findall(target_src) for p in _ident_parts(t)}
+    idents = set(re.findall(r"[A-Za-z_$][\w$]*", target_src))
+    for t in _BACKTICK_RE.findall(introduced_text or ""):
+        idents |= set(re.findall(r"[A-Za-z_$][\w$]*", t))
+    idents |= {w for w in re.findall(r"[A-Za-z_$][\w$]*", introduced_text or "")
+               if re.search(r"[a-z0-9][A-Z]", w) or "_" in w}
+    ident_parts = [[_sing(p) for p in _ident_parts(i)] for i in idents]
+    out = []
+    for text in texts:
+        for owner, field in _POSSESSIVE_RE.findall(text or ""):
+            o = _sing(owner)
+            if o in _PRONOUN_OWNERS or not _codeish(field, text, target_src):
+                continue
+            fparts = {_sing(p) for p in _ident_parts(field)}
+            if o in {_sing(t) for t in types_}:
+                continue
+            if any(o in ps and fparts & set(ps) for ps in ident_parts):
+                continue
+            if re.search(r"\b%s\??\.%s\b" % (re.escape(owner), re.escape(field)),
+                         target_src, re.I):
+                continue
+            if (owner.lower(), field) not in out:
+                out.append((owner.lower(), field))
+    return out
+
+
+def _distinct(rx, text):
+    return sorted({m for m in rx.findall(text or "")})
+
+
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+
+
+def _code_only(src):
+    """Crude comment strip (/* */, //, and # line comments) so English words in a
+    file's COMMENTS do not count as code names. Strings are left alone."""
+    if not src:
+        return src
+    t = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
+    t = re.sub(r"(?m)(^|[^:\\'\"])//.*$", r"\1", t)
+    return re.sub(r"(?m)^\s*#.*$", "", t)
+
+
+def _codeish(name, text, target_src=None, allow_pascal=False):
+    """PURE. Is `name` (a regex capture from intent prose) a CODE token rather than an
+    English word? (2026-10-03, replay-endorse plan: 'Keep PURE (no prisma). Mark
+    endorsed (own reservation) links; drop the rest (unendorsed).' read as THREE
+    signatures (PURE, endorsed, rest) and 'function body must' as a definition of
+    `body` -- MULTI_PROPERTY then forced the plan into duplicate/preserve-only slices.)
+    Code iff ANY of: inside backticks; camelCase / snake_case / `$`; written as an
+    immediate call `name(` (no space -- prose parentheticals have one); present as a
+    whole word in the target file; (definitions only) PascalCase like `Foo`."""
+    n = str(name)
+    if any(re.search(r"(?<![\w$])%s(?![\w$])" % re.escape(n), span)
+           for span in _BACKTICK_RE.findall(text or "")):
+        return True
+    if re.search(r"[a-z0-9][A-Z]", n) or "_" in n or "$" in n:
+        return True
+    if re.search(r"(?<![\w$])%s\(" % re.escape(n), text or ""):
+        return True
+    if target_src and re.search(r"(?<![\w$])%s(?![\w$])" % re.escape(n), target_src):
+        return True
+    if allow_pascal and re.match(r"^[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)*$", n):
+        return True
+    return False
+
+
+_DECORATOR_CALL_RE = re.compile(r"@{1,2}[A-Za-z_][\w.]*\((?:[^()]|\([^()]*\))*\)")
+
+
+def _multi_property_defect(sid, intent, title, target_src=None):
+    """Heuristic: does this slice describe MORE THAN ONE property?
+
+    A slice is the unit the pipeline gates; two properties in one slice means one
+    adversarial verify has to cover both, which is exactly how a verify stops
+    being relevant to either. Signals, in decreasing confidence:
+      1. two or more DEFINITIONS (def/function/func/class/struct/interface) --
+         two things being defined is two properties, near-unambiguous.
+      2. three or more distinct call/definition signatures mentioned -- one
+         property may legitimately name its own signature plus a helper it calls;
+         three is a laundry list.
+      3. two or more signatures PLUS an "also/additionally/separately" marker --
+         the model explicitly announcing a second change.
+    Returns a defect sentence or None."""
+    text = (intent or "") + " \n " + (title or "")
+    defs = [d for d in _distinct(_DEF_RE, text)
+            if _codeish(d, text, target_src, allow_pascal=True)]
+    # Schema ATTRIBUTES are not call signatures (2026-10-05, rt-egift-link-s1 s0:
+    # `@default(autoincrement())`, `@default(now())`, `@relation(fields:[..])` read
+    # as 4 signatures, so a one-model slice was MULTI_PROPERTY). Strip `@attr(...)`
+    # (one nesting level) before counting.
+    _sigtext = _DECORATOR_CALL_RE.sub(" ", text)
+    sigs = [g for g in _distinct(_SIG_RE, _sigtext) if _codeish(g, _sigtext, target_src)]
+    if len(defs) >= 2:
+        return (f"slice {sid!r} defines {len(defs)} separate things "
+                f"({', '.join(defs)}) -- that is {len(defs)} properties, not one. "
+                f"Split it into one slice per definition.")
+    if len(sigs) >= 3:
+        return (f"slice {sid!r} names {len(sigs)} different function signatures "
+                f"({', '.join(sigs)}) -- a slice must describe exactly ONE "
+                f"property. Split it.")
+    marker = _ALSO_RE.search(text)
+    if marker and len(sigs) >= 2:
+        return (f"slice {sid!r} says {marker.group(0)!r} and names "
+                f"{len(sigs)} signatures ({', '.join(sigs)}) -- it bundles a "
+                f"second, separate change. Split it into one slice per change.")
+    return None
+
+
+# ---- CROSS-SLICE literal checks (2026-10-04, chat-frontend plan d53c7400b2b5) ----
+# LITERAL_NOT_IN_INTENT only checks a literal against the slice's OWN intent, which
+# the model writes, so a copied clause launders any literal: s6-routes' intent
+# ended "chat_template_kwargs {...} is passed to the model" (lifted from property
+# (5), the model-call slice) and must_contain gained 'chat_template_kwargs' --
+# forcing model-call code into the routes slice. Nothing compared literals ACROSS
+# slices or against the omnibus property they came from.
+_PROP_MARK_RE = re.compile(r"(?<![\w$])\((\d{1,2})\)(?=\s)")
+
+
+def _property_segments(top):
+    """PURE. {n: text} for an omnibus written as numbered properties
+    '(1) ... (2) ...'. Markers are taken only in sequence (1,2,3...), so a later
+    cross-reference like 'running (4)+(5) for that message' is NOT a new segment.
+    {} unless there are >= 2 segments."""
+    want, cuts = 1, []
+    for m in _PROP_MARK_RE.finditer(top or ""):
+        if int(m.group(1)) == want:
+            cuts.append((want, m.start(), m.end()))
+            want += 1
+    if len(cuts) < 2:
+        return {}
+    out = {}
+    for i, (n, _s, e) in enumerate(cuts):
+        end = cuts[i + 1][1] if i + 1 < len(cuts) else len(top)
+        out[n] = top[e:end]
+    return out
+
+
+def _lit_occurs(lit, text):
+    """Case-sensitive occurrence of `lit` in `text`, word-bounded on any end of
+    the literal that is a word character ('6' does not occur in 'base64')."""
+    lit = str(lit)
+    if not lit or not text:
+        return False
+    pre = r"(?<![\w$])" if re.match(r"[\w$]", lit) else ""
+    post = r"(?![\w$])" if re.search(r"[\w$]$", lit) else ""
+    return re.search(pre + re.escape(lit) + post, text) is not None
+
+
+def _codeish_literal(lit):
+    """A literal that can only be code: snake_case, camelCase, dotted/pathy, call."""
+    t = str(lit)
+    return bool(re.search(r"[a-z0-9][A-Z]|[A-Za-z0-9]_[A-Za-z0-9]|\w\.\w|/|\w\(", t))
+
+
+def foreign_property_defects(top, slices):
+    """PURE. [(sid, lit, home, others)] where a slice's code-form literal occurs in
+    the numbered omnibus ONLY in properties other than the slice's own. A slice's
+    home = the property segment(s) holding the most of its literals, plus any
+    property a home segment cross-references ('(7) ... running (4)+(5)').
+    Single-segment / unnumbered omnibuses are not checked (no attribution)."""
+    segs = _property_segments(top)
+    if not segs:
+        return []
+    out = []
+    for s in slices:
+        if not isinstance(s, dict) or not isinstance(s.get("must_contain"), list):
+            continue
+        lits = [l for l in s["must_contain"] if isinstance(l, str) and l.strip()]
+        hits = {n: sum(_lit_occurs(l, t) for l in lits) for n, t in segs.items()}
+        best = max(hits.values() or [0])
+        if best == 0:
+            continue
+        home = {n for n, c in hits.items() if c == best}
+        for n in list(home):
+            home |= {int(x) for x in re.findall(r"\((\d{1,2})\)", segs[n])
+                     if int(x) in segs}
+        for l in lits:
+            if not _codeish_literal(l):
+                continue
+            where = sorted(n for n, t in segs.items() if _lit_occurs(l, t))
+            if where and not (set(where) & home):
+                out.append((s.get("id"), l, sorted(home), where))
+    return out
+
+
+# ---- PARENT-GROUNDING checks (2026-10-05, rt-egift-link-s1 r2 plan) ----------------
+# Every older check compares a slice to ITSELF (literal-in-own-intent) or to sibling
+# slices, so a token the model mangled CONSISTENTLY across slices passed everything:
+# "OrderEgitftLink" x4 + "EgitftLink.tsx" x2 (parent: OrderEgiftLink, EgiftLink.tsx),
+# a back-relation moved onto User (parent: Order.egiftLink), and accept-examples
+# shaped /login?code= while the parent requires a non-empty `login` query param.
+# The structural gate said CLEAN; only the advisory reviewer caught the typo, AFTER
+# plan-gen had already finished. These compare each slice to the PARENT intent.
+_IDWORD_RE = re.compile(r"(?<![\w$])[A-Za-z_$][\w$]*")
+
+
+def _identlike(tok, text=""):
+    """PURE. camelCase / multi-hump PascalCase / snake_case, or a >=3-char name
+    written as an immediate call `name(` in `text`. Plain words never count."""
+    t = str(tok)
+    if t in _CODE_KEYWORDS or t in ("void", "typeof", "instanceof", "self", "this"):
+        return False
+    if re.search(r"[a-z0-9][A-Z]", t) and re.search(r"[a-z]", t):
+        return True
+    if re.search(r"[A-Za-z0-9]_[A-Za-z0-9]", t):
+        return True
+    return len(t) >= 3 and bool(re.search(r"(?<![\w$])%s\(" % re.escape(t), text or ""))
+
+
+def _ident_tokens(text):
+    """PURE. Distinct identifier-like tokens in `text` (path stems included:
+    'components/EgiftLink.tsx' yields 'EgiftLink')."""
+    out = []
+    for t in _IDWORD_RE.findall(text or ""):
+        if t not in out and _identlike(t, text):
+            out.append(t)
+    return out
+
+
+def _dl_distance(a, b, cap=3):
+    """Damerau-Levenshtein (optimal string alignment), early-out above `cap`."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev2, prev = None, list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            c = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + c)
+            if (prev2 is not None and i > 1 and j > 1 and a[i - 1] == b[j - 2]
+                    and a[i - 2] == b[j - 1]):
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+        if min(prev) > cap:
+            return cap + 1
+    return prev[-1]
+
+
+def _typo_of(tok, parent_toks):
+    """PURE. The parent token `tok` is a near-miss misspelling of, or None.
+    A near miss is: edit distance <= 2, parent token >= 6 chars, same first AND
+    last letter, and NOT a case-only / plural ('s'/'es') variant. The first/last
+    letter rule is what keeps real sibling identifiers apart: encryptSetting vs
+    decryptSetting, getUser vs setUser, hashLink vs hashLinks are not typos."""
+    tl = tok.lower()
+    best = None
+    for p in parent_toks:
+        pl = p.lower()
+        if len(p) < 6 or pl == tl or tl in (pl + "s", pl + "es") or \
+                pl in (tl + "s", tl + "es"):
+            continue
+        if tl[0] != pl[0] or tl[-1] != pl[-1]:
+            continue
+        dist = _dl_distance(tok, p, 2)
+        if dist <= 2 and (best is None or dist < best[0]):
+            best = (dist, p)
+    return best[1] if best else None
+
+
+def _slice_fields_text(s):
+    mc = s.get("must_contain") if isinstance(s.get("must_contain"), list) else []
+    return " \n ".join([str(s.get(k) or "") for k in ("title", "intent", "verify_shape")]
+                       + [str(x) for x in mc if isinstance(x, str)])
+
+
+def _grounding_text(plan, top, body=None):
+    """The text a slice token may legitimately come from WITHOUT being a typo: the
+    parent intent, the baseline target, and every repo file the parent names
+    (bounded, same path rules as repo_context: inside the repo, no stale trees)."""
+    parts = [top or "", body or ""]
+    try:
+        root = Path(os.path.expanduser(str(plan.get("repo")))).resolve()
+        if root.is_dir():
+            for rel in intent_paths(top, None)[:20]:
+                if _STALE_TREE_RE.search(rel):
+                    continue
+                p = (root / rel).resolve()
+                try:
+                    p.relative_to(root)
+                except ValueError:
+                    continue
+                if p.is_file():
+                    parts.append(p.read_text(errors="replace")[:200000])
+    except Exception:
+        pass
+    return "\n".join(parts)
+
+
+def identifier_typo_defects(top, slices, ground_text=""):
+    """PURE. [(sid, token, parent_token)] for an identifier-like token in a slice's
+    title/intent/must_contain/verify_shape that appears NOWHERE in the parent intent,
+    the target, or the parent-named repo files, but is a near miss (_typo_of) of a
+    parent-intent token. Occurring in OTHER slices does NOT excuse it: the incident
+    typo was copied across 3 slices. Tokens the parent does not come close to (a
+    new helper name, a derived table name) are not judged here."""
+    if not isinstance(top, str) or not top.strip():
+        return []
+    ptoks = _ident_tokens(top)
+    hay = (top or "") + "\n" + (ground_text or "")
+    out = []
+    for s in slices:
+        if not isinstance(s, dict):
+            continue
+        for t in _ident_tokens(_slice_fields_text(s)):
+            if _lit_occurs(t, hay):
+                continue
+            p = _typo_of(t, ptoks)
+            if p and (s.get("id"), t, p) not in out:
+                out.append((s.get("id"), t, p))
+    return out
+
+
+_DOTTED_REL_RE = re.compile(r"(?<![\w$.])([A-Z][A-Za-z0-9]*)\.([a-z][A-Za-z0-9_]*)\b")
+_REL_ON_RE = re.compile(
+    r"\brelation(?:\s+field)?\b[^.;]{0,80}?\bon\s+(?:the\s+)?(?:existing\s+)?"
+    r"(?:model\s+)?`?'?([A-Z][A-Za-z0-9]*)\b")
+_SENT_SPLIT_RE = re.compile(r"(?<=[.;!?])\s+(?=[A-Z(`'\"])|\n")
+
+
+def _relation_claims(text):
+    """PURE. [(Model, field_or_None)] stated in sentences mentioning a relation:
+    dotted `Model.field` and 'relation ... on (the existing) Model'."""
+    out = []
+    for sent in _SENT_SPLIT_RE.split(text or ""):
+        if not re.search(r"relation", sent, re.I):
+            continue
+        for m, f in _DOTTED_REL_RE.findall(sent):
+            if (m, f) not in out:
+                out.append((m, f))
+        for m in _REL_ON_RE.findall(sent):
+            if (m, None) not in out and not any(x == m for x, _ in out):
+                out.append((m, None))
+    return out
+
+
+def _fieldkey(f):
+    return _sing(re.sub(r"[^a-z0-9]", "", str(f).lower()))
+
+
+def relation_owner_defects(top, slices):
+    """PURE. [(sid, model, field, parent_owners)] where a slice puts a relation /
+    back-relation on a model the parent does not: the parent states relation claims
+    (`Order.egiftLink` in a sentence mentioning a relation), and the slice's
+    relation claim either (a) names the same field (singular/plural-insensitive)
+    on a DIFFERENT model, or (b) names a model the parent intent never mentions at
+    all. Only fires when the parent itself states the relation, so a plan for an
+    intent that leaves the relation open is never judged."""
+    pclaims = [(m, f) for m, f in _relation_claims(top) if f]
+    if not pclaims:
+        return []
+    pwords = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z0-9]*", top or "")}
+    out = []
+    for s in slices:
+        if not isinstance(s, dict):
+            continue
+        txt = " \n ".join(str(s.get(k) or "") for k in ("title", "intent", "verify_shape"))
+        for m, f in _relation_claims(txt):
+            owners = sorted({f"{pm}.{pf}" for pm, pf in pclaims
+                             if f and _fieldkey(pf) == _fieldkey(f)})
+            if f and owners and m not in {o.split(".")[0] for o in owners}:
+                hit = (s.get("id"), m, f, owners)
+            elif m.lower() not in pwords and _sing(m) not in {_sing(w) for w in pwords}:
+                hit = (s.get("id"), m, f, sorted({f"{pm}.{pf}" for pm, pf in pclaims}))
+            else:
+                continue
+            if hit not in out:
+                out.append(hit)
+    return out
+
+
+_NONEMPTY_PARAM_RE = re.compile(
+    r"\bnon-?empty\s+`?([A-Za-z_][\w-]*)`?\s+query\s+param(?:eter)?s?\b", re.I)
+_HOST_EXACT_RE = re.compile(r"\bhost(?:name)?\s+(?:is\s+)?exactly\s+`?([a-z0-9.-]+\.[a-z]{2,})",
+                            re.I)
+_URL_RE = re.compile(r"https?://[^\s'\"`)<>\]]+")
+_NEG_MARK_RE = re.compile(r"ok\s*:\s*false|\breject|\binvalid|\berror|\bfail|\bthrow|"
+                          r"\braise|\bnull\b|\bfalse\b|\b4\d\d\b", re.I)
+
+
+def example_shape_defects(top, slices):
+    """PURE. [(sid, url, param)] -- a POSITIVE example URL in a slice's verify_shape
+    that violates the parent's own stated URL rule. DELIBERATELY NARROW (deterministic
+    or nothing): fires only when the parent states BOTH 'host(name) exactly H' and
+    'non-empty P query param', and only for a URL on host H that sits in the
+    behavioral part (before 'ADVERSARIAL') in a ';'-clause with no negative marker
+    (ok:false/reject/invalid/error/fail/throw/null/4xx). Such a URL is presented as a
+    valid input, so if its query has no non-empty P it contradicts the parent.
+    Every other kind of example-vs-rule contradiction is NOT checked."""
+    params = [p for p in _NONEMPTY_PARAM_RE.findall(top or "")]
+    hosts = {h.lower().rstrip(".") for h in _HOST_EXACT_RE.findall(top or "")}
+    if not params or not hosts:
+        return []
+    from urllib.parse import urlsplit, parse_qs
+    out = []
+    for s in slices:
+        if not isinstance(s, dict) or not isinstance(s.get("verify_shape"), str):
+            continue
+        pos = re.split(r"\badversarial\b", s["verify_shape"], maxsplit=1, flags=re.I)[0]
+        for clause in re.split(r";", pos):
+            if _NEG_MARK_RE.search(clause):
+                continue
+            for url in _URL_RE.findall(clause):
+                try:
+                    u = urlsplit(url.rstrip(".,"))
+                    qs = parse_qs(u.query, keep_blank_values=True)
+                except Exception:
+                    continue
+                if (u.hostname or "").lower() not in hosts:
+                    continue
+                for p in params:
+                    if not any(v.strip() for v in qs.get(p, [])):
+                        hit = (s.get("id"), url.rstrip(".,"), p)
+                        if hit not in out:
+                            out.append(hit)
+    return out
+
+
+def _ancestors(slices):
+    """{sid: set(transitive depends_on ids)}; tolerant of unknown ids / cycles."""
+    deps = {s.get("id"): [x for x in (s.get("depends_on") or []) if isinstance(x, str)]
+            for s in slices if isinstance(s, dict) and isinstance(s.get("id"), str)}
+    out = {}
+    for sid in deps:
+        seen, stack = set(), list(deps[sid])
+        while stack:
+            x = stack.pop()
+            if x in seen or x == sid:
+                continue
+            seen.add(x)
+            stack.extend(deps.get(x, []))
+        out[sid] = seen
+    return out
+
+
+def chain_vacuous_defects(slices, body=None):
+    """PURE. [(sid, {lit: covering_ancestor_or_'baseline'})] for a slice whose EVERY
+    must_contain literal is already guaranteed at its CHAIN baseline: present in
+    the repo target (`body`) or a substring of a must_contain literal of a
+    transitive ancestor (that ancestor's gate forces it into the file first). The
+    repo-baseline VACUOUS_MUST_CONTAIN misses this whenever the target is empty or
+    new -- the slicer then parks it at execute time (replay-endorse s4b). Slices
+    whose literals are ALL repo-baseline are left to VACUOUS_MUST_CONTAIN."""
+    by_id = {s.get("id"): s for s in slices if isinstance(s, dict)}
+    anc = _ancestors(slices)
+    out = []
+    for sid, s in by_id.items():
+        if s.get("kind") == "invariant":
+            continue
+        mc = s.get("must_contain")
+        if not isinstance(mc, list) or not mc or \
+                any(not isinstance(x, str) or not x.strip() for x in mc):
+            continue
+        cover = {}
+        for lit in mc:
+            if body is not None and _literal_baseline_class(lit, body) == "used":
+                cover[lit] = "baseline"
+                continue
+            for a in sorted(anc.get(sid, ())):
+                if any(isinstance(m, str) and lit in m
+                       for m in (by_id.get(a, {}).get("must_contain") or [])):
+                    cover[lit] = a
+                    break
+        if len(cover) == len(mc) and any(v != "baseline" for v in cover.values()):
+            out.append((sid, cover))
+    return out
+
+
+# <= 6 letters: across 51 real plans, 7-8 letter words were mostly domain nouns that
+# double as field names (payload, shipment, endorsed); the short ones are the noise.
+_GENERIC_WORD_RE = re.compile(r"[a-z]{2,6}")
+
+
+def generic_literal_defects(slices):
+    """PURE. [(sid, lit, other_ids)] for a must_contain literal that is one short
+    bare lowercase English word ('status', 'done', 'error'), NOT written as code in
+    its own intent (backticks, `word(`), not a language keyword, and used by OTHER
+    slices' intents/literals too. check_literals is a raw substring test, so such a
+    word is satisfied by unrelated code, docstrings or a sibling slice's work -- it
+    pins nothing about THIS slice (chat-frontend s5: 'status','done','error').
+    The example slice in the prompt taught it ('phone', 'email').
+    NOT flagged: a dict KEY the intent writes in key form ({'version': ...},
+    {id,project}) -- the rules invite dict keys; a word that is a substring of an
+    ANCESTOR's literal (carried, harmless dead weight; a slice whose literals are
+    ALL carried is VACUOUS_AT_CHAIN_BASELINE instead)."""
+    out = []
+    good = [s for s in slices if isinstance(s, dict)]
+    anc = _ancestors(good)
+    by_id = {s.get("id"): s for s in good}
+    for s in good:
+        intent = s.get("intent") if isinstance(s.get("intent"), str) else ""
+        carried = [m for a in anc.get(s.get("id"), ())
+                   for m in (by_id.get(a, {}).get("must_contain") or [])
+                   if isinstance(m, str)]
+        for lit in (s.get("must_contain") or []):
+            if not isinstance(lit, str) or not _GENERIC_WORD_RE.fullmatch(lit):
+                continue
+            if lit in _CODE_KEYWORDS or _codeish(lit, intent):
+                continue
+            w = re.escape(lit)
+            if re.search(r"['\"]%s['\"]\s*:|[{,]\s*%s\s*[,:}]" % (w, w), intent):
+                continue
+            if any(lit in m for m in carried):
+                continue
+            others = []
+            for o in good:
+                if o is s:
+                    continue
+                txt = (o.get("intent") or "") + " " + " ".join(
+                    x for x in (o.get("must_contain") or []) if isinstance(x, str))
+                if _lit_occurs(lit, txt):
+                    others.append(o.get("id"))
+            if others:
+                out.append((s.get("id"), lit, others))
+    return out
+
+
+def _topo_defect(slices):
+    """Kahn's algorithm purely for cycle detection. Returns a defect sentence
+    naming the slices stuck in the cycle, or None."""
+    ids = [s.get("id") for s in slices]
+    indeg = {i: 0 for i in ids}
+    adj = {i: [] for i in ids}
+    for s in slices:
+        for d in (s.get("depends_on") or []):
+            if d in indeg:
+                adj[d].append(s.get("id"))
+                indeg[s.get("id")] += 1
+    ready = [i for i in ids if indeg[i] == 0]
+    seen = 0
+    while ready:
+        n = ready.pop(0)
+        seen += 1
+        for m in adj.get(n, []):
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                ready.append(m)
+    if seen != len(ids):
+        stuck = sorted(i for i in ids if indeg.get(i, 0) > 0)
+        return (f"depends_on contains a CYCLE -- these slices can never be "
+                f"ordered: {', '.join(str(x) for x in stuck)}. depends_on must "
+                f"point only at slices that come EARLIER in the array.")
+    return None
+
+
+def gate_plan(plan, expect=None):
+    """Validate a slice plan. Returns a list of (CODE, sentence) defects; empty
+    list == the plan is structurally sound. `expect` is a dict of the values the
+    caller asked for (repo/target/lang/label) -- a plan that quietly retargets
+    a different file is a defect, not a suggestion."""
+    expect = expect or {}
+    d = []
+
+    def bad(code, msg):
+        d.append((code, msg))
+
+    if not isinstance(plan, dict):
+        return [("NOT_AN_OBJECT", "the plan must be a JSON object, got "
+                 f"{type(plan).__name__}")]
+
+    for k in ("label", "repo", "target", "lang", "slices"):
+        if k not in plan:
+            bad("MISSING_KEY", f"top-level key {k!r} is missing")
+    if d:
+        return d
+
+    for k in ("repo", "target", "lang", "label"):
+        want = expect.get(k)
+        if want is None:
+            continue
+        got = plan.get(k)
+        if k == "repo":
+            same = os.path.abspath(os.path.expanduser(str(got))) == \
+                   os.path.abspath(os.path.expanduser(str(want)))
+        else:
+            same = str(got) == str(want)
+        if not same:
+            bad("EXPECT_MISMATCH",
+                f"top-level {k!r} is {got!r} but this plan was requested for "
+                f"{want!r} -- do not change it")
+
+    if str(plan.get("lang")) not in LANGS:
+        bad("BAD_LANG", f"lang must be one of {'/'.join(LANGS)}, got "
+                        f"{plan.get('lang')!r}")
+
+    slices = plan.get("slices")
+    if not isinstance(slices, list):
+        bad("SLICES_NOT_LIST", "slices must be a JSON array")
+        return d
+    if len(slices) < 1:
+        bad("NO_SLICES", "slices is empty -- a plan needs at least one slice")
+        return d
+
+    _tgt_src = _baseline_target_text(plan)
+    _tgt_code = _code_only(_tgt_src)
+    seen_ids = {}
+    for n, s in enumerate(slices):
+        where = f"slices[{n}]"
+        if not isinstance(s, dict):
+            bad("SLICE_NOT_OBJECT", f"{where} is not a JSON object")
+            continue
+        sid = s.get("id")
+        if not isinstance(sid, str) or not sid.strip():
+            bad("BAD_ID", f"{where} has no usable string 'id'")
+            continue
+        if not ID_RE.match(sid):
+            bad("BAD_ID", f"slice id {sid!r} must be a lowercase slug "
+                          f"(letters, digits, '-', '_', '.')")
+        if sid in seen_ids:
+            bad("DUP_ID", f"slice id {sid!r} appears twice "
+                          f"(slices[{seen_ids[sid]}] and {where}) -- ids must be unique")
+        seen_ids[sid] = n
+
+        intent = s.get("intent")
+        if not isinstance(intent, str) or len(intent.strip()) < 25:
+            bad("THIN_INTENT",
+                f"slice {sid!r} has no usable 'intent' -- it must be a full, "
+                f"self-contained sentence (>=25 chars) stating the ONE property "
+                f"to implement, specific enough to author a test from")
+            intent = intent if isinstance(intent, str) else ""
+
+        title = s.get("title")
+        if not isinstance(title, str) or not title.strip():
+            bad("NO_TITLE", f"slice {sid!r} has no 'title'")
+            title = ""
+
+        vs = s.get("verify_shape")
+        if not isinstance(vs, str) or len(vs.strip()) < 15:
+            bad("THIN_VERIFY_SHAPE",
+                f"slice {sid!r} has no usable 'verify_shape' -- state the "
+                f"behavioural check plus an ADVERSARIAL case a plausible-wrong "
+                f"implementation would fail")
+
+        # PER-SLICE SCOPE (2026-10-05, rt-egift-link-s1): a slice whose intent
+        # creates/edits a file other than the plan target (a prisma schema, a new
+        # route, a component + the page that mounts it) must declare it as its own
+        # `target` and/or `edit_files` (or `reads` for a file it only references).
+        # Without that the harness said "Only edit <plan target>" while needing the
+        # other file, and the slicer landed only the plan target.
+        for _k in ("edit_files", "reads"):
+            _v = s.get(_k)
+            if _v is not None and (not isinstance(_v, list)
+                                   or any(not isinstance(x, str) or not x.strip() for x in _v)):
+                bad("BAD_SCOPE_FIELD", f"slice {sid!r} {_k!r} must be an array of repo paths")
+        if s.get("target") is not None and (not isinstance(s.get("target"), str)
+                                            or not s["target"].strip()):
+            bad("BAD_SCOPE_FIELD", f"slice {sid!r} 'target' must be a repo path string")
+        for _f in unscoped_edit_files(plan, s):
+            bad("UNSCOPED_EDIT_FILE",
+                f"slice {sid!r} intent creates/edits {_f!r} but the slice's scope is only "
+                f"{slice_scope(plan, s)!r} -- set the slice's own \"target\" to the file it "
+                f"creates, list the other files it edits in \"edit_files\", or list a file "
+                f"it only references in \"reads\"")
+
+        deps = s.get("depends_on")
+        if not isinstance(deps, list) or any(not isinstance(x, str) for x in deps):
+            bad("BAD_DEPENDS_ON",
+                f"slice {sid!r} 'depends_on' must be an array of slice-id strings "
+                f"(use [] for none)")
+        else:
+            for dep in deps:
+                if dep == sid:
+                    bad("SELF_DEP", f"slice {sid!r} depends on itself")
+
+        mc = s.get("must_contain")
+        if not isinstance(mc, list) or not mc or \
+                any(not isinstance(x, str) or not x.strip() for x in mc):
+            bad("EMPTY_MUST_CONTAIN",
+                f"slice {sid!r} has an empty or invalid 'must_contain' -- it must "
+                f"list at least one NON-EMPTY literal string that the finished "
+                f"code will literally contain (a function name, a key, a constant)")
+        else:
+            hay = _norm(intent + " " + title)
+            for lit in mc:
+                core = _norm(_LIT_PREFIX_RE.sub("", lit))
+                if not core:
+                    bad("NON_SUBSTANTIVE_LITERAL",
+                        f"slice {sid!r} must_contain entry {lit!r} has no "
+                        f"alphanumeric content -- punctuation is not a literal "
+                        f"worth gating on")
+                elif _prose_literal(lit, _tgt_code):
+                    bad("PROSE_LITERAL",
+                        f"slice {sid!r} must_contain entry {lit!r} is English prose, "
+                        f"not code: the finished code can only contain it inside a "
+                        f"COMMENT, so it gates nothing. List the identifier, key, "
+                        f"constant or call the change introduces (e.g. a new "
+                        f"function/field name, `name(`), and name it in the intent.")
+                elif core not in hay and not _identifier_from_intent(lit, intent + " " + title):
+                    bad("LITERAL_NOT_IN_INTENT",
+                        f"slice {sid!r} must_contain entry {lit!r} never appears "
+                        f"in its intent/title -- either the literal is invented or "
+                        f"the intent does not actually describe it. Name it in the "
+                        f"intent or drop the literal.")
+
+        mp = _multi_property_defect(sid, intent, title, _tgt_code)
+        if mp:
+            bad("MULTI_PROPERTY", mp)
+
+    # depends_on referential integrity (needs the full id set)
+    known = set(seen_ids)
+    for s in slices:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("id")
+        for dep in (s.get("depends_on") or []):
+            if isinstance(dep, str) and dep not in known:
+                bad("UNKNOWN_DEP",
+                    f"slice {sid!r} depends_on {dep!r}, which is not a slice id "
+                    f"in this plan (ids: {', '.join(sorted(known))})")
+
+    if not any(c == "UNKNOWN_DEP" for c, _ in d) and \
+            not any(c in ("BAD_ID", "SLICE_NOT_OBJECT") for c, _ in d):
+        cyc = _topo_defect([s for s in slices if isinstance(s, dict)])
+        if cyc:
+            bad("DAG_CYCLE", cyc)
+
+    # VACUOUS AT BASELINE (#9, 2026-09-23). must_contain literals are FROZEN and
+    # asserted against the target, so a set already true in the target BEFORE any
+    # slice runs is satisfied by an empty diff -- the slicer parks such a slice as
+    # a plan defect at execute time (5 of 7 live escalations on 2026-09-23 were
+    # this class). Catch it HERE, while the drafter can still restate it. Only
+    # when the target is readable; a creation target has nothing at baseline.
+    #   VACUOUS_MUST_CONTAIN  every literal is already USED in the target;
+    #   DECLARED_ONLY_LITERAL a bare name that is only imported/declared, whose
+    #                         call-site form `NAME(` would discriminate -- say so.
+    # An `invariant` slice is exempt: its literals name structures that exist.
+    body = _baseline_target_text(plan)
+    if body is not None:
+        for s in slices:
+            if not isinstance(s, dict) or s.get("kind") == "invariant":
+                continue
+            sid = s.get("id")
+            mc = s.get("must_contain")
+            if not isinstance(mc, list) or not mc or \
+                    any(not isinstance(x, str) or not x.strip() for x in mc):
+                continue
+            classes = {lit: _literal_baseline_class(lit, body) for lit in mc}
+            if all(c == "used" for c in classes.values()):
+                bad("VACUOUS_MUST_CONTAIN",
+                    f"slice {sid!r}: every must_contain literal "
+                    f"({', '.join(repr(l) for l in mc[:6])}) is ALREADY used in "
+                    f"{plan.get('target')} at baseline, so the set is satisfied by an "
+                    f"empty diff. Name something the change INTRODUCES (a new call, "
+                    f"key, constant, or the call-site form `name(` of a symbol the "
+                    f"slice starts calling).")
+                continue
+            for lit, c in classes.items():
+                if c == "declared" and (lit + "(") not in body:
+                    bad("DECLARED_ONLY_LITERAL",
+                        f"slice {sid!r}: must_contain literal {lit!r} already appears "
+                        f"in {plan.get('target')} at baseline on an import/declaration "
+                        f"line (declared, never used). Use its call-site form "
+                        f"{lit + '('!r}, which is absent at baseline and discriminates.")
+
+    # CROSS-SLICE literal checks (2026-10-04, chat-frontend): see the helpers.
+    _good = [s for s in slices if isinstance(s, dict)]
+    for sid, cover in chain_vacuous_defects(_good, body):
+        bad("VACUOUS_AT_CHAIN_BASELINE",
+            f"slice {sid!r}: every must_contain literal is already guaranteed before "
+            f"this slice runs ("
+            + ", ".join(f"{l!r} via {'the repo target' if v == 'baseline' else 'ancestor ' + repr(v)}"
+                        for l, v in list(cover.items())[:6])
+            + ") -- an ancestor's own gate forces it into the file first, so this "
+            f"slice is green on an empty diff. Name something THIS slice introduces.")
+    _top_i = expect.get("intent") or plan.get("intent")
+    for sid, lit, home, where in foreign_property_defects(_top_i, _good):
+        bad("FOREIGN_PROPERTY_LITERAL",
+            f"slice {sid!r} must_contain {lit!r}, but the omnibus mentions {lit!r} "
+            f"only in property {', '.join(f'({n})' for n in where)}, while this slice "
+            f"implements property {', '.join(f'({n})' for n in home)}. It belongs to "
+            f"the slice for {', '.join(f'({n})' for n in where)}: drop it here (and "
+            f"drop the copied clause from this slice's intent) -- otherwise this "
+            f"slice's harness forces that other property's code into it.")
+    # DATUM NOT IN TARGET (2026-10-03, replay-endorse s3): see missing_datum_defects.
+    if body is not None:
+        _all_int = [s.get("intent") for s in slices if isinstance(s, dict)
+                    and isinstance(s.get("intent"), str)]
+        _top = expect.get("intent") or plan.get("intent")
+        _intro = " ".join(_all_int + ([_top] if isinstance(_top, str) else []))
+        for _s in slices:
+            if not isinstance(_s, dict) or not isinstance(_s.get("intent"), str):
+                continue
+            for owner, field in missing_datum_defects([_s["intent"]], _code_only(body), _intro):
+                bad("DATUM_NOT_IN_TARGET",
+                    f"slice {_s.get('id')!r} reads \"{owner}'s {field}\", but nothing in "
+                    f"{plan.get('target')} carries it: no {owner!r} type, no field/param "
+                    f"joining {owner!r} and {field!r}. The function cannot see that datum, "
+                    f"so the slice is unimplementable as stated. Name the field or "
+                    f"parameter that will carry it (e.g. `{owner}{field[:1].upper()}"
+                    f"{field[1:]}` on the input type) in the intent of the slice that "
+                    f"adds it, and depend on that slice.")
+
+    # PARENT GROUNDING (2026-10-05, rt-egift-link-s1): see identifier_typo_defects,
+    # relation_owner_defects, example_shape_defects. Blocking: each one goes back to
+    # the model as a REDO defect naming the exact token / model / URL to fix.
+    _ptop = expect.get("intent") or plan.get("intent")
+    if isinstance(_ptop, str) and _ptop.strip():
+        _gtxt = _grounding_text(plan, _ptop, body)
+        for sid, tok, ptok in identifier_typo_defects(_ptop, _good, _gtxt):
+            bad("IDENTIFIER_TYPO",
+                f"slice {sid!r} uses {tok!r}, which appears nowhere in the parent intent, "
+                f"the target, or the repo files the intent names -- but the parent intent "
+                f"says {ptok!r}. It is a misspelling: replace every {tok!r} with {ptok!r} "
+                f"in this slice's title/intent/must_contain/verify_shape (and in any other "
+                f"slice that copied it).")
+        for sid, model, field, owners in relation_owner_defects(_ptop, _good):
+            if field and owners and model not in {o.split(".")[0] for o in owners}:
+                why = (f"the parent intent states that relation as "
+                       f"{' / '.join(owners)} -- on {owners[0].split('.')[0]}, not {model}")
+            else:
+                why = (f"the parent intent never mentions {model!r}; the relation(s) it "
+                       f"states: {' / '.join(owners) or '(none)'}")
+            bad("RELATION_OWNER_MISMATCH",
+                f"slice {sid!r} states a relation on {model}"
+                f"{'.' + field if field else ''}, but {why}. Use exactly the relation the "
+                f"parent intent states (owner model and field name) and do not add a "
+                f"relation to any other model.")
+        for sid, url, param in example_shape_defects(_ptop, _good):
+            bad("EXAMPLE_CONTRADICTS_PARENT",
+                f"slice {sid!r} verify_shape presents {url!r} as a VALID example, but the "
+                f"parent intent requires a non-empty {param!r} query param and this URL has "
+                f"none. Every accept-path example must satisfy the parent's own rule (e.g. "
+                f"...?{param}=ABC123); a harness built on this example would reject-test "
+                f"the wrong shape.")
+
+    # ROOT-CAUSE LINT (2026-10-06, rt-egift-link-s1-s4 / replay-endorse): see plan_lint.py.
+    # HEADER_PAIR_LITERAL + INTENT_SHAPE_CONFLICT are blocking (each one makes the slice
+    # unsatisfiable by construction); SIBLING_OVERLAP + UNDEFINED_FIELD are warnings
+    # (plan_warnings) because real plans trip them legitimately.
+    _pl = _plan_lint()
+    if _pl is None:
+        bad("PLAN_LINT_UNAVAILABLE",
+            "plan_lint.py could not be loaded, so header-pair literals and intent/verify body "
+            "shape conflicts cannot be checked -- refusing (fail-closed)")
+    else:
+        for _code, _sev, _msg in _pl.lint_plan(plan):
+            if _sev == "error":
+                bad(_code, _msg)
+
+    # BEHAVIOR COVERAGE (2026-10-03, replay-bfmr-replace-tracking): a plan whose
+    # slices are bare signatures drops every behavioral clause of the omnibus
+    # (throw/never/must/trim/exactly...), so each slice gate verifies shape only and
+    # wrong code lands green. Every behavioral clause of the top-level intent must be
+    # substantially carried by SOME slice's intent; no non-type slice may be a bare
+    # declaration. Shared implementation with the auto-slicer (omnibus_slice).
+    # The REQUESTED intent wins: a model that drops or rewrites the top-level
+    # "intent" key must not thereby opt out of the coverage check.
+    top = expect.get("intent") or plan.get("intent")
+    if isinstance(top, str) and top.strip():
+        osl = _omnibus_slice()
+        if osl is None:
+            bad("BEHAVIOR_CHECK_UNAVAILABLE",
+                "omnibus_slice.py could not be loaded, so behavior coverage of the "
+                "top-level intent cannot be checked -- refusing (fail-closed)")
+        else:
+            good = [s for s in slices if isinstance(s, dict)]
+            for frag in osl.uncovered_behavior(top, good):
+                bad("BEHAVIOR_NOT_CARRIED",
+                    f"the top-level intent requires {frag!r}, but NO slice's intent "
+                    f"carries it -- put that clause (near-verbatim) in the intent of "
+                    f"the slice that implements it, and assert it in verify_shape")
+            for sid in (osl.preserve_only_slices(good)
+                        if callable(getattr(osl, "preserve_only_slices", None)) else []):
+                bad("PRESERVE_ONLY_SLICE",
+                    f"slice {sid!r} only PRESERVES/ENSURES something and changes nothing "
+                    f"-- it is green at its baseline by construction, so it can never be "
+                    f"authored (its fixture cannot fail first). Delete it and move its "
+                    f"clause (near-verbatim, so coverage still holds) into the intent and "
+                    f"verify_shape ADVERSARIAL case of the slice that EDITS that same "
+                    f"function, as a constraint that slice must not break")
+            for sid in osl.signature_only_slices(good):
+                bad("SIGNATURE_ONLY_INTENT",
+                    f"slice {sid!r} intent is a bare declaration with no behavior -- "
+                    f"state what it returns/throws/guarantees (from the top-level "
+                    f"intent); a signature alone lets any body pass the slice gate")
+
+    return d
+
+
+_PL = []
+
+
+def _plan_lint():
+    """plan_lint.py (shared pure lint), loaded once; None when it cannot be loaded."""
+    if not _PL:
+        try:
+            import importlib.util as _iu
+            _p = Path(__file__).resolve().parent / "plan_lint.py"
+            _sp = _iu.spec_from_file_location("plan_lint", str(_p))
+            _m = _iu.module_from_spec(_sp)
+            _sp.loader.exec_module(_m)
+            _PL.append(_m)
+        except Exception:
+            _PL.append(None)
+    return _PL[0]
+
+
+_OSL = []
+
+
+def _omnibus_slice():
+    """Load ~/bin/omnibus_slice.py (beside this script) once; None if it fails."""
+    if not _OSL:
+        try:
+            import importlib.util
+            p = os.path.join(os.path.dirname(SELF), "omnibus_slice.py")
+            spec = importlib.util.spec_from_file_location("omnibus_slice_cov", p)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            _OSL.append(m if callable(getattr(m, "uncovered_behavior", None)) else None)
+        except Exception:
+            _OSL.append(None)
+    return _OSL[0]
+
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_DECL_LINE_RE = re.compile(
+    r"^\s*(?:from\s|import\s|export\s|def\s|async\s+def\s|class\s|interface\s|type\s"
+    r"|(?:const|let|var)\s+[^=]*=\s*(?:await\s+)?require\(|@)")
+
+
+def _literal_baseline_class(lit, body):
+    """'absent' | 'declared' | 'used' -- same classification the slicer applies at
+    execute time (classify_baseline_literals in ollama-dispatch-slice)."""
+    if lit not in body:
+        return "absent"
+    if not _IDENT_RE.match(lit):
+        return "used"
+    word = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(lit) + r"(?![A-Za-z0-9_])")
+    hits = [ln for ln in body.splitlines() if word.search(ln)]
+    return "declared" if hits and all(_DECL_LINE_RE.match(ln) for ln in hits) else "used"
+
+
+# Same parser as ollama-dispatch-slice _INTENT_EDIT_FILE_RE/uncovered_edit_files
+# (the slicer refuses to author such a slice; this catches it at generation time).
+# test-scope-pins-dirty-slicefiles.py asserts both agree on the same intents.
+_INTENT_EDIT_FILE_RE = re.compile(
+    r"\b(?:to|into|in|edit|modify|update|extend|create(?:\s+(?:a\s+)?new)?(?:\s+[\w-]+){0,2}"
+    r"|mounted\s+in|add(?:s|ed)?\s+to)\s+['\"`]?"
+    r"((?:[\w.\[\]-]+/)+[\w.\[\]-]+\.(?:prisma|sql|tsx|ts|jsx|js|mjs|cjs|py|css|html|json|swift))(?![\w-])",
+    re.I)
+
+
+def slice_scope(plan, s):
+    t = s.get("target") if isinstance(s.get("target"), str) and s["target"].strip() \
+        else plan.get("target")
+    out = [t] if t else []
+    for f in s.get("edit_files") or []:
+        if isinstance(f, str) and f not in out:
+            out.append(f)
+    return out
+
+
+def unscoped_edit_files(plan, s):
+    """PURE. Files the slice intent creates/edits that are outside its scope."""
+    have = set(slice_scope(plan, s)) | {r for r in (s.get("reads") or []) if isinstance(r, str)}
+    out = []
+    for m in _INTENT_EDIT_FILE_RE.finditer(s.get("intent") or "" if isinstance(s.get("intent"), str) else ""):
+        f = m.group(1).strip("'\"`.,;:)")
+        if f not in have and f not in out:
+            out.append(f)
+    return out
+
+
+def _baseline_target_text(plan):
+    """The plan's target file as it is in the repo NOW, or None when unreadable
+    (creation target, bad path). Never raises."""
+    try:
+        repo, target = plan.get("repo"), plan.get("target")
+        if not isinstance(repo, str) or not isinstance(target, str):
+            return None
+        p = Path(os.path.expanduser(repo)) / target
+        if not p.is_file():
+            return None
+        return p.read_text(errors="replace")
+    except Exception:
+        return None
+
+
+def plan_warnings(plan):
+    """NON-BLOCKING findings: printed by --gate and recorded in the generated plan's
+    note, never a defect (no REDO round). GENERIC_LITERAL is warn-only by
+    coordinator decision 2026-10-04: 6 of 51 real plans flag and some look like
+    false positives ('bilt', 'listed') -- a blocking FP costs a generation round, a
+    missed generic costs a refine loop that is already visible."""
+    if not isinstance(plan, dict) or not isinstance(plan.get("slices"), list):
+        return []
+    out = []
+    for sid, lit, others in generic_literal_defects(
+            [s for s in plan["slices"] if isinstance(s, dict)]):
+        out.append(("GENERIC_LITERAL",
+                    f"slice {sid!r} must_contain {lit!r} is a bare common word that other "
+                    f"slices also use ({', '.join(map(repr, others[:4]))}); the literal "
+                    f"check is a raw substring test, so unrelated code or a comment "
+                    f"satisfies it and it pins nothing about THIS slice. Prefer dropping "
+                    f"it (verify_shape pins the behaviour) or a distinctive identifier/"
+                    f"constant/call `name(` this slice introduces."))
+    _pl = _plan_lint()
+    if _pl is not None:
+        try:
+            _root = Path(os.path.expanduser(str(plan.get("repo")))).resolve()
+            _body = _baseline_target_text(plan)
+            _gt = _grounding_text(plan, plan.get("intent"), _body)
+
+            def _in_repo(tok):
+                r = subprocess.run(["git", "-C", str(_root), "grep", "-qwF", tok],
+                                   capture_output=True, timeout=20)
+                return r.returncode == 0
+            for _code, _sev, _msg in _pl.lint_plan(plan, _gt, _in_repo if _root.is_dir() else None):
+                if _sev == "warn":
+                    out.append((_code, _msg))
+        except Exception:
+            pass
+    return out
+
+
+def gate_file(path, expect=None):
+    """Gate a plan FILE. Returns (defects, plan_or_None)."""
+    p = Path(os.path.expanduser(path))
+    if not p.is_file():
+        return [("NO_FILE", f"{path} does not exist -- write the plan there")], None
+    txt = p.read_text(errors="replace")
+    if not txt.strip():
+        return [("EMPTY_FILE", f"{path} is empty -- write the complete JSON plan "
+                               f"into it")], None
+    try:
+        plan = json.loads(txt)
+    except Exception as e:
+        return [("BAD_JSON", f"{path} is not valid JSON ({e}). Write ONLY the JSON "
+                             f"object -- no markdown fences, no prose, no trailing "
+                             f"commas.")], None
+    return gate_plan(plan, expect), plan
+
+
+# ==========================================================================
+# PROMPTING
+# ==========================================================================
+GATE_RULES_TEXT = """\
+A deterministic gate will REJECT your plan (and you will be asked to redo it)
+unless ALL of these hold:
+  * plan.json parses as JSON -- the whole file is ONE object, nothing else in it
+    (no ``` fences, no commentary, no trailing commas).
+  * top-level keys are exactly: label, repo, target, lang, slices -- and label,
+    repo, target and lang are COPIED VERBATIM from the values given above.
+  * slices is a non-empty array; every slice has id, title, intent, depends_on,
+    must_contain, verify_shape.
+  * every id is unique and a lowercase slug (a-z, 0-9, '-', '_').
+  * depends_on is an array of ids of slices that appear EARLIER in the array.
+    No cycles, no self-references, no unknown ids. Use [] when the slice stands
+    alone. Wire a dependency ONLY when the later slice's code needs the earlier
+    slice's code to already exist.
+  * each slice describes exactly ONE property. Two `def`/`function`/`class`
+    definitions in one slice, three different function signatures in one slice,
+    or an "also/additionally/separately" clause joining two changes = REJECTED.
+  * intent is a full, self-contained sentence of at least 25 characters that a
+    test could be authored from WITHOUT reading the other slices. Name the file,
+    the function, the exact signature, and the exact expected behaviour.
+  * must_contain is a non-empty array of literal strings the finished code will
+    literally contain (function names, dict keys, constants). EVERY literal must
+    also appear in that slice's own intent -- if you list a literal, say it in
+    the intent. A new identifier (camelCase/snake_case) whose words all appear in
+    the intent also counts (intent "endorsed links" -> literal `isEndorsed`). Do
+    not list bare punctuation, and do NOT list English phrases ("fall back",
+    "smallest id"): code only contains those in a comment (PROSE_LITERAL).
+  * a literal belongs to the slice whose property it implements. If the omnibus
+    numbers its properties (1) (2) ..., do NOT put a literal from another
+    property into this slice, and do NOT copy another property's clause into this
+    intent to justify one (FOREIGN_PROPERTY_LITERAL).
+  * do NOT list a bare common word ('status', 'done', 'error', 'items') that other
+    slices also use: the literal check is a raw substring test, so any code or
+    comment satisfies it (GENERIC_LITERAL -- printed as a WARN; fix it anyway).
+    List the identifier/constant/call THIS slice introduces.
+  * a literal of a slice this one depends on (directly or transitively) is
+    already in the file when this slice starts. If EVERY literal of a slice is,
+    the slice is green on an empty diff (VACUOUS_AT_CHAIN_BASELINE).
+  * if behaviour depends on a datum the target's inputs do not carry today (e.g.
+    "the reservation's trackingNumber" when the input type has no such field),
+    the intent of the slice that adds it must NAME the new field/parameter in
+    backticks (DATUM_NOT_IN_TARGET).
+  * EVERY behavioral clause of the omnibus (throw/raise, never, must, only,
+    exactly, trim, unchanged, empty/whitespace, zero-or-more-than-one, ...) must
+    appear near-verbatim in the intent of the slice that implements it. A slice
+    intent that is only a signature/declaration is rejected (BEHAVIOR_NOT_CARRIED,
+    SIGNATURE_ONLY_INTENT) unless it is a pure type/interface slice.
+  * A clause that only PRESERVES behaviour ("must keep working", "must still be
+    dropped", "unchanged", "stays PURE", "exactly as before") is a CONSTRAINT, not
+    a slice: carry it in the intent + verify_shape adversarial case of the slice
+    that EDITS that same code. A standalone preserve/ensure slice is already true
+    at its baseline and can never be authored (PRESERVE_ONLY_SLICE).
+  * verify_shape states the behavioural check AND an adversarial case that a
+    plausible-wrong implementation would fail.
+  * a slice that creates or edits a file OTHER than the top-level target (a
+    prisma schema + its migration, a new API route, a component and the page
+    that mounts it) sets its own "target" (the main file it creates/edits) and
+    "edit_files" (every other file it edits, e.g. ["prisma/schema.prisma",
+    "prisma/migrations/<YYYYMMDDHHMMSS>_<name>/migration.sql"]); a file it only
+    references/mirrors goes in "reads". A schema model change always ships its
+    migration in the same slice (UNSCOPED_EDIT_FILE).
+  * spell every identifier, model and file name EXACTLY as the omnibus does. A
+    name that is not in the omnibus/target but is 1-2 letters off one that is
+    ("OrderEgitftLink" for OrderEgiftLink) is rejected (IDENTIFIER_TYPO).
+  * a relation/back-relation goes on exactly the model and field the omnibus
+    names (omnibus "Order.egiftLink" -> never "User.egiftLinks")
+    (RELATION_OWNER_MISMATCH).
+  * every VALID example in verify_shape must satisfy the omnibus's own input
+    rules (a "non-empty login query param" rule -> accept examples carry
+    ?login=<value>) (EXAMPLE_CONTRADICTS_PARENT).
+"""
+
+EXAMPLE_SLICE = """\
+{
+  "id": "s1-query-matrix",
+  "title": "build_search_queries (independent-key search matrix)",
+  "intent": "Create broker_guard/detection.py with build_search_queries(phones: list[str], emails: list[str], name_variants: list[str], addresses: list[str]) -> list[dict] emitting one query per phone {'kind':'phone','value':<phone>}, one per email {'kind':'email','value':<email>}, and one per (name_variant, address) pair {'kind':'name_address',...}, in that class order, de-duplicated preserving first occurrence.",
+  "depends_on": [],
+  "must_contain": ["build_search_queries", "name_address"],
+  "verify_shape": "behavioral: phones=[p1,p2], emails=[e1], name_variants=['John Smith'], addresses=[a1,a2] -> exactly 5 queries: 2 phone, 1 email, then 2 name_address, in that order. ADVERSARIAL: with addresses=[] and name_variants=[] the phone-only and email-only queries MUST still be emitted -- an implementation that only pairs names with addresses fails this."
+}"""
+
+
+# ---- REPO CONTEXT, pre-read for the model (2026-10-05) ----------------------------
+# bfe0699081c4 (plan-gen-rt-bfmr-push-via-sidecar-r1) spent ALL 12 of its iterations
+# reading the repo -- the repo is outside the scratch cwd, so it ran `find`/`cat` over
+# it, read STALE COPIES under nested worktree dirs (rt-wt-onecontainer/,
+# .claude/worktrees/), had a whole-repo grep time out at 240s -- and ended with
+# plan.json still `{}`. Round 2's REDO prompt then said "fix exactly these defects ...
+# do not discard the slices that were fine" about an EMPTY plan, so it re-explored
+# from scratch. Fix: hand the model the target file and every repo file the intent
+# NAMES, up front and bounded, tell it which tree is real, and require a draft
+# plan.json early; a REDO after an empty round says so plainly.
+CONTEXT_BUDGET = int(os.environ.get("PLAN_GEN_CONTEXT_BUDGET", "14000"))
+_CTX_FILE_CAP = 5000
+_PATHISH_RE = re.compile(r"(?<![\w./-])((?:[\w.-]+/)*[\w.-]+\.(?:tsx?|jsx?|mjs|cjs|py|"
+                         r"swift|sh|cs|json|prisma|go|rb))(?![\w/-])")
+_STALE_TREE_RE = re.compile(r"(?:^|/)(?:node_modules|\.git|\.claude|worktrees?|"
+                            r"[\w-]*-wt-[\w-]*|wt-[\w-]+|dist|build|\.next)(?:/|$)")
+
+
+def intent_paths(intent, target=None):
+    """PURE. Repo-relative file paths the intent (plus the target) names, in order of
+    first mention, de-duplicated. `lib/bfmrJoin.ts`, `app/api/x/route.ts`."""
+    out = []
+    tgt = [str(target).strip()] if target else []
+    named = [p for p in _PATHISH_RE.findall(intent or "") if "/" in p]
+    for p in tgt + named:
+        while p.startswith("./"):
+            p = p[2:]
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def repo_context(repo, target, intent, budget=None):
+    """The pre-read context block: the target file and each intent-named file that
+    EXISTS under `repo` (never a path that escapes it, never one inside a nested
+    worktree/vendor dir), each capped at _CTX_FILE_CAP chars, all within `budget`.
+    Returns markdown ('' when nothing readable)."""
+    budget = CONTEXT_BUDGET if budget is None else budget
+    root = Path(repo).resolve()
+    parts, used, listed = [], 0, []
+    for rel in intent_paths(intent, target):
+        if _STALE_TREE_RE.search(rel):
+            continue
+        p = (root / rel).resolve()
+        try:
+            p.relative_to(root)
+        except ValueError:
+            continue
+        if not p.is_file():
+            continue
+        try:
+            txt = p.read_text(errors="replace")
+        except OSError:
+            continue
+        cut = txt[:_CTX_FILE_CAP]
+        room = budget - used
+        if room <= 400:
+            listed.append(f"{rel} ({len(txt)} chars, not inlined: context budget used)")
+            continue
+        cut = cut[:room]
+        trunc = len(cut) < len(txt)
+        parts.append(f"### `{rel}` ({len(txt)} chars{', TRUNCATED' if trunc else ''})\n"
+                     f"```\n{cut}\n```\n")
+        used += len(cut)
+    if not parts and not listed:
+        return ""
+    head = (f"## Repo context (already read for you -- do NOT re-read these)\n"
+            f"The REAL source tree is `{root}`. Never read copies under nested "
+            f"worktree/vendor dirs inside it (`*-wt-*/`, `.claude/worktrees/`, "
+            f"`worktrees/`, `node_modules/`) -- they are stale. Never grep the whole "
+            f"repo (it times out); read a specific file by path if you need one.\n\n")
+    tail = ("".join(f"- {x}\n" for x in listed))
+    return head + "".join(parts) + (f"\nAlso named but not inlined:\n{tail}" if tail else "")
+
+
+PREV_PLAN_CAP = 16000
+
+
+def _prev_plan_for_prompt(full):
+    """PURE. The previous plan as build_prompt takes it: the text capped at
+    PREV_PLAN_CAP, or -- when the cap cut a plan that HAS slices into unparseable
+    JSON -- {'text', 'has_slices': True}, so the REDO still says 'repair these'."""
+    cut = (full or "")[:PREV_PLAN_CAP]
+    if len(cut) < len(full or "") and _plan_has_slices(full):
+        return {"text": cut + "\n... (truncated -- the full file is plan.json in this "
+                              "directory)", "has_slices": True}
+    return cut
+
+
+def _plan_has_slices(text):
+    if isinstance(text, dict):
+        return bool(text.get("has_slices"))
+    try:
+        return bool((json.loads(text or "") or {}).get("slices"))
+    except Exception:
+        return False
+
+
+def build_prompt(a, label, defects=None, prev_plan_text=None, context=""):
+    iters = getattr(a, "max_iters", None) or 12
+    head = f"""\
+# TASK: decompose an omnibus coding intent into a slice PLAN
+
+You are writing `plan.json` in this directory. It is the input to an automated
+pipeline that will dispatch EACH SLICE as its own independently-gated coding job:
+every slice gets its own adversarial test harness and must pass on its own. That
+is why a slice must be ONE property -- a slice that bundles two changes cannot be
+gated on a relevant test.
+
+## The omnibus to decompose
+repo:   {a.repo}
+target: {a.target}
+lang:   {a.lang}
+label:  {label}
+
+intent (the WHOLE job, to be split):
+{a.intent}
+
+## Output format
+Write the complete plan to `plan.json` in this directory. Shape:
+
+{{
+  "label": {json.dumps(label)},
+  "repo": {json.dumps(a.repo)},
+  "target": {json.dumps(a.target)},
+  "lang": {json.dumps(a.lang)},
+  "intent": "<the omnibus intent, copied>",
+  "slices": [ ...one object per property, in dependency order... ]
+}}
+
+One slice looks EXACTLY like this (this is the quality bar -- match this level of
+specificity, do not write sentence fragments):
+
+{EXAMPLE_SLICE}
+
+## Rules the gate enforces
+{GATE_RULES_TEXT}
+## How to decompose well
+  * Read the omnibus and list the distinct PROPERTIES a reviewer would test
+    separately. Each becomes one slice. Aim for 2-8 slices; if the omnibus is a
+    single change, ONE slice is a correct answer -- do not pad.
+  * Order them so a slice only needs code that an earlier slice already landed;
+    put that earlier id in depends_on.
+  * Slice 1 of a brand-new file creates the file; later slices edit it.
+  * Prefer slices that are small enough for a 27B model to implement in one pass.
+
+## Budget: DRAFT FIRST, then repair (you have only {iters} tool calls)
+The relevant repo files are inlined below -- you do NOT need to explore the repo.
+By your 3rd tool call at the latest, write a COMPLETE draft plan.json (every
+slice, every field). Then run `bash verify.sh` and repair what it reports. A run
+that spends its calls reading files and never writes plan.json is a total failure.
+
+## Self-check before you finish
+Run `bash verify.sh` in this directory. It runs the exact gate described above
+and prints every defect. Keep fixing plan.json until it prints GATE: CLEAN.
+"""
+    if context:
+        head += "\n" + context
+    if isinstance(prev_plan_text, dict):
+        _prev_has, prev_plan_text = True, prev_plan_text.get("text")
+    else:
+        _prev_has = _plan_has_slices(prev_plan_text)
+    if defects and not _prev_has:
+        bullets = "\n".join(f"  - [{c}] {m}" for c, m in defects)
+        head += f"""
+
+## !!! THIS IS A REDO -- last round wrote NO plan !!!
+plan.json was still empty (no slices) when the last round ended -- it ran out of
+tool calls before writing anything. There is nothing to repair. Do not explore:
+write the WHOLE plan.json in your FIRST tool call using the context above, then
+run `bash verify.sh` and fix what it reports. Last round's gate output:
+{bullets}
+"""
+    elif defects:
+        bullets = "\n".join(f"  - [{c}] {m}" for c, m in defects)
+        head += f"""
+
+## !!! THIS IS A REDO -- your previous plan was REJECTED !!!
+The gate found these SPECIFIC defects in the plan you wrote last round:
+{bullets}
+
+Fix exactly these. Do not start over from scratch and do not discard the slices
+that were fine -- repair the defective ones. Your previous plan.json content:
+
+{prev_plan_text or '(no readable previous plan)'}
+"""
+    return head
+
+
+# ==========================================================================
+# QUEUE DISPATCH  (mirrors ollama-dispatch-auto.dispatch_model)
+# ==========================================================================
+def job_row(job):
+    try:
+        d = json.loads(QUEUE_STATE.read_text())
+        return next((j for j in (d.get("jobs") or [])
+                     if str(j.get("id")).startswith(job)), None)
+    except Exception:
+        return None
+
+
+def sidecar_status(job):
+    """Terminal outcome from the never-pruned `<id>.done.json` sidecar, for when
+    the live queue row is pruned between polls (the same fast-completion race
+    ollama-dispatch-slice Bug #5 documents). Returns 'done'/'failed'/None."""
+    if not job:
+        return None
+    for base in (LOG_DIR, LOG_DIR / "archive"):
+        cands = [base / f"{job}.done.json"] + \
+                [Path(p) for p in sorted(glob.glob(str(base / f"*{job}*.done.json")))]
+        for path in cands:
+            if not path.is_file():
+                continue
+            try:
+                rec = json.loads(path.read_text())
+            except Exception:
+                continue
+            st = str(rec.get("status") or "done")
+            return "done" if st == "done" else "failed"
+    return None
+
+
+def seal_scratch_baseline(wt: Path, label: str = "") -> bool:
+    """Commit everything THIS PIPELINE put in the scratch dir (PLAN-TASK.md, the
+    previous round's plan.json, a rewritten verify.sh) as the round's baseline,
+    BEFORE the job is enqueued.
+
+    Why (2026-10-03, 146bd205e5bb / 5f865e95009e): the scratch repo's one baseline
+    commit was made before PLAN-TASK.md and plan.json existed, so every round
+    launched with `?? PLAN-TASK.md ?? plan.json`; the queue measured a dirty launch
+    baseline and gate-on-complete parked the job needs_opus as "untrusted
+    baseline" -- on nothing but harness files. Sealing them makes the launch
+    baseline clean, so only what the MODEL changes during the job is its diff,
+    and the queue's dirty-baseline check stays untouched (it still bites on any
+    genuinely stray path). Scratch repo only; never merged anywhere."""
+    capture(["git", "-C", str(wt), "add", "-A"])
+    rc, _out, _err = capture(["git", "-C", str(wt), "-c", "user.email=plan@local",
+                              "-c", "user.name=plan-gen", "commit", "-q", "--no-verify",
+                              "--allow-empty", "-m",
+                              f"plan-gen round baseline {label}".strip()])
+    return rc == 0
+
+
+def dispatch_round(wt: Path, prompt: str, label: str, a, bundle=None):
+    """Enqueue one plan-authoring job at the BACK of the queue and poll it to a
+    terminal state. Returns (ok, why). --drafter-cmd substitutes a local command
+    for the model (used by the end-to-end test so the harness can be exercised
+    without spending a GPU slot)."""
+    pf = wt / "PLAN-TASK.md"
+    pf.write_text(prompt)
+    seal_scratch_baseline(wt, label)
+    if a.drafter_cmd:
+        rc, out, err = capture(["bash", "-lc", a.drafter_cmd], cwd=str(wt),
+                               timeout=a.timeout)
+        if rc != 0:
+            return False, f"--drafter-cmd exited {rc}: {(err or out).strip()[-400:]}"
+        return True, "drafter-cmd ran"
+
+    cmd = [sys.executable, QUEUE, "enqueue", "--model", a.model, "--host", a.host,
+           "--cwd", str(wt), "--allow-unisolated",
+           "--task-file", str(pf), "--task-kind", "coding",
+           "--num-ctx", str(a.num_ctx), "--verify", "bash verify.sh",
+           "--max-iters", str(a.max_iters), "--chat-timeout", str(a.chat_timeout),
+           "--label", label]
+    # BUNDLE (2026-10-05, no-bounce): a plan-gen round is part of the SAME feature
+    # as the slices it produces. Without an explicit tag the queue derived
+    # `plan-gen-<label>` from the queue label while the slicer stamps the slices
+    # `<label>` -- one feature, two bundles, and the commitment bounced between them.
+    if bundle:
+        cmd += ["--bundle", str(bundle)]
+    # NOTE: deliberately no --front and no preempt. Plan generation is background
+    # work; the qwen auto-author queue keeps precedence.
+    rc, out, err = capture(cmd)
+    if rc != 0 and "enqueued " not in (out or ""):
+        return False, f"enqueue failed (rc={rc}): {(err or out).strip()[-500:]}"
+    m = re.search(r"\benqueued\s+([0-9a-f]{8,})\b", out or "") or \
+        re.search(r"\b([0-9a-f]{12})\b", out or "")
+    if not m:
+        return False, f"could not read a job id from: {(out or '').strip()[:300]}"
+    job = m.group(1)
+    print(f"    queued {job} ({label}) at the back of the queue; polling...")
+    gone_since = None
+    last = None
+    soft = time.time() + a.timeout
+    warned = False
+    while True:
+        time.sleep(15)
+        row = job_row(job)
+        if not row:
+            out = sidecar_status(job)
+            if out == "done":
+                return True, f"job {job} done (live row pruned post-completion)"
+            if out == "failed":
+                return False, f"job {job} failed (per the handoff sidecar)"
+            if gone_since is None:
+                gone_since = time.time()
+            elif time.time() - gone_since > 300:
+                return False, (f"job {job} vanished from the queue for >300s "
+                               f"without a terminal state")
+            continue
+        gone_since = None
+        st = row.get("status")
+        if st != last:
+            print(f"    {job}: {st}")
+            last = st
+        if st == "done":
+            return True, f"job {job} done"
+        if st in ("failed", "cancelled", "error", "blocked"):
+            return False, f"job {job} {st} (exit {row.get('exit_code')})"
+        if time.time() > soft and not warned:
+            print(f"    {job}: still {st} after {a.timeout}s -- still polling "
+                  f"(no hard cutoff).", file=sys.stderr)
+            warned = True
+
+
+# ==========================================================================
+# GENERATE
+# ==========================================================================
+def slugify(s, n=40):
+    s = re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")
+    return (s[:n].rstrip("-") or "plan")
+
+
+def print_plan(plan):
+    print(f"# ---- GENERATED SLICE PLAN: {plan.get('label')} "
+          f"({len(plan.get('slices') or [])} slices) ----")
+    print(f"# repo:   {plan.get('repo')}")
+    print(f"# target: {plan.get('target')}   lang: {plan.get('lang')}")
+    for i, s in enumerate(plan.get("slices") or []):
+        print(f"#\n# {i+1}. {s.get('id')} -- {s.get('title')}")
+        if s.get("depends_on"):
+            print(f"#    depends_on:   {', '.join(s['depends_on'])}")
+        print(f"#    intent:       {s.get('intent')}")
+        print(f"#    must_contain: {', '.join(s.get('must_contain') or [])}")
+        print(f"#    verify:       {s.get('verify_shape')}")
+
+
+def write_verify(wt: Path, expect):
+    v = wt / "verify.sh"
+    args = " ".join([q(SELF), "--gate", "plan.json",
+                     "--expect-repo", q(expect["repo"]),
+                     "--expect-target", q(expect["target"]),
+                     "--expect-lang", q(expect["lang"]),
+                     "--expect-label", q(expect["label"])]
+                    + (["--expect-intent", q(expect["intent"])]
+                       if expect.get("intent") else []))
+    v.write_text("#!/usr/bin/env bash\n# structural gate for the generated slice "
+                 "plan -- the SAME gate the orchestrator runs.\nexec python3 "
+                 + args + "\n")
+    v.chmod(0o755)
+
+
+def do_generate(a):
+    a.repo = os.path.abspath(os.path.expanduser(a.repo))
+    if not os.path.isdir(a.repo):
+        die(f"--repo {a.repo} is not a directory")
+    if a.lang not in LANGS:
+        die(f"--lang must be one of {'/'.join(LANGS)}")
+    label = a.label or slugify(f"{os.path.basename(a.repo)}-{Path(a.target).stem}")
+    expect = {"repo": a.repo, "target": a.target, "lang": a.lang, "label": label,
+              "intent": a.intent}
+
+    wt = GEN_ROOT / label
+    wt.mkdir(parents=True, exist_ok=True)
+    write_verify(wt, expect)
+    # A tiny throwaway git repo: the queue's coding path wants a baseline to diff
+    # the worker's edit against. This is scratch -- it is never merged anywhere.
+    if not (wt / ".git").exists():
+        capture(["git", "init", "-q", str(wt)])
+        capture(["git", "-C", str(wt), "add", "-A"])
+        capture(["git", "-C", str(wt), "-c", "user.email=plan@local",
+                 "-c", "user.name=plan-gen", "commit", "-q", "--no-verify",
+                 "-m", "plan-gen scratch baseline"])
+    plan_file = wt / "plan.json"
+    if not plan_file.exists():
+        plan_file.write_text("{}\n")
+
+    defects, prev_text = None, None
+    ctx = repo_context(a.repo, a.target, a.intent)
+    for rnd in range(1, a.max_rounds + 1):
+        print(f"\n[plan-gen] round {rnd}/{a.max_rounds} -- dispatching the "
+              f"decomposition to {a.model}...")
+        prompt = build_prompt(a, label, defects, prev_text, context=ctx)
+        ok, why = dispatch_round(wt, prompt, f"plan-gen-{label}-r{rnd}", a, bundle=label)
+        if not ok:
+            print(f"[plan-gen] round {rnd} dispatch did not converge: {why}")
+        defects, plan = gate_file(plan_file, expect)
+        # The REDO branch test (_plan_has_slices) must see the WHOLE file: the old
+        # [:6000] cut made any plan > 6000 chars unparseable, so a real 6-slice plan
+        # (rt-egift-link-s1, 9.2k) got "last round wrote NO plan -- write the WHOLE
+        # plan.json" instead of "repair exactly these defects" (2026-10-05).
+        prev_text = _prev_plan_for_prompt(plan_file.read_text(errors="replace")) \
+            if plan_file.exists() else None
+        if not defects:
+            print(f"[plan-gen] GATE: CLEAN after round {rnd}.")
+            return finish(a, plan, label, expect, rnd)
+        print(f"[plan-gen] GATE: {len(defects)} defect(s) after round {rnd}:")
+        for c, m in defects:
+            print(f"    [{c}] {m}")
+        if rnd == a.max_rounds:
+            print(f"\n[plan-gen] GIVING UP after {a.max_rounds} rounds -- the "
+                  f"gate never went clean. Nothing was written to {PLAN_DIR}. "
+                  f"The last attempt is at {plan_file}; fix it by hand and gate "
+                  f"it with:\n    {SELF} --gate {plan_file} "
+                  f"--expect-repo {q(a.repo)} --expect-target {q(a.target)} "
+                  f"--expect-lang {a.lang} --expect-label {label}")
+            return 1
+    return 1
+
+
+def finish(a, plan, label, expect, rounds):
+    """A structurally-clean plan: normalize, persist, and STOP for the human
+    plan review. The plan is the highest-leverage judgement in the pipeline, so
+    generating one never auto-executes it."""
+    plan["label"] = label
+    plan["repo"] = expect["repo"]
+    plan["target"] = expect["target"]
+    plan["lang"] = expect["lang"]
+    plan.setdefault("intent", a.intent)
+    plan["shared_worktree"] = True
+    plan["note"] = (
+        f"GENERATED by ollama-dispatch-plan (qwen decomposition, {rounds} "
+        f"round(s), structural gate CLEAN). "
+        + (f"Single-file OMNIBUS: all slices edit {expect['target']}"
+           if not any(isinstance(s, dict) and (s.get("target") or s.get("edit_files"))
+                      for s in plan.get("slices") or [])
+           else f"Multi-file OMNIBUS: slices edit {expect['target']} unless they set their "
+                f"own target/edit_files")
+        + f" in a sequential chain on branch slice/{label}, each "
+        f"authored via ollama-dispatch-auto --repo <chain-wt> and gated on its OWN "
+        f"adversarial verify. Integrate by copying the finished branch tree onto "
+        f"main, never merge.")
+    _warns = plan_warnings(plan)
+    if _warns:
+        plan["note"] += (" GATE WARNINGS (non-blocking, review before executing): "
+                         + " | ".join(f"[{c}] {m}" for c, m in _warns))
+        for c, m in _warns:
+            print(f"[plan-gen] WARN (non-blocking) [{c}] {m}")
+    PLAN_DIR.mkdir(parents=True, exist_ok=True)
+    out = Path(os.path.expanduser(a.out)) if a.out else PLAN_DIR / f"{label}.slices.json"
+    out.write_text(json.dumps(plan, indent=2) + "\n")
+
+    print()
+    print_plan(plan)
+    print(f"\n# written to: {out}")
+
+    execute_cmd = f"{SLICER} {q(out)} --execute"
+    if not a.auto_confirm_plan:
+        print("\n" + "=" * 72)
+        print("PLAN REVIEW -- STOPPING HERE ON PURPOSE.")
+        print("The structural gate proves the plan is well-FORMED. It cannot prove")
+        print("the decomposition is RIGHT: that each slice is a property worth")
+        print("gating, in the right order, at the right granularity. Read the")
+        print("slices above, then run:")
+        print(f"\n    {execute_cmd}\n")
+        print("(re-run this generator with --auto-confirm-plan to skip this stop)")
+        print("=" * 72)
+        return 0
+
+    print("\n# --auto-confirm-plan: plan review SKIPPED (fully autonomous run).")
+    if a.then_execute:
+        print(f"# executing: {execute_cmd}")
+        return subprocess.run([SLICER, str(out), "--execute"]).returncode
+    print(f"# to execute:  {execute_cmd}")
+    return 0
+
+
+# ==========================================================================
+# SELF-TEST -- the gate must BITE (revert-test style)
+# ==========================================================================
+def _good_plan():
+    return {
+        "label": "demo",
+        "repo": "/tmp/demo-repo",
+        "target": "demo/parse.py",
+        "lang": "python",
+        "slices": [
+            {
+                "id": "s1-parse-header",
+                "title": "parse_header",
+                "intent": ("Create demo/parse.py with parse_header(raw: str) -> dict "
+                           "returning {'version': <int>, 'flags': <list[str]>} parsed "
+                           "from the first line of raw; a missing version field "
+                           "raises ValueError."),
+                "depends_on": [],
+                "must_contain": ["parse_header", "version", "flags"],
+                "verify_shape": ("behavioral: 'v2 a,b' -> {'version': 2, 'flags': "
+                                 "['a','b']}. ADVERSARIAL: an empty first line must "
+                                 "raise ValueError, not return a default dict."),
+            },
+            {
+                "id": "s2-render-header",
+                "title": "render_header",
+                "intent": ("In demo/parse.py add render_header(header: dict) -> str "
+                           "that is the exact inverse of parse_header: it emits "
+                           "'v<version> <comma-joined flags>' with no trailing space."),
+                "depends_on": ["s1-parse-header"],
+                "must_contain": ["render_header", "version"],
+                "verify_shape": ("behavioral: render_header(parse_header(x)) == x for "
+                                 "'v2 a,b'. ADVERSARIAL: an empty flags list must emit "
+                                 "'v2' with NO trailing space."),
+            },
+        ],
+    }
+
+
+def _expect_codes(name, plan, want, results, expect=None):
+    got = gate_plan(plan, expect)
+    codes = {c for c, _ in got}
+    if want is None:                       # must be CLEAN
+        ok = not got
+        detail = "clean" if ok else f"unexpected defects: {sorted(codes)}"
+    else:
+        ok = want in codes
+        detail = (f"bit with [{want}]" if ok
+                  else f"DID NOT BITE -- got {sorted(codes) or 'nothing'}")
+    results.append((ok, name, detail))
+    print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")
+    if got and want:
+        for c, m in got:
+            if c == want:
+                print(f"          -> {m}")
+    return ok
+
+
+def self_test():
+    print("== ollama-dispatch-plan --self-test : does the structural gate BITE? ==")
+    r = []
+
+    # 0. the control: a good plan must pass. Without this, every "FAIL" below
+    #    could just be a gate that rejects everything (a vacuous gate).
+    _expect_codes("good plan passes (control)", _good_plan(), None, r)
+
+    # 1. dependency CYCLE
+    p = _good_plan()
+    p["slices"][0]["depends_on"] = ["s2-render-header"]
+    _expect_codes("dependency cycle FAILS", p, "DAG_CYCLE", r)
+
+    # 2. MULTI-PROPERTY slice (three definitions in one slice)
+    p = _good_plan()
+    p["slices"][0]["intent"] = (
+        "In demo/parse.py define def parse_header(raw) returning a dict, and "
+        "def render_header(h) returning a string, and also def validate_header(h) "
+        "raising on a bad version field.")
+    p["slices"][0]["must_contain"] = ["parse_header", "render_header",
+                                      "validate_header"]
+    _expect_codes("multi-property slice FAILS", p, "MULTI_PROPERTY", r)
+
+    # 3. EMPTY must_contain
+    p = _good_plan()
+    p["slices"][1]["must_contain"] = []
+    _expect_codes("empty must_contain FAILS", p, "EMPTY_MUST_CONTAIN", r)
+
+    # 4. unknown depends_on id
+    p = _good_plan()
+    p["slices"][1]["depends_on"] = ["s9-does-not-exist"]
+    _expect_codes("unknown depends_on id FAILS", p, "UNKNOWN_DEP", r)
+
+    # 5. duplicate slice ids
+    p = _good_plan()
+    p["slices"][1]["id"] = p["slices"][0]["id"]
+    p["slices"][1]["depends_on"] = []
+    _expect_codes("duplicate slice id FAILS", p, "DUP_ID", r)
+
+    # 6. a must_contain literal invented out of thin air
+    p = _good_plan()
+    p["slices"][0]["must_contain"] = ["parse_header", "TOTALLY_INVENTED_CONST"]
+    _expect_codes("literal absent from intent FAILS", p, "LITERAL_NOT_IN_INTENT", r)
+
+    # 6b. VACUOUS AT BASELINE (#9): literals already true in the target file
+    import tempfile as _tf
+    _vd = _tf.mkdtemp(prefix="plan-selftest-")
+    try:
+        os.makedirs(os.path.join(_vd, "demo"))
+        Path(_vd, "demo", "parse.py").write_text(
+            "from lib import upsert_schedule\n\n"
+            "def parse_header(raw):\n    return {}\n\n"
+            "x = parse_header('v1')\n")
+        p = _good_plan()
+        p["repo"] = _vd
+        # s1 names parse_header + version + flags; parse_header is USED (called) at
+        # baseline but version/flags are absent -> the set still discriminates.
+        _expect_codes("a set with one absent literal is NOT vacuous (control)", p, None, r)
+        p = _good_plan(); p["repo"] = _vd
+        p["slices"][0]["intent"] += " parse_header"
+        p["slices"][0]["must_contain"] = ["parse_header"]
+        _expect_codes("every literal already USED at baseline FAILS", p,
+                      "VACUOUS_MUST_CONTAIN", r)
+        p = _good_plan(); p["repo"] = _vd
+        p["slices"][1]["intent"] += " It must call upsert_schedule."
+        p["slices"][1]["must_contain"] = ["upsert_schedule"]
+        _expect_codes("an import-only literal FAILS with the call-site suggestion", p,
+                      "DECLARED_ONLY_LITERAL", r)
+        p["slices"][1]["must_contain"] = ["upsert_schedule("]
+        _expect_codes("...and its call-site form `upsert_schedule(` is clean", p, None, r)
+        p = _good_plan(); p["repo"] = _vd
+        p["slices"][0]["intent"] += " parse_header"
+        p["slices"][0]["must_contain"] = ["parse_header"]
+        p["slices"][0]["kind"] = "invariant"
+        _expect_codes("an invariant slice is exempt from the baseline check", p, None, r)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(_vd, ignore_errors=True)
+
+    # 7. no slices at all
+    p = _good_plan()
+    p["slices"] = []
+    _expect_codes("empty slices array FAILS", p, "NO_SLICES", r)
+
+    # 8. thin, fragment intent (the failure mode of the old regex auto-slicer)
+    p = _good_plan()
+    p["slices"][0]["intent"] = "adapter_cls)."
+    p["slices"][0]["must_contain"] = ["adapter_cls"]
+    _expect_codes("sentence-fragment intent FAILS", p, "THIN_INTENT", r)
+
+    # 9. target/lang drift away from what was requested
+    p = _good_plan()
+    p["target"] = "demo/something_else.py"
+    _expect_codes("retargeted plan FAILS", p, "EXPECT_MISMATCH", r,
+                  expect={"repo": "/tmp/demo-repo", "target": "demo/parse.py",
+                          "lang": "python", "label": "demo"})
+
+    # 10. not JSON at all, via the file path
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        bad = Path(td) / "plan.json"
+        bad.write_text("```json\n{ nope }\n```")
+        got, _ = gate_file(bad)
+        ok = any(c == "BAD_JSON" for c, _ in got)
+        r.append((ok, "non-JSON file FAILS", "bit with [BAD_JSON]" if ok else "DID NOT BITE"))
+        print(f"  {'PASS' if ok else 'FAIL'}  non-JSON file FAILS: "
+              f"{'bit with [BAD_JSON]' if ok else 'DID NOT BITE'}")
+
+    # 10b. PARENT GROUNDING replay (2026-10-05, rt-egift-link-s1 r2): the plan the
+    #      structural gate called CLEAN must now FAIL with all three new codes, and
+    #      the corrected plan must trip NONE of them. Hermetic: repo is pointed at an
+    #      empty temp dir so grounding is the parent intent only (strictest case).
+    _fx = Path(SELF + ".fixtures")
+    _NEWC = {"IDENTIFIER_TYPO", "RELATION_OWNER_MISMATCH", "EXAMPLE_CONTRADICTS_PARENT"}
+    with tempfile.TemporaryDirectory() as td:
+        for fname, want in (("rt-egift-link-s1.typo.slices.json", _NEWC),
+                            ("rt-egift-link-s1.corrected.slices.json", set())):
+            fp = _fx / fname
+            if not fp.is_file():
+                r.append((False, f"replay {fname}", "fixture missing"))
+                print(f"  FAIL  replay {fname}: fixture missing at {fp}")
+                continue
+            p = json.loads(fp.read_text()); p["repo"] = td
+            got = {c for c, _ in gate_plan(p)} & _NEWC
+            ok = got == want
+            name = (f"replay {fname}: " + ("flags " + "+".join(sorted(want)) if want
+                                            else "control trips no grounding check"))
+            r.append((ok, name, f"got {sorted(got)}"))
+            print(f"  {'PASS' if ok else 'FAIL'}  {name}: got {sorted(got) or 'none'}")
+            if want:
+                msgs = [m for c, m in gate_plan(p) if c in _NEWC]
+                ok2 = (any("'OrderEgitftLink'" in m and "'OrderEgiftLink'" in m for m in msgs)
+                       and any("'EgitftLink'" in m and "'EgiftLink'" in m for m in msgs)
+                       and any("User" in m and "Order.egiftLink" in m for m in msgs)
+                       and any("login?code=" in m for m in msgs))
+                r.append((ok2, "replay messages name the exact token/model/URL", ""))
+                print(f"  {'PASS' if ok2 else 'FAIL'}  replay messages name the exact "
+                      f"token/model/URL to fix")
+    # 10b2. a large (>cap) previous plan WITH slices gets the "repair" REDO, not the
+    #       "you wrote NO plan" one (the old [:6000] cut broke the JSON parse).
+    class _A:
+        repo, target, lang, intent, max_iters = "/r", "t.ts", "ts", "x", 12
+    _big = json.dumps({"slices": [{"id": "s%d" % i, "intent": "y" * 900} for i in range(25)]})
+    _pp = build_prompt(_A, "l", [("X", "m")], _prev_plan_for_prompt(_big))
+    ok = "previous plan was REJECTED" in _pp and "wrote NO plan" not in _pp
+    r.append((ok, "REDO after a >cap plan says repair, not 'wrote NO plan'", ""))
+    print(f"  {'PASS' if ok else 'FAIL'}  REDO after a {len(_big)}-char plan says repair, "
+          f"not 'wrote NO plan'")
+    _pp = build_prompt(_A, "l", [("X", "m")], _prev_plan_for_prompt("{}\n"))
+    ok = "wrote NO plan" in _pp
+    r.append((ok, "REDO after an empty plan still says 'wrote NO plan'", ""))
+    print(f"  {'PASS' if ok else 'FAIL'}  REDO after an empty plan still says 'wrote NO plan'")
+
+    # 10c. near-miss rules do not false-fail real sibling identifiers
+    _top = ("Add parseLink(raw) and hashLink(s); encryptSetting from lib/secrets.ts; "
+            "getUser(id) returns the user.")
+    for name, toks, want in (
+            ("decryptSetting vs encryptSetting is NOT a typo", ["decryptSetting"], []),
+            ("setUser vs getUser is NOT a typo", ["setUser"], []),
+            ("hashLinks (plural) is NOT a typo", ["hashLinks"], []),
+            ("parseLinks (plural of parseLink) is NOT a typo", ["parseLinks"], []),
+            ("encrytpSetting (transposition) IS a typo", ["encrytpSetting"],
+             ["encrytpSetting"])):
+        sl = [{"id": "s1", "title": "t", "intent": " ".join(toks) + " does a thing",
+               "must_contain": toks, "verify_shape": "x"}]
+        got = [t for _sid, t, _p in identifier_typo_defects(_top, sl, "")]
+        ok = got == want
+        r.append((ok, name, f"got {got}"))
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}: got {got}")
+    # 10d. relation check stays silent when the parent states no relation
+    sl = [{"id": "s1", "title": "back-relation on User", "intent": "relation User.links",
+           "verify_shape": "x"}]
+    got = relation_owner_defects("Add model Link { id Int }.", sl)
+    ok = got == []
+    r.append((ok, "relation check silent when parent states no relation", f"got {got}"))
+    print(f"  {'PASS' if ok else 'FAIL'}  relation check silent when parent states no "
+          f"relation: got {got or 'none'}")
+    # 10e. example check: a negative example in the behavioral part is not judged
+    sl = [{"id": "s1", "verify_shape": "behavioral: f('https://h.example.com/x') returns "
+           "{ok:false}; f('https://h.example.com/?login=A') returns {ok:true}"}]
+    got = example_shape_defects("hostname exactly h.example.com, non-empty login query "
+                                "param", sl)
+    ok = got == []
+    r.append((ok, "example check ignores negative-marked clauses", f"got {got}"))
+    print(f"  {'PASS' if ok else 'FAIL'}  example check ignores negative-marked "
+          f"clauses: got {got or 'none'}")
+
+    # 11. every real plan already on disk that the slicer has executed must still
+    #     be gateable for JSON/DAG soundness (a gate that rejects the corpus it is
+    #     meant to admit is useless). Structural-soundness subset only.
+    HARD = {"BAD_JSON", "DAG_CYCLE", "UNKNOWN_DEP", "DUP_ID", "NO_SLICES",
+            "SLICES_NOT_LIST", "MISSING_KEY", "SELF_DEP"}
+    bad_corpus = []
+    for f in sorted(PLAN_DIR.glob("*.slices.json")):
+        got, _ = gate_file(f)
+        hits = sorted({c for c, _ in got} & HARD)
+        if hits:
+            bad_corpus.append((f.name, hits))
+    ok = not bad_corpus
+    detail = ("all existing plans are structurally sound"
+              if ok else f"{len(bad_corpus)} existing plan(s) hit hard defects: "
+                         f"{bad_corpus[:4]}")
+    r.append((ok, "existing plan corpus still admitted", detail))
+    print(f"  {'PASS' if ok else 'FAIL'}  existing plan corpus still admitted: {detail}")
+
+    failed = [n for ok_, n, _ in r if not ok_ for n in [n]]
+    print(f"\n== {len(r) - len(failed)}/{len(r)} checks passed ==")
+    if failed:
+        print("FAILED: " + ", ".join(failed))
+        return 1
+    print("The gate BITES: a good plan passes, and a cycle / multi-property slice /")
+    print("empty must_contain / unknown dep / dup id / invented literal / empty")
+    print("plan / fragment intent / retarget / non-JSON each FAIL with a specific,")
+    print("re-promptable defect.")
+    return 0
+
+
+# ==========================================================================
+def main():
+    ap = argparse.ArgumentParser(
+        description="Generate (and structurally gate) a slice plan for "
+                    "ollama-dispatch-slice, using qwen via ollama-queue.py.")
+    ap.add_argument("--generate", action="store_true",
+                    help="dispatch qwen to decompose --intent into slices[]")
+    ap.add_argument("--gate", metavar="PLAN",
+                    help="run the structural gate on an existing plan file and exit "
+                         "(this is what the in-job verify.sh runs)")
+    ap.add_argument("--self-test", action="store_true",
+                    help="prove the structural gate bites (revert-test style)")
+
+    ap.add_argument("--repo")
+    ap.add_argument("--target")
+    ap.add_argument("--intent")
+    ap.add_argument("--lang", choices=list(LANGS))
+    ap.add_argument("--label")
+    ap.add_argument("--out", help="write the plan here instead of "
+                                  "~/.ollama-dispatch/slice-plans/<label>.slices.json")
+
+    ap.add_argument("--expect-repo"), ap.add_argument("--expect-target")
+    ap.add_argument("--expect-lang"), ap.add_argument("--expect-label")
+    ap.add_argument("--expect-intent")
+
+    ap.add_argument("--model", default="qwen3.6-35b-a3b-vl-mtp-mxfp8")
+    ap.add_argument("--host", default="studio")
+    ap.add_argument("--max-rounds", type=int, default=4,
+                    help="bounded re-prompt loop: each round feeds the SPECIFIC "
+                         "gate defects back to the model (default 4)")
+    ap.add_argument("--num-ctx", type=int, default=32768)
+    ap.add_argument("--max-iters", type=int, default=20)
+    ap.add_argument("--chat-timeout", type=int, default=1200)
+    ap.add_argument("--timeout", type=int, default=3600,
+                    help="SOFT poll threshold (warn, keep polling)")
+    ap.add_argument("--drafter-cmd",
+                    help="run this shell command in the scratch dir INSTEAD of "
+                         "dispatching the model (test/offline harness path)")
+    ap.add_argument("--auto-confirm-plan", action="store_true",
+                    help="skip the human plan-review stop (fully autonomous runs). "
+                         "DEFAULT is to stop -- the decomposition is the highest-"
+                         "leverage judgement in the pipeline.")
+    ap.add_argument("--then-execute", action="store_true",
+                    help="with --auto-confirm-plan, run ollama-dispatch-slice "
+                         "--execute on the generated plan immediately")
+    a = ap.parse_args()
+
+    if a.self_test:
+        sys.exit(self_test())
+
+    if a.gate:
+        expect = {k: v for k, v in (("repo", a.expect_repo),
+                                    ("target", a.expect_target),
+                                    ("lang", a.expect_lang),
+                                    ("label", a.expect_label),
+                                    ("intent", a.expect_intent)) if v}
+        defects, _gp = gate_file(a.gate, expect or None)
+        for c, m in plan_warnings(_gp):
+            print(f"  WARN (non-blocking) [{c}] {m}")
+        if not defects:
+            print("GATE: CLEAN")
+            sys.exit(0)
+        print(f"GATE: {len(defects)} DEFECT(S) -- fix these in {a.gate}:")
+        for c, m in defects:
+            print(f"  [{c}] {m}")
+        sys.exit(1)
+
+    if not a.generate:
+        ap.print_help()
+        sys.exit(2)
+    for k in ("repo", "target", "intent", "lang"):
+        if not getattr(a, k):
+            die(f"--generate requires --{k}")
+    if a.then_execute and not a.auto_confirm_plan:
+        die("--then-execute requires --auto-confirm-plan (refusing to execute a "
+            "decomposition no one has looked at)")
+    sys.exit(do_generate(a))
+
+
+if __name__ == "__main__":
+    main()

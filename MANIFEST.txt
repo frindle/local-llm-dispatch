@@ -1,0 +1,472 @@
+# MANIFEST: <repo-dest-dir>|<live source path>   (one per line; files or whole dirs; '~' = $HOME)
+# Consumed by SYNC.sh (one-way, live -> repo). Edit this file to add/remove tracked pieces.
+bin|~/bin/ollama-queue.py
+bin|~/bin/ollama-worker.py
+bin|~/bin/ollama-dispatch
+bin|~/bin/ollama-dispatch-auto
+bin|~/bin/ollama-dispatch-slice
+bin|~/bin/ollama-dispatch-scaffold
+bin|~/bin/ollama-dispatch-preflight
+bin|~/bin/ollama-dispatch-integrate
+bin|~/bin/ollama-dispatch-draft
+bin|~/bin/ollama-dispatch-plan
+bin|~/bin/ollama-dispatch-manual
+bin|~/bin/gate-on-complete.py
+bin|~/bin/gate.py
+bin|~/bin/gate_identity.py
+bin|~/bin/gate_finding_check.py
+bin|~/bin/gate-audit.py
+bin|~/bin/gate-notify-canary.py
+bin|~/bin/gate-finding-check-live-smoke.sh
+bin|~/bin/handoff-emit.py
+bin|~/bin/slice_obligations.py
+bin|~/bin/omnibus_slice.py
+bin|~/bin/plan_cancel.py
+bin|~/bin/verify-relevance.py
+bin|~/bin/verify-quality.py
+bin|~/bin/verify-quality-canary.py
+bin|~/bin/verify-orphan-reap.py
+bin|~/bin/pipeline-canary.py
+bin|~/bin/pipeline-canary-periodic.sh
+bin|~/bin/pipeline-watch.py
+bin|~/bin/signoff.py
+bin|~/bin/signoff-canary.py
+bin|~/bin/qctl
+bin|~/bin/queue-submit
+bin|~/bin/wait-for-jobs.sh
+bin|~/bin/qwen-dispatch.sh
+bin|~/bin/unraid-3080-queue.sh
+bin|~/bin/dispatch_langs.py
+bin|~/bin/dispatch_progress.py
+bin|~/bin/dispatch-ack-hook.sh
+bin|~/bin/dispatch-ack-reconcile.py
+bin|~/bin/dispatch-diagnostics.py
+bin|~/bin/dispatch-escalation-watcher.py
+bin|~/bin/dispatch-self-heal.py
+bin|~/bin/dispatch-stall-detect.py
+bin|~/bin/dispatch-tally.py
+bin|~/bin/dispatch-worktree-reap
+bin|~/bin/escalation_index_janitor.py
+bin|~/bin/live-validation-ledger.py
+bin|~/bin/ollama-diagnosis-followup.py
+bin|~/bin/ollama-throughput-trend.py
+bin|~/bin/diagnosis-check.py
+bin|~/bin/diagnosis-classcause-canary.py
+bin|~/bin/diagnosis-constcause-canary.py
+bin|~/bin/diagnosis-exec-canary.py
+bin|~/bin/diagnosis-holea-canary.py
+bin|~/bin/diagnosis-fixture-scaffold
+bin|~/bin/diagnosis-run-harness
+bin|~/bin/bench-integrity.py
+bin|~/bin/check-guard.py
+bin|~/bin/checker-probe.py
+bin|~/bin/code-review-agent.py
+bin|~/bin/completeness.py
+bin|~/bin/dataless_policy.py
+bin|~/bin/faithful-harness-lint.py
+bin|~/bin/find-anchored-regressions.py
+bin|~/bin/validate-anchored-regressions.py
+bin|~/bin/invariant-guard.py
+bin|~/bin/model-fitness.py
+bin|~/bin/model-preflight.py
+bin|~/bin/repair-truncated-literals.py
+bin|~/bin/review-diff.sh
+bin|~/bin/review-prefilter.py
+bin|~/bin/scope-check.py
+bin|~/bin/source_text_harness.py
+bin|~/bin/task-harness-contract.py
+bin|~/bin/sweep-gradeable-regressions.py
+bin|~/bin/tw-class-check.mjs
+bin|~/bin/darkbloom_chat.py
+bin|~/bin/goose-darkbloom.sh
+bin|~/bin/goose-queue-mcp.py
+bin|~/bin/goose-queue-proxy.py
+bin|~/bin/gpu-exclusive-runner.py
+bin|~/bin/bakeoff-fire.py
+bin|~/bin/bakeoff-roster.py
+bin|~/bin/bakeoff-runner.py
+bin|~/bin/bakeoff-score.py
+bin|~/bin/judge-bakeoff.py
+bin|~/bin/strata-h2h-arm.sh
+bin|~/bin/studio-research.py
+bin|~/bin/unraid-research-round.sh
+bin|~/bin/unraid-review-round.sh
+bin|~/bin/unraid-share-agent.sh
+bin|~/bin/unraid-spillover-watch.sh
+bin|~/bin/mount-ollama-models.sh
+bin|~/bin/vault_conf.py
+bin|~/bin/notify-[a-z]*.py
+bin|~/bin/pgrun.py
+bin|~/bin/prep-tokens.py
+bin|~/bin/claude-token-cursor.py
+bin|~/bin/verify-claims
+bin|~/bin/dispatch-fixes
+bin|~/bin/dispatch-templates
+bin|~/bin/ts-mutator
+bin|~/bin/ollama-dispatch-plan.fixtures
+tests|~/bin/test-author-burn-guards.py
+tests|~/bin/test-author-continuation.py
+tests|~/bin/test-auto-author-prompt.py
+tests|~/bin/test-auto-ctx-and-split.py
+tests|~/bin/test-auto-driver-gone.py
+tests|~/bin/test-auto-gate-preempt-pause.py
+tests|~/bin/test-auto-harness-env-park.py
+tests|~/bin/test-auto-mock-module-lint.py
+tests|~/bin/test-auto-module-not-found-hint.py
+tests|~/bin/test-auto-multi-module.py
+tests|~/bin/test-auto-park-escalate.py
+tests|~/bin/test-auto-refine-batching.py
+tests|~/bin/test-auto-resume-driver.py
+tests|~/bin/test-auto-skip.py
+tests|~/bin/test-auto-stale-restart.py
+tests|~/bin/test-auto-test-file-target.py
+tests|~/bin/test-auto-tla-mock-refresh.py
+tests|~/bin/test-auto-ts-symbol-modify.py
+tests|~/bin/test-auto-ts-symbol.py
+tests|~/bin/test-baseline-green-discriminate.py
+tests|~/bin/test-bundle-cancelled.py
+tests|~/bin/test-bundle-default-focus.py
+tests|~/bin/test-bundle-park-dedupe.py
+tests|~/bin/test-darkbloom-base-fallback.py
+tests|~/bin/test-darkbloom-coldload.py
+tests|~/bin/test-darkbloom-repetition-penalty.py
+tests|~/bin/test-dataless-policy-wiring.py
+tests|~/bin/test-default-model.py
+tests|~/bin/test-dispatch-diagnostics.py
+tests|~/bin/test-dispatch-langs.py
+tests|~/bin/test-dispatch-worktree-reap-nvme.py
+tests|~/bin/test-driver-pid-reuse.py
+tests|~/bin/test-dropped-members-readd.py
+tests|~/bin/test-escalation-index-janitor.py
+tests|~/bin/test-escalation-label-context.py
+tests|~/bin/test-escalation-literal-drift.py
+tests|~/bin/test-escalation-ready-stale-retire.py
+tests|~/bin/test-escalation-ready-to-land.py
+tests|~/bin/test-escalation-review-blocked.py
+tests|~/bin/test-escalation-review-dedup.py
+tests|~/bin/test-escalation-verdict-fallback.py
+tests|~/bin/test-gate-evidence-identity.py
+tests|~/bin/test-gate-finding-check.py
+tests|~/bin/test-gate-merge-archived-parent.py
+tests|~/bin/test-gate-near-miss-recorded-diff.py
+tests|~/bin/test-gate-no-autofix-investigation.py
+tests|~/bin/test-gate-no-regate-on-verify-fail.py
+tests|~/bin/test-gate-pregate-corroboration.py
+tests|~/bin/test-gate-relevance-harness-check-substitution.py
+tests|~/bin/test-gate-scaffold-exclude.py
+tests|~/bin/test-gate-served-ladder.py
+tests|~/bin/test-gate-tree-race.py
+tests|~/bin/test-git-optional-locks.py
+tests|~/bin/test-goose-queue-proxy.py
+tests|~/bin/test-hand-lock-inflight.py
+tests|~/bin/test-handoff-acted-reason-order.py
+tests|~/bin/test-handoff-merge-remote-verify.py
+tests|~/bin/test-handoff-unproven-over-fail.py
+tests|~/bin/test-harness-check-fixture-suspect.py
+tests|~/bin/test-harness-check-git-failclosed.py
+tests|~/bin/test-harness-check-newdir-creation.py
+tests|~/bin/test-harness-failcarry-prisma-stale.py
+tests|~/bin/test-heal-ladder-queue.py
+tests|~/bin/test-invariant-guard.py
+tests|~/bin/test-janitor-harness-go-row.py
+tests|~/bin/test-lane-restart.py
+tests|~/bin/test-launch-baseline-creation-stub.py
+tests|~/bin/test-literal-backslash-roundtrip.py
+tests|~/bin/test-needs-opus-job-heal.py
+tests|~/bin/test-no-progress-guard.py
+tests|~/bin/test-ollama-dispatch-auto-harness.py
+tests|~/bin/test-ollama-dispatch-auto-timeout.py
+tests|~/bin/test-ollama-dispatch-auto-verify-script.py
+tests|~/bin/test-ollama-dispatch-preflight.py
+tests|~/bin/test-ollama-queue-dupe-label.py
+tests|~/bin/test-ollama-tool-call-parse.py
+tests|~/bin/test-omnibus-small-target.py
+tests|~/bin/test-parked-row-supersede.py
+tests|~/bin/test-pipeline-commit-no-autopush.py
+tests|~/bin/test-pipeline-e2e.py
+tests|~/bin/test-pipeline-watch.py
+tests|~/bin/test-plan-behavior-coverage.py
+tests|~/bin/test-plan-cross-slice.py
+tests|~/bin/test-plan-gen-prompt.py
+tests|~/bin/test-plan-gen-scratch-baseline.py
+tests|~/bin/test-plan-prose-gates.py
+tests|~/bin/test-preempt-escalation.py
+tests|~/bin/test-preflight-autoseal-creation-target.py
+tests|~/bin/test-preflight-baseline-ctx.py
+tests|~/bin/test-preflight-paused-row.py
+tests|~/bin/test-preflight-refimpl-journal.py
+tests|~/bin/test-preflight-refimpl-tests.py
+tests|~/bin/test-preflight-relevance-added-file.py
+tests|~/bin/test-preflight-treelock.py
+tests|~/bin/test-preserve-only-baseline-green.py
+tests|~/bin/test-qctl.py
+tests|~/bin/test-queue-backfill-focus-note.py
+tests|~/bin/test-queue-bundle-no-bounce.py
+tests|~/bin/test-queue-cancel-job-scoped.py
+tests|~/bin/test-queue-creation-reset.py
+tests|~/bin/test-queue-dead-attempt.py
+tests|~/bin/test-queue-gpu-exclusive.py
+tests|~/bin/test-queue-launch-treelock.py
+tests|~/bin/test-queue-preflight-missing-verify-script.py
+tests|~/bin/test-queue-resume-keeps-baseline.py
+tests|~/bin/test-queue-runner-allowlist-symlink.py
+tests|~/bin/test-queue-status-gate-nesting.py
+tests|~/bin/test-redundant-vs-unexercised.py
+tests|~/bin/test-refimpl-apply-revert-tryfinally.py
+tests|~/bin/test-refine-guard-never-sealed.py
+tests|~/bin/test-refine-survivor-locations.py
+tests|~/bin/test-regate-failed.py
+tests|~/bin/test-regate-hold-scope.py
+tests|~/bin/test-relevance-applied-creation-target.py
+tests|~/bin/test-relevance-behavioural-optout.py
+tests|~/bin/test-relevance-io-adapter.py
+tests|~/bin/test-relevance-reindent-typeonly.py
+tests|~/bin/test-resume-author.py
+tests|~/bin/test-resume-stale-refine-guard.py
+tests|~/bin/test-retry-guard.py
+tests|~/bin/test-review-darkbloom-schema-exhausted.py
+tests|~/bin/test-review-false-code-high.py
+tests|~/bin/test-review-identifier-drift.py
+tests|~/bin/test-review-noreviewable-report.py
+tests|~/bin/test-review-num-predict-clamp.py
+tests|~/bin/test-rivian-rootcause.py
+tests|~/bin/test-scaffold-chk-got.py
+tests|~/bin/test-scaffold-creation-seal.py
+tests|~/bin/test-scaffold-dataclass-import.py
+tests|~/bin/test-scaffold-dataless-git.py
+tests|~/bin/test-scaffold-expression.py
+tests|~/bin/test-scaffold-fresh-base.py
+tests|~/bin/test-scaffold-migration-gate.py
+tests|~/bin/test-scaffold-nm-mirror.py
+tests|~/bin/test-scaffold-repo-suite-own-files.py
+tests|~/bin/test-scope-pins-dirty-slicefiles.py
+tests|~/bin/test-secondop-diff-archived.py
+tests|~/bin/test-self-heal-extract-tree.py
+tests|~/bin/test-self-heal-hygiene.py
+tests|~/bin/test-selfheal-hand-edits.py
+tests|~/bin/test-selftest-hermetic.py
+tests|~/bin/test-slice-accept-resolves-row.py
+tests|~/bin/test-slice-advance-lock-race.py
+tests|~/bin/test-slice-auto-land-passed.py
+tests|~/bin/test-slice-bug2-bug5.py
+tests|~/bin/test-slice-cancel-retires-handoff.py
+tests|~/bin/test-slice-chain-state-bugs.py
+tests|~/bin/test-slice-commit-dataless.py
+tests|~/bin/test-slice-empty-scope-landed.py
+tests|~/bin/test-slice-escalation-msg.py
+tests|~/bin/test-slice-failed-autoheal.py
+tests|~/bin/test-slice-foreign-harness.py
+tests|~/bin/test-slice-harness-check-survives-seal.py
+tests|~/bin/test-slice-inflight-continuation.py
+tests|~/bin/test-slice-late-regate-verdict.py
+tests|~/bin/test-slice-needs-opus-poll.py
+tests|~/bin/test-slice-notes-not-failure.py
+tests|~/bin/test-slice-plan-context.py
+tests|~/bin/test-slice-review-failed-terminal.py
+tests|~/bin/test-slice-review-notes.py
+tests|~/bin/test-slice-shared-tail-resolve.py
+tests|~/bin/test-slice-stage-treelock.py
+tests|~/bin/test-slice-stale-confirm.py
+tests|~/bin/test-slice-stale-verdict.py
+tests|~/bin/test-slice-state-rmw.py
+tests|~/bin/test-sole-mechanism-replaced.py
+tests|~/bin/test-source-text-harness.py
+tests|~/bin/test-stale-worktree-prune.py
+tests|~/bin/test-subcommand-swap-scope.py
+tests|~/bin/test-test-target-relevance-na.py
+tests|~/bin/test-vault-callers.py
+tests|~/bin/test-verify-hang-groupkill.py
+tests|~/bin/test-verify-orphan-reap.py
+tests|~/bin/test-verify-relevance.py
+tests|~/bin/test-verify-sandbox-guard.py
+tests|~/bin/test-worker-api-key-file.py
+tests|~/bin/test-worker-no-progress-shadow.py
+tests|~/bin/test-worker-openai-streaming.py
+tests|~/bin/test-worker-output-cap-loop.py
+tests|~/bin/test-worker-prose-loop-budget.py
+tests|~/bin/test-worker-resume-budget.py
+tests|~/bin/test-worker-think-cap-recovery.py
+tests|~/bin/test-worker-unverified-stamp.py
+tests|~/bin/test-worker-verify-feedback.py
+tests|~/bin/test-worker-zero-diff-verdict.py
+tests|~/bin/test-worker-zero-fetch-nudge.py
+tests|~/bin/test-fixtures
+tests|~/bin/test-fixtures-gate-finding-check
+tests|~/bin/test-fixtures-gate-verify-exit
+tests|~/bin/test-fixtures-review-false-code-high
+tests|~/bin/test-fixtures-slice-plan-context
+tests|~/bin/test-fixtures-source-text-harness
+config|~/bin/agentic-tool-call-system-prompt.txt
+config|~/bin/devstral-system-prompt.txt
+config|~/bin/devstral-tool-template.jinja
+config|~/bin/dispatch-diagnostics-catalog.json
+config|~/bin/signoff-rules.json
+config|~/bin/signoff.json
+config|~/.ollama-dispatch/defaults.json
+config|~/.ollama-dispatch/model-ladder.json
+launchd|~/Library/LaunchAgents/com.*.ollama-queue-daemon.plist
+launchd|~/Library/LaunchAgents/com.*.ollama-queue-api.plist
+launchd|~/Library/LaunchAgents/com.*.dispatch-ack-reconcile.plist
+launchd|~/Library/LaunchAgents/com.*.dispatch-escalation-watcher.plist
+hooks|~/.claude/hooks/dispatch-handauthor-gate.sh
+hooks|~/.claude/hooks/dispatch-handauthor-guard.sh
+hooks|~/.claude/hooks/dispatch-to-qwen-reminder.sh
+hooks|~/.claude/hooks/dispatch-troubleshoot-gate.sh
+hooks|~/.claude/hooks/dispatch-worktree-guard.sh
+hooks|~/.claude/hooks/ollama-prep-tokens-inject.sh
+hooks|~/.claude/hooks/ollama-prep-tokens-reminder.sh
+hooks|~/.claude/hooks/ollama-queue-watch-reminder.sh
+hooks|~/.claude/hooks/pipeline-canary-reminder.sh
+hooks|~/.claude/hooks/session-start-escalations.sh
+hooks|~/.claude/hooks/session-start-handoff-panel.sh
+hooks|~/.claude/hooks/session-start-live-validation.sh
+hooks|~/.claude/hooks/vault-agent-dispatch-reminder.sh
+docs|~/.ollama-dispatch/proposals/bundle-triage-2026-10-06.md
+docs|~/.ollama-dispatch/proposals/unattended-signoff-by-exception.md
+docs|~/Desktop/GitHub Projects/llm-dispatch/docs/MIGRATION.md
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/src
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/tests
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/docs
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/chat
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/config
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/docker
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/assets
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/LaunchAgents
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/README.md
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/Dockerfile
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/docker-compose.yml
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/requirements.txt
+dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/.gitignore
+dashboard/bin|~/Desktop/GitHub Projects/ollama-queue-dashboard/bin/backend-dispatch.py
+dashboard/bin|~/Desktop/GitHub Projects/ollama-queue-dashboard/bin/servers_config.py
+harness/ollama-dispatch-pkg|~/Desktop/GitHub Projects/ollama-dispatch
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-bonsai-ternary-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-bonsai-ternary-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-driver-buildoff.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-driver-devstral-fixed.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-driver-macstudio-remaining.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-driver-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-driver-unraid-7b.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-driver-unraid-remaining.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-driver.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-redispatch-deepseek7b-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-redispatch-mfdoom.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-redispatch-qwen25-14b.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-redispatch-qwen3codernext.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-redispatch-qwen7b-photo.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-rerun-envfixed-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-bulk-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-catchup-debug-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-h2h-cellE-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-h2h-debug-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-parity-debug-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-parity-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-tiebreak-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v11-retest-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v12-strata-h2h.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v2-lib.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v2-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v2-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v5-macstudio-extra.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v6-devstral-llamaserver.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v6-launch.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v6-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v6-prestage.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v6-stop-after-ds14b.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v6-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v61-clamshell-lib.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v61-devstral-llamaserver.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v61-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7-devstral-llamaserver.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7-launch.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7-lib.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7b-nosearch-lib.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7b-nosearch-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7c-replication-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7d-token-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7e-generalize-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7f-selfverify-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v7g-unraid.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v8-ALL.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v8-arms.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v8-b3check.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v8-calibrate.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v9-r1-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v9-r2-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v9-r3-macstudio.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v9-scrub-debugcell.sh
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-fixture-check.py
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-routing-build.py
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-bulk-read.py
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-bulk-reclassify.py
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-bulk-score.py
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v10-bulk-task.py
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v12-calibrate.py
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v8-score.py
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v9-calibration.py
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v9-dialect-check.py
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/BAKEOFF-QUEUE-TASK.md
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-v9-runplan-fable.md
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/BONSAI-TERNARY-QUEUE-TASK-UNRAID.md
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/BONSAI-TERNARY-QUEUE-TASK.md
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/H2H-CELLE-TASK.md
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/H2H-DEBUG-TASK.md
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/STRATA-H2H-PLAN.md
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/harness
+harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/strata-h2h
+harness/ollama-bakeoff|~/Desktop/GitHub Projects/ollama/ollama-bakeoff/harness
+harness/ollama-bakeoff|~/Desktop/GitHub Projects/ollama/ollama-bakeoff/workers
+harness/ollama-bakeoff|~/Desktop/GitHub Projects/ollama/ollama-bakeoff/designs
+harness/ollama-bakeoff|~/Desktop/GitHub Projects/ollama/ollama-bakeoff/README.md
+harness/ollama-bakeoff|~/Desktop/GitHub Projects/ollama/ollama-bakeoff/PROVENANCE.md
+harness/agent-dispatch|~/Desktop/GitHub Projects/ollama/agent-dispatch (results/fixtures/config.toml excluded)
+
+# --- 2026-10-08 consolidated update: robustness, harness gates, Bloom control, CPU lane ---
+bin|~/bin/bloom_control.py
+bin|~/bin/cpu_dispatch.py
+bin|~/bin/cpu_job.py
+bin|~/bin/cpu_lane.py
+bin|~/bin/cpu_stage.py
+bin|~/bin/cpu_vr_measure.py
+bin|~/bin/dispatch_harness_gates.py
+bin|~/bin/failure_ledger.py
+bin|~/bin/plan_lint.py
+bin|~/bin/handoff-triage.py
+bin|~/bin/model_profile.py
+bin|~/bin/model_profiles.yaml
+bin|~/bin/worker_robust.py
+bin|~/bin/darkbloom-field-probe.py
+bin|~/bin/darkbloom-apply-wide-models.sh
+bin|~/bin/bloom-integration-livetest.sh
+tests|~/bin/test-auto-continue-go.py
+tests|~/bin/test-bloom-control.py
+tests|~/bin/test-cpu-lane-api.py
+tests|~/bin/test-cpu-lane-queue.py
+tests|~/bin/test-cpu-stage.py
+tests|~/bin/test-darkbloom-apply.py
+tests|~/bin/test-gate-harness-refine.py
+tests|~/bin/test-handoff-triage.py
+tests|~/bin/test-harness-gates.py
+tests|~/bin/test-model-profile-conformance.py
+tests|~/bin/test-phase2-replay-corpus.py
+tests|~/bin/test-preflight-harness-gates.py
+tests|~/bin/test-selfcheck-hang.py
+tests|~/bin/test-slice-spec-satisfiability.py
+tests|~/bin/test-worker-robust.py
+docs|~/Desktop/GitHub Projects/machine-config/docs/bloom-control.md
+docs|~/Desktop/GitHub Projects/machine-config/docs/cpu-lane.md
+docs|~/Desktop/GitHub Projects/machine-config/docs/harness-gates.md
+docs|~/Desktop/GitHub Projects/machine-config/docs/worker-robustness.md
+docs|~/Desktop/GitHub Projects/machine-config/docs/macos-pipe-starvation-heredoc-hang.md
+bin|~/bin/triage_packets.py
+bin|~/bin/triage-emit.py
+bin|~/bin/darkbloom-keepwarm.py
+tests|~/bin/test-auto-unsat-harness.py
+tests|~/bin/test-darkbloom-keepwarm.py
+tests|~/bin/test-failure-ledger.py
+tests|~/bin/test-plan-lint-rootcause.py
+tests|~/bin/test-queue-gate-priority.py
+tests|~/bin/test-slice-orphan-enqueue.py
+tests|~/bin/test-zombie-driver-lock.py

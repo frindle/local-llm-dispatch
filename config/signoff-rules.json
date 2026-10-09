@@ -1,0 +1,112 @@
+{
+  "_comment": "Policy, not code. Basenames whose presence in a diff forces a sign-off. Matched on BASENAME because dispatches run in scratch worktrees -- the directory a file sits in during a job says nothing about where it lands.",
+  "default_reviewer": "owner",
+  "basenames": [
+    "arr-webhook.py",
+    "completeness.py",
+    "gate-on-complete.py",
+    "gate.py",
+    "handoff-emit.py",
+    "ollama-queue-api.py",
+    "ollama-queue.py",
+    "ollama-worker.py",
+    "orderLock.ts",
+    "paymentStatus.ts",
+    "schema.prisma",
+    "scope-check.py",
+    "signoff.py",
+    "verify-quality.py"
+  ],
+  "basename_globs": [
+    "guided-piv*"
+  ],
+  "_auto_comment": "Autonomous sign-off. auto_approve.requires are DECIDABLE conditions that must ALL hold -- no model opinion appears anywhere, deliberately: 'a reviewer model said it looked fine' is the same vacuous acceptance rule as 'the repro fired'. never_auto is the carve-out that makes it safe, checked FIRST and unsatisfiable by evidence. Two kinds of file belong in it: (a) the CHECKERS -- weaken verify-quality and it approves itself and everything after; (b) the EVIDENCE PRODUCERS -- ollama-worker.py enforces the verify gate and ollama-queue.py is what SETS verify_failed_at_baseline, the load-bearing condition, so a change to either could falsify the very evidence auto_decide trusts. Surfacing counts too (handoff-emit, queue-api): a change that hides a row erases the gate as effectively as one that disables it.",
+  "never_auto": [
+    "signoff.py",
+    "signoff-rules.json",
+    "gate.py",
+    "gate-on-complete.py",
+    "verify-quality.py",
+    "scope-check.py",
+    "completeness.py",
+    "invariant-guard.py",
+    "code-review-agent.py",
+    "handoff-emit.py",
+    "diagnosis-check.py",
+    "ollama-worker.py",
+    "ollama-queue.py",
+    "ollama-queue-api.py"
+  ],
+  "never_auto_globs": [
+    "guided-piv*"
+  ],
+  "auto_approve": {
+    "enabled": true,
+    "max_files": 12,
+    "max_diff_lines": 600,
+    "requires": [
+      "gate_verdict_pass",
+      "no_code_issues",
+      "verify_exit_zero",
+      "verify_failed_at_baseline",
+      "verify_not_gameable",
+      "review_actually_ran",
+      "clean_launch_baseline",
+      "scope_clean",
+      "within_size_caps",
+      "not_never_auto",
+      "verify_relevance_proven",
+      "change_class_safe"
+    ],
+    "mode": "shadow",
+    "relevance": {
+      "min_score": 0.8,
+      "max_survivors": 3
+    },
+    "safe_classes": {
+      "bounded_single_site": {
+        "max_files": 1,
+        "max_hunks": 3,
+        "max_diff_lines": 80,
+        "no_new_files": true
+      }
+    },
+    "security_adjacent_patterns": [
+      "auth",
+      "token",
+      "passw",
+      "secret",
+      "credential",
+      "keychain",
+      "\\bpin\\b",
+      "jwt",
+      "session",
+      "cookie",
+      "crypt",
+      "subprocess",
+      "os\\.system",
+      "shell=True",
+      "\\beval\\(",
+      "\\bexec\\(",
+      "chmod",
+      "sudo",
+      "rm -rf",
+      "payout",
+      "payment",
+      "prisma",
+      "migrat",
+      "DROP TABLE",
+      "DELETE FROM",
+      "truncate"
+    ]
+  },
+  "path_globs": [
+    "*/app/api/*auth*",
+    "*/app/auth/*",
+    "*/prisma/migrations/*",
+    "*payout*"
+  ],
+  "_widen_comment": "2026-09-02, the owner's GO on option 1. basenames/path_globs now cover risk-bearing PRODUCT code (data-destruction, money, access) in addition to gate machinery. These entries are deliberately ABSENT from never_auto: product code is not the gate, so it is exactly the domain autonomous sign-off was built for. path_globs is new -- the highest-risk handlers are named route.ts and cannot be addressed by basename without firing on every route in every app.",
+  "_signer_comment": "2026-09-02: Fable retired as signer per the owner (\"we don't need fable to sign off on final code\"). The sign-off REQUIREMENT is unchanged -- the owner GO'd the widening the same day; only who signs changed. Entries in signoff.json that already carry a Fable verdict were left alone: they record a decision that was actually made.",
+  "_autonomy_comment": "2026-09-03: three new auto_approve keys, every one CONSUMED by signoff.py (grep the key name; the canary asserts it). mode: 'shadow' logs the harness decision beside the human's and never acts; 'live' acts. ABSENT MEANS SHADOW. relevance: floor on the preflight ledger's verify_relevance (mutation kill score) -- a verify that lets property-breaking mutants of the refimpl pass cannot certify a fix. safe_classes.bounded_single_site: the ONLY auto-approvable change class -- one file, few hunks, small, no new/deleted files. security_adjacent_patterns: regexes matched against the diff's file PATHS and its changed lines (added AND removed); any hit routes to a human. Err toward matching -- a false hit costs a look, a miss auto-approves a credential change. Widen any of these by measured --agreement over real dispatches, never by argument."
+}

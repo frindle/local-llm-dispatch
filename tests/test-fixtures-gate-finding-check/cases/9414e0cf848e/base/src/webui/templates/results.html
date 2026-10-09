@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Results - Award Search</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }
+        .container { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+        h1 { margin-bottom: 0.5rem; }
+        .nav { display: flex; gap: 2rem; margin-bottom: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 1rem; }
+        .nav a { color: #0066cc; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+        .card { background: white; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .query-info { color: #666; margin-bottom: 1rem; }
+        .query-info span { margin-right: 1rem; }
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; padding: 0.75rem; border-bottom: 2px solid #ddd; color: #666; font-size: 0.875rem; }
+        td { padding: 0.75rem; border-bottom: 1px solid #eee; }
+        tr:hover { background: #fafafa; }
+        .badge { display: inline-block; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
+        .badge-economy { background: #e3f2fd; color: #1565c0; }
+        .badge-business { background: #fff3e0; color: #e65100; }
+        .badge-first { background: #f3e5f5; color: #7b1fa2; }
+        .badge-direct { background: #e8f5e9; color: #2e7d32; }
+        .miles { font-weight: bold; color: #0066cc; }
+        .btn { background: #0066cc; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; }
+        .btn:hover { background: #0052a3; }
+        .btn-small { padding: 0.25rem 0.5rem; font-size: 0.875rem; }
+        .no-results { text-align: center; padding: 2rem; color: #666; }
+        .section-title { font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #ddd; }
+        .balances-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 1rem; }
+        .balance-card { background: #fafafa; padding: 1rem; border-radius: 4px; }
+        .balance-name { font-weight: 600; margin-bottom: 0.25rem; }
+        .balance-amount { font-size: 1.25rem; color: #0066cc; }
+        .balance-status { font-size: 0.875rem; color: #666; }
+        .error-box { background: #fff3cd; border: 1px solid #ffc107; padding: 1rem; border-radius: 4px; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <nav class="nav">
+            <a href="/">Search</a>
+            <a href="/balances">Balances</a>
+            <a href="/alerts">Alerts</a>
+            <a href="/positioning">Positioning</a>
+            <a href="/settings">Settings</a>
+        </nav>
+
+        <h1>Search Results</h1>
+        <p class="query-info">
+            <span><strong>{{ origin }}</strong> → <strong>{{ destination }}</strong></span>
+            <span>{{ departure_date }}{% if return_date %} ← {{ return_date }}{% endif %}</span>
+            <span>{{ cabin|title }}</span>
+            <span>{{ search_results.timestamp }}</span>
+        </p>
+
+        {% if search_results.balances %}
+        <div class="card">
+            <div class="section-title">Your Available Miles</div>
+            <div class="balances-grid">
+                {% for a in search_results.balances.airlines %}
+                <div class="balance-card">
+                    <div class="balance-name">{{ a.name }}</div>
+                    <div class="balance-amount">{{ a.balance }}</div>
+                    {% if a.status %}
+                    <div class="balance-status">{{ a.status }}</div>
+                    {% endif %}
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        {% if search_results.seats_aero_results %}
+        <div class="card">
+            <div class="section-title">Seats.aero Results ({{ search_results.seats_aero_results|length }} flights)</div>
+            {% if search_results.seats_aero_results %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Program</th>
+                        <th>Date</th>
+                        <th>Cost (miles)</th>
+                        <th>Seats</th>
+                        <th>Airlines</th>
+                        <th>Direct</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for r in search_results.seats_aero_results %}
+                    <tr>
+                        <td><span class="badge badge-{{ cabin }}">{{ r.source }}</span></td>
+                        <td>{{ r.date }}</td>
+                        <td class="miles">{{ r.cost|default(0)|formatnumber }}</td>
+                        <td>{{ r.seats }}</td>
+                        <td>{{ r.airlines|join(', ') if r.airlines else '-' }}</td>
+                        <td>{% if r.direct %}<span class="badge badge-direct">Yes</span>{% else %}No{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="no-results">No availability found for the selected criteria.</div>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        {% if search_results.browser_results %}
+        <div class="card">
+            <div class="section-title">Browser Search Results ({{ search_results.browser_results|length }} flights)</div>
+            {% if search_results.browser_results %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Program</th>
+                        <th>Flight</th>
+                        <th>Route</th>
+                        <th>Time</th>
+                        <th>Duration</th>
+                        <th>Stops</th>
+                        <th>Miles</th>
+                        <th>Taxes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for r in search_results.browser_results %}
+                    {% for seg in r.segments %}
+                    <tr>
+                        {% if loop.first %}
+                        <td rowspan="{{ r.segments|length }}"><span class="badge badge-{{ cabin }}">{{ r.program }}</span></td>
+                        {% endif %}
+                        <td>{{ seg.flight_number }}</td>
+                        <td>{{ seg.departure_airport }} → {{ seg.arrival_airport }}</td>
+                        <td>{{ seg.departure_time }} - {{ seg.arrival_time }}</td>
+                        <td>{{ seg.duration_minutes//60 }}h {{ seg.duration_minutes%60 }}m</td>
+                        <td>{{ seg.stops }}</td>
+                        {% if loop.first %}
+                        <td rowspan="{{ r.segments|length }}" class="miles">{{ r.miles|default(0)|formatnumber }}</td>
+                        <td rowspan="{{ r.segments|length }}">${{ "%.2f"|format(r.taxes|default(0)) }}</td>
+                        {% endif %}
+                    </tr>
+                    {% endfor %}
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="no-results">No results found. Try different programs or dates.</div>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        {% if not search_results.seats_aero_results and not search_results.browser_results %}
+        <div class="card">
+            <div class="no-results">No results. Try checking the selected programs and date.</div>
+        </div>
+        {% endif %}
+
+        {% if external_links %}
+        <div class="card" style="margin-top: 1rem;">
+            <strong>Cross-check on other services:</strong>
+            {% for link in external_links %}
+            <a href="{{ link.url }}" target="_blank" rel="noopener" style="margin-left: 0.75rem;">{{ link.name }} ↗</a>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <div style="margin-top: 1rem;">
+            <a href="/" class="btn">New Search</a>
+            <button class="btn" onclick="document.getElementById('alert-form').style.display='block'">Create Alert</button>
+        </div>
+
+        <div id="alert-form" class="card" style="display: none; margin-top: 1rem;">
+            <div class="section-title">Create Alert for This Search</div>
+            <form action="/alerts/create" method="post">
+                <input type="hidden" name="origin" value="{{ origin }}">
+                <input type="hidden" name="destination" value="{{ destination }}">
+                <input type="hidden" name="departure_date" value="{{ departure_date }}">
+                <input type="hidden" name="cabin" value="{{ cabin }}">
+                {% for p in selected_programs %}
+                <input type="hidden" name="programs" value="{{ p }}">
+                {% endfor %}
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+                <div class="form-row" style="margin-bottom: 1rem;">
+                    <div>
+                        <label>
+                            <input type="checkbox" name="notify_pushover" value="true">
+                            Send Pushover notification when space found
+                        </label>
+                    </div>
+                    <div>
+                        <button type="submit" class="btn">Save Alert</button>
+                        <button type="button" class="btn" style="background: #666;" onclick="document.getElementById('alert-form').style.display='none'">Cancel</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

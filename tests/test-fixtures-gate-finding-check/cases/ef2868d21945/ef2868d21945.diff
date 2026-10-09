@@ -1,0 +1,92 @@
+diff --git a/dashboard_chat.py b/dashboard_chat.py
+index db9d600..42960ad 100644
+--- a/dashboard_chat.py
++++ b/dashboard_chat.py
+@@ -5,6 +5,7 @@ import os
+ import re
+ import sys
+ import tempfile
++import threading
+ from pathlib import Path
+ 
+ _SESSION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+@@ -66,6 +67,7 @@ def write_session(base_dir: str, session_id: str, session_data: dict) -> None:
+                 "files": msg.get("files", []),
+                 "ts": msg.get("ts", ""),
+                 "status": msg.get("status", ""),
++                **({"mode": msg["mode"]} if "mode" in msg else {}),
+             }
+             for msg in messages
+         ],
+@@ -364,6 +366,21 @@ def read_session(base_dir: str, session_id: str) -> dict:
+         return json.load(f)
+ 
+ 
++def enqueue_job(session_id, message_index):
++    """Enqueue a job via ollama-queue.py --bundle chat."""
++    import subprocess as _sub
++    _sub.run(
++        ["python3", str(Path.home() / "bin" / "ollama-queue.py"), "enqueue",
++         "--bundle", "chat"],
++        check=False,
++    )
++
++
++def start_direct(session_id, message_index):
++    """Start a daemon thread that calls job(session_id, message_index)."""
++    threading.Thread(target=job, args=(session_id, message_index), daemon=True).start()
++
++
+ def handle(method: str, path: str, query: dict, body_bytes: bytes) -> tuple[int, dict, bytes]:
+     """Server-independent routing for chat endpoints.
+ 
+@@ -494,6 +511,14 @@ def handle(method: str, path: str, query: dict, body_bytes: bytes) -> tuple[int,
+                             except Exception:
+                                 pass
+ 
++                # Determine mode: absent -> auto, None -> auto, present -> must be "chat"/"job"
++                if "mode" not in body or body.get("mode") is None:
++                    mode = "job" if is_job_request(text) else "chat"
++                else:
++                    mode = body["mode"]
++                    if mode not in ("chat", "job"):
++                        return (400, {"Content-Type": "application/json"}, json.dumps({"error": "mode must be 'chat' or 'job'"}).encode())
++
+                 messages = session.get("messages", [])
+                 user_msg = {
+                     "role": "user",
+@@ -511,8 +536,10 @@ def handle(method: str, path: str, query: dict, body_bytes: bytes) -> tuple[int,
+                     "files": [],
+                     "images": [],
+                     "ts": "",
+-                    "status": "queued",
++                    "status": "running" if mode == "chat" else "queued",
+                 }
++                if mode is not None:
++                    assistant_msg["mode"] = mode
+                 messages.append(assistant_msg)
+ 
+                 session["messages"] = messages
+@@ -520,17 +547,12 @@ def handle(method: str, path: str, query: dict, body_bytes: bytes) -> tuple[int,
+ 
+                 message_index = len(messages) - 1
+ 
+-                def enqueue(session_id, message_index):
+-                    import subprocess as _sub
+-                    _sub.run(
+-                        ["python3", str(Path.home() / "bin" / "ollama-queue.py"), "enqueue",
+-                         "--bundle", "chat"],
+-                        check=False,
+-                    )
+-
+-                enqueue(session_id, message_index)
++                if mode == "job":
++                    enqueue_job(session_id, message_index)
++                else:
++                    start_direct(session_id, message_index)
+ 
+-                return (202, {"Content-Type": "application/json"}, json.dumps({"status": "queued"}).encode())
++                return (202, {"Content-Type": "application/json"}, json.dumps({"mode": mode, "message_index": message_index, "status": assistant_msg["status"]}).encode())
+ 
+             # GET /api/chat/sessions/<id>
+             if method == "GET":

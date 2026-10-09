@@ -1,0 +1,43 @@
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+
+# --- The owner's PII / identity (NEVER commit) ---
+.env
+profile.local.json
+profile.*.local.json
+*.local.json
+
+# --- runtime data tied to the owner's identity (NEVER commit) ---
+data/state.sqlite
+*.sqlite
+*.db
+logs/
+results/
+serpwatch-hits/
+removals/
+*.removal.json
+
+# --- broker dataset: maintained in the SEPARATE PUBLIC repo, pulled at runtime ---
+data/brokers.json
+
+# --- vendored removal engine (cloned, not committed) ---
+vendor/eraser/
+
+# --- dispatch harness leakage ---
+.preflight-state.json
+
+# --- self-monitoring / health (PII-bearing: snapshots, dispatch queue, reports) ---
+snapshots/
+needs-fix/
+heartbeat.json
+health-report.txt
+run-log.jsonl
+
+# --- automated escalation (PII-bearing: letters, complaints, audit trail) ---
+escalations/
+letters/
+complaints/
+audit-log.jsonl
+escalation-rules.json

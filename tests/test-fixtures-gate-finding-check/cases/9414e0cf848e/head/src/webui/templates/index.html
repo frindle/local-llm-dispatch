@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Award Search</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; padding: 2rem; }
+        h1 { margin-bottom: 0.5rem; }
+        .subtitle { color: #666; margin-bottom: 2rem; }
+        .card { background: white; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
+        .form-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
+        label { display: block; margin-bottom: 0.25rem; font-size: 0.875rem; color: #666; }
+        input, select { width: 100%; padding: 0.5rem; border: 1px solid #ddd; border-radius: 4px; font-size: 1rem; }
+        input:focus, select:focus { outline: none; border-color: #0066cc; }
+        .btn { background: #0066cc; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 4px; cursor: pointer; font-size: 1rem; }
+        .btn:hover { background: #0052a3; }
+        .programs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 0.5rem; margin-top: 1rem; }
+        .program-check { display: flex; align-items: center; gap: 0.5rem; }
+        .program-check input { width: auto; }
+        .source-tabs { display: flex; gap: 1rem; margin-bottom: 1rem; border-bottom: 2px solid #eee; }
+        .source-tab { padding: 0.5rem 1rem; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+        .source-tab.active { border-color: #0066cc; color: #0066cc; }
+        .status { font-size: 0.875rem; color: #666; margin-top: 0.5rem; }
+        .status.warning { color: #f0ad4e; }
+        .status.ok { color: #5cb85c; }
+        .nav { display: flex; gap: 2rem; margin-bottom: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 1rem; }
+        .nav a { color: #0066cc; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+        .checkbox-group { margin-top: 0.5rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <nav class="nav">
+            <a href="/">Search</a>
+            <a href="/balances">Balances</a>
+            <a href="/alerts">Alerts</a>
+            <a href="/positioning">Positioning</a>
+            <a href="/settings">Settings</a>
+        </nav>
+
+        <h1>Award Flight Search</h1>
+        <p class="subtitle">Search for award space across multiple loyalty programs</p>
+
+        <div class="card">
+            <form action="/search" method="post">
+                <div class="form-row">
+                    <div>
+                        <label for="origin">From</label>
+                        <input type="text" id="origin" name="origin" placeholder="JFK" required maxlength="3">
+                    </div>
+                    <div>
+                        <label for="destination">To</label>
+                        <input type="text" id="destination" name="destination" placeholder="LAX" required maxlength="3">
+                    </div>
+                    <div>
+                        <label for="departure_date">Departure</label>
+                        <input type="date" id="departure_date" name="departure_date" required>
+                    </div>
+                </div>
+
+                <div class="form-row-3">
+                    <div>
+                        <label for="return_date">Return (optional)</label>
+                        <input type="date" id="return_date" name="return_date">
+                    </div>
+                    <div>
+                        <label for="cabin">Cabin</label>
+                        <select id="cabin" name="cabin">
+                            <option value="economy">Economy</option>
+                            <option value="business">Business</option>
+                            <option value="first">First</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label>&nbsp;</label>
+                        <input type="checkbox" id="round_trip" name="round_trip" value="true">
+                        <label for="round_trip" style="display:inline; margin-left: 0.25rem;">Round trip</label>
+                    </div>
+                </div>
+
+                <div class="source-tabs">
+                    <div class="source-tab active" onclick="setSource('browser')">Browser Search</div>
+                    <div class="source-tab" onclick="setSource('seats_aero')">Seats.aero API</div>
+                </div>
+                <input type="hidden" name="search_source" id="search_source" value="browser">
+
+                <div class="form-row" style="margin-top: 1rem;">
+                    <div style="grid-column: span 3;">
+                        <label>Programs</label>
+                        <div class="programs-grid">
+                            {% for pid, p in programs.items() %}
+                            <div class="program-check">
+                                <input type="checkbox" name="selected_programs" value="{{ pid }}" id="prog_{{ pid }}">
+                                <label for="prog_{{ pid }}">{{ p.name }}</label>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-row" style="margin-top: 1rem;">
+                    <div>
+                        <label for="user_id">AwardWallet User ID</label>
+                        <input type="text" id="user_id" name="user_id" placeholder="For balances" value="{{ awardwallet_user }}">
+                    </div>
+                    <div class="checkbox-group" style="padding-top: 1.5rem;">
+                        <input type="checkbox" name="show_balances" id="show_balances" value="true">
+                        <label for="show_balances" style="display: inline;">Show my balances</label>
+                    </div>
+                    <div style="display: flex; align-items: flex-end;">
+                        <button type="submit" class="btn">Search</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+
+        <div class="status {% if awardwallet_user %}ok{% else %}warning{% endif %}">
+            AwardWallet: {{ awardwallet_user|default('not configured')|truncate(8, true) }}
+            &nbsp;|&nbsp; Seats.aero: {{ seats_aero_status }}
+        </div>
+    </div>
+
+    <script>
+        function setSource(source) {
+            document.getElementById('search_source').value = source;
+            document.querySelectorAll('.source-tab').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+        }
+    </script>
+</body>
+</html>

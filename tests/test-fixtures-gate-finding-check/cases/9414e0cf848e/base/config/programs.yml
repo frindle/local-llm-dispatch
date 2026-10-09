@@ -1,0 +1,126 @@
+programs:
+  - id: united
+    name: United MileagePlus
+    website: https://www.united.com/en/us
+    login_url: https://www.united.com/en/us/account/signin
+    search_url: https://www.united.com/en/us/flight-search/book-a-flight
+    requires_login: true
+    rate_limit_seconds: 5
+    alliance: star_alliance
+
+  - id: delta
+    name: Delta SkyMiles
+    website: https://www.delta.com
+    login_url: https://www.delta.com/us/en/log-in
+    search_url: https://www.delta.com/us/en/flights-fares/flights
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: skyteam
+
+  - id: american
+    name: American AAdvantage
+    website: https://www.aa.com
+    login_url: https://www.aa.com/login
+    search_url: https://www.aa.com/booking/find-flights
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: oneworld
+
+  - id: southwest
+    name: Southwest Rapid Rewards
+    website: https://www.southwest.com
+    login_url: https://www.southwest.com/login
+    search_url: https://www.southwest.com/flights/find-flights
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: null
+
+  - id: jetblue
+    name: JetBlue TrueBlue
+    website: https://www.jetblue.com
+    login_url: https://www.jetblue.com/login
+    search_url: https://www.jetblue.com/flights
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: null
+
+  - id: lufthansa
+    name: Lufthansa Miles & More
+    website: https://www.lufthansa.com
+    login_url: https://www.lufthansa.com/en/account/login
+    search_url: https://www.lufthansa.com/en/flight-search
+    requires_login: true
+    rate_limit_seconds: 8
+    alliance: star_alliance
+
+  - id: air_canada
+    name: Air Canada Aeroplan
+    website: https://www.aircanada.com
+    login_url: https://www.aircanada.com/en/login
+    search_url: https://www.aircanada.com/en/flights/search
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: star_alliance
+
+  - id: flying_blue
+    name: Flying Blue (Air France/KLM)
+    website: https://www.flyingblue.com
+    login_url: https://www.flyingblue.com/en/login
+    search_url: https://www.flyingblue.com/en/search
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: skyteam
+
+  - id: emirates
+    name: Emirates Skywards
+    website: https://www.emirates.com
+    login_url: https://www.emirates.com/en/login
+    search_url: https://www.emirates.com/en/flight-search
+    requires_login: false
+    rate_limit_seconds: 8
+    alliance: null
+
+  - id: virgin_atlantic
+    name: Virgin Atlantic Flying Club
+    website: https://www.virginatlantic.com
+    login_url: https://www.virginatlantic.com/gb/en/login
+    search_url: https://www.virginatlantic.com/gb/en/flight-search
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: null
+
+  - id: alaska
+    name: Alaska Mileage Plan
+    website: https://www.alaskaair.com
+    login_url: https://www.alaskaair.com/login
+    search_url: https://www.alaskaair.com/search
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: null
+
+  - id: british_airways
+    name: British Airways Executive Club
+    website: https://www.britishairways.com
+    login_url: https://www.britishairways.com/tickets/login
+    search_url: https://www.britishairways.com/flights/search
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: oneworld
+
+  - id: cathay_pacific
+    name: Cathay Pacific Asia Miles
+    website: https://www.cathaypacific.com
+    login_url: https://www.cathaypacific.com/cx/en_US/login
+    search_url: https://www.cathaypacific.com/cx/en_US/flight-search
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: oneworld
+
+  - id: singapore
+    name: Singapore Airlines KrisFlyer
+    website: https://www.singaporeair.com
+    login_url: https://www.singaporeair.com/en_US/sg/login
+    search_url: https://www.singaporeair.com/en_US/sg/flight-search
+    requires_login: false
+    rate_limit_seconds: 5
+    alliance: star_alliance

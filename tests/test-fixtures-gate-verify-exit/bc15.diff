@@ -1,0 +1,71 @@
+diff --git a/lib/bfmrVanished.ts b/lib/bfmrVanished.ts
+index 50d504e..8e97dfc 100644
+--- a/lib/bfmrVanished.ts
++++ b/lib/bfmrVanished.ts
+@@ -22,3 +22,66 @@ export function vanishedOrderIds(local: LocalOpenRow[], seenKeys: Set<string>, c
+ export function itemsForOrder(items: Record<string, unknown>[], orderId: string): Record<string, unknown>[] {
+   return items.filter(i => String(i.order_id ?? '') === orderId);
+ }
++
++import { reservationLineKey } from './bfmrReservationLineKey';
++
++const FINISHED_STATUSES = new Set(['paid', 'cancelled', 'returned', 'return', 'set_aside', 'closed']);
++
++export function supersededRowIds(
++  local: Array<{id: number; lineKey: string; reserveId: string; itemId: string|number; status: string}>,
++  lookupItems: unknown[],
++): number[] {
++  if (!Array.isArray(lookupItems) || lookupItems.length === 0) return [];
++
++  // Build lookup line keys and item_id -> reserve_id heads mapping
++  const lookupLineKeys = new Set<string>();
++  const lookupItemIds = new Map<string, string[]>();
++  const lookupReserveIdHeads = new Set<string>();
++
++  for (const item of lookupItems) {
++    if (item == null || typeof item !== 'object') continue;
++    const obj = item as Record<string, unknown>;
++
++    const lk = reservationLineKey(obj);
++    lookupLineKeys.add(lk);
++
++    const reserveId = String(obj.reserve_id ?? '').trim();
++    const purchaseId = String(obj.purchase_id ?? '').trim();
++    const shipmentId = String(obj.shipment_id ?? '').trim();
++    const head = reserveId || purchaseId || shipmentId;
++    if (head) lookupReserveIdHeads.add(head);
++
++    const itemId = String(obj.item_id ?? '');
++    if (itemId) {
++      if (!lookupItemIds.has(itemId)) lookupItemIds.set(itemId, []);
++      if (head) lookupItemIds.get(itemId)!.push(head);
++    }
++  }
++
++  const result: number[] = [];
++
++  for (const row of local) {
++    // (1) Status is not finished
++    if (FINISHED_STATUSES.has(row.status.toLowerCase())) continue;
++
++    // (2) Row lineKey is ABSENT from lookup lines
++    if (lookupLineKeys.has(row.lineKey)) continue;
++
++    // Split-sibling guard: any lookup line sharing the row's reserve_id head
++    const rowReserveIdHead = row.reserveId;
++    const hasSplitSibling = lookupReserveIdHeads.has(rowReserveIdHead);
++    if (hasSplitSibling) continue;
++
++    // Replacement: lookup has same item_id with a different reserve_id head
++    const rowItemId = String(row.itemId);
++    const headsForItem = lookupItemIds.get(rowItemId);
++    if (!headsForItem) continue;
++
++    const hasReplacement = headsForItem.some(h => h !== rowReserveIdHead);
++    if (!hasReplacement) continue;
++
++    result.push(row.id);
++  }
++
++  return result;
++}

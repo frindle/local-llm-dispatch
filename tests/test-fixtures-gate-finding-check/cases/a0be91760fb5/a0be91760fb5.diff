@@ -1,0 +1,47 @@
+diff --git a/dashboard_chat.py b/dashboard_chat.py
+index 5aea96c..26ddedc 100644
+--- a/dashboard_chat.py
++++ b/dashboard_chat.py
+@@ -265,18 +265,31 @@ def build_request(project_name: str, messages: list[dict], files: list[str], ima
+         else:
+             content.append({"type": "text", "text": "[FILE: " + f + "]"})
+ 
+-    for msg in messages:
+-        content.append({"type": "text", "text": f"{msg.get('role', 'user')}: {msg.get('content', '')}"})
++    # Build individual message objects inside system content (not concatenated strings)
++    last_user = None
++
++    for i, msg in enumerate(messages):
++        role = msg.get('role', 'user')
++        text = msg.get('content', '')
++
++        if role == 'user':
++            last_user = len(content)
++
++        if images and role == 'user' and i == len(messages) - 1:
++            # Attach images to the last user message as content parts
++            parts = [{"type": "text", "text": text}]
++            for img in images:
++                mime = img.get("mime", "image/png")
++                encoded = img.get("encoded", "")
++                parts.append({
++                    "type": "image_url",
++                    "image_url": {"url": f"data:{mime};base64,{encoded}"}
++                })
++            content.append({"role": "user", "content": parts})
++        else:
++            content.append({"role": role, "content": text})
+ 
+-    for img in images:
+-        mime = img.get("mime", "image/png")
+-        encoded = img.get("encoded", "")
+-        content.append({
+-            "type": "image_url",
+-            "image_url": {"url": f"data:{mime};base64,{encoded}"}
+-        })
+-
+-    return {"messages": [{"role": "system", "content": content}], "files": files}
++    return {"messages": [{"role": "system", "content": content}], "files": files, "last_user": last_user}
+ 
+ 
+ import uuid

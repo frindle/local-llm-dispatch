@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Balances - Award Search</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; padding: 2rem; }
+        h1 { margin-bottom: 0.5rem; }
+        .nav { display: flex; gap: 2rem; margin-bottom: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 1rem; }
+        .nav a { color: #0066cc; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+        .card { background: white; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .section-title { font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #ddd; }
+        .balances-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 1rem; }
+        .balance-card { background: #fafafa; padding: 1rem; border-radius: 4px; }
+        .balance-name { font-weight: 600; margin-bottom: 0.25rem; }
+        .balance-amount { font-size: 1.5rem; color: #0066cc; font-weight: bold; }
+        .balance-status { font-size: 0.875rem; color: #666; margin-top: 0.25rem; }
+        .balance-account { font-size: 0.75rem; color: #999; font-family: monospace; }
+        .error-box { background: #f8d7da; border: 1px solid #f5c6cb; padding: 1rem; border-radius: 4px; color: #721c24; }
+        .user-info { color: #666; font-size: 0.875rem; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <nav class="nav">
+            <a href="/">Search</a>
+            <a href="/balances">Balances</a>
+            <a href="/alerts">Alerts</a>
+            <a href="/positioning">Positioning</a>
+            <a href="/settings">Settings</a>
+        </nav>
+
+        <h1>AwardWallet Balances</h1>
+
+        {% if error %}
+        <div class="error-box">{{ error }}</div>
+        {% elif balances %}
+        <p class="user-info">User ID: {{ user_id }} | Last updated: {{ balances.timestamp }}</p>
+
+        {% if balances.airlines() %}
+        <div class="card">
+            <div class="section-title">Airlines ({{ balances.airlines()|length }})</div>
+            <div class="balances-grid">
+                {% for a in balances.airlines() %}
+                <div class="balance-card">
+                    <div class="balance-name">{{ a.display_name }}</div>
+                    <div class="balance-amount">{{ a.balance_formatted }}</div>
+                    {% if a.status %}
+                    <div class="balance-status">{{ a.status }}</div>
+                    {% endif %}
+                    {% if a.account_number %}
+                    <div class="balance-account">{{ a.account_number }}</div>
+                    {% endif %}
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        {% if balances.credit_cards() %}
+        <div class="card">
+            <div class="section-title">Credit Cards / Points ({{ balances.credit_cards()|length }})</div>
+            <div class="balances-grid">
+                {% for a in balances.credit_cards() %}
+                <div class="balance-card">
+                    <div class="balance-name">{{ a.display_name }}</div>
+                    <div class="balance-amount">{{ a.balance_formatted }}</div>
+                    {% if a.account_number %}
+                    <div class="balance-account">{{ a.account_number }}</div>
+                    {% endif %}
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        {% if balances.hotels() %}
+        <div class="card">
+            <div class="section-title">Hotels ({{ balances.hotels()|length }})</div>
+            <div class="balances-grid">
+                {% for a in balances.hotels() %}
+                <div class="balance-card">
+                    <div class="balance-name">{{ a.display_name }}</div>
+                    <div class="balance-amount">{{ a.balance_formatted }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        {% else %}
+        <div class="card">
+            <p>No balance data available.</p>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>

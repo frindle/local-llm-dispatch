@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""Model-profile CONFORMANCE: the JSON body we actually put on the wire must equal the
+model card's profile (model_profiles.yaml), for every served model x role x path.
+
+  * A stub HTTP server captures real request bodies.
+  * Senders exercised (the REAL code, not mocks of it):
+      ollama-worker.py  call_ollama (openai + native), call_openai_streaming,
+                        call_ollama_streaming, and a full `ollama-worker.py` subprocess
+                        (proves the CLI defaults resolve from the profile, not constants)
+      darkbloom_chat.py chat()
+  * Expected values are read straight from the raw YAML (yaml.safe_load), NOT via
+    model_profile.build_request_fields, so the builder is checked, not trusted.
+  * Also asserts: explicit CLI/caller overrides win; the forbidden legacy values
+    (temperature 0/0.15, max_tokens 8192, repetition_penalty 1.1) never leak into a
+    profiled model; the qwen3.8 alias is declared, logged once, lane-scoped.
+  * --drift: every profile cites a card that exists and whose sha256 matches.
+
+Env: WORKER_SRC / DBC_SRC / MP_SRC / PROFILES_SRC point at alternative sources (used by
+the canary's --prove red-on-revert mutations). Exit 0 = conformant.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+QUEUE = Path(os.environ.get("QUEUE_SRC") or Path(__file__).resolve().parent / "ollama-queue.py")
+WORKER = Path(os.environ.get("WORKER_SRC") or HERE / "ollama-worker.py")
+DBC = Path(os.environ.get("DBC_SRC") or HERE / "darkbloom_chat.py")
+MP = Path(os.environ.get("MP_SRC") or HERE / "model_profile.py")
+PROFILES = Path(os.environ.get("PROFILES_SRC") or HERE / "model_profiles.yaml")
+FAILS = []
+NCHECK = [0]
+
+os.environ["MODEL_PROFILES_PATH"] = str(PROFILES)
+import pwd
+os.environ["MODEL_CARDS_ROOT"] = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Desktop/GitHub Projects/references")
+os.environ["HOME"] = tempfile.mkdtemp(prefix="mpconf-home-")   # no real Darkbloom key
+os.environ.pop("OBSIDIAN_TOKEN", None)
+
+# Put the (possibly mutated) model_profile where the worker/dbc will import it from:
+# they do sys.path.insert(0, <their own dir>), so for a mutated copy we pre-seed
+# sys.modules instead.
+sys.path.insert(0, str(HERE))
+
+
+def _load(path, name):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+mp = _load(MP, "model_profile")        # the worker's `import model_profile` reuses this
+import yaml  # noqa: E402
+
+RAW = yaml.safe_load(PROFILES.read_text())
+
+
+def check(name, got, want):
+    NCHECK[0] += 1
+    ok = got == want
+    if not ok:
+        FAILS.append(name)
+    print(("ok  " if ok else "FAIL") + f": {name}" + ("" if ok else f"\n      got  {got!r}\n      want {want!r}"))
+
+
+# ------------------------------------------------------------------ stub server
+SENT = []
+
+
+class Stub(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, obj, code=200):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        if self.path.startswith("/v1/models"):
+            return self._json({"data": [{"id": m, "object": "model"} for m in RAW["models"]]})
+        if self.path.startswith("/api/tags"):
+            return self._json({"models": [{"name": m, "model": m, "size": 1} for m in RAW["models"]]})
+        return self._json({})
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        SENT.append({"path": self.path, "body": body})
+        if self.path == "/v1/chat/completions":
+            if body.get("stream"):
+                data = (b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n'
+                        b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}\n\n'
+                        b'data: [DONE]\n\n')
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            return self._json({"choices": [{"message": {"role": "assistant", "content": "hi"},
+                                            "finish_reason": "stop"}],
+                               "usage": {"prompt_tokens": 3, "completion_tokens": 1}})
+        if self.path == "/api/chat":
+            if body.get("stream"):
+                data = (json.dumps({"message": {"role": "assistant", "content": "hi"}, "done": False}) + "\n" +
+                        json.dumps({"message": {"role": "assistant", "content": ""}, "done": True,
+                                    "done_reason": "stop", "prompt_eval_count": 3, "eval_count": 1}) + "\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            return self._json({"message": {"role": "assistant", "content": "hi"}, "done": True,
+                               "prompt_eval_count": 3, "eval_count": 1})
+        return self._json({})
+
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+HOST = f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def take():
+    out = list(SENT)
+    SENT.clear()
+    return out
+
+
+# ------------------------------------------------------------------ expectations
+def raw_mode(model, role):
+    ent = RAW["models"][model]
+    return ent["modes"][RAW["roles"][role]]
+
+
+def expect_openai(model, role, overrides=None, think=None):
+    m = dict(raw_mode(model, role))
+    for k, v in (overrides or {}).items():
+        if v is not None:
+            m[k] = v
+    f = {}
+    for k in ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "repetition_penalty"):
+        if m.get(k) is not None:
+            f[k] = m[k]
+    if "repetition_penalty" in f:
+        f["repeat_penalty"] = f["repetition_penalty"]
+    if m.get("max_tokens") is not None:
+        f["max_tokens"] = m["max_tokens"]
+    if m.get("stop"):
+        f["stop"] = m["stop"]
+    th = think if think is not None else m.get("enable_thinking")
+    ctk = {}
+    if th is not None:
+        ctk["enable_thinking"] = bool(th)
+    if m.get("preserve_thinking") is not None and th:
+        ctk["preserve_thinking"] = bool(m["preserve_thinking"])
+    if ctk:
+        f["chat_template_kwargs"] = ctk
+    return f
+
+
+def expect_ollama(model, role, overrides=None, think=None):
+    m = dict(raw_mode(model, role))
+    for k, v in (overrides or {}).items():
+        if v is not None:
+            m[k] = v
+    o = {}
+    for k in ("temperature", "top_p", "top_k", "min_p", "presence_penalty"):
+        if m.get(k) is not None:
+            o[k] = m[k]
+    if m.get("repetition_penalty") is not None:
+        o["repeat_penalty"] = m["repetition_penalty"]
+    o["num_ctx"] = m["ctx"] if "num_ctx" not in (overrides or {}) else overrides["num_ctx"]
+    if m.get("max_tokens") is not None:
+        o["num_predict"] = m["max_tokens"]
+    if m.get("stop"):
+        o["stop"] = m["stop"]
+    f = {"options": o}
+    th = think if think is not None else m.get("enable_thinking")
+    if th is not None:
+        f["think"] = bool(th)
+    return f
+
+
+OPENAI_STRUCT = {"model", "messages", "stream", "tools", "stream_options"}
+OLLAMA_STRUCT = {"model", "messages", "stream", "tools", "options", "think"}
+
+
+def sampling_openai(body):
+    return {k: v for k, v in body.items() if k not in OPENAI_STRUCT}
+
+
+def sampling_ollama(body):
+    return {k: v for k, v in body.items() if k in ("options", "think")}
+
+
+MODELS = list(RAW["models"])
+ROLES = ["author", "review", "non_thinking"]
+
+
+def run_matrix(w, dbc):
+    msgs = [{"role": "user", "content": "x"}]
+    for model in MODELS:
+        for role in ROLES:
+            tag = f"{model}/{role}"
+            # worker, OpenAI non-streaming
+            take()
+            w.call_ollama(HOST, model, msgs, None, None, api_style="openai", tools=False, role=role)
+            b = take()[-1]["body"]
+            check(f"worker openai   {tag}", sampling_openai(b), expect_openai(model, role))
+            # worker, OpenAI streaming
+            take()
+            w.call_openai_streaming(HOST, model, msgs, None, None, tools=False, role=role)
+            b = take()[-1]["body"]
+            check(f"worker openai-sse {tag}", sampling_openai(b), expect_openai(model, role))
+            # worker, native Ollama non-streaming
+            take()
+            w.call_ollama(HOST, model, msgs, None, None, api_style="ollama", tools=False, role=role)
+            b = take()[-1]["body"]
+            check(f"worker ollama   {tag}", sampling_ollama(b), expect_ollama(model, role))
+            # worker, native Ollama streaming
+            take()
+            w.call_ollama_streaming(HOST, model, msgs, None, None, tools=False, role=role)
+            b = take()[-1]["body"]
+            check(f"worker ollama-stream {tag}", sampling_ollama(b), expect_ollama(model, role))
+    # darkbloom_chat: review (default) + author(think=True) for the Darkbloom-served profiles
+    dbc.base_url = lambda: HOST
+    for model in [m for m in MODELS if RAW["models"][m].get("backend") == "darkbloom"]:
+        take()
+        dbc.chat(HOST, model, "sys", "user")
+        b = take()[-1]["body"]
+        check(f"darkbloom_chat review {model}", sampling_openai(b), expect_openai(model, "review"))
+        take()
+        dbc.chat(HOST, model, "sys", "user", think=True)
+        b = take()[-1]["body"]
+        check(f"darkbloom_chat think->author {model}", sampling_openai(b), expect_openai(model, "author", think=True))
+
+
+def run_overrides(w):
+    msgs = [{"role": "user", "content": "x"}]
+    pair = "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+    ov = {"temperature": 0.2, "top_k": 7, "max_tokens": 1234, "repetition_penalty": 1.25, "top_p": 0.5}
+    take()
+    w.call_ollama(HOST, pair, msgs, 0.2, None, api_style="openai", tools=False, top_p=0.5, top_k=7,
+                  max_tokens=1234, repeat_penalty=1.25, role="author")
+    check("explicit overrides beat the profile (openai)", sampling_openai(take()[-1]["body"]),
+          expect_openai(pair, "author", ov))
+    take()
+    w.call_ollama(HOST, pair, msgs, None, None, api_style="openai", tools=False, role="author", think=False)
+    check("explicit think=False beats the profile", take()[-1]["body"]["chat_template_kwargs"],
+          {"enable_thinking": False})
+
+
+def run_invariants():
+    for model in MODELS:
+        for role in ("author", "coding"):
+            p = mp.get_profile(model, role)
+            check(f"author max_tokens >= 32768 ({model}/{role})", (p["max_tokens"] or 0) >= 32768, True)
+    for model in MODELS:
+        o = mp.build_request_fields(model, "author", "openai")
+        bad = {k: o[k] for k in ("temperature", "repetition_penalty", "max_tokens")
+               if (k == "temperature" and o.get(k) in (0, 0.0, 0.15))
+               or (k == "repetition_penalty" and o.get(k) == 1.1)
+               or (k == "max_tokens" and o.get(k) == 8192)}
+        check(f"no legacy hardcoded default leaks ({model})", bad, {})
+    # alias: declared, lane-scoped, logged, never silent
+    got = mp.resolve_alias("qwen3.8:27b-q4_K_M", "darkbloom")
+    check("qwen3.8 alias resolves on the darkbloom lane via the PROFILE",
+          got, ("qwen3.6-35b-a3b-vl-mtp-mxfp8", "qwen3.8:27b-q4_K_M"))
+    check("qwen3.8 alias does NOT apply without a lane (Ollama keeps its own profile)",
+          mp.resolve_alias("qwen3.8:27b-q4_K_M", None), ("qwen3.8:27b-q4_K_M", None))
+    # the alias must be LOGGED (once), never silent
+    import contextlib
+    import io
+    mp._WARNED.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        mp.resolve_alias("qwen3.8:27b-q4_K_M", "darkbloom")
+        mp.resolve_alias("qwen3.8:27b-q4_K_M", "darkbloom")
+    check("alias logs a warning exactly once", buf.getvalue().count("ALIAS qwen3.8:27b-q4_K_M"), 1)
+    # unknown model: fallback, flagged loudly
+    p = mp.get_profile("totally-unknown:7b", "author")
+    check("unknown model -> fallback profile flagged", p["fallback"], True)
+
+
+def run_cli_defaults(w):
+    """The worker's argparse defaults must be None (profile-resolved), not constants."""
+    src = WORKER.read_text()
+    check("CLI --temperature default is None (profile owns it)",
+          'ap.add_argument("--temperature", type=float, default=None' in src, True)
+    check("CLI --max-tokens default is None", 'ap.add_argument("--max-tokens", type=int, default=None' in src, True)
+    check("CLI --repeat-penalty default is None", 'ap.add_argument("--repeat-penalty", type=float, default=None' in src, True)
+    check("CLI --num-ctx default is None", 'ap.add_argument("--num-ctx", type=int, default=None' in src, True)
+
+
+def run_queue():
+    """The queue's launch builder: no hardcoded temperature reaches the worker argv;
+    an explicit enqueue --temperature does; legacy rows (temperature 0, not explicit)
+    are NOT honored; the alias comes from the profile."""
+    q = _load(QUEUE, "oq_conf")
+    tf = Path(tempfile.mkdtemp(prefix="mpconf-q-")) / "task.md"
+    tf.write_text("do a thing")
+    job = {"id": "j1", "model": "qwen3.6-35b-a3b-vl-mtp-mxfp8", "cwd": str(tf.parent), "task_file": str(tf),
+           "num_ctx": 65536, "max_iters": None, "api": "openai", "temperature": 0, "task_kind": "coding"}
+    cmd = q._build_cmd(dict(job), HOST)
+    check("queue launch: legacy temperature=0 row is NOT forwarded", "--temperature" in cmd, False)
+    cmd = q._build_cmd(dict(job, temperature=0.4, temperature_explicit=True), HOST)
+    check("queue launch: explicit --temperature IS forwarded",
+          cmd[cmd.index("--temperature") + 1] if "--temperature" in cmd else None, "0.4")
+    cmd = q._build_cmd(dict(job, role="review"), HOST)
+    check("queue launch: --role forwarded", cmd[cmd.index("--role") + 1] if "--role" in cmd else None, "review")
+    qsrc = QUEUE.read_text()
+    check("queue enqueue --temperature default is None",
+          'e.add_argument("--temperature", type=float, default=None' in qsrc, True)
+    check("queue alias qwen3.8 -> profile alias target",
+          q._darkbloom_model("qwen3.8:27b-q4_K_M"), "qwen3.6-35b-a3b-vl-mtp-mxfp8")
+
+
+def run_e2e_subprocess():
+    """Full worker process: argparse -> run_task -> real request. Proves the CLI path
+    (not just the call_* functions) sends the profile."""
+    pair = "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+    cwd = tempfile.mkdtemp(prefix="mpconf-cwd-")
+    for role in ("author", "review"):
+        take()
+        env = {**os.environ, "WORKER_NO_WARMUP": "1"}
+        r = subprocess.run([sys.executable, str(WORKER), "--model", pair, "--host", HOST, "--api", "openai",
+                            "--task", "reply with the single word hi", "--cwd", cwd, "--max-iters", "1",
+                            "--role", role, "--chat-timeout", "30", "--direct-ok"],
+                           capture_output=True, text=True, timeout=180, env=env)
+        allreq = [s for s in take() if s["path"] == "/v1/chat/completions"]
+        probe = [s for s in allreq if s["body"]["messages"][0]["content"] == "ready"]
+        sent = [s for s in allreq if s["body"]["messages"][0]["content"] != "ready"]
+        if probe:
+            check(f"e2e preflight probe uses the non-thinking profile ({role})",
+                  sampling_openai(probe[0]["body"]),
+                  expect_openai(pair, "review", {"max_tokens": 256}))
+        if os.environ.get("MPCONF_DEBUG"):
+            print("      sent:", json.dumps(sent)[:1500])
+        check(f"e2e worker subprocess sent a chat request ({role})", bool(sent), True)
+        if sent:
+            check(f"e2e worker subprocess body == profile ({role})",
+                  sampling_openai(sent[0]["body"]), expect_openai(pair, role))
+        elif r.returncode is not None:
+            print("      worker stderr tail:", (r.stderr or r.stdout)[-400:])
+
+
+def run_drift():
+    probs = mp.check_profiles(PROFILES)
+    check("model-card drift: every profile cites an existing, unchanged card", probs, [])
+    # the detector itself must bite: a corrupted card_sha256 / an edited card number is reported
+    first = next(iter(RAW["models"]))
+    txt = PROFILES.read_text()
+    bad_hash = txt.replace(RAW["models"][first]["card_sha256"], "0" * 64, 1)
+    tmp = Path(tempfile.mkdtemp(prefix="mpconf-drift-")) / "model_profiles.yaml"
+    tmp.write_text(bad_hash)
+    check("drift detector flags a changed card (sha256 mismatch)",
+          any("card changed" in x for x in mp.check_profiles(tmp)), True)
+    tmp.write_text(txt.replace("temperature: 0.7, top_p: 0.8, top_k: 20", "temperature: 0.71, top_p: 0.8, top_k: 20", 1))
+    check("drift detector flags a number the card does not state",
+          any("do not match the card" in x for x in mp.check_profiles(tmp)), True)
+    mp.load_profiles(PROFILES, refresh=True)
+    for name, e in RAW["models"].items():
+        check(f"has source citation ({name})", bool(str(e.get("source") or "").strip()), True)
+
+
+def main():
+    if "--drift" in sys.argv:
+        run_drift()
+    else:
+        w = _load(WORKER, "ow_conf")
+        dbc = _load(DBC, "dbc_conf")
+        run_drift()
+        run_invariants()
+        run_cli_defaults(w)
+        run_queue()
+        run_matrix(w, dbc)
+        run_overrides(w)
+        run_e2e_subprocess()
+    print(f"\n{NCHECK[0] - len(FAILS)}/{NCHECK[0]} passed")
+    print("CONFORMANT" if not FAILS else f"NON-CONFORMANT: {len(FAILS)} FAILED")
+    return 0 if not FAILS else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

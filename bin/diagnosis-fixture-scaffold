@@ -1,0 +1,1080 @@
+#!/usr/bin/env python3
+"""diagnosis-fixture-scaffold -- stage a VALIDATED, answer-key-clean diagnosis fixture.
+
+WHY THIS EXISTS
+---------------
+Real-history diagnosis supply came back as 3 cases across every repo, then 1
+after the born-broken filter tightened. Purpose-built fixtures are the only
+scalable path, and hand-building one is a long checklist whose steps are exactly
+the kind that get skipped: strip the history, audit the prompt for the answer,
+prove the case is gradeable at all. A skipped step here does not fail loudly --
+it produces a fixture that MEASURES NOTHING and looks fine.
+
+THE TWO THINGS THAT MAKE THIS MORE THAN A COPY SCRIPT
+-----------------------------------------------------
+1. BORN-BROKEN IS MEASURED, NEVER INFERRED.
+   A bug introduced by the same commit that ADDED the feature has no ancestor
+   where a test can pass, so it grades REJECTED however good the diagnosis is.
+   The AST check ("is the def defined at the anchor?") is a useful CHEAP
+   PRE-FILTER and nothing more -- Research measured it still admitting
+   born-broken cases, because the def can exist at the anchor while the
+   behaviour path does not. No static filter -- file, token, or AST -- can
+   decide a behavioural question. So the authoritative gate is: check out the
+   anchor, RUN the true test there, require it to pass.
+
+2. THE GRADER'S VERDICT IS CLASSIFIED, NOT OBEYED.
+   Validating a fixture with the same grader that will later MEASURE it is
+   circular: discard what the grader rejects and the fixture set silently
+   evolves into "cases the grader already handles", so its blind spots become
+   unmeasurable and the bench reports that the grader agrees with itself. The
+   disagreements are the yield. So:
+
+     AGREE              true->ACCEPTED and herring->REJECTED    -> joins the set
+     GRADER-TOO-TIGHT   true->REJECTED  (ground truth is sound) -> QUARANTINE
+     GRADER-TOO-LOOSE   herring->ACCEPTED                       -> QUARANTINE
+
+   Quarantined, tagged, routed to Research. Never discarded.
+
+   This is kept strictly SEPARATE from born-broken: a born-broken case is a
+   STAGING defect (our fault, reject the fixture); a grader disagreement on a
+   sound case is a GRADER signal (their yield). Collapsing the two would throw
+   away exactly the evidence that improves the grader.
+
+3. THE SYMPTOM IS AUDITED FOR MECHANISM, NOT JUST FOR THE ANSWER KEY.
+   `answer-key` greps for the file, symbol, shas and mechanism tokens -- the
+   LEXICAL leaks. The rivian case showed the other kind: "timestamps are 7
+   hours off" and "only the first 12 days appear" are honest observables that
+   ARE the diagnosis (a timezone offset; a day<=12 month/day swap) and contain
+   no forbidden token. `telegraph` checks the decidable approximation -- a
+   symptom that states the CONDITION of the effect with mechanism-level
+   precision (a threshold, a fingerprint magnitude, a code-level operation
+   word, or a literal the regression's diff changed) -- and says out loud
+   which side of the decidable boundary a PASS is on. See check_telegraph().
+
+Read-only with respect to the source repo: it is cloned, never written.
+Emits into machine-config/diagnosis-offload/fixtures/<name>/ and does NOT
+git-commit or push -- Research owns the domain and lands the result.
+
+  diagnosis-fixture-scaffold --name discount-pct --repo ~/src/proj \\
+      --anchor <sha> --true-file lib.py --true-symbol discount \\
+      --true-test t_good.py --herring-test t_herring.py \\
+      --herring-symbol format_price --symptom symptom.md
+  diagnosis-fixture-scaffold ... --telegraph-allow "19-character"   # waive a hit, recorded
+  diagnosis-fixture-scaffold --self-check
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+GRADER = Path.home() / "bin" / "diagnosis-check.py"
+DEFAULT_OUT = (Path.home() / "Desktop" / "GitHub Projects" / "machine-config"
+               / "diagnosis-offload" / "fixtures")
+TEST_TIMEOUT = 120
+ARTIFACTS = {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache",
+             ".mypy_cache", ".ruff_cache", "build", "dist", ".tox", ".build"}
+
+PASS, FAIL, WARN, INFO = "PASS", "FAIL", "WARN", "INFO"
+
+
+class Result:
+    def __init__(self, cid, status, msg, detail=""):
+        self.id, self.status, self.msg, self.detail = cid, status, msg, detail
+
+    def as_dict(self):
+        return {"check": self.id, "status": self.status, "message": self.msg,
+                "detail": self.detail}
+
+
+def sh(cmd, cwd=None, timeout=None):
+    p = subprocess.run(cmd, cwd=cwd and str(cwd), capture_output=True,
+                       text=True, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+def git(repo, *a):
+    return sh(["git", "-C", str(repo), *a])
+
+
+# ---------------------------------------------------------------------------
+# Telegraph gate: does the symptom describe an OBSERVABLE or encode a MECHANISM?
+# ---------------------------------------------------------------------------
+#
+# THE PROPERTY. A symptom prompt is honest when it states an EFFECT and its
+# SCOPE ("Rivian clips lose their date; Tesla clips are fine; started after the
+# scanner change"). It telegraphs when it states the CONDITION under which the
+# effect occurs with MECHANISM-LEVEL PRECISION -- a threshold ("from the 13th
+# onward"), a magnitude that fingerprints a mechanism class ("7 hours off" =
+# timezone; "12" = month bound; "100" = percent-vs-fraction), a code-level
+# operation word ("swapped", "off by one", "not closed"), or a literal that the
+# regression's own diff changed. Every observable narrows the search; these
+# narrow it to the mechanism, and a model reading them is not diagnosing.
+#
+# THE BOUNDARY. Only the marker forms above are decidable. A symptom can imply
+# the mechanism with none of them ("clips from later in the month") and this
+# scan will PASS it. So a PASS here is labelled as the checkable half only, and
+# the residual -- does the prose IMPLY the mechanism -- is named as a human
+# read. A WARN says "this may telegraph, here is why, a human decides"; that
+# is the correct answer for the residual, and a silent pass is not.
+#
+# THE ASYMMETRY. Under-flagging makes the run measure nothing while looking
+# clean; over-flagging makes the gate noise people route around. So only the
+# unambiguous forms FAIL (a changed literal quoted verbatim; an operation word
+# that no user report would contain), the rest WARN, and any hit can be waived
+# by --telegraph-allow -- recorded in ground-truth.json, never silent.
+
+TELEGRAPH_HARD = (        # code-level operation words -> FAIL
+    (r"off[- ]by[- ]one", "off-by-one names the mechanism class"),
+    (r"\binvert(?:ed|s)?\b", "an inverted condition is a mechanism, not an effect"),
+    (r"\bswapp?ed\b|\btranspos(?:ed|es)\b", "swapped/transposed arguments is a mechanism"),
+    (r"\btime ?zones?\b|\butc\b", "timezone/UTC names the offset mechanism"),
+    (r"\b(?:over|under)flow(?:s|ed)?\b", "overflow/underflow is a mechanism"),
+    (r"\btruncat\w*", "truncation is a mechanism"),
+    (r"\bswallow\w*", "a swallowed exception is a mechanism"),
+    (r"\bun(?:handled|caught)\b", "unhandled/uncaught names the control-flow mechanism"),
+    (r"\brace condition\b|\bdata race\b", "race condition is a mechanism"),
+    (r"\bregex\b|\bregular expression", "naming the regex points at the parser"),
+    (r"\b(?:never|not|isn't|is not|n't)\s+(?:being\s+)?closed\b|\bunclosed\b",
+     "'not closed' is the resource-management mechanism"),
+    (r"(?<![\w.])[<>]=?\s*\d|(?<![\w.])(?:==|!=)(?![\w.])", "a comparison operator is code, not a symptom"),
+    (r"\bfraction\b.{0,40}\bpercent|\bpercent\w*.{0,40}\bfraction\b",
+     "percent-vs-fraction names the unit-confusion mechanism"),
+)
+TELEGRAPH_SOFT = (        # interpretation words -> WARN
+    (r"\bleak\w*", "'leak' interprets the observable (a climbing count) as its cause"),
+    (r"\boffsets?\b", "'offset' is the mechanism behind a shifted value"),
+    (r"\bboundar(?:y|ies)\b|\bthresholds?\b", "names the condition as a boundary"),
+    (r"\bround(?:ing|ed)\b", "rounding is a mechanism"),
+    (r"\bstale\b|\bcach(?:e|ed|es|ing)\b", "cache/stale interprets the observable"),
+    (r"\bfallback\b|\bretr(?:y|ies|ied)\b", "names the control path"),
+    (r"\bencod(?:ing|ed)\b|\bdecod\w+", "encoding names the transformation"),
+    (r"\bpaginat\w+", "pagination names the bound mechanism"),
+    (r"\bprecision\b", "precision names the numeric mechanism"),
+)
+# Magnitudes that fingerprint a mechanism class. WARN, because a count can be
+# innocent ("12 cameras") -- the reason is printed so a human can tell.
+TELEGRAPH_FINGERPRINTS = {
+    7: "7 (hours) = US-Pacific vs UTC offset (PDT)", 8: "8 (hours) = US-Pacific vs UTC offset (PST)",
+    12: "12 = month bound -> day/month swap", 13: "13 = first day a swapped month is invalid",
+    24: "24 = hours/day", 60: "60 = minutes/seconds", 3600: "3600 = seconds/hour",
+    86400: "86400 = seconds/day", 28: "28 = February bound", 30: "30/31 = days/month bound",
+    31: "30/31 = days/month bound", 365: "365/366 = leap-year bound", 366: "365/366 = leap-year bound",
+    100: "100 = percent-vs-fraction", 1000: "1000 = ms/s or SI-vs-binary", 1024: "1024 = binary kilo",
+    127: "127/128 = int8 bound", 128: "127/128 = int8 bound", 255: "255/256 = byte bound",
+    256: "255/256 = byte bound", 32767: "32767 = int16 bound", 65535: "65535 = uint16 bound",
+    2147483647: "2147483647 = int32 bound", 1970: "1970 = epoch",
+}
+_SPELLED = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+            "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+            "fourteen": 14, "fifteen": 15, "sixteen": 16, "twenty": 20, "thirty": 30,
+            "sixty": 60, "hundred": 100, "thousand": 1000}
+_NUM = r"(\d+|" + "|".join(_SPELLED) + r")"
+_THRESHOLD = (
+    r"\b(?:first|last|only|exactly|more than|less than|fewer than|at least|at most|over|under|"
+    r"beyond|up to|longer than|shorter than|above|below|larger than|smaller than|greater than|"
+    r"past|after|before|within)\s+(?:the\s+)?" + _NUM + r"\b(?!\s*(?:%|percent|px|ms\b))",
+    r"\b" + _NUM + r"(?:st|nd|rd|th)?\s+(?:or more|or fewer|or later|or earlier|onwards?|and (?:up|above|beyond|later|later on))\b",
+    r"\b\d+(?:st|nd|rd|th)\b",
+    r"\b" + _NUM + r"[- ](?:digit|char(?:acter)?|byte|bit|second|minute|hour|day|week|month|item|element|line|entr(?:y|ies)|row|column)s?\b",
+)
+# Numbers that are observables in their own right, never fingerprints.
+_EXEMPT = (r"\bHTTP\s*/?\s*\d{3}\b", r"\b(?:status|code|returns?|returned|error)\s+\d{3}\b",
+           r"\berrno\s*\d+", r"\bexit(?:ed|s)?\s+(?:code\s+)?\d+", r"\bport\s+\d+", r"\bline\s+\d+",
+           r"\bv?\d+\.\d+(?:\.\d+)*\b", r"\b(?:19|20)\d\d\b", r"\bpid\s+\d+",
+           r"\bpython\s*\d(?:\.\d+)?\b")
+
+
+def diff_literals(repo, anchor, head):
+    """Literals the regression's own diff changed: numbers of 2+ digits and
+    string-literal contents of 4+ characters on +/- lines. A symptom that
+    quotes one of these is quoting the fix. Returns a set of lowercase strings;
+    empty on any git failure (fail-open: this tier can then only under-flag,
+    and the other tiers still run)."""
+    rc, out, _ = git(repo, "diff", "-U0", anchor, head)
+    if rc != 0:
+        return set()
+    lits = set()
+    for line in out.splitlines():
+        if not line or line[0] not in "+-" or line.startswith(("+++", "---")):
+            continue
+        body = line[1:]
+        lits.update(m for m in re.findall(r"(?<![\w.])(\d{2,})(?![\w.])", body))
+        for q in re.findall(r"""(["'])((?:(?!\1).){4,}?)\1""", body):
+            v = q[1].strip().lower()
+            if re.search(r"[a-z]", v) and " " in v or len(v) >= 6:
+                lits.add(v)
+    return lits
+
+
+def telegraph_scan(text, changed_literals=(), allow=()):
+    """Classify a symptom prompt. Returns
+    {"status": PASS|WARN|FAIL, "hits": [...], "waived": [...], "boundary": str}.
+
+    Each hit: {"tier": FAIL|WARN, "kind": ..., "match": ..., "why": ...}.
+    `allow` waives hits whose match contains (or is contained in) a token; a
+    waived FAIL still leaves a WARN, so a waiver is visible, never silent.
+    """
+    low = text.lower()
+    hits = []
+
+    def add(tier, kind, match, why):
+        hits.append({"tier": tier, "kind": kind, "match": match, "why": why})
+
+    for lit in sorted(set(changed_literals)):
+        if lit and re.search(r"(?<![\w.])" + re.escape(lit) + r"(?![\w.])", low):
+            add(FAIL, "changed-literal", lit,
+                f"the symptom quotes {lit!r}, a literal the regression's diff changed")
+    for pat, why in TELEGRAPH_HARD:
+        for m in re.finditer(pat, low):
+            add(FAIL, "mechanism-word", m.group(0).strip(), why)
+    for pat, why in TELEGRAPH_SOFT:
+        for m in re.finditer(pat, low):
+            add(WARN, "interpretation-word", m.group(0).strip(), why)
+    exempt = [(m.start(), m.end()) for pat in _EXEMPT for m in re.finditer(pat, low)]
+
+    def is_exempt(span):
+        return any(a <= span[0] and span[1] <= b for a, b in exempt)
+
+    spans = [m.span() for pat in _THRESHOLD for m in re.finditer(pat, low)
+             if not is_exempt(m.span())]
+    # One hit per region: '13th' inside '13th onward' is the same telegraph,
+    # and a WARN that repeats itself reads as noise -- the thing a gate must
+    # not become.
+    spans = sorted({sp for sp in spans
+                    if not any(o != sp and o[0] <= sp[0] and sp[1] <= o[1] for o in spans)})
+    for a, b in spans:
+        add(WARN, "precise-condition", low[a:b],
+            "states the condition of the effect as a precise threshold/format -- "
+            "the boundary IS the mechanism (off-by-one, swap, limit)")
+    for m in re.finditer(r"\b(\d+|" + "|".join(_SPELLED) + r")\b", low):
+        if is_exempt(m.span()):
+            continue
+        tok = m.group(1)
+        n = int(tok) if tok.isdigit() else _SPELLED.get(tok)
+        if n in TELEGRAPH_FINGERPRINTS:
+            ctx = low[max(0, m.start() - 30): m.end() + 30].replace("\n", " ").strip()
+            add(WARN, "fingerprint-magnitude", tok,
+                f"{TELEGRAPH_FINGERPRINTS[n]} (in: ...{ctx}...)")
+
+    allow_l = [a.lower() for a in allow if a]
+    waived = []
+    kept = []
+    for h in hits:
+        if any(a in h["match"] or h["match"] in a for a in allow_l):
+            waived.append(h)
+        else:
+            kept.append(h)
+    if any(h["tier"] == FAIL for h in kept):
+        status = FAIL
+    elif kept or waived:
+        status = WARN
+    else:
+        status = PASS
+    boundary = (
+        "DECIDED by marker(s) -- the decidable half fired; a human still owns the "
+        "question of whether the marker is a necessary part of an honest report"
+        if kept or waived else
+        "UNDECIDED-RESIDUAL -- no threshold, fingerprint magnitude, operation word, "
+        "or changed literal found. This is the CHECKABLE half only: whether the prose "
+        "IMPLIES the mechanism without any marker is not decidable here and remains a "
+        "human read.")
+    return {"status": status, "hits": kept, "waived": waived, "boundary": boundary}
+
+
+class Scaffold:
+    def __init__(self, a):
+        self.a = a
+        self.repo = Path(a.repo).expanduser().resolve()
+        self.results: list[Result] = []
+        self.meta: dict = {}
+
+    def add(self, cid, status, msg, detail=""):
+        self.results.append(Result(cid, status, msg, detail))
+        return status
+
+    # ---- 1. inputs ---------------------------------------------------
+    def check_inputs(self):
+        if not (self.repo / ".git").exists():
+            return self.add("inputs", FAIL, f"{self.repo} is not a git repo")
+        rc, out, _ = git(self.repo, "rev-parse", "--verify", f"{self.a.anchor}^{{commit}}")
+        if rc != 0:
+            return self.add("inputs", FAIL, f"anchor {self.a.anchor} does not resolve")
+        self.anchor = out.strip()
+        rc, out, _ = git(self.repo, "rev-parse", "--verify", f"{self.a.head}^{{commit}}")
+        if rc != 0:
+            return self.add("inputs", FAIL, f"head {self.a.head} does not resolve")
+        self.head = out.strip()
+        missing = [p for p in (self.a.true_test, self.a.herring_test,
+                               self.a.symptom) if p and not Path(p).expanduser().is_file()]
+        if missing:
+            return self.add("inputs", FAIL, "missing input file(s)",
+                            "; ".join(missing))
+        rc, _, _ = git(self.repo, "cat-file", "-e", f"{self.head}:{self.a.true_file}")
+        if rc != 0:
+            return self.add("inputs", FAIL,
+                            f"{self.a.true_file} does not exist at head")
+        return self.add("inputs", PASS,
+                        f"anchor {self.anchor[:12]} head {self.head[:12]}")
+
+    # ---- 2. AST pre-filter (CHEAP, NEVER THE DECISION) ---------------
+    def check_ast_prefilter(self):
+        """Is the named definition present at the anchor?
+
+        Reused from sweep-gradeable-regressions.py criterion 5. It fails fast on
+        the obvious born-broken case and costs nothing. It is NOT the gate:
+        Research measured it admitting born-broken cases where the def existed
+        at the anchor but the behaviour path did not. Static analysis cannot
+        answer a behavioural question; only `born-broken` below can.
+        """
+        rc, src, _ = git(self.repo, "show", f"{self.anchor}:{self.a.true_file}")
+        if rc != 0:
+            return self.add("ast-prefilter", WARN,
+                            f"{self.a.true_file} absent at the anchor",
+                            "strongly suggests born-broken; the measured gate decides")
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return self.add("ast-prefilter", WARN, "target unparseable at anchor")
+        names = {n.name for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef))}
+        if self.a.true_symbol not in names:
+            return self.add("ast-prefilter", FAIL,
+                            f"`{self.a.true_symbol}` is NOT defined at the anchor",
+                            "the feature was added by the bug commit -- born broken, "
+                            "no ancestor can pass. Cheap pre-filter; the measured "
+                            "born-broken gate would catch it too, slower.")
+        return self.add("ast-prefilter", PASS,
+                        f"`{self.a.true_symbol}` is defined at the anchor "
+                        "(pre-filter only, not the decision)")
+
+    # ---- 3. answer-key audit (MANDATORY) -----------------------------
+    def check_answer_key(self):
+        """The symptom prompt must not contain the answer.
+
+        A leak makes the run measure nothing while looking like a clean pass --
+        the model reads the cause out of the prompt. Required step; never skip.
+        """
+        text = Path(self.a.symptom).expanduser().read_text(errors="replace")
+        low = text.lower()
+        hits = []
+        fname = Path(self.a.true_file).name
+        for label, tok in (
+                ("target filename", fname),
+                ("target stem", Path(fname).stem),
+                ("true symbol", self.a.true_symbol),
+                ("anchor sha", self.anchor), ("anchor sha (short)", self.anchor[:7]),
+                ("head sha", self.head), ("head sha (short)", self.head[:7])):
+            if tok and len(tok) >= 4 and tok.lower() in low:
+                hits.append(f"{label}: {tok!r}")
+        for tok in (self.a.mechanism_token or []):
+            if tok.lower() in low:
+                hits.append(f"mechanism token: {tok!r}")
+        if hits:
+            return self.add("answer-key", FAIL,
+                            f"{len(hits)} answer-key leak(s) in the symptom prompt",
+                            "; ".join(hits))
+        return self.add("answer-key", PASS,
+                        "symptom prompt names no file, symbol, sha or mechanism token")
+
+    # ---- 3b. telegraph audit: observable vs mechanism -------------------
+    def check_telegraph(self):
+        """Does the symptom ENCODE the mechanism while naming no forbidden token?
+
+        Scar tissue: the rivian fixture's first symptom said "clips recorded
+        during the first 12 days of any month show up with the right date, but
+        clips from the 13th onward come in with no date". Every clause was an
+        honest observable, `answer-key` was clean, and the prompt handed over
+        the month/day swap to anyone who has seen one. A run on it would have
+        measured reading comprehension and reported it as diagnosis.
+
+        The decidable property and its boundary are documented above
+        telegraph_scan(). FAIL blocks (waivable, recorded); WARN passes with
+        the reason printed; PASS is labelled as the checkable half only.
+        """
+        text = Path(self.a.symptom).expanduser().read_text(errors="replace")
+        lits = diff_literals(self.repo, self.anchor, self.head)
+        res = telegraph_scan(text, lits, getattr(self.a, "telegraph_allow", None) or [])
+        self.meta["telegraph"] = {"status": res["status"],
+                                  "hits": res["hits"], "waived": res["waived"]}
+        desc = "; ".join(f"[{h['tier']}] {h['kind']} {h['match']!r}: {h['why']}"
+                         for h in res["hits"])
+        if res["waived"]:
+            desc += (" | WAIVED by --telegraph-allow: "
+                     + ", ".join(repr(h["match"]) for h in res["waived"]))
+        if res["status"] == FAIL:
+            return self.add("telegraph", FAIL,
+                            f"symptom TELEGRAPHS the mechanism ({len(res['hits'])} marker(s))",
+                            desc + " -- rewrite the symptom as effect + scope, or waive "
+                            "each marker with --telegraph-allow and own it.")
+        if res["status"] == WARN:
+            return self.add("telegraph", WARN,
+                            "symptom MAY telegraph the mechanism -- a human decides",
+                            desc + f" || {res['boundary']}")
+        return self.add("telegraph", PASS,
+                        "no mechanism marker in the symptom (checkable half only; whether "
+                        "the prose IMPLIES the mechanism is a human read)")
+
+    # ---- 4. stage ----------------------------------------------------
+    def stage(self, dest: Path):
+        """HEAD tree ONLY: no history for the model to `git log` the answer from."""
+        dest.mkdir(parents=True, exist_ok=True)
+        rc, _, err = sh(["git", "-C", str(self.repo), "worktree", "add", "--detach",
+                         str(dest / "_export"), self.head])
+        if rc != 0:
+            return None, f"export failed: {err.strip()[-200:]}"
+        arm = dest / "arm"
+        shutil.copytree(dest / "_export", arm,
+                        ignore=shutil.ignore_patterns(*ARTIFACTS))
+        sh(["git", "-C", str(self.repo), "worktree", "remove", "--force",
+            str(dest / "_export")])
+        for d in list(arm.rglob("*")):
+            if d.is_dir() and d.name in ARTIFACTS:
+                shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(arm / ".git", ignore_errors=True)
+        sh(["git", "init", "-q", "-b", "main"], cwd=arm)
+        sh(["git", "config", "user.email", "fixture@local"], cwd=arm)
+        sh(["git", "config", "user.name", "fixture"], cwd=arm)
+        sh(["git", "add", "-A"], cwd=arm)
+        sh(["git", "commit", "-qm", "initial"], cwd=arm)
+        rc, out, _ = git(arm, "log", "--oneline")
+        n = len([l for l in out.splitlines() if l.strip()])
+        self.add("stage", PASS if n == 1 else FAIL,
+                 f"model arm has {n} commit(s) and no upstream history"
+                 if n == 1 else f"model arm has {n} commits, expected 1")
+        return arm, None
+
+    # ---- 5. env parity ------------------------------------------------
+    def check_env_parity(self, arm: Path):
+        mod = Path(self.a.true_file).with_suffix("").as_posix().replace("/", ".")
+        # PYTHONDONTWRITEBYTECODE: this very check used to create __pycache__ in
+        # the arm AFTER staging had stripped artifacts, so every emitted fixture
+        # shipped compiled bytecode of the buggy module. Belt and braces -- the
+        # arm is re-stripped before emit too, since anything else that runs
+        # python in there would leak the same way.
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        p = subprocess.run([sys.executable, "-c", f"import {mod}"], cwd=str(arm),
+                           capture_output=True, text=True, timeout=60,
+                           env=env)
+        rc, out, err = p.returncode, p.stdout, p.stderr
+        if rc != 0:
+            tail = (err or out).strip().splitlines()[-1:] or [""]
+            return self.add("env-parity", FAIL,
+                            f"the arm cannot import {mod}", tail[0][:200])
+        return self.add("env-parity", PASS, f"the arm imports {mod}")
+
+    # ---- 6. born-broken: MEASURED, authoritative ----------------------
+    def check_born_broken(self):
+        """Run the TRUE test at the anchor. It must PASS.
+
+        Measured independently of the grader on purpose. The grader's own
+        passes_at_anchor is the same fact, but taking it from the grader would
+        make the gate depend on the tool this fixture exists to measure -- the
+        circularity the three-bucket classification is designed to avoid.
+        """
+        tmp = Path(tempfile.mkdtemp(prefix="dfs-anchor-"))
+        try:
+            rc, _, err = sh(["git", "clone", "-q", str(self.repo), str(tmp / "at")])
+            if rc != 0:
+                return self.add("born-broken", FAIL, "could not clone for the anchor run",
+                                err.strip()[-200:])
+            work = tmp / "at"
+            rc, _, err = git(work, "checkout", "-q", self.anchor)
+            if rc != 0:
+                return self.add("born-broken", FAIL, "anchor checkout failed",
+                                err.strip()[-200:])
+            # The test postdates the anchor, so it must be carried in -- else we
+            # would be measuring "file missing", not "bug absent".
+            rel = Path(self.a.true_test).name
+            shutil.copyfile(Path(self.a.true_test).expanduser(), work / rel)
+            rc, out, err = sh([sys.executable, rel], cwd=work, timeout=TEST_TIMEOUT)
+            self.meta["passes_at_anchor"] = (rc == 0)
+            if rc != 0:
+                tail = ((err or out).strip().splitlines() or [""])[-1]
+                return self.add(
+                    "born-broken", FAIL,
+                    "BORN BROKEN: the true test does NOT pass at the anchor",
+                    f"{tail[:200]} -- there is no ancestor where the symptom is "
+                    "absent, so this case grades REJECTED however good the "
+                    "diagnosis. STAGING DEFECT: reject the fixture. This is NOT "
+                    "a grader signal and must not be routed as one.")
+            return self.add("born-broken", PASS,
+                            "MEASURED: the true test passes at the anchor "
+                            "(a correct diagnosis is reachable)")
+        except subprocess.TimeoutExpired:
+            return self.add("born-broken", FAIL,
+                            f"the true test timed out at the anchor (>{TEST_TIMEOUT}s)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def check_symptom_reproduces(self):
+        """Does the SYMPTOM AS DESCRIBED actually happen at HEAD?
+
+        A second empirical gate, and a DIFFERENT question from born-broken.
+        born-broken asks "can a test pass at the anchor" -- that the case is
+        gradeable at all. This asks "is the thing we told the model to look for
+        real" -- that the case is honest.
+
+        A fixture can pass the first and fail this one. Research hit exactly
+        that: the FTPS case described a climbing socket leak ending in EMFILE,
+        inferred from the FIX's intent, and the leak never actually happens. The
+        model correctly failed to reproduce a symptom that does not exist and
+        would have been recorded as INCAPABLE. A false negative that looks
+        precisely like model incapacity is the failure this whole pipeline
+        exists to prevent, so the symptom gets measured too.
+
+        BOTH ways, because a demo is a test and an unproven test is worthless:
+          at HEAD   -> exit 0, the symptom IS observed
+          at ANCHOR -> non-zero, the symptom is ABSENT
+        Without the anchor half, `sys.exit(0)` passes and proves nothing.
+        """
+        demo = self.a.symptom_demo
+        if not demo and getattr(self.a, "no_symptom_demo", False):
+            self.meta["symptom_reproduces_at_head"] = None
+            return self.add(
+                "symptom-reproduces", WARN,
+                "WAIVED (--no-symptom-demo): UNPROVEN that the symptom is real",
+                "if it turns out not to occur, the model's failure to reproduce "
+                "it will read as incapacity")
+        if not demo:
+            self.meta["symptom_reproduces_at_head"] = None
+            return self.add(
+                "symptom-reproduces", FAIL,
+                "no --symptom-demo: nobody has shown the described symptom "
+                "actually happens",
+                "A symptom inferred from the fix's intent rather than observed "
+                "can be a symptom that never occurs. The model then fails to "
+                "reproduce it and is recorded as incapable. Pass "
+                "--symptom-demo <script>, or waive with --no-symptom-demo and "
+                "own the risk.")
+        demo = Path(demo).expanduser()
+        tmp = Path(tempfile.mkdtemp(prefix="dfs-symptom-"))
+        try:
+            rc, _, err = sh(["git", "clone", "-q", str(self.repo), str(tmp / "w")])
+            if rc != 0:
+                return self.add("symptom-reproduces", FAIL, "clone failed",
+                                err.strip()[-200:])
+            work = tmp / "w"
+            rel = demo.name
+            results = {}
+            for label, ref in (("head", self.head), ("anchor", self.anchor)):
+                git(work, "checkout", "-q", ref)
+                shutil.copyfile(demo, work / rel)
+                try:
+                    rc, out, err = sh([sys.executable, rel], cwd=work,
+                                      timeout=TEST_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    rc, out, err = None, "", "timeout"
+                results[label] = (rc, ((err or out).strip().splitlines() or [""])[-1])
+            head_rc, head_tail = results["head"]
+            anch_rc, anch_tail = results["anchor"]
+            self.meta["symptom_reproduces_at_head"] = (head_rc == 0)
+            self.meta["symptom_absent_at_anchor"] = (anch_rc not in (0, None))
+            if head_rc != 0:
+                return self.add(
+                    "symptom-reproduces", FAIL,
+                    "the described symptom does NOT reproduce at HEAD",
+                    f"demo exited {head_rc} at head: {head_tail[:180]} -- the "
+                    "symptom was probably inferred from the fix's intent rather "
+                    "than observed. A model that fails to reproduce a symptom "
+                    "that never happens gets recorded as INCAPABLE. Rewrite the "
+                    "symptom to what the code actually does, or drop the case.")
+            if anch_rc == 0:
+                return self.add(
+                    "symptom-reproduces", FAIL,
+                    "the symptom demo ALSO 'reproduces' at the anchor",
+                    "it passes at both ends, so it does not demonstrate THIS "
+                    "bug -- a vacuous demo (`sys.exit(0)`) looks identical to a "
+                    "working one without this half of the check.")
+            return self.add(
+                "symptom-reproduces", PASS,
+                "MEASURED: the described symptom occurs at HEAD and not at the "
+                "anchor")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- 7. grader classification (NOT a gate) ------------------------
+    def grade(self, repo: Path, test_rel: str, symbol: str):
+        if not GRADER.is_file():
+            return None, "diagnosis-check.py not found"
+        # A relative --test is REQUIRED: an absolute path makes the grader put
+        # the ORIGINAL directory on sys.path, so the anchor checkout is bypassed
+        # and a correct diagnosis reports passes_at_anchor=false.
+        rc, out, err = sh([sys.executable, str(GRADER), "--repo", str(repo),
+                           "--test", test_rel, "--symbol", symbol,
+                           "--anchor", self.anchor, "--target-file",
+                           self.a.true_file, "--json"], timeout=600)
+        try:
+            return json.loads(out), None
+        except Exception:
+            return None, (err or out).strip()[-200:]
+
+    def classify(self):
+        true_v, e1 = self.grade(self.repo, Path(self.a.true_test).name,
+                                self.a.true_symbol)
+        herr_v, e2 = self.grade(self.repo, Path(self.a.herring_test).name,
+                                self.a.herring_symbol or self.a.true_symbol) \
+            if self.a.herring_test else (None, None)
+        tv = (true_v or {}).get("verdict")
+        hv = (herr_v or {}).get("verdict")
+        self.meta["grader"] = {"true_verdict": tv, "herring_verdict": hv,
+                               "true_why": (true_v or {}).get("why"),
+                               "herring_why": (herr_v or {}).get("why")}
+        if e1 or (tv is None):
+            return self.add("grader-classify", WARN,
+                            "grader did not return a verdict for the true diagnosis",
+                            e1 or "")
+        tags = []
+        # ACCEPTED_LOOSE_ANCHOR / _UNVERIFIED_ANCHOR / _UNCHECKED_LANGUAGE are
+        # QUALIFIED accepts -- the grader is saying "all criteria pass, BUT
+        # confirm by hand". Collapsing them into a clean ACCEPTED via
+        # startswith() throws the qualifier away and the fixture set silently
+        # fills with cases nobody confirmed. The spec prefers a clean ACCEPTED
+        # (single-file introducing commit), so a qualified one is surfaced.
+        if not str(tv).startswith("ACCEPTED"):
+            tags.append("right-but-grader-rejected")
+        elif tv != "ACCEPTED":
+            tags.append(f"qualified-accept:{tv}")
+        if hv is not None and str(hv).startswith("ACCEPTED"):
+            tags.append("grader-hole")
+        self.meta["tags"] = tags
+        if not tags:
+            self.meta["bucket"] = "AGREE"
+            return self.add("grader-classify", PASS,
+                            f"AGREE -- true={tv}, herring={hv}: fixture joins the set")
+        qualified = [x for x in tags if x.startswith("qualified-accept:")]
+        if qualified and len(tags) == 1:
+            self.meta["bucket"] = "AGREE"
+            return self.add(
+                "grader-classify", WARN,
+                f"AGREE, but the accept is QUALIFIED ({tv}) -- joins the set, "
+                "confirm the anchor by hand",
+                f"{(true_v or {}).get('why')} -- prefer a single-file "
+                "introducing commit so the anchor is the bug's immediate "
+                "parent and the verdict is a clean ACCEPTED.")
+        bucket = ("GRADER-TOO-TIGHT" if "right-but-grader-rejected" in tags
+                  else "GRADER-TOO-LOOSE")
+        self.meta["bucket"] = bucket
+        return self.add(
+            "grader-classify", WARN,
+            f"{bucket} -- QUARANTINE, route to Research (NOT a fixture defect)",
+            f"true={tv} ({(true_v or {}).get('why')}) herring={hv} "
+            f"({(herr_v or {}).get('why')}) tags={tags}. born-broken already "
+            "PASSED, so the ground truth is sound and the disagreement is the "
+            "yield -- do not discard.")
+
+    # ---- 8. emit -------------------------------------------------------
+    @staticmethod
+    def strip_artifacts(arm: Path):
+        """Remove build/cache dirs. Run AFTER every step that executes code in
+        the arm, not just at staging -- see check_env_parity."""
+        removed = []
+        for d in sorted(arm.rglob("*"), reverse=True):
+            if d.is_dir() and d.name in ARTIFACTS and d.name != ".git":
+                shutil.rmtree(d, ignore_errors=True)
+                removed.append(str(d.relative_to(arm)))
+        return removed
+
+    def emit(self, dest: Path, arm: Path):
+        leaked = self.strip_artifacts(arm)
+        if leaked:
+            self.add("artifacts-stripped", PASS,
+                     f"removed {len(leaked)} artifact dir(s) created after staging",
+                     ", ".join(leaked[:5]))
+        gt = {
+            "name": self.a.name,
+            "source_repo": str(self.repo),
+            "anchor": self.anchor, "head": self.head,
+            "true_file": self.a.true_file, "true_symbol": self.a.true_symbol,
+            # The harness's attribution CONTROL re-grades this known-good test
+            # through the live grader; it needs to know which file that is.
+            "true_test": Path(self.a.true_test).name,
+            "herring_symbol": self.a.herring_symbol,
+            "passes_at_anchor_measured": self.meta.get("passes_at_anchor"),
+            "symptom_reproduces_at_head": self.meta.get("symptom_reproduces_at_head"),
+            "symptom_absent_at_anchor": self.meta.get("symptom_absent_at_anchor"),
+            "telegraph": self.meta.get("telegraph"),
+            "bucket": self.meta.get("bucket"),
+            "tags": self.meta.get("tags", []),
+            "grader": self.meta.get("grader"),
+        }
+        (dest / "ground-truth.json").write_text(json.dumps(gt, indent=2) + "\n")
+        for p in (self.a.true_test, self.a.herring_test, self.a.symptom,
+                  self.a.symptom_demo):
+            if p:
+                shutil.copyfile(Path(p).expanduser(), dest / Path(p).name)
+        (dest / "rebuild.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            "# Reproducible rebuild of this fixture. Read-only on the source repo.\n"
+            "set -euo pipefail\n"
+            f"exec {shlex_quote(str(Path(__file__).resolve()))} \\\n"
+            f"  --name {shlex_quote(self.a.name)} \\\n"
+            f"  --repo {shlex_quote(str(self.repo))} \\\n"
+            f"  --anchor {self.anchor} --head {self.head} \\\n"
+            f"  --true-file {shlex_quote(self.a.true_file)} "
+            f"--true-symbol {shlex_quote(self.a.true_symbol)} \\\n"
+            f"  --true-test {shlex_quote(Path(self.a.true_test).name)} \\\n"
+            + (f"  --herring-test {shlex_quote(Path(self.a.herring_test).name)} \\\n"
+               if self.a.herring_test else "")
+            + (f"  --herring-symbol {shlex_quote(self.a.herring_symbol)} \\\n"
+               if self.a.herring_symbol else "")
+            # Every gate-bearing input must be here. Omitting --symptom-demo
+            # made rebuild.sh REJECT a fixture it had just emitted as READY:
+            # a "reproducible builder" that does not reproduce is worse than
+            # none, because it looks like the fixture rotted.
+            + (f"  --symptom-demo {shlex_quote(Path(self.a.symptom_demo).name)} \\\n"
+               if self.a.symptom_demo else "  --no-symptom-demo \\\n")
+            + "".join(f"  --mechanism-token {shlex_quote(m)} \\\n"
+                      for m in (self.a.mechanism_token or []))
+            + "".join(f"  --telegraph-allow {shlex_quote(m)} \\\n"
+                      for m in (getattr(self.a, "telegraph_allow", None) or []))
+            + f"  --symptom {shlex_quote(Path(self.a.symptom).name)} \"$@\"\n")
+        os.chmod(dest / "rebuild.sh", 0o755)
+        self.add("emit", PASS, f"fixture written to {dest}",
+                 "ground-truth.json + rebuild.sh + arm/")
+
+    # ---- run -----------------------------------------------------------
+    def run(self):
+        if self.check_inputs() == FAIL:
+            return self.report()
+        if self.check_ast_prefilter() == FAIL:
+            return self.report()
+        if self.check_answer_key() == FAIL:
+            return self.report()
+        if self.check_telegraph() == FAIL:
+            return self.report()
+        dest = Path(self.a.out or (DEFAULT_OUT / self.a.name)).expanduser()
+        if dest.exists() and not self.a.force:
+            self.add("emit", FAIL, f"{dest} exists (use --force)")
+            return self.report()
+        shutil.rmtree(dest, ignore_errors=True)
+        arm, err = self.stage(dest)
+        if arm is None:
+            self.add("stage", FAIL, err)
+            return self.report()
+        if self.check_env_parity(arm) == FAIL:
+            return self.report()
+        if self.check_born_broken() == FAIL:
+            return self.report()
+        if self.check_symptom_reproduces() == FAIL:
+            return self.report()
+        self.classify()
+        self.emit(dest, arm)
+        return self.report()
+
+    def report(self):
+        blockers = [r for r in self.results if r.status == FAIL]
+        warns = [r for r in self.results if r.status == WARN]
+        verdict = "REJECT" if blockers else (
+            "QUARANTINE" if self.meta.get("bucket", "AGREE") != "AGREE" else "READY")
+        if self.a.json:
+            print(json.dumps({"verdict": verdict, "meta": self.meta,
+                              "checks": [r.as_dict() for r in self.results]},
+                             indent=2))
+            return 1 if blockers else 0
+        print(f"\ndiagnosis fixture: {self.a.name}")
+        print("-" * 72)
+        for r in self.results:
+            print(f"  [{r.status:4}] {r.id:<16} {r.msg}")
+            if r.detail and r.status in (FAIL, WARN):
+                for line in _wrap(r.detail, 66):
+                    print(f"         {line}")
+        print("-" * 72)
+        print(verdict + (f" -- {len(warns)} warning(s)" if warns else ""))
+        if verdict == "QUARANTINE":
+            print("       NOT discarded. The ground truth is measured sound; the")
+            print("       grader disagrees. That disagreement is the yield --")
+            print("       route it to Research.")
+        return 1 if blockers else 0
+
+
+def shlex_quote(s):
+    import shlex
+    return shlex.quote(s)
+
+
+def _wrap(text, width):
+    words, line, out = str(text).split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line); line = w
+        else:
+            line = f"{line} {w}".strip()
+    if line:
+        out.append(line)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--name")
+    ap.add_argument("--repo")
+    ap.add_argument("--anchor")
+    ap.add_argument("--head", default="HEAD")
+    ap.add_argument("--true-file")
+    ap.add_argument("--true-symbol")
+    ap.add_argument("--true-test")
+    ap.add_argument("--herring-test")
+    ap.add_argument("--herring-symbol")
+    ap.add_argument("--symptom")
+    ap.add_argument("--symptom-demo",
+                    help="script demonstrating the DESCRIBED symptom. Run at "
+                         "HEAD (must exit 0 = observed) and at the anchor "
+                         "(must exit non-zero = absent).")
+    ap.add_argument("--no-symptom-demo", action="store_true",
+                    help="EXPLICIT waiver: nobody has shown the symptom is real")
+    ap.add_argument("--mechanism-token", action="append", default=[],
+                    help="extra token the symptom prompt must NOT contain. "
+                         "Repeatable.")
+    ap.add_argument("--telegraph-allow", action="append", default=[],
+                    help="waive one telegraph hit (the matched text). Recorded "
+                         "in ground-truth.json and rebuild.sh. Repeatable.")
+    ap.add_argument("--out")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--self-check", action="store_true")
+    a = ap.parse_args()
+    if a.self_check:
+        return self_check()
+    for req in ("name", "repo", "anchor", "true_file", "true_symbol",
+                "true_test", "symptom"):
+        if not getattr(a, req):
+            ap.error(f"--{req.replace('_', '-')} is required")
+    return Scaffold(a).run()
+
+
+# ---------------------------------------------------------------------------
+# Self-check: prove each gate FIRES. A scaffolder nobody proved can reject is
+# the same defect as a verify nobody proved can fail, one level up.
+# ---------------------------------------------------------------------------
+def _mk(root: Path, mode="good", leak=False, symptom=None):
+    """mode: good | absent-at-anchor | defined-but-broken
+
+    `defined-but-broken` is the case that justifies this tool: the def EXISTS at
+    the anchor, so the AST pre-filter is happy, but calling it raises there --
+    the behaviour path was added later. Research measured exactly this shape
+    surviving the AST filter, and it is why born-broken must be RUN, not
+    reasoned about.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    sh(["git", "init", "-q", "-b", "main"], cwd=root)
+    sh(["git", "config", "user.email", "x@x"], cwd=root)
+    sh(["git", "config", "user.name", "x"], cwd=root)
+    if mode == "absent-at-anchor":
+        (root / "lib.py").write_text("VERSION = 1\n")
+    elif mode == "defined-but-broken":
+        # defined at the anchor, but its dependency does not exist yet
+        (root / "lib.py").write_text(
+            "def discount(price, pct):\n    return _rate(price, pct)\n")
+    else:
+        (root / "lib.py").write_text(
+            'def discount(price, pct):\n    return price * (1 - pct / 100)\n')
+    sh(["git", "add", "-A"], cwd=root); sh(["git", "commit", "-qm", "anchor"], cwd=root)
+    rc, anchor, _ = git(root, "rev-parse", "HEAD")
+    (root / "lib.py").write_text(
+        "def _rate(price, pct):\n    return price * (1 - pct)\n\n"
+        "def discount(price, pct):\n    return _rate(price, pct)\n")
+    sh(["git", "add", "-A"], cwd=root); sh(["git", "commit", "-qm", "refactor"], cwd=root)
+    (root / "t_good.py").write_text(
+        "from lib import discount\nassert discount(100, 10) == 90\n")
+    # A REAL red herring: never touches the true symbol, so a sound grader
+    # REJECTS it. (Using a copy of the true test here would make every run
+    # report GRADER-TOO-LOOSE and the AGREE path would never be exercised.)
+    (root / "t_herring.py").write_text(
+        "def test():\n    assert False\ntest()\n")
+    # ...and one that IS accepted, to prove the too-loose branch fires.
+    (root / "t_herring_accepted.py").write_text(
+        "from lib import discount\nassert discount(100, 10) == 90\n")
+    # demo of the DESCRIBED symptom: exit 0 when observed.
+    (root / "demo.py").write_text(
+        "import sys\nfrom lib import discount\n"
+        "sys.exit(0 if discount(100, 10) != 90 else 1)\n")
+    # a symptom that never actually happens (inferred from the fix's intent)
+    (root / "demo_unreal.py").write_text(
+        "import sys\nfrom lib import discount\n"
+        "sys.exit(0 if discount(100, 10) == 12345 else 1)\n")
+    # vacuous: 'reproduces' everywhere, proves nothing
+    (root / "demo_vacuous.py").write_text("import sys\nsys.exit(0)\n")
+    (root / "symptom.md").write_text(
+        symptom if symptom is not None else
+        "Prices come out wrong when a promotion is applied.\n" +
+        ("The bug is in lib.py discount().\n" if leak else ""))
+    return anchor.strip()
+
+
+def self_check():
+    import types
+    tmp = Path(tempfile.mkdtemp(prefix="dfs-self-"))
+    cases, failures = [], []
+    try:
+        def run(name, root, expect_fail_check=None, expect_verdict=None,
+                expect_status=None, **over):
+            anchor = over.pop("anchor")
+            a = types.SimpleNamespace(
+                name=name, repo=str(root), anchor=anchor, head="HEAD",
+                true_file="lib.py", true_symbol="discount",
+                true_test=str(root / "t_good.py"),
+                herring_test=over.pop("herring_test", str(root / "t_herring.py")),
+                herring_symbol="discount",
+                symptom=str(root / "symptom.md"), mechanism_token=[],
+                telegraph_allow=over.pop("telegraph_allow", []),
+                symptom_demo=over.pop("symptom_demo", str(root / "demo.py")),
+                no_symptom_demo=False,
+                out=str(tmp / f"out-{name}"), force=True, json=False,
+                self_check=False, **over)
+            s = Scaffold(a)
+            s.a.json = True
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                s.run()
+            data = json.loads(buf.getvalue())
+            got = {c["check"]: c["status"] for c in data["checks"]}
+            ok = True
+            why = []
+            if expect_fail_check:
+                if got.get(expect_fail_check) != FAIL:
+                    ok = False
+                    why.append(f"{expect_fail_check} was {got.get(expect_fail_check)}, want FAIL")
+            if expect_verdict and data["verdict"] != expect_verdict:
+                ok = False
+                why.append(f"verdict {data['verdict']}, want {expect_verdict}")
+            for cid, want in (expect_status or {}).items():
+                if got.get(cid) != want:
+                    ok = False
+                    why.append(f"{cid} was {got.get(cid)}, want {want}")
+            cases.append((name, ok, "; ".join(why) or data["verdict"]))
+            if not ok:
+                failures.append(name)
+
+        good = tmp / "good"
+        # The honest symptom ("prices come out wrong when a promotion is
+        # applied") must PASS the telegraph gate: effect + scope, no condition
+        # stated with mechanism precision. This is the no-over-fire case.
+        run("agree", good, expect_verdict="READY", anchor=_mk(good),
+            expect_status={"telegraph": PASS})
+
+        loose = tmp / "loose"
+        run("grader-too-loose", loose, expect_verdict="QUARANTINE",
+            anchor=_mk(loose),
+            herring_test=str(loose / "t_herring_accepted.py"))
+
+        bb = tmp / "bornbroken"
+        run("born-broken-ast", bb, expect_fail_check="ast-prefilter",
+            expect_verdict="REJECT", anchor=_mk(bb, mode="absent-at-anchor"))
+
+        # THE case this tool exists for: AST says fine, running it says no.
+        dbb = tmp / "definedbroken"
+        run("born-broken-measured", dbb, expect_fail_check="born-broken",
+            expect_verdict="REJECT", anchor=_mk(dbb, mode="defined-but-broken"))
+
+        # the FTPS shape: symptom inferred from the fix's intent, never occurs
+        un = tmp / "unreal"
+        run("symptom-never-occurs", un, expect_fail_check="symptom-reproduces",
+            expect_verdict="REJECT", anchor=_mk(un),
+            symptom_demo=str(un / "demo_unreal.py"))
+
+        # a demo that "reproduces" everywhere proves nothing
+        vac = tmp / "vacuous"
+        run("symptom-demo-vacuous", vac, expect_fail_check="symptom-reproduces",
+            expect_verdict="REJECT", anchor=_mk(vac),
+            symptom_demo=str(vac / "demo_vacuous.py"))
+
+        lk = tmp / "leak"
+        run("answer-key-leak", lk, expect_fail_check="answer-key",
+            expect_verdict="REJECT", anchor=_mk(lk, leak=True))
+
+        # --- telegraph gate: the rivian shape and its neighbours -----------
+        # No forbidden token anywhere in these; answer-key passes all of them.
+        tg = tmp / "telegraph-word"
+        run("telegraph-mechanism-word", tg, expect_fail_check="telegraph",
+            expect_verdict="REJECT",
+            anchor=_mk(tg, symptom="Promotion prices come out wrong; it looks like "
+                                   "the percent is treated as a fraction of one.\n"))
+        # the diff changes `pct / 100` -> `pct`, so "100" is a changed literal
+        tl = tmp / "telegraph-literal"
+        run("telegraph-changed-literal", tl, expect_fail_check="telegraph",
+            expect_verdict="REJECT",
+            anchor=_mk(tl, symptom="Promotion prices are wrong whenever the price "
+                                   "is 100 or more.\n"))
+        # a waiver turns the FAIL into a visible WARN and the fixture proceeds
+        tw = tmp / "telegraph-waived"
+        run("telegraph-waiver-recorded", tw, expect_verdict="READY",
+            expect_status={"telegraph": WARN}, telegraph_allow=["100"],
+            anchor=_mk(tw, symptom="Promotion prices are wrong whenever the price "
+                                   "is 100 or more.\n"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- telegraph_scan on raw text: the rivian case and its controls --------
+    # Each pair: (label, text, changed literals, want status, must-see kind).
+    for label, text, lits, want, kind in (
+            ("rivian-original (first 12 days / 13th onward)",
+             "Rivian dashcam clips are going missing from the timeline. Clips recorded "
+             "during the first 12 days of any month show up with the right date, but "
+             "clips recorded from the 13th onward come in with no date at all. Tesla "
+             "clips are fine.", (), WARN, "precise-condition"),
+            ("rivian-7-hours-off",
+             "Every Rivian clip's timestamp is 7 hours off from the time on the "
+             "vehicle's own screen.", (), WARN, "fingerprint-magnitude"),
+            ("rivian-rewritten (effect + scope)",
+             "A chunk of Rivian dashcam clips are losing their dates and dropping off the "
+             "date-sorted timeline. It is a sizable fraction of the Rivian clips, not every "
+             "one of them, and there is no obvious pattern. Tesla clips are all fine. This "
+             "started after a recent change to the scanner.", (), PASS, None),
+            ("giftcard (19-character boundary)",
+             "It only happens to the longer 19-character codes, and only when OCR breaks "
+             "the code into two or more separate regions. The 16-character codes are fine.",
+             (), WARN, "precise-condition"),
+            ("hard word: off by one", "The last item is dropped; the loop bound is off by one.",
+             (), FAIL, "mechanism-word"),
+            ("hard word: swapped", "Dates look like the month and day got swapped.",
+             (), FAIL, "mechanism-word"),
+            ("observable numbers are exempt (HTTP 500, EMFILE, exit 1)",
+             "GET /api/containers returns HTTP 500 once there is traffic data; the "
+             "process exits 1 and the open-socket count climbs until EMFILE.",
+             (), PASS, None),
+            ("changed literal quoted", "Orders over 100 dollars get the wrong total.",
+             ("100",), FAIL, "changed-literal"),
+            ("plain symptom", "Sonarr is grabbing duplicates again for a small set of "
+             "series; this worked before a recent refactor of the matching code.",
+             (), PASS, None)):
+        r = telegraph_scan(text, lits)
+        kinds = {h["kind"] for h in r["hits"]}
+        ok = r["status"] == want and (kind is None or kind in kinds)
+        cases.append((f"telegraph_scan: {label}", ok,
+                      f"{r['status']} {sorted(kinds)}" if not ok else r["status"]))
+        if not ok:
+            failures.append(f"telegraph_scan: {label}")
+    r = telegraph_scan("Timestamps are 7 hours off.", (), allow=["7 hours"])
+    ok = r["status"] == WARN and r["waived"] and not r["hits"]
+    cases.append(("telegraph_scan: waiver is visible, not silent", ok, r["status"]))
+    if not ok:
+        failures.append("telegraph_scan: waiver is visible, not silent")
+    r = telegraph_scan("Prices come out wrong when a promotion is applied.")
+    ok = r["status"] == PASS and "UNDECIDED-RESIDUAL" in r["boundary"]
+    cases.append(("telegraph_scan: a PASS names its own boundary", ok, r["boundary"][:60]))
+    if not ok:
+        failures.append("telegraph_scan: a PASS names its own boundary")
+
+    for name, ok, why in cases:
+        print(f"  {'ok  ' if ok else 'FAIL'} {name:<20} {why}")
+    print(f"\n--- {len(failures)} of {len(cases)} failed ---")
+    if failures:
+        print("FAILED: " + ", ".join(failures))
+        return 1
+    print("SELF_CHECK_OK: each gate fires on the case it owns")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

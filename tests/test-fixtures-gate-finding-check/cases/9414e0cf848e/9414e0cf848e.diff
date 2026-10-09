@@ -1,0 +1,15 @@
+diff --git a/src/scheduled_runner.py b/src/scheduled_runner.py
+index 04e0437..abb1a03 100644
+--- a/src/scheduled_runner.py
++++ b/src/scheduled_runner.py
+@@ -69,8 +69,9 @@ def _result_key(r: Dict) -> str:
+ 
+ 
+ def search_schedule(sched: Dict, client=None, today=None) -> List[Dict]:
++    c = client or SeatsAeroClient()
+     s = sched or {}
+-    return list(client.search(
++    return list(c.search(
+         s.get("origin"),
+         s.get("destination"),
+         s.get("start_date"),
