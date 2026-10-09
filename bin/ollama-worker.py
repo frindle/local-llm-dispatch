@@ -1344,7 +1344,16 @@ def tool_list_files(cwd: Path, args: dict) -> str:
     skip = {".git", "node_modules", ".next", ".build", "__pycache__", ".venv"}
     entries = []
     try:
-        for child in sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name)):
+        _all = sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name))
+        if len(_all) > _wr.LIST_FILES_MAX_ENTRIES:
+            # HUGE DIRECTORY (2026-10-09: a review listed `.` = $HOME, 2149 entries / 82 KB, and
+            # every later turn re-read that). Refuse with a short sample and a way forward.
+            _sample = [(c.name + "/") if c.is_dir() else c.name for c in _all[:25]]
+            return (f"ERROR: {args.get('path') or '.'} has {len(_all)} entries (more than "
+                    f"{_wr.LIST_FILES_MAX_ENTRIES}) -- too large to list. Call list_files on a "
+                    f"specific subdirectory, or read_file / run_bash grep a path you already know. "
+                    f"First entries: {', '.join(_sample)} ...")
+        for child in _all:
             if child.name in skip:
                 entries.append(f"{child.name}/  (skipped: large/generated)")
             elif child.is_dir():
@@ -2902,7 +2911,8 @@ DEFAULT_REPEAT_PENALTY = 1.1   # legacy; NOT used as a default any more (profile
 
 
 def _profile_fields(model, role, api_style, temperature=None, num_ctx=None, top_p=None,
-                    top_k=None, max_tokens=None, repeat_penalty=None, think=None):
+                    top_k=None, max_tokens=None, repeat_penalty=None, think=None,
+                    sampling_step=0, seed=None):
     """The request fields for (model, role, api): the model card's profile
     (model_profiles.yaml) with explicit non-None caller values layered on top. The
     ONLY place a request body's sampling / max_tokens / thinking control is decided."""
@@ -2911,7 +2921,7 @@ def _profile_fields(model, role, api_style, temperature=None, num_ctx=None, top_
         overrides={"temperature": temperature, "num_ctx": num_ctx, "top_p": top_p,
                    "top_k": top_k, "max_tokens": max_tokens,
                    "repetition_penalty": repeat_penalty},
-        think=think)
+        think=think, sampling_step=sampling_step, seed=seed)
 
 
 def _strip_inline_think(msg):
@@ -3051,7 +3061,8 @@ def call_ollama(host: str, model: str, messages: list, temperature: float, num_c
                  max_tokens: int = None,
                  repeat_penalty: float = None, think=None,
                  preserve_reasoning: bool = False, role: str = "author",
-                 tool_choice: str = None, max_attempts: int = None) -> dict:
+                 tool_choice: str = None, max_attempts: int = None,
+                 sampling_step: int = 0, seed: int = None) -> dict:
     """api_style="openai" targets llama-server (or any OpenAI-compatible
     /v1/chat/completions endpoint) instead of Ollama's native /api/chat.
     Added 2026-08-22: confirmed live that Ollama's own chat-template
@@ -3064,7 +3075,8 @@ def call_ollama(host: str, model: str, messages: list, temperature: float, num_c
     to know which backend actually served the request."""
     # Profile-driven (model_profiles.yaml): None args => the model card's values for `role`.
     _f = _profile_fields(model, role, api_style, temperature, num_ctx, top_p, top_k,
-                         max_tokens, repeat_penalty, think)
+                         max_tokens, repeat_penalty, think,
+                         sampling_step=sampling_step, seed=seed)
     preserve_reasoning = preserve_reasoning or _mp.role_wants_reasoning_kept(model, role)
 
     if api_style == "openai":
@@ -3551,7 +3563,7 @@ def call_ollama_streaming(host: str, model: str, messages: list, temperature: fl
                           top_p: float = None, top_k: int = None, live: "LiveLog" = None,
                           max_tokens: int = None,
                           repeat_penalty: float = None, think=None,
-                          role: str = "author") -> dict:
+                          role: str = "author", sampling_step: int = 0, seed: int = None) -> dict:
     """Streaming counterpart of call_ollama() for the native Ollama
     /api/chat path ONLY (api_style="ollama", native tools). Used only when
     --live-log is active: sends the same request with stream: true, parses
@@ -3566,7 +3578,8 @@ def call_ollama_streaming(host: str, model: str, messages: list, temperature: fl
     covered here (out of scope for this pass); run_task falls back to the
     blocking call_ollama for those."""
     _f = _profile_fields(model, role, "ollama", temperature, num_ctx, top_p, top_k,
-                         max_tokens, repeat_penalty, think)
+                         max_tokens, repeat_penalty, think,
+                         sampling_step=sampling_step, seed=seed)
     payload = {"model": model, "messages": messages, "stream": True, "options": _f["options"]}
     if "think" in _f:  # native /api/chat top-level key (see call_ollama)
         payload["think"] = _f["think"]
@@ -3814,7 +3827,7 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
                           max_tokens: int = None,
                           repeat_penalty: float = None,
                           preserve_reasoning: bool = False, think=None,
-                          role: str = "author") -> dict:
+                          role: str = "author", sampling_step: int = 0, seed: int = None) -> dict:
     """Streaming counterpart of call_ollama()'s api_style="openai" branch, for
     the Darkbloom local endpoint (/v1/chat/completions) and any other
     OpenAI-compatible server. Added 2026-10-01: after every Studio dispatch
@@ -3840,7 +3853,8 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
     accepts), and the same OPT-IN reasoning_content -> thinking promotion the
     non-streaming branch does under --preserve-reasoning."""
     _f = _profile_fields(model, role, "openai", temperature, num_ctx, top_p, top_k,
-                         max_tokens, repeat_penalty, think)
+                         max_tokens, repeat_penalty, think,
+                         sampling_step=sampling_step, seed=seed)
     preserve_reasoning = preserve_reasoning or _mp.role_wants_reasoning_kept(model, role)
     payload = {"model": model, "messages": messages, "stream": True}
     payload.update(_f)
@@ -6757,6 +6771,23 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
     _rb = _prof.get("robust") or {}
     _fmt_requery = _wr.FormatRequery(int(_rb.get("format_requery_max", 3)))
     _loop_det = _wr.LoopDetector(_wr.loop_config(_rb))
+    _rev_bounds = _wr.review_bounds_active(task_kind, capture_final_as)
+    _rep_guard = _wr.RepeatCallGuard()
+    # Sampling escalation ladder: default OFF (model_profiles.yaml sampling_escalation.arm).
+    # Per-job arm with no queue change: a `Sampling-arm: ladder|off` line in the task text sets this
+    # worker process's MODEL_SAMPLING_ARM (one process per job), which build_request_fields reads.
+    _sa_m = re.search(r"(?im)^[ \t]*Sampling-arm:[ \t]*(ladder|off)[ \t]*$", task or "")
+    if _sa_m and not os.environ.get("MODEL_SAMPLING_ARM"):
+        os.environ["MODEL_SAMPLING_ARM"] = _sa_m.group(1).lower()
+        log(f"[worker] SAMPLING ARM {_sa_m.group(1).lower()} (from the task's Sampling-arm line; A/B arm, unvalidated on Qwen3.6).")
+    _ladder = _wr.SamplingLadder(
+        enabled=_mp.sampling_ladder_enabled(role), seed_base=int(time.time()) % 100000)
+    if _ladder.enabled:
+        log("[worker] SAMPLING LADDER enabled (A/B arm): abort1 -> temp>=0.8/rep 1.2/new seed, abort2 -> "
+            "presence 1.0 (+thinking off under the hybrid arm), abort3 -> sampling_ladder_exhausted; "
+            "2 aborts on the same failing check -> spec_defect_repeat_abort.")
+    _ladder_exit = None
+    _rev_abort = None             # (named reason, detail) once a review bound trips; ends the run at the next turn top
     _stop_gate_fails = 0
     _STOP_GATE_MAX = int(_rb.get("stop_gate_max", 3))
     _stop_gate_exhausted = False
@@ -6824,6 +6855,13 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         _dispatch_metrics["iterations"] = i
         if _bp is not None:
             _bp.begin_turn(i)
+
+        if _rev_abort:
+            log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: bounded review -- {_rev_abort[1]} "
+                f"-- {_rev_abort[0]}. Stopping; the captured answer is a REVIEW CAPPED marker, "
+                f"not a verdict.")
+            _dispatch_metrics["early_abort"] = _rev_abort[0]
+            break
 
         if _wall_budget and time.monotonic() - _wall_t0 > _wall_budget:
             log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: WALL BUDGET spent "
@@ -6993,6 +7031,10 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             return base
         _turn_think = think if _next_turn_think is None else _next_turn_think
         _next_turn_think = None
+        _turn_sstep, _turn_seed = _ladder.take()
+        if _turn_sstep:
+            _dispatch_metrics["sampling_steps"] = _dispatch_metrics.get("sampling_steps", 0) + 1
+            log(f"[worker] sampling ladder step {_turn_sstep} for this turn only (fresh seed {_turn_seed}).")
         while True:
             try:
                 if live is not None and api_style == "ollama" and not manual_tools:
@@ -7004,7 +7046,8 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                                                  timeout=chat_timeout, tools=not manual_tools,
                                                  top_p=top_p, top_k=top_k, live=live,
                                                  max_tokens=_turn_max_tokens, repeat_penalty=_turn_repeat_penalty,
-                                                 think=_turn_think, role=role)
+                                                 think=_turn_think, role=role,
+                                                 sampling_step=_turn_sstep, seed=_turn_seed)
                 elif live is not None and api_style == "openai" and not manual_tools:
                     # Darkbloom / OpenAI-style streaming lane (added 2026-10-01). Same
                     # normalized return shape; OpenAIStreamUnavailable means the stream
@@ -7018,7 +7061,8 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                                                      max_tokens=_turn_max_tokens,
                                                      repeat_penalty=_turn_repeat_penalty,
                                                      preserve_reasoning=preserve_reasoning,
-                                                     think=_turn_think, role=role)
+                                                     think=_turn_think, role=role,
+                                                 sampling_step=_turn_sstep, seed=_turn_seed)
                     except OpenAIStreamUnavailable as _sse_err:
                         log(f"[worker] live-log streaming unavailable on the OpenAI lane "
                             f"({_sse_err}) -- falling back to the non-streaming request for "
@@ -7028,12 +7072,14 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                                            top_p=top_p, top_k=top_k, api_style=api_style,
                                            max_tokens=_turn_max_tokens,
                                            repeat_penalty=_turn_repeat_penalty, think=_turn_think,
-                                           preserve_reasoning=preserve_reasoning, role=role)
+                                           preserve_reasoning=preserve_reasoning, role=role,
+                                           sampling_step=_turn_sstep, seed=_turn_seed)
                 else:
                     resp = call_ollama(host, model, _view(), _eff_temperature, num_ctx, timeout=chat_timeout,
                                         tools=not manual_tools, top_p=top_p, top_k=top_k, api_style=api_style,
                                         max_tokens=_turn_max_tokens, repeat_penalty=_turn_repeat_penalty, think=_turn_think,
-                                        preserve_reasoning=preserve_reasoning, role=role)
+                                        preserve_reasoning=preserve_reasoning, role=role,
+                                        sampling_step=_turn_sstep, seed=_turn_seed)
                 _LANE_LAST_CAUSE[0] = None     # this turn succeeded: no stale cause
                 break
             except ChatAbortedForReasoningRunaway as rr_err:
@@ -7044,6 +7090,16 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 _runaway_streak += 1
                 _dispatch_metrics["reasoning_runaways"] = _dispatch_metrics.get("reasoning_runaways", 0) + 1
                 _rr_chars = rr_err.args[0] if rr_err.args else 0
+                _lad = _ladder.on_abort("reasoning_runaway")
+                if _lad[0] == "exit":
+                    log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: sampling ladder -- {_lad[1]} "
+                        f"after a reasoning runaway ({_rr_chars} chars).")
+                    _dispatch_metrics["early_abort"] = _lad[1]
+                    _outer_break = True
+                    break
+                _turn_sstep, _turn_seed = _ladder.take()   # the retry below IS the next turn
+                if _turn_sstep:
+                    log(f"[worker] sampling ladder step {_turn_sstep} on the runaway retry (fresh seed {_turn_seed}).")
                 if _turn_think is False or _runaway_streak > 2:
                     log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: REASONING RUNAWAY again "
                         f"({_rr_chars} chars, thinking already disabled for this turn or "
@@ -7298,6 +7354,19 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                         "the salvaged XML call, so the model doesn't imitate its own malformed "
                         "formatting on the next turn.")
 
+        if (_rev_bounds and not tool_calls and (
+                think_cap_truncated(msg, usage, resp.get("done_reason"), _turn_max_tokens)
+                or output_cap_cut_prose(msg, usage, resp.get("done_reason"), _turn_max_tokens))):
+            # A review whose single turn fills the (small, explicit) output cap is a runaway,
+            # not an answer: no retry, no recovery turn, no nudge -- a named exit.
+            _dispatch_metrics["output_cap_prose_cuts"] = _dispatch_metrics.get("output_cap_prose_cuts", 0) + 1
+            log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: bounded review -- a turn hit "
+                f"the {_turn_max_tokens}-token output cap with no tool call "
+                f"(~{(usage or {}).get('completion_tokens')} tokens generated) -- {_wr.REASON_REVIEW_CAP}.")
+            _rev_abort = (_wr.REASON_REVIEW_CAP, f"a turn hit the {_turn_max_tokens}-token output cap")
+            _dispatch_metrics["early_abort"] = _wr.REASON_REVIEW_CAP
+            break
+
         _turn_rec["parse"] = "ok" if tool_calls else "no_tool_call"
         if tool_calls:
             _fmt_requery.on_ok()
@@ -7387,6 +7456,15 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 msg["content"] = _compact
                 log(f"[worker] compacted the cut-off turn in context: dropped {_dropped} "
                     f"chars of repeated/cut-off prose, kept {len(_compact)}.")
+            _lad = _ladder.on_abort("cutoff")
+            if _lad[0] == "exit":
+                log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: sampling ladder -- {_lad[1]} "
+                    f"(aborts={_ladder.aborts}, by_check={len(_ladder.by_check)}). "
+                    + ("Two aborts on the same failing check: the spec-defect path comes first, not more "
+                       "sampling changes." if _lad[1] == _wr.REASON_SPEC_DEFECT_REPEAT else
+                       "Still looping after both steps: the scheduler re-specs."))
+                _dispatch_metrics["early_abort"] = _lad[1]
+                break
             if _cap_cut_streak > OUTPUT_CAP_CUT_MAX:
                 log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: {_cap_cut_streak} "
                     f"consecutive turns were CUT OFF at the {_turn_max_tokens}-token output cap "
@@ -7423,6 +7501,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
 
         if tool_calls:
             _cap_cut_streak = 0
+            _ladder.on_ok()
         try:
             _loop_det.observe_turn(bool(tool_calls))
         except Exception as _ld_err:
@@ -7701,6 +7780,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                         _bp.observe_verify(i, v_out, v_ok)
                     except Exception:
                         pass
+                _ladder.note_check(_verify_failure_signature(v_out) if not v_ok else None)
                 _did_work = (_files_modified_count > 0 or _run_bash_success_count > 0)
                 _no_regression = (bool(_baseline_verify_sig) and current_recognized
                                    and not new_failures)
@@ -7843,6 +7923,11 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             # FAILED calls, and a read that returns page 1 is a success every
             # time -- so it would never fire. Count successful same-page reads
             # separately and hand back the arithmetic rather than a scolding.
+            if _rev_bounds and _rev_abort is None:
+                _rdetail = _rep_guard.observe(_wr.repeat_call_key(
+                    name, args, lambda _p: resolve_path(cwd, _p)))
+                if _rdetail:
+                    _rev_abort = (_wr.REASON_REPEAT_CALL, _rdetail)
             if name == "read_file" and isinstance(args, dict):
                 _rk = (str(args.get("path")), str(args.get("offset") or 1))
                 _repeat_reads[_rk] = _repeat_reads.get(_rk, 0) + 1
@@ -7928,6 +8013,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                             _bp.observe_verify(i, v_out, v_ok)
                         except Exception:
                             pass
+                    _ladder.note_check(_verify_failure_signature(v_out) if not v_ok else None)
                     # Evidence the model actually did work this session -- required before a
                     # BASELINE-BROKEN accept so a zero-edit claim on a broken baseline can't
                     # exit clean (Fable review 2026-08-30, condition 2: mirrors the end-of-run
@@ -8619,6 +8705,11 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         _cap = resolve_path(cwd, capture_final_as)
         _should, _text, _tag = _capture_decision(
             capture_final_as, _cap.exists(), paused_for_review, (final_summary or content or ""))
+        if _rev_bounds and _rev_abort and not converged and not _cap.exists():
+            # a bounded review stopped by a worker bound: the captured file is the deterministic
+            # REVIEW CAPPED marker (never the runaway's partial text).
+            _should, _tag = True, "capture=review-capped"
+            _text = _wr.review_capped_text(_rev_abort[0], _rev_abort[1], i)
         if _should:
             try:
                 _cap.write_text(_text)

@@ -157,7 +157,7 @@ def get_profile(model, role="author", lane=None, data=None):
 
 
 def build_request_fields(model, role, api, overrides=None, think=None, lane=None,
-                         turn_kind=None, arm=None):
+                         turn_kind=None, arm=None, sampling_step=0, seed=None, sampling_arm=None):
     """What to put in the request body for `api` ("openai" | "ollama").
     `overrides`: {temperature, top_p, top_k, min_p, presence_penalty,
     repetition_penalty, max_tokens, num_ctx, stop}; None values are ignored.
@@ -173,6 +173,19 @@ def build_request_fields(model, role, api, overrides=None, think=None, lane=None
         _pol = thinking_policy(role, turn_kind, arm)      # None = keep the profile's value
         if _pol is not None:
             thinking = _pol
+    # SAMPLING ESCALATION LADDER (A/B arm, default OFF -> the block is skipped and the body is
+    # byte-identical to before). One declared step for ONE turn; see sampling_step_overrides().
+    _seed = None
+    if sampling_step:
+        _so = sampling_step_overrides(role, sampling_step, arm=arm, sampling_arm=sampling_arm)
+        if _so:
+            for _k in ("temperature", "repetition_penalty", "presence_penalty"):
+                if _k in _so:
+                    v[_k] = max(float(v[_k]) if v.get(_k) is not None else float("-inf"), _so[_k])
+            if _so.get("thinking") is False and think is None and thinking is not False:
+                thinking = False
+            if _so.get("fresh_seed") and seed is not None:
+                _seed = int(seed)
     if api == "openai":
         f = {k: val for k, val in v.items() if val is not None}
         if "repetition_penalty" in f:
@@ -183,6 +196,8 @@ def build_request_fields(model, role, api, overrides=None, think=None, lane=None
             f["max_tokens"] = max_tokens
         if stop:
             f["stop"] = list(stop)
+        if _seed is not None:
+            f["seed"] = _seed
         ctk = {}
         if thinking is not None:
             ctk["enable_thinking"] = bool(thinking)
@@ -203,6 +218,8 @@ def build_request_fields(model, role, api, overrides=None, think=None, lane=None
             opts["num_predict"] = max_tokens
         if stop:
             opts["stop"] = list(stop)
+        if _seed is not None:
+            opts["seed"] = _seed
         f = {"options": opts}
         if thinking is not None:
             f["think"] = bool(thinking)
@@ -249,6 +266,97 @@ def thinking_policy(role, turn_kind, arm=None, data=None):
         return None
     v = str(table.get(turn_kind, "profile")).strip().lower()
     return _ONOFF.get(v)
+
+
+# SAMPLING_ESCALATION_MARK (2026-10-09). A declared A/B ARM, default OFF. Settings live in
+# model_profiles.yaml `sampling_escalation:`; the arm is `arm:` there (or env MODEL_SAMPLING_ARM /
+# the sampling_arm argument): "off" (default) or "ladder". With the arm off build_request_fields
+# ignores sampling_step entirely. The ladder is the worker's one-turn recovery after a runaway /
+# cut-off turn (ollama-worker.py `_ladder`); it is NOT validated on Qwen3.6 -- see
+# docs/sampling-escalation-ab.md for the evidence grading and the A/B plan.
+SAMPLING_ARMS = ("off", "ladder")
+_STEP_KEYS = ("temperature_min", "repetition_penalty_min", "presence_penalty", "thinking",
+              "requires_thinking_arm", "fresh_seed")
+
+
+def sampling_arm_of(arm=None, data=None):
+    """The effective sampling arm: explicit arg > env MODEL_SAMPLING_ARM > yaml `arm:` > "off"."""
+    data = data or load_profiles()
+    cfg = data.get("sampling_escalation") or {}
+    ya = cfg.get("arm")
+    ya = "off" if ya is False else ya  # bare `off` in YAML 1.1 loads as False
+    a = arm or os.environ.get("MODEL_SAMPLING_ARM") or ya or "off"
+    return str(a).strip().lower() if str(a).strip().lower() in SAMPLING_ARMS else "off"
+
+
+def sampling_step_overrides(role, step, arm=None, sampling_arm=None, data=None):  # noqa: arm = THINKING arm
+    """{temperature, repetition_penalty, presence_penalty, thinking(False), fresh_seed} for ladder
+    `step` (1, 2), or {} when the arm is off / the role is not in `roles` / the step is undeclared.
+    `thinking: off` only applies when the effective THINKING arm equals the step's
+    `requires_thinking_arm` (hybrid): the A/B for the thinking policy owns that dimension."""
+    data = data or load_profiles()
+    if sampling_arm_of(sampling_arm, data) != "ladder":
+        return {}
+    cfg = data.get("sampling_escalation") or {}
+    if str(role or "author") not in (cfg.get("roles") or []):
+        return {}
+    st = ((cfg.get("ladder") or {}).get(int(step)) or (cfg.get("ladder") or {}).get(str(step)))
+    if not isinstance(st, dict):
+        return {}
+    out = {}
+    if st.get("temperature_min") is not None:
+        out["temperature"] = float(st["temperature_min"])
+    if st.get("repetition_penalty_min") is not None:
+        out["repetition_penalty"] = float(st["repetition_penalty_min"])
+    if st.get("presence_penalty") is not None:
+        out["presence_penalty"] = float(st["presence_penalty"])
+    if st.get("fresh_seed"):
+        out["fresh_seed"] = True
+    if str(st.get("thinking", "")).strip().lower() in ("off", "false"):
+        need = st.get("requires_thinking_arm")
+        have = arm or os.environ.get("MODEL_THINKING_ARM") or None
+        if not need or need == have:
+            out["thinking"] = False
+    return out
+
+
+def sampling_ladder_enabled(role, data=None, arm=None):
+    """True when the ladder arm is on AND `role` may use it (the worker keys its state machine on this)."""
+    data = data or load_profiles()
+    if sampling_arm_of(arm, data) != "ladder":
+        return False
+    return str(role or "author") in ((data.get("sampling_escalation") or {}).get("roles") or [])
+
+
+def check_sampling(data):
+    """Problems in the sampling_escalation section (used by check_profiles). The shipped default
+    arm must be OFF."""
+    out = []
+    cfg = data.get("sampling_escalation")
+    if cfg is None:
+        return out
+    if cfg.get("arm", "off") not in ("off", False):
+        out.append("sampling_escalation.arm must be 'off' in the shipped profile (A/B arm only)")
+    for r in cfg.get("roles") or []:
+        if r not in (data.get("roles") or {}):
+            out.append(f"sampling_escalation.roles: unknown role {r!r}")
+    arms = ((data.get("thinking_policy") or {}).get("arms") or {})
+    for stp, st in (cfg.get("ladder") or {}).items():
+        if str(stp) not in ("1", "2"):
+            out.append(f"sampling_escalation.ladder: unknown step {stp!r} (steps 1 and 2; step 3 is the named exit)")
+        for k, val in (st or {}).items():
+            if k not in _STEP_KEYS:
+                out.append(f"sampling_escalation.ladder.{stp}: unknown key {k!r}")
+        for k, lo, hi in (("temperature_min", 0.0, 2.0), ("repetition_penalty_min", 1.0, 2.0),
+                          ("presence_penalty", 0.0, 2.0)):
+            if (st or {}).get(k) is not None and not (lo <= float(st[k]) <= hi):
+                out.append(f"sampling_escalation.ladder.{stp}.{k}={st[k]} outside [{lo}, {hi}]")
+        rta = (st or {}).get("requires_thinking_arm")
+        if rta and rta not in arms:
+            out.append(f"sampling_escalation.ladder.{stp}.requires_thinking_arm: unknown arm {rta!r}")
+    if not str(cfg.get("evidence") or "").strip():
+        out.append("sampling_escalation: missing evidence: (cite what each step rests on and its grade)")
+    return out
 
 
 def escalation_models(role, data=None):
@@ -371,6 +479,7 @@ def check_profiles(path=None):
         if not e.get("tool_call_format"):
             problems.append(f"{name}: missing tool_call_format")
     problems += check_policy(data)
+    problems += check_sampling(data)
     for src, a in (data.get("aliases") or {}).items():
         if _find_entry(data, a.get("to"))[1] is None:
             problems.append(f"alias {src}: target {a.get('to')} has no profile")

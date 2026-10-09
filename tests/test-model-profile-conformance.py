@@ -264,6 +264,94 @@ def run_overrides(w):
           {"enable_thinking": False})
 
 
+def run_ladder(w):
+    """SAMPLING ESCALATION LADDER (A/B arm, default OFF): the exact request body per step, expected
+    values read from the RAW yaml (ladder table + the author mode), over every sender path.
+    Arm off => step/seed are ignored and the body is byte-identical to the plain body."""
+    msgs = [{"role": "user", "content": "x"}]
+    model = "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+    lad = RAW["sampling_escalation"]["ladder"]
+    check("shipped sampling arm is off", RAW["sampling_escalation"]["arm"] in ("off", False), True)
+    base = raw_mode(model, "author")
+    seed = 424242
+
+    def want_mode(step, thinking_arm):
+        st = lad[step]
+        ov = {}
+        if st.get("temperature_min") is not None:
+            ov["temperature"] = max(base["temperature"], st["temperature_min"])
+        if st.get("repetition_penalty_min") is not None:
+            ov["repetition_penalty"] = max(base["repetition_penalty"], st["repetition_penalty_min"])
+        if st.get("presence_penalty") is not None:
+            ov["presence_penalty"] = max(base["presence_penalty"], st["presence_penalty"])
+        th = None
+        off = str(st.get("thinking")).lower() in ("off", "false")
+        if off and st.get("requires_thinking_arm") in (None, thinking_arm):
+            th = False
+        return ov, th
+
+    saved = {k: os.environ.get(k) for k in ("MODEL_SAMPLING_ARM", "MODEL_THINKING_ARM")}
+    try:
+        # arm OFF: step + seed must change nothing
+        os.environ.pop("MODEL_SAMPLING_ARM", None)
+        os.environ.pop("MODEL_THINKING_ARM", None)
+        take()
+        w.call_ollama(HOST, model, msgs, None, None, api_style="openai", tools=False, role="author",
+                      sampling_step=1, seed=seed)
+        b = take()[-1]["body"]
+        check("ladder OFF: step 1 + seed leave the body untouched", sampling_openai(b), expect_openai(model, "author"))
+        check("ladder OFF: no seed on the wire", "seed" in b, False)
+        # arm ON
+        os.environ["MODEL_SAMPLING_ARM"] = "ladder"
+        for thinking_arm in (None, "hybrid"):
+            if thinking_arm:
+                os.environ["MODEL_THINKING_ARM"] = thinking_arm
+            else:
+                os.environ.pop("MODEL_THINKING_ARM", None)
+            for step in (1, 2):
+                ov, th = want_mode(step, thinking_arm)
+                tag = f"ladder step {step} (thinking arm {thinking_arm or 'none'})"
+                want_o = expect_openai(model, "author", ov, think=th)
+                want_o["seed"] = seed
+                take()
+                w.call_ollama(HOST, model, msgs, None, None, api_style="openai", tools=False, role="author",
+                              sampling_step=step, seed=seed)
+                check(f"{tag} openai", sampling_openai(take()[-1]["body"]), want_o)
+                take()
+                w.call_openai_streaming(HOST, model, msgs, None, None, tools=False, role="author",
+                                        sampling_step=step, seed=seed)
+                check(f"{tag} openai-sse", sampling_openai(take()[-1]["body"]), want_o)
+                want_n = expect_ollama(model, "author", ov, think=th)
+                want_n["options"]["seed"] = seed
+                take()
+                w.call_ollama(HOST, model, msgs, None, None, api_style="ollama", tools=False, role="author",
+                              sampling_step=step, seed=seed)
+                check(f"{tag} ollama", sampling_ollama(take()[-1]["body"]), want_n)
+                take()
+                w.call_ollama_streaming(HOST, model, msgs, None, None, tools=False, role="author",
+                                        sampling_step=step, seed=seed)
+                check(f"{tag} ollama-stream", sampling_ollama(take()[-1]["body"]), want_n)
+        # a role outside `roles:` (review) is never touched, even with the arm on
+        take()
+        w.call_ollama(HOST, model, msgs, None, None, api_style="openai", tools=False, role="review",
+                      sampling_step=2, seed=seed)
+        b = take()[-1]["body"]
+        check("ladder ON: role outside sampling_escalation.roles untouched", sampling_openai(b),
+              expect_openai(model, "review"))
+        # step 0 (no abort pending) with the arm on is the plain body
+        take()
+        w.call_ollama(HOST, model, msgs, None, None, api_style="openai", tools=False, role="author",
+                      sampling_step=0, seed=seed)
+        check("ladder ON, step 0: plain body, no seed", sampling_openai(take()[-1]["body"]),
+              expect_openai(model, "author", think=None))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def run_invariants():
     for model in MODELS:
         for role in ("author", "coding"):
@@ -389,6 +477,7 @@ def main():
         run_queue()
         run_matrix(w, dbc)
         run_overrides(w)
+        run_ladder(w)
         run_e2e_subprocess()
     print(f"\n{NCHECK[0] - len(FAILS)}/{NCHECK[0]} passed")
     print("CONFORMANT" if not FAILS else f"NON-CONFORMANT: {len(FAILS)} FAILED")

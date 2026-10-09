@@ -99,6 +99,15 @@ READY_MD = ESC_DIR / "READY-TO-LAND.md"
 QUEUE_PY = Path.home() / "bin" / "ollama-queue.py"
 QUEUE_LOGS = Path.home() / "bin" / "ollama-queue-logs"
 RUNS_API = "http://127.0.0.1:7684/api/runs"
+AUTO_RUNS = DISPATCH_DIR / "auto-runs"
+WORKTREES = DISPATCH_DIR / "worktrees"
+# The model review of an escalation is a BOUNDED job: a "<400 words" answer needs ~1K output
+# tokens, so the cap is generous for a verdict plus a small diff yet ends a runaway in ~1.5 min
+# instead of the profile's 32768 (job 2ac42be77bcc, 2026-10-09: 5+ min of one unbounded generation).
+# role=review = the card's NON-thinking reviewer sampling (a reviewer has nothing to think for
+# 32K tokens about; thinking content is what ran away).
+ESC_REVIEW_MAX_TOKENS = 6144
+ESC_REVIEW_ROLE = "review"
 
 # --- thresholds (judgment, with the evidence that set them) ------------------
 # ATTEMPTS_ESCALATE: s4 burned 11 authoring attempts. Two identical failures is
@@ -749,6 +758,204 @@ def _log_tail(job_id, lines=LOG_TAIL_LINES):
         return ""
 
 
+_QMOD = []
+
+
+def _queue_module():
+    """ollama-queue.py loaded once (its chain/bundle resolvers), or None."""
+    if _QMOD:
+        return _QMOD[0]
+    try:
+        import importlib.machinery as _im
+        import importlib.util as _iu
+        ld = _im.SourceFileLoader("_oq_for_watcher", str(Path(__file__).resolve().parent / "ollama-queue.py"))
+        sp = _iu.spec_from_loader(ld.name, ld)
+        m = _iu.module_from_spec(sp)
+        ld.exec_module(m)
+        _QMOD.append(m)
+    except Exception:
+        _QMOD.append(None)
+    return _QMOD[0]
+
+
+_STAGE_PREFIX_RE = re.compile(r"^(?:auto-(?:author|refine)-|needs-opus-auto-|needs-opus-|gate-|regate-|secondop-|esc-review-|plan-gen-)+")
+
+
+def _base_label(label):
+    m = _queue_module()
+    try:
+        if m is not None:
+            return m.default_bundle_from_label(label) or ""
+    except Exception:
+        pass
+    s = _STAGE_PREFIX_RE.sub("", str(label or "")).strip()
+    prev = None
+    while prev != s:
+        prev, s = s, re.sub(r"-(?:s|r|c)\d+$", "", s)
+    return s.strip("-")
+
+
+def _is_wt(p):
+    try:
+        return bool(p) and (Path(str(p)) / "TASK.md").is_file()
+    except OSError:
+        return False
+
+
+def resolve_job_evidence(e, state_path=None, auto_runs=None, worktrees=None, dispatch_dir=None):
+    """The evidence a bare JOB row (source C/D, no plan: e.g. the synthetic
+    `needs-opus-auto-<label>` placeholder ollama-dispatch-auto parks, host=? pid=None) never
+    carried into its context file (2026-10-09, 444c051f2538: a 499-byte stub and a model review
+    that spent 7 min looking for evidence that was never written).
+
+    Everything is derived from the LABEL: the queue row (cwd, bundle) -> the label's base ->
+    the driver's chain record auto-runs/<bundle>.json (`runs[<base>]`: parked.reason / .log /
+    .worktree, the round job ids, outcome) -> the worktree wt-<base> -> the driver log
+    <base>-auto.log. Returns a dict with only the keys that RESOLVED to something real;
+    {} when nothing did. Pure reads, never raises."""
+    out = {}
+    try:
+        state_path = Path(state_path) if state_path else Path.home() / "bin" / "ollama-queue-state.json"
+        ar = Path(auto_runs) if auto_runs else AUTO_RUNS
+        wts = Path(worktrees) if worktrees else WORKTREES
+        dd = Path(dispatch_dir) if dispatch_dir else DISPATCH_DIR
+        row = {}
+        try:
+            for j in (json.loads(state_path.read_text()).get("jobs") or []):
+                if j.get("id") == e.get("job_id"):
+                    row = j
+                    break
+        except (OSError, ValueError, AttributeError):
+            row = {}
+        label = e.get("label") or row.get("label")
+        base = _base_label(label)
+        rec, chain_file = None, None
+        cands = []
+        if row.get("bundle") or e.get("bundle"):
+            cands.append(ar / ("%s.json" % (e.get("bundle") or row.get("bundle"))))
+        try:
+            cands += sorted(ar.glob("*.json"))
+        except OSError:
+            pass
+        for f in cands:
+            if f.name.endswith(".attempts.json"):
+                continue
+            d = _load_json(f)
+            r = ((d or {}).get("runs") or {}).get(base) if isinstance(d, dict) and base else None
+            if isinstance(r, dict):
+                rec, chain_file = r, f
+                break
+        if rec:
+            out["chain_file"] = str(chain_file)
+            for k in ("bundle", "phase", "outcome", "started_at", "updated_at"):
+                if rec.get(k):
+                    out[k] = rec[k]
+            if rec.get("rounds"):
+                out["rounds"] = [str(x) for x in rec["rounds"]]
+            pk = rec.get("parked") if isinstance(rec.get("parked"), dict) else {}
+            if pk.get("reason"):
+                out["parked_reason"] = str(pk["reason"])
+        elif row.get("bundle"):
+            out["bundle"] = row["bundle"]
+        pk = (rec or {}).get("parked") if isinstance((rec or {}).get("parked"), dict) else {}
+        for c in (pk.get("worktree"), row.get("cwd"), wts / ("wt-%s" % base) if base else None):
+            if _is_wt(c):
+                out["worktree"] = str(c)
+                break
+        for c in (pk.get("log"), dd / ("%s-auto.log" % base) if base else None):
+            try:
+                if c and Path(str(c)).is_file():
+                    out["driver_log"] = str(c)
+                    break
+            except OSError:
+                pass
+    except Exception:
+        return {}
+    return out
+
+
+def _file_tail(path, lines=LOG_TAIL_LINES):
+    try:
+        return "\n".join(Path(path).read_text(errors="replace").splitlines()[-lines:])
+    except Exception:
+        return ""
+
+
+def _clip_lines(text, width=300):
+    return "\n".join(l if len(l) <= width else l[:width] + " ...[clipped]" for l in str(text or "").splitlines())
+
+
+def driver_evidence_lines(ev, tail_rounds=2):
+    """PURE-ish markdown for resolve_job_evidence(); [] when there is nothing to show."""
+    if not ev:
+        return []
+    L = ["## driver evidence (resolved from the label by the watcher)", ""]
+    for k, lab in (("bundle", "bundle"), ("chain_file", "chain record (driver state)"),
+                   ("phase", "driver phase"), ("outcome", "driver outcome"),
+                   ("worktree", "worktree (TASK.md, verify.sh, check_literals.py live here)"),
+                   ("driver_log", "driver log")):
+        if ev.get(k):
+            L.append("- %s: `%s`" % (lab, ev[k]))
+    if ev.get("rounds"):
+        L.append("- rounds (job ids, oldest first): %s" % ", ".join("`%s`" % r for r in ev["rounds"]))
+    if ev.get("parked_reason"):
+        L += ["", "### park reason (full)", "```", ev["parked_reason"][:2500], "```"]
+    for jid in (ev.get("rounds") or [])[-tail_rounds:]:
+        t = _clip_lines(_log_tail(jid, 30))
+        if t:
+            L += ["", "### last lines of round job %s (failure signature)" % jid, "```", t, "```"]
+    if ev.get("driver_log"):
+        t = _clip_lines(_file_tail(ev["driver_log"], 40))
+        if t:
+            L += ["", "### driver log tail", "```", t, "```"]
+    L.append("")
+    return L
+
+
+# Headings whose presence means the context carries evidence the review task tells the
+# reviewer to read (plan state / slice record / worktree literals / driver evidence / log tail /
+# integration records). A context with NONE of them is a stub: nothing for a model to diagnose.
+EVIDENCE_HEADINGS = ("## plan\n", "## slice record", "## log tail", "## driver evidence",
+                     "## machine-checked spec literals", "## whole-chain integration gate",
+                     "## chain staged for landing", "## chain was STAGED")
+
+
+def context_has_evidence(body):
+    """PURE. (ok, missing_description). ok when the rendered context contains at least one
+    evidence block; otherwise a model review would only be asked to explore for evidence the
+    context never held."""
+    b = str(body or "")
+    if any(("\n" + h) in ("\n" + b) for h in EVIDENCE_HEADINGS):
+        return True, ""
+    return False, "plan state / worktree / driver log / spec literals"
+
+
+NO_EVIDENCE_MARK = "NO EVIDENCE AVAILABLE"
+
+
+def no_evidence_section(e):
+    return ("\n## %s\n\nThe watcher could not resolve any of: plan state, worktree, driver log, "
+            "round failure signatures, machine-checked spec literals for this escalation "
+            "(job `%s`, label `%s`). No model review was spawned -- there is nothing for it to "
+            "read; a review would only explore.\n" % (NO_EVIDENCE_MARK, e.get("job_id"), e.get("label")))
+
+
+def no_evidence_review(e, fc=None, ev=None):
+    """The deterministic (no LLM) review for an evidence-less context: a first-line marker
+    (escalation_verdict.is_no_verdict_review -> self-heal refuses to act on it), then the
+    machine-resolved verdict via escalation_verdict.resolve (failure_class > reason keywords >
+    default), always low confidence."""
+    if ev is None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import escalation_verdict as ev
+    vd = ev.resolve("", fc, e.get("reason"), key_parts=(esc_key(e), NO_EVIDENCE_MARK))
+    return ("%s -- the escalation context carried no evidence (no plan state, worktree, driver "
+            "log or literals could be resolved from the label). No model review was run.\n\n"
+            "VERDICT: %s -- (machine-resolved from %s: %s; confidence low; NO ACTION TAKEN, "
+            "the escalation stays open for a human)\n"
+            % (NO_EVIDENCE_MARK, vd["verdict"], vd["source"], vd["why"]))
+
+
 def _git(repo, *args, timeout=30):
     """(rc, stdout). Never raises -- a panel must render even on a broken repo."""
     if not repo:
@@ -832,7 +1039,7 @@ def integration_freshness(integ, repo):
     return L, stale
 
 
-def build_context(e, state=None):
+def build_context(e, state=None, evidence=None):
     """The never-pruned record. Written BEFORE the review is spawned, so an
     escalation is durable even if the review agent fails to start."""
     L = []
@@ -1002,7 +1209,14 @@ def build_context(e, state=None):
         L.append("    ollama-dispatch-slice <plan.json> --integrate")
         L.append("")
     s = e.get("slice") or {}
-    _lwt = escalation_worktree(e, state)
+    # BARE JOB ROW (source C/D, no plan): resolve the driver's evidence from the label --
+    # chain record, worktree, driver log, last rounds' failure tails. Without it the file is
+    # a stub (2026-10-09, 444c051f2538) and the review has nothing to read.
+    _jev = {}
+    if e.get("job_id") and not e.get("plan") and not isinstance(state, dict):
+        _jev = evidence if evidence is not None else resolve_job_evidence(e)
+        L += driver_evidence_lines(_jev)
+    _lwt = escalation_worktree(e, state, evidence=_jev)
     if _lwt:
         L += literal_facts_lines(spec_literal_facts(_lwt))
     if s:
@@ -1109,7 +1323,7 @@ def spec_literal_facts(worktree):
         return None
 
 
-def escalation_worktree(e, state=None, logs=None):
+def escalation_worktree(e, state=None, logs=None, evidence=None):
     """The worktree holding the code under review: the slice record's worktree, the
     plan state's for that slice, else (source D/C job rows carry none) the job's own
     cwd from its persisted queue record -- only when that cwd has a TASK.md."""
@@ -1126,6 +1340,12 @@ def escalation_worktree(e, state=None, logs=None):
                 break
     if wt and (Path(str(wt)) / "TASK.md").is_file():
         return str(wt)
+    # a bare job row whose queue record is gone/placeholder: the label-resolved worktree
+    # (chain record parked.worktree / queue row cwd / wt-<base>) -- see resolve_job_evidence.
+    if e.get("job_id") and not (state and e.get("slice_id")):
+        ev = evidence if evidence is not None else resolve_job_evidence(e)
+        if ev.get("worktree"):
+            return ev["worktree"]
     return None
 
 
@@ -1498,7 +1718,7 @@ def _sibling_review(stem, rows):
 
 
 def spawn_review(ctx_path, repo=None, timeout=REVIEW_TIMEOUT, model=REVIEW_QUEUE_MODEL,
-                 prompt=None, bundle=None):
+                 prompt=None, bundle=None, max_tokens=ESC_REVIEW_MAX_TOKENS):
     """Diagnosis review as a QUEUE JOB on the local Darkbloom lane (2026-10-01: the
     old `claude -p --model opus` spawn exhausted the weekly Claude limit). The job is
     a read-only research dispatch; its final answer is captured to a file next to the
@@ -1542,7 +1762,10 @@ def spawn_review(ctx_path, repo=None, timeout=REVIEW_TIMEOUT, model=REVIEW_QUEUE
                 (prompt or REVIEW_PROMPT).format(ctx=ctx_path)
                 + "\n\nOUTPUT: your FINAL ANSWER is the complete review text, starting "
                   "with the VERDICT: line (and any ```diff block). Use the read-only "
-                  "file tools to read the context file and evidence first.\n")
+                  "file tools to read the context file and evidence first. The context "
+                  "file names every path you need as an absolute path: read each file AT "
+                  "MOST ONCE, never list '.' or $HOME, and answer as soon as you have read "
+                  "it. Your output is hard-capped; a long answer is cut off and discarded.\n")
             # cwd is ALWAYS $HOME: the worker refuses a --capture-final-as path outside its
             # cwd, and both the escalations dir and every dispatch worktree live under it.
             cwd = str(Path.home())
@@ -1550,7 +1773,8 @@ def spawn_review(ctx_path, repo=None, timeout=REVIEW_TIMEOUT, model=REVIEW_QUEUE
                 [sys.executable, str(QUEUE), "enqueue", "--model", model, "--host", "studio",
                  "--task-kind", "research", "--cwd", cwd, "--allow-unisolated",
                  "--allow-no-verify", "--task-file", str(task), "--label", label,
-                 "--allow-duplicate-label", "--capture-final-as", str(out)]
+                 "--allow-duplicate-label", "--capture-final-as", str(out),
+                 "--role", ESC_REVIEW_ROLE, "--max-tokens", str(int(max_tokens))]
                 + (["--bundle", str(bundle)] if bundle else []),
                 capture_output=True, text=True, timeout=120)
             m = re.search(r"enqueued\s+([0-9a-f]{6,})", r.stdout or "")
@@ -1724,6 +1948,12 @@ c = harness/dispatch defect; d = genuine model incapacity. Pick the single best 
 """
 
 
+def _verdict_mod():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import escalation_verdict
+    return escalation_verdict
+
+
 def ensure_verdict(e, ctx, stem, review, rerun=None, ev=None):
     """A review with no usable verdict is never left: re-run ONE classify-only review
     (local queue job, cheap), then fall back to the machine resolution (mechanical
@@ -1733,7 +1963,7 @@ def ensure_verdict(e, ctx, stem, review, rerun=None, ev=None):
         if ev is None:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             import escalation_verdict as ev
-        if is_review_blocked(review) or ev.has_verdict(review):
+        if is_review_blocked(review) or ev.has_verdict(review) or ev.is_no_verdict_review(review):
             return review
         cfg = ev.load_config()
         key = esc_key(e)
@@ -2070,6 +2300,60 @@ def worktree_reap_daily(run=subprocess.run, now=None, stamp=None, tool=None):
         return False
 
 
+def handle_no_evidence(e, body, ctx, stem, render_failed=False, esc_dir=None, index_md=None):
+    """The pre-spawn evidence gate. True when the context carries NO evidence (and the render did
+    not fail): the context file gets a `NO EVIDENCE AVAILABLE` section, a deterministic (no LLM)
+    review + verdict line is recorded, the index row is written, and the caller must NOT spawn a
+    model review or self-heal. False when a review should proceed."""
+    if render_failed:
+        return False
+    ok, _missing = context_has_evidence(body)
+    if ok:
+        return False
+    esc_dir = Path(esc_dir) if esc_dir else ESC_DIR
+    try:
+        Path(ctx).write_text(body.rstrip("\n") + "\n" + no_evidence_section(e))
+    except Exception:
+        pass
+    fc = e.get("failure_class")
+    if not fc and e.get("job_id"):
+        try:
+            fc = next((j.get("failure_class") for j in json.loads(
+                (Path.home() / "bin" / "ollama-queue-state.json").read_text()).get("jobs") or []
+                if j.get("id") == e["job_id"]), None)
+        except Exception:
+            fc = None
+    try:
+        nrev = no_evidence_review(e, fc)
+    except Exception as nx:
+        nrev = ("%s -- no evidence in the context; no model review was run "
+                "(deterministic verdict failed: %r).\n" % (NO_EVIDENCE_MARK, nx))
+    try:
+        (esc_dir / ("%s.review.md" % stem)).write_text(nrev)
+    except Exception:
+        pass
+    vl = "%s -- %s: no model review run, no action taken, escalation stays open" % (
+        verdict_line(nrev, e.get("reason")), NO_EVIDENCE_MARK)
+    append_index(e, ctx, vl, index_md or INDEX_MD)
+    notify_desktop("Dispatch escalation (no evidence): %s" % _subject(e), rerun_line(e, vl))
+    print("  NO EVIDENCE %s -> %s (no review spawned, no action)" % (esc_key(e), ctx))
+    return True
+
+
+def handle_no_verdict_review(e, ctx, review, index_md=None):
+    """A review that is a NAMED STOP, not a verdict (REVIEW CAPPED from a worker bound): True when
+    handled -- the index row says why, and the caller must not classify, patch, self-heal or
+    re-review. The escalation stays open."""
+    if not _verdict_mod().is_no_verdict_review(review):
+        return False
+    first = (str(review).strip().splitlines() or ["REVIEW CAPPED"])[0].strip()[:240]
+    append_index(e, ctx, "%s -- no model verdict, no action taken, escalation stays open" % first,
+                 index_md or INDEX_MD)
+    notify_desktop("Dispatch review capped: %s" % _subject(e), rerun_line(e, first))
+    print("  REVIEW CAPPED %s (%s) -> %s" % (esc_key(e), first, ctx))
+    return True
+
+
 def run_once(dry_run=False):
     if not dry_run:
         prune_escalations()
@@ -2188,9 +2472,11 @@ def run_once(dry_run=False):
         # file that says "the builder failed, here is the reason line" still gets
         # the escalation in front of a reviewer; a traceback gets it in front of
         # nobody.
+        _render_failed = False
         try:
             body = build_context(e, state)
         except Exception as ex:
+            _render_failed = True
             body = ("# %s\n\n- key: `%s`\n- reason: %s\n\n(context builder failed: %r "
                     "-- the escalation is real, the rendering is not; see the plan "
                     "state file)\n" % (_subject(e), esc_key(e), e.get("reason"), ex))
@@ -2237,6 +2523,17 @@ def run_once(dry_run=False):
             append_index(e, ctx, _line, _idx)
             notify_desktop("Dispatch: %s" % _subject(e), rerun_line(e, _line))
             print("  NOTICE %s -> %s" % (esc_key(e), ctx))
+            continue
+
+        # PRE-SPAWN EVIDENCE GATE (2026-10-09, the owner: "how was it missing the required
+        # checks and still queued?"). The review task tells the reviewer to read plan state /
+        # worktree / log evidence; a context without ANY of it (a bare job row whose evidence
+        # could not be resolved from its label) used to be reviewed anyway -- the model
+        # explored for 7 min and ran away. No evidence -> no model review: record
+        # `NO EVIDENCE AVAILABLE` + a deterministic (no LLM) verdict, take NO action (the
+        # marker line is refused by self-heal), keep the escalation open. A render failure is
+        # exempt: its minimal context still points the reviewer at the plan state file.
+        if handle_no_evidence(e, body, ctx, stem, render_failed=_render_failed):
             continue
 
         # (the session-limit deferral now runs at the TOP of this loop, before the
@@ -2298,6 +2595,11 @@ def run_once(dry_run=False):
             print("  REVIEW BLOCKED %s (%s, %s) -> %s"
                   % (esc_key(e), _when,
                      "will retry" if retryable else "GIVING UP", ctx))
+            continue
+
+        # CAPPED / NO-VERDICT REVIEW (worker exit reason output_cap_review / repeat_call_loop):
+        # a named stop, not a verdict -- nothing classified, patched, self-healed or re-reviewed.
+        if handle_no_verdict_review(e, ctx, review, INDEX_MD):
             continue
 
         # PROPOSE, NEVER APPLY. The review is still read-only (REVIEW_TOOLS has
@@ -2394,12 +2696,9 @@ def _queue_label_bundle(label):
     if not label:
         return None
     try:
-        import importlib.machinery as _im
-        import importlib.util as _iu
-        ld = _im.SourceFileLoader("_oq_for_bundle", str(Path(__file__).resolve().parent / "ollama-queue.py"))
-        sp = _iu.spec_from_loader(ld.name, ld)
-        m = _iu.module_from_spec(sp)
-        ld.exec_module(m)
+        m = _queue_module()
+        if m is None:
+            return None
         return m.chain_bundle_for_label(label) or m.default_bundle_from_label(label) or None
     except Exception:
         return None

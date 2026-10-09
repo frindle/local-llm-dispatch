@@ -235,6 +235,22 @@ def resolve(review, failure_class=None, reason=None, cache_path=None, key_parts=
     return out
 
 
+# A review file that is NOT a model verdict: the model review was capped by the worker
+# (named exit reason) or never spawned because the context carried no evidence. The first
+# line is a fixed marker; every consumer that would ACT on a review (self-heal retry/respec/
+# skip/close) must refuse these -- the escalation stays open for a human, nothing is done.
+NO_VERDICT_MARKERS = ("REVIEW CAPPED", "NO EVIDENCE AVAILABLE")
+
+
+def is_no_verdict_review(review):
+    """PURE. True when the review's first non-blank line is a NO_VERDICT_MARKERS marker."""
+    for line in str(review or "").splitlines():
+        s = line.strip().lstrip("*# <!->").strip()
+        if s:
+            return s.upper().startswith(NO_VERDICT_MARKERS)
+    return False
+
+
 def has_verdict(review):
     """True when the review itself carries a verdict (any parse level above 'keyword')."""
     v, src = parse_review(review)

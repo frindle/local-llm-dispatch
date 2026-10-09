@@ -109,6 +109,38 @@ thinking_policy:
     always_off: {oneshot: off, tool_first: off, tool_after_failure: off, tool_mechanical: off}
     hybrid:     {oneshot: on,  tool_first: on, tool_after_failure: on, tool_mechanical: off}
 
+# SAMPLING_ESCALATION_MARK -- one-turn sampling LADDER for runaway / cut-off turns. A declared A/B ARM,
+# DEFAULT OFF (arm: off => model_profile.build_request_fields ignores sampling_step; request bodies are
+# byte-identical). Turn it on only for an experiment: env MODEL_SAMPLING_ARM=ladder (or arm: ladder here).
+# State machine: worker_robust.SamplingLadder (ollama-worker.py `_ladder`). Per abort-type turn (output-cap
+# cut, prose runaway, reasoning runaway):
+#   abort 1 -> step 1 for the NEXT turn only, then back to the card profile
+#   abort 2 -> if the same failing check (verify failure signature) was re-attempted and failed again:
+#              exit `spec_defect_repeat_abort` (spec-defect path FIRST, no more sampling changes);
+#              otherwise step 2 for the next turn only
+#   abort 3 -> exit `sampling_ladder_exhausted` (the scheduler re-specs instead of burning rounds)
+# A fresh `seed` rides every step >= 1 (Darkbloom honours seed: d-inference inference.md L488).
+# EVIDENCE GRADES (honest): nothing here is validated on Qwen3.6.
+#   * the card's own presets: thinking/precise-coding temp 0.6 presence 0.0; non-thinking temp 0.7
+#     presence 1.5 (qwen3.6 card L663-665) -- STRONG (vendor), but they are mode presets, not a recovery ladder.
+#   * Qwen3-14B card L327-329: "DO NOT use greedy decoding ... endless repetitions"; presence_penalty 0-2
+#     "to reduce endless repetitions", at the risk of language mixing -- MEDIUM (older, different model,
+#     vendor-stated); it is the only vendor statement that presence_penalty is the repetition lever.
+#   * step 1 temperature >= 0.8 and repetition_penalty 1.2 (+ fresh seed) -- WEAK: our own choice, the
+#     0.4 / 1.2 values already used by ollama-worker.py's output-cap recovery turn (itself unvalidated);
+#     repetition_penalty 1.2 is OUTSIDE the card's 1.0. Temperature 0.8 sits between the card's coding
+#     (0.6) and general-thinking (1.0) presets.
+#   * step 2 presence_penalty 1.0 with thinking off (hybrid thinking arm only) -- WEAK: the owner's proposal;
+#     1.0 is inside the 0-2 range of the 14B card and below the card's non-thinking 1.5.
+# Roles it may touch are `roles:`; reviewers/gates already run the non-thinking preset.
+sampling_escalation:
+  arm: "off"   # quoted: bare off parses as boolean False in YAML 1.1
+  roles: [author, coding, thinking_coding]
+  evidence: "qwen3.6 card L663-665 (presets); Qwen3-14B card L327-329 (no greedy; presence 0-2 vs endless repetition); steps are our design, unvalidated on Qwen3.6 -- docs/sampling-escalation-ab.md"
+  ladder:
+    1: {temperature_min: 0.8, repetition_penalty_min: 1.2, fresh_seed: true}
+    2: {presence_penalty: 1.0, thinking: off, requires_thinking_arm: hybrid, fresh_seed: true}
+
 # Escalation (bigger-model) steps: ordered models per role. NOT hardcoded anywhere else (the queue's
 # N-sample escalation reads this via model_profile.escalation_models). The owner 2026-10-09: any model he
 # can host on Darkbloom is allowed. A model must have a `models:` entry (card + sha) to be listed.

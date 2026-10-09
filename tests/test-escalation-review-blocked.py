@@ -28,6 +28,10 @@ MOD = Path.home() / "bin" / "dispatch-escalation-watcher.py"
 spec = importlib.util.spec_from_file_location("escwatch", MOD)
 W = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(W)
+# This test is about the REVIEW BLOCKED path; the pre-spawn evidence gate (a bare row context spawns no
+# review) has its own test, test-esc-review-bounds.py, and would otherwise make this one depend on whatever
+# driver state the machine happens to hold for the job id. Hermetic: the gate is open here.
+W.handle_no_evidence = lambda *a, **k: False
 
 LIMIT_STDOUT = "You've hit your session limit · resets 7:30pm (America/Los_Angeles)"
 REAL_STDOUT = ("VERDICT: c -- harness defect: the verify command never ran.\n"

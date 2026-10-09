@@ -272,7 +272,8 @@ def classify(rec, fp, scrape):
         tags.append("stop-gate-failed")
     if reason == "reasoning_runaway":
         tags.append("reasoning-runaway")
-    if reason in ("error_loop", "monologue_loop", "alternation_loop", "nav_loop"):
+    if reason in ("error_loop", "monologue_loop", "alternation_loop", "nav_loop",
+                  "repeat_call_loop", "output_cap_review"):
         tags.append(reason.replace("_", "-"))     # worker_robust named loop exits (2026-10-09)
     if reason == "fixed_lane_exhausted":
         tags.append("fixed-lane-exhausted")

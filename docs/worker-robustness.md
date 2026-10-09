@@ -86,3 +86,21 @@ Each step logs `422 recovery: step N (...) ok|failed`; `_dispatch_metrics["recov
 ends `PAUSED FOR REVIEW` (`chat_request_failed`). `call_ollama` gained `tool_choice=` and `max_attempts=`.
 Test: `test-worker-422-recovery.py` (stub HTTP server; red on the old worker); canary seam `worker422`
 (4 revert proofs).
+
+## Bounded, evidence-gated escalation reviews (2026-10-09)
+
+Trigger: esc-review `2ac42be77bcc` (row `444c051f2538`) ran ~7.5 min on a 499-byte stub context. A bare
+`needs_opus` job row carried no driver evidence, so the model re-read two tiny files, listed `$HOME` (2149
+entries) and ran away. Now:
+* `dispatch-escalation-watcher.py` resolves evidence from the label (auto-runs chain record, worktree
+  `wt-<label>`, driver log) into a `## driver evidence` block; before spawning, `handle_no_evidence` checks
+  the context carries what the review task tells the reviewer to read. If nothing resolves it spawns NO model:
+  the escalation gets an explicit `NO EVIDENCE AVAILABLE` line, a deterministic verdict, stays open. A render
+  failure still announces (per-entry containment).
+* The review job is enqueued `--role review --max-tokens 6144`; for a research task with
+  `--capture-final-as` the worker ends a run under a named reason with a `REVIEW CAPPED (<reason>)` marker:
+  `repeat_call_loop` (same read-only call twice in a row / third time overall), `output_cap_review` (a turn
+  hit the cap), and `list_files` refuses directories over 400 entries.
+* `escalation_verdict.is_no_verdict_review` (first line `REVIEW CAPPED` / `NO EVIDENCE AVAILABLE`) makes
+  `dispatch-self-heal.py` take no action and the escalation stay open. Test `test-esc-review-bounds.py`,
+  canary seam `escbounds`.

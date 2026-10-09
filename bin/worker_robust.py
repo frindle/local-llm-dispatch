@@ -43,8 +43,78 @@ REASON_ALTERNATION = "alternation_loop"     # A,B,A,B,... alternation
 REASON_NAV_LOOP = "nav_loop"                # endless grep/find/ls/view/read_file navigation
 LOOP_KIND_REASONS = {"error_streak": REASON_ERROR_LOOP, "monologue": REASON_MONOLOGUE,
                      "alternation": REASON_ALTERNATION, "nav_streak": REASON_NAV_LOOP}
+# BOUNDED READ-ONLY REVIEW JOBS (2026-10-09, esc-review 2ac42be77bcc: 8 iterations re-reading the
+# same two tiny files, a `list_files .` of 2149 entries, then one unbounded 1500+-line generation).
+# A research task that captures its final answer to a file (an escalation review) gets three hard
+# bounds, each ending the run under a NAMED reason and a captured "REVIEW CAPPED" marker file:
+REASON_REPEAT_CALL = "repeat_call_loop"     # the same read-only call re-issued (2x in a row / 3x total)
+REASON_REVIEW_CAP = "output_cap_review"     # a turn hit the (explicit, small) output-token cap
+# SAMPLING ESCALATION LADDER (A/B arm, default OFF; model_profiles.yaml `sampling_escalation`).
+REASON_SPEC_DEFECT_REPEAT = "spec_defect_repeat_abort"   # 2 aborts on the SAME failing check: spec path first
+REASON_LADDER_EXHAUSTED = "sampling_ladder_exhausted"    # step 3: still looping -> scheduler re-specs
 NEW_EXIT_REASONS = (REASON_FORMAT, REASON_LOOP, REASON_STOPGATE, REASON_REASONING,
-                    REASON_ERROR_LOOP, REASON_MONOLOGUE, REASON_ALTERNATION, REASON_NAV_LOOP)
+                    REASON_ERROR_LOOP, REASON_MONOLOGUE, REASON_ALTERNATION, REASON_NAV_LOOP,
+                    REASON_REPEAT_CALL, REASON_REVIEW_CAP,
+                    REASON_SPEC_DEFECT_REPEAT, REASON_LADDER_EXHAUSTED)
+REVIEW_REPEAT_CONSECUTIVE = 2   # the identical read-only call twice in a row ends the run
+REVIEW_REPEAT_TOTAL = 3         # ... or the third time overall (A,B,A,B,A re-reading evades "in a row")
+LIST_FILES_MAX_ENTRIES = 400    # list_files refuses a directory bigger than this (lists a sample)
+
+
+def review_bounds_active(task_kind, capture_final_as):
+    """PURE. The bounds above apply to research tasks that capture a final answer to a file."""
+    return task_kind == "research" and bool(capture_final_as)
+
+
+def repeat_call_key(name, args, resolve=None):
+    """PURE. The normalised identity of a read-only inspection (read_file / list_files), or None
+    for any other tool. read_file ignores `length` (a model varying length/offset spelling of the
+    same page is the same read); the path is resolved so `x`, `./x` and the absolute path match."""
+    if name not in ("read_file", "list_files") or not isinstance(args, dict):
+        return None
+    path = str(args.get("path") or ".")
+    if resolve is not None:
+        try:
+            path = str(resolve(path))
+        except Exception:
+            pass
+    if name == "read_file":
+        try:
+            off = int(args.get("offset") or 1)
+        except (TypeError, ValueError):
+            off = 1
+        return (name, path, off)
+    return (name, path)
+
+
+class RepeatCallGuard:
+    """observe(key) -> None, or a human detail string when the call has been repeated too often."""
+
+    def __init__(self, consecutive=REVIEW_REPEAT_CONSECUTIVE, total=REVIEW_REPEAT_TOTAL):
+        self.consecutive, self.total = consecutive, total
+        self.counts, self.last, self.run = {}, None, 0
+
+    def observe(self, key):
+        if key is None:
+            self.last, self.run = None, 0
+            return None
+        self.counts[key] = self.counts.get(key, 0) + 1
+        self.run = self.run + 1 if key == self.last else 1
+        self.last = key
+        if self.run >= self.consecutive:
+            return "%s re-issued %d times in a row" % (" ".join(map(str, key)), self.run)
+        if self.counts[key] >= self.total:
+            return "%s issued %d times in total" % (" ".join(map(str, key)), self.counts[key])
+        return None
+
+
+def review_capped_text(reason, detail, iteration=None):
+    """PURE. The text captured as the review when a bound ended the run. FIRST LINE is the marker
+    escalation_verdict.is_no_verdict_review() recognises (consumers must NOT act on it). No partial
+    model output is included: a runaway's tail is junk and could contain verdict-looking text."""
+    return ("REVIEW CAPPED (%s) -- the review stopped by a worker bound before giving a verdict%s: %s. "
+            "No model verdict exists; the escalation stays open and nothing was acted on.\n"
+            % (reason, (" at iteration %s" % iteration) if iteration else "", detail))
 
 
 def loop_exit_reason(kind):
@@ -1365,3 +1435,63 @@ def mask_observations(messages, cfg=None, state=None, verify=None):
         stats["masked"] += 1
         stats["chars_saved"] += len(text) - len(ph)
     return view, stats
+
+
+class SamplingLadder:
+    """PURE state machine for the sampling escalation ladder (default OFF; `enabled` False => every
+    method is inert and the worker's request bodies are untouched).
+
+    on_abort(kind): called when a turn is aborted/cut (output cap, prose runaway, reasoning runaway).
+      abort 1                       -> ("step", 1)   next turn only: temp>=0.8, rep 1.2, fresh seed
+      2nd abort on the SAME failing check -> ("exit", REASON_SPEC_DEFECT_REPEAT)  spec-defect path FIRST
+      abort 2, different/unknown    -> ("step", 2)   next turn only: presence ~1.0, thinking off (hybrid arm)
+      abort 3+                      -> ("exit", REASON_LADDER_EXHAUSTED)    scheduler re-specs
+    A turn that produced a tool call resets the consecutive count (`on_ok`). `take()` returns
+    (step, seed) for the NEXT turn exactly once, with a fresh seed per call (a new seed per
+    retry/refine round: `seed_base` is round-specific and the counter advances every take)."""
+
+    def __init__(self, enabled=False, seed_base=0):
+        self.enabled = bool(enabled)
+        self.seed_base = int(seed_base or 0)
+        self.aborts = 0
+        self.pending = 0
+        self.by_check = {}         # failing-check signature -> aborts seen while it was the failing check
+        self.last_check = None     # latest known failing-check signature (fed by note_check)
+        self.takes = 0
+        self.history = []
+
+    def note_check(self, sig):
+        s = frozenset(sig or ())
+        self.last_check = s or None
+
+    def on_abort(self, kind="cut"):
+        if not self.enabled:
+            return ("off", None)
+        self.aborts += 1
+        # per-check count survives a good turn in between: two aborts while the SAME check is the
+        # failing one is a spec problem however the turns were interleaved.
+        same = False
+        if self.last_check is not None:
+            self.by_check[self.last_check] = self.by_check.get(self.last_check, 0) + 1
+            same = self.by_check[self.last_check] >= 2
+        self.history.append((self.aborts, kind, same))
+        if same:
+            self.pending = 0
+            return ("exit", REASON_SPEC_DEFECT_REPEAT)
+        if self.aborts >= 3:
+            self.pending = 0
+            return ("exit", REASON_LADDER_EXHAUSTED)
+        self.pending = self.aborts
+        return ("step", self.aborts)
+
+    def on_ok(self):
+        if self.enabled:
+            self.aborts = 0
+
+    def take(self):
+        """(step, seed) for the next turn; (0, None) when nothing is pending. One-shot."""
+        if not self.enabled or not self.pending:
+            return (0, None)
+        step, self.pending = self.pending, 0
+        self.takes += 1
+        return (step, (self.seed_base * 1009 + self.takes * 7919 + 17) % (2 ** 31 - 1))

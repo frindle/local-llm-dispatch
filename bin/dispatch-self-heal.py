@@ -226,7 +226,10 @@ _NOISE = ("node_modules", ".tsbuildinfo", ".refine-guard.json")
 
 
 def review_says_satisfied(review: str) -> bool:
-    """PURE. The review's VERDICT line claims (a) / already satisfied."""
+    """PURE. The review's VERDICT line claims (a) / already satisfied. A capped /
+    no-evidence review (escalation_verdict.NO_VERDICT_MARKERS) claims nothing."""
+    if _ev().is_no_verdict_review(review):
+        return False
     for line in (review or "").splitlines():
         if line.strip().upper().startswith("VERDICT"):
             return bool(_SATISFIED_RE.search(line))
@@ -680,6 +683,8 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
     """Decide and (when warranted) act. Returns the action taken:
     'regate' | 'retry' | 'skip:<why>'. `launch` is injectable for the self-test."""
     launch = launch or _slicer_detached
+    if _ev().is_no_verdict_review(review_text):
+        return "skip:no model verdict (review capped / no evidence) -- escalation stays open, no action taken"
     st = _load(Path(slice_runs or SLICE_RUNS) / f"{plan}.json") or {}
     s = (st.get("slices") or {}).get(sid) or {}
     # A HUMAN cancel is terminal (plan_cancel.py): the ev-service-screen retry of
@@ -1426,6 +1431,8 @@ def _heal_job(job, review_text, jobs=None, ledger_path=None, slice_runs=None, no
       c harness defect      -> harness-repair continuation; the same signature again -> re-spec
       d model incapable     -> ONE round on the configured bigger model, else re-slice"""
     ev = _ev()
+    if ev.is_no_verdict_review(review_text):
+        return "skip:no model verdict (review capped / no evidence) -- escalation stays open, no action taken"
     enqueue = enqueue or _queue_enqueue
     jobs = jobs if jobs is not None else _queue_jobs()
     ok, why = job_heal_eligible(job, slice_runs)

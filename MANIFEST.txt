@@ -453,6 +453,8 @@ tests|~/bin/test-gate-harness-refine.py
 tests|~/bin/test-handoff-triage.py
 tests|~/bin/test-harness-gates.py
 tests|~/bin/test-model-profile-conformance.py
+tests|~/bin/test-sampling-ladder.py
+tests|~/bin/test-esc-review-bounds.py
 tests|~/bin/test-phase2-replay-corpus.py
 tests|~/bin/test-preflight-harness-gates.py
 tests|~/bin/test-selfcheck-hang.py
@@ -463,6 +465,7 @@ docs|~/Desktop/GitHub Projects/machine-config/docs/cpu-lane.md
 docs|~/Desktop/GitHub Projects/machine-config/docs/cpu-prefetch.md
 docs|~/Desktop/GitHub Projects/machine-config/docs/harness-gates.md
 docs|~/Desktop/GitHub Projects/machine-config/docs/worker-robustness.md
+docs|~/Desktop/GitHub Projects/machine-config/docs/sampling-escalation-ab.md
 docs|~/Desktop/GitHub Projects/machine-config/docs/macos-pipe-starvation-heredoc-hang.md
 bin|~/bin/triage_packets.py
 bin|~/bin/triage-emit.py
