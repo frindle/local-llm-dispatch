@@ -1152,6 +1152,16 @@ def revert():
 # target back to HEAD for the measurement only; revert() restores the model's
 # version afterwards from pre_tracked.
 _target_reset = None
+# Fixture text, captured BEFORE the measurement (revert() runs before the hint is built and may
+# drop an untracked fixture); the failure hint below keys on what the fixture actually fakes.
+_FIXTURE_TEXT = ""
+for _g in _FIXTURE_GLOBS:
+    for _p in sorted(WT.glob(_g)):
+        try:
+            if _p.is_file():
+                _FIXTURE_TEXT += _p.read_text(errors="replace") + "\n"
+        except OSError:
+            pass
 try:
     import json as _json
     _hj = WT / ".dispatch-harness.json"
@@ -1465,20 +1475,42 @@ if not ok:
     _jsfx = _FIXTURE_GLOBS[0].endswith((".ts", ".mts", ".js", ".mjs"))
     if _jsfx and (_re.search(r"^#\s*fail\s+[1-9]", tail, _re.M)
                   or "AssertionError" in tail or "!==" in tail):
-        _hint = (
-            "\n\nHINT: YOUR OWN refimpl.py fails YOUR OWN tests. Before touching "
-            "refimpl.py, suspect the FAKE ENVIRONMENT in `" + _FIXTURE_GLOBS[0] +
-            "`: (1) fake page globals (window, document, XMLHttpRequest, fetch) must "
-            "stay installed for the WHOLE test when the code under test reads them "
-            "lazily -- event handlers and async callbacks run AFTER the init call, "
-            "so restoring the globals in a `finally` right after it breaks every "
-            "later capture; restore only after your last assertion. (2) Build a "
-            "FRESH fake class/object per test -- a shared FakeXHR whose prototype an "
-            "earlier test patched leaks into later tests. (3) Mirror the real API's "
-            "shape (NodeList has no .some()/.map(); a fetch Response has .ok/.status/"
-            "async .json()). If this same failure repeats, it is the fake, not the "
-            "refimpl. Use the sealed `dispatch-env.ts` (installFakeBrowser / makeFakePage / "
-            "installFetchStub / installChromeStub) instead of a hand-written double."
+        _fxt = _FIXTURE_TEXT
+        # The browser/extension hint below is ONLY right for a fixture that fakes page globals.
+        # rt-walmart-cancel-import (2026-10-09): a Next.js API route fixture (mock.module prisma, no
+        # window/XHR) got it, and the real cause was a fake prisma whose findMany returned the SAME
+        # objects its update() mutated, so a post-update `!existing.cancelled` count read 0.
+        _browserfx = bool(_re.search(r"\b(window|document|XMLHttpRequest|installFakeBrowser|makeFakePage|"
+                                     r"installChromeStub|chrome\.runtime|globalThis\.fetch)\b", _fxt))
+        if not _browserfx:
+            _hint = (
+                "\n\nHINT: YOUR OWN refimpl.py fails YOUR OWN tests, and `" + _FIXTURE_GLOBS[0] +
+                "` fakes no browser globals (it is a server-side / library test), so this is NOT a "
+                "page-globals problem. Check, in order: (1) STATE ALIASING -- a fake `findMany`/`get` "
+                "that returns the live fixture array while the fake `update`/`set` mutates those same "
+                "objects (Object.assign) makes any value the target reads AFTER the write (a "
+                "`!existing.cancelled` count, a before/after diff) see the post-write state; the real "
+                "client returns a snapshot. Either have the fake return copies (`.map(o => ({...o}))`) "
+                "or make the refimpl decide/count BEFORE the write. (2) A counter computed in a branch "
+                "the fixture's rows never reach. (3) The fixture's expected number contradicting "
+                "TASK.md. Read the failing case's rows and trace the number by hand before editing "
+                "either file.")
+        else:
+            _hint = (
+                "\n\nHINT: YOUR OWN refimpl.py fails YOUR OWN tests. Before touching "
+                "refimpl.py, suspect the FAKE ENVIRONMENT in `" + _FIXTURE_GLOBS[0] +
+                "`: (1) fake page globals (window, document, XMLHttpRequest, fetch) must "
+                "stay installed for the WHOLE test when the code under test reads them "
+                "lazily -- event handlers and async callbacks run AFTER the init call, "
+                "so restoring the globals in a `finally` right after it breaks every "
+                "later capture; restore only after your last assertion. (2) Build a "
+                "FRESH fake class/object per test -- a shared FakeXHR whose prototype an "
+                "earlier test patched leaks into later tests. (3) Mirror the real API's "
+                "shape (NodeList has no .some()/.map(); a fetch Response has .ok/.status/"
+                "async .json()). If this same failure repeats, it is the fake, not the "
+                "refimpl. Use the sealed `dispatch-env.ts` (installFakeBrowser / makeFakePage / "
+                "installFetchStub / installChromeStub) instead of a hand-written double.")
+        _hint += (
             "\n\nPASS-THEN-INVERT: if the failures are setup errors (ReferenceError, 'is not a "
             "function' on the fixture's own double or mock, MODULE_NOT_FOUND, a SyntaxError in "
             "the fixture) rather than AssertionErrors naming a wrong value, step back: make the "

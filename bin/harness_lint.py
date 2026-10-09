@@ -256,6 +256,58 @@ def check_retry(hist, task_mtime=None):
     return []
 
 
+# ------------------------------------------------- refimpl vs fixture (self-consistency)
+def check_refimpl_vs_fixture(wt, timeout=420):
+    """The refimpl, applied to a throwaway copy of HEAD with the authored harness files, must make
+    the harness's own verify.sh print VERIFY_OK. harness-lint --full delegates fail-before/pass-after
+    to preflight, which reports UNPR (and lint passed) whenever the worktree is not at baseline --
+    exactly when a salvaged model diff sits in the tree. rt-walmart-cancel-import: a refimpl that
+    counted `cancelledMarked` AFTER the update loop failed the fixture's aliasing fake prisma
+    (0 !== 1) while lint said HARNESS_LINT_OK for 7 rounds. Fail-open on infrastructure errors."""
+    wt = Path(wt)
+    ri, vs = wt / "refimpl.py", wt / "verify.sh"
+    if not ri.is_file() or not vs.is_file():
+        return []
+    rt = _read(ri)
+    if "TODO" in rt[:400] and "STUB" in rt.upper()[:600]:
+        return []
+    if "SCAFFOLD: cases not yet authored" in _read(wt / "verify.test.ts"):
+        return []
+    tmp = Path(tempfile.mkdtemp(prefix="hlint-rv-"))
+    try:
+        ar = subprocess.run(["git", "-C", str(wt), "archive", "HEAD"], capture_output=True, timeout=60)
+        if ar.returncode != 0:
+            return []
+        subprocess.run(["tar", "-x", "-C", str(tmp)], input=ar.stdout, check=True, capture_output=True, timeout=60)
+        for f in (man_authored(wt) or []):
+            if (wt / f).is_file():
+                (tmp / f).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(wt / f, tmp / f)
+        nm = wt / "node_modules"
+        if nm.exists() and not (tmp / "node_modules").exists():
+            os.symlink(os.path.realpath(nm), tmp / "node_modules")
+        r = subprocess.run([sys.executable, "refimpl.py", str(tmp)], cwd=str(tmp), capture_output=True,
+                           text=True, timeout=90)
+        if r.returncode != 0:
+            return []                       # refimpl unrunnable is the literals check's business
+        v = subprocess.run(["bash", "verify.sh"], cwd=str(tmp), capture_output=True, text=True, timeout=timeout)
+        if "VERIFY_OK" in (v.stdout or "") and v.returncode == 0:
+            return []
+        tail = " | ".join(l.strip() for l in (v.stdout or "").splitlines() if l.strip())[-400:]
+        return [_f("REFIMPL_FAILS_FIXTURE", "the refimpl does not satisfy the harness's own verify.sh",
+                   str(wt / "refimpl.py"),
+                   "refimpl applied to HEAD does not print VERIFY_OK: the fixture and refimpl contradict "
+                   "(fixture double aliasing/over-strict, or refimpl wrong). Tail: " + tail)]
+    except (subprocess.SubprocessError, OSError):
+        return []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def man_authored(wt):
+    return _manifest(wt).get("authored") or ["TASK.md", "check_literals.py", "verify.sh", "verify.test.ts"]
+
+
 # ---------------------------------------------------------------- contract
 def check_contract(wt):
     try:
@@ -295,6 +347,11 @@ def run_lint(wt, stage=None, target=None, full=False, quick=False, attempts=None
         pass
     if stage and not quick:
         out += check_stage_dryrun(wt, stage, target, lang)
+    if not quick and _is_real_task(task):
+        try:
+            out += check_refimpl_vs_fixture(wt)
+        except Exception as e:                           # noqa: BLE001
+            print(f"[harness-lint] refimpl-vs-fixture crashed (ignored): {type(e).__name__}: {e}", file=sys.stderr)
     if full:
         out += check_contract(wt)
     return out

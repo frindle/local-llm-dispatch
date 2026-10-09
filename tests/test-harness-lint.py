@@ -11,7 +11,7 @@ REVERT = "--revert-check" in sys.argv
 sp = importlib.util.spec_from_file_location("harness_lint", HERE / "harness_lint.py")
 hl = importlib.util.module_from_spec(sp); sp.loader.exec_module(hl)
 if REVERT:
-    for n in ("check_literals", "check_consistency", "check_stale_prompt", "check_retry", "check_stage_dryrun"):
+    for n in ("check_literals", "check_consistency", "check_stale_prompt", "check_retry", "check_stage_dryrun", "check_refimpl_vs_fixture"):
         setattr(hl, n, lambda *a, **k: [])
 FAILS = []
 
@@ -91,6 +91,22 @@ check("(6) identical failure signature twice -> REPEAT_FAILURE_SIGNATURE",
 # stage dry-run
 fs = hl.check_stage_dryrun(d3, "task", "app/r.ts")
 check("(4) the stage's static self-check executes and prints STAGE_OK/STAGE_FAIL", fs == [], fs)
+
+# (7) refimpl vs the harness's own verify.sh (rt-walmart-cancel-import: lint OK while refimpl failed 0 !== 1)
+def with_verify(d, want):
+    (d / "verify.sh").write_text('#!/bin/sh\ngrep -q "cancelledMarked = %s" app/r.ts && echo VERIFY_OK && exit 0\necho "FAILED CASE: not ok 1 - mixed"; exit 1\n' % want)
+    (d / "verify.test.ts").write_text("// real fixture\n")
+    (d / ".dispatch-harness.json").write_text(json.dumps({"target": "app/r.ts", "authored": ["TASK.md", "verify.sh", "verify.test.ts", "refimpl.py"]}))
+    return d
+dbad = with_verify(repo(TASK.replace("- `normalize(orderNumber)`\n", "- `normalize(s.orderNumber)`\n")), 1)
+fs = hl.run_lint(dbad, attempts=[])
+check("(7) refimpl that does not make verify.sh print VERIFY_OK -> REFIMPL_FAILS_FIXTURE",
+      "REFIMPL_FAILS_FIXTURE" in codes(fs) and any("FAILED CASE" in f["message"] for f in fs), fs)
+dok = with_verify(repo(TASK.replace("- `normalize(orderNumber)`\n", "- `normalize(s.orderNumber)`\n")), 0)
+check("(7) refimpl that satisfies verify.sh is clean", hl.run_lint(dok, attempts=[]) == [], hl.run_lint(dok, attempts=[]))
+check("(7) --quick (stage entry, no refimpl yet) skips the proof", "REFIMPL_FAILS_FIXTURE" not in codes(hl.run_lint(dbad, quick=True, attempts=[])))
+(dbad / "verify.test.ts").write_text("test('SCAFFOLD: cases not yet authored')\n")
+check("(7) scaffold fixture (not authored yet) is not judged", "REFIMPL_FAILS_FIXTURE" not in codes(hl.run_lint(dbad, attempts=[])))
 
 # CLI contract: exit 3 + SPEC_DEFECT line on a defect, 0 on clean
 r = subprocess.run([sys.executable, str(HERE / "harness_lint.py"), str(d), "--quick"], capture_output=True, text=True)

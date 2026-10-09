@@ -83,9 +83,16 @@ def main():
 
     # 3) control: a real assertion failure still gets the fake-environment hint
     wt3 = mk_wt(m, "AssertionError: 0 !== 2\n")
+    (wt3 / "verify.test.ts").write_text("// fixture\nimport { installFakeBrowser } from './dispatch-env.ts'; installFakeBrowser({});\n")
     o3 = run(wt3)
     check("control: assertion failure keeps the fake hint", "suspect the FAKE ENVIRONMENT" in o3, o3)
     check("control: no import hint", "import PATH bug" not in o3, o3)
+    # rt-walmart-cancel-import: a server-route fixture (no window/XHR) must not be told to use installFakeBrowser
+    wt3s = mk_wt(m, "AssertionError: 0 !== 1\n")
+    (wt3s / "verify.test.ts").write_text("mock.module('@/lib/db', { exports: { prisma: {} } });\n")
+    o3s = run(wt3s)
+    check("server fixture: aliasing hint, no browser-globals blame",
+          "STATE ALIASING" in o3s and "suspect the FAKE ENVIRONMENT" not in o3s and "installFakeBrowser" not in o3s, o3s)
 
     # 4) continuation prompt: no fake-browser paste, import note instead
     last = ("FAIL: the reference impl (refimpl.py) does not make verify.sh print VERIFY_OK\n"

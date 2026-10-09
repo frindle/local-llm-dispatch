@@ -134,8 +134,8 @@ def main():
 
     o = run(mk_wt(m, GOOD))
     check("control: correct pattern -> no lint", "mock.module lint" not in o, o)
-    check("control: correct pattern keeps the generic fake hint",
-          "suspect the FAKE ENVIRONMENT" in o, o)
+    check("control: correct pattern (server fixture, no browser globals) gets the server/aliasing hint, NOT the browser one",
+          "STATE ALIASING" in o and "suspect the FAKE ENVIRONMENT" not in o, o)
 
     o = run(mk_wt(m, "import { test } from 'node:test';\ntest('x', () => {});\n"))
     check("control: no mock.module -> no lint", "mock.module lint" not in o, o)

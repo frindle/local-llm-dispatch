@@ -115,7 +115,9 @@ def main():
     check("b: no fake-environment blame", "suspect the FAKE ENVIRONMENT" not in o2, o2)
 
     # control
-    o3 = run(mk_wt(m, ASSERT_OUT))
+    wt3 = mk_wt(m, ASSERT_OUT)
+    (wt3 / "verify.test.ts").write_text("// fixture\nimport { installFakeBrowser } from './dispatch-env.ts'; installFakeBrowser({});\n")
+    o3 = run(wt3)
     check("control: assertion failure keeps the fake hint",
           "suspect the FAKE ENVIRONMENT" in o3, o3)
     check("control: no compile / mock hint", "compile error" not in o3

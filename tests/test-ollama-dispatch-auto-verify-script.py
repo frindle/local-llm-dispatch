@@ -216,6 +216,7 @@ with tempfile.TemporaryDirectory() as td:
     (wt / "verify.test.ts").write_text("// fixture\n")
     for c in (["git", "add", "-A"], ["git", "commit", "-qm", "base"]):
         subprocess.run(c, cwd=wt, check=True)
+    (wt / "verify.test.ts").write_text("// fixture\nimport { installFakeBrowser } from './dispatch-env.ts'; installFakeBrowser({});\n")
     oda.write_harness_check(wt, "ts")
     r = subprocess.run([sys.executable, "auto-harness-check.py"], cwd=wt,
                        capture_output=True, text=True)
