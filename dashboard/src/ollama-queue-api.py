@@ -1340,9 +1340,26 @@ def _wait_reason_for(r, active, by_id, running, db_status=None):
     if db and db[0]:
         return db[1]                    # every Darkbloom slot is taken (local+fleet)
     if busy:
-        return (f"held on running job {busy[0].get('id')} ({busy[0].get('label')})"
+        return (_busy_job_phrase(r, busy[0])
                 + (f"; Darkbloom {db[2]}/{db[3]} slots busy" if db else ""))
     return "next in line"
+
+
+def _busy_job_phrase(r, b):
+    """'waiting for job <id> (<label>) to finish' + WHOSE job it is (the owner 2026-10-09: an
+    escalation row read 'held on running job 48c096d8d690 (rt-bg-sync-zero-guard)' as if the
+    failed job itself were running; that job belonged to a different bundle)."""
+    key = r.get("group_key") or r.get("bundle") or None
+    bk = b.get("group_key") or b.get("bundle") or None
+    if bk == b.get("id"):
+        bk = None           # a standalone row is its own group_key
+    if bk and key and bk == key:
+        whose = "in this bundle"
+    elif bk:
+        whose = f"another bundle: {bk}"
+    else:
+        whose = "not in any bundle"
+    return f"waiting for job {b.get('id')} ({b.get('label')}; {whose}) to finish"
 
 
 def _darkbloom_wait(r, st=None):
@@ -8002,11 +8019,11 @@ console.log(JSON.stringify({
           _bundle_view_lib()[0].build_job_view("x", [_tj[2]])["slices"][0]["title"],
           "722d979c6a59")
     _gw = _wait_reason_for(_tj[2], "ev-service", {}, [_tj[3]])
-    check("a gate pinned to unraid never says 'held on running job' for a studio job",
-          ("held on running job" not in _gw and "committed bundle ev-service" in _gw), True)
+    check("a gate pinned to unraid never says 'waiting for job' for a studio job",
+          ("waiting for job" not in _gw and "committed bundle ev-service" in _gw), True)
     check("...but a plain row still names the busy lane's job",
           _wait_reason_for({"id": "z", "label": "x", "status": "pending", "lane": "studio-db"},
-                           None, {}, [_tj[3]], {}).startswith("held on running job eea8e2a7134c"), True)
+                           None, {}, [_tj[3]], {}).startswith("waiting for job eea8e2a7134c"), True)
     # --- Darkbloom slot saturation names itself (only from parsed `darkbloom status`) ---
     _dbr = {"id": "z", "label": "x", "status": "pending", "lane": "studio-db", "model": "m"}
     _dbfull = {"unfinished": 4, "concurrency": {}, "default_cap": 4}

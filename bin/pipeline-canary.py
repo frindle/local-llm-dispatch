@@ -3045,6 +3045,23 @@ SEAMS = (
                  [{"mut": "ollama-queue-api.py", "old": "        if gk and gk in _retired:\n            continue\n", "new": "",
                    "why": "superseded bundle still raises Needs attention"}]]),
 
+    dict(id="healnonterm",
+         name="dashboard: a job whose heal/escalation ladder still has a pending/held/running esc-review row is "
+              "NON-terminal (escalation-review, not red failed, headline failed count agrees); failed only when no heal row "
+              "is outstanding; a waiting row's blocker reads 'waiting for job <id> (<label>; another bundle: <key>) to finish'",
+         tool="test-heal-nonterminal.py", args=["--api", "{bin}/ollama-queue-api.py"],
+         marker="ALL PASSED", timeout=300,
+         proofs=[[{"mut": "bundle_view.py", "old": "        elif heal_wait:\n", "new": "        elif False:\n",
+                   "why": "pending heal row still renders red failed"}],
+                 [{"mut": "bundle_view.py", "old": "            if esc_review_ref(j.get(\"label\")) and j.get(\"status\") in _LIVE]",
+                   "new": "            if esc_review_ref(j.get(\"label\")) and j.get(\"status\") == \"running\"]",
+                   "why": "only a RUNNING heal row counts (pending still failed)"}],
+                 [{"mut": "ollama-queue-api.py", "old": "        whose = f\"another bundle: {bk}\"", "new": "        whose = \"\"",
+                   "why": "blocker no longer says whose job it is"}],
+                 [{"mut": "ollama-queue-api.py", "old": "        return (_busy_job_phrase(r, busy[0])",
+                   "new": "        return (f\"held on running job {busy[0].get('id')} ({busy[0].get('label')})\"",
+                   "why": "old ambiguous held-on-running-job text"}]]),
+
     dict(id="relnecessity",
          name="relevance: every hunk of the reference solution must be NECESSARY (revert one -> verify red); "
               "an untested hunk is LOW naming file:start-end; doc-only / single-hunk / Must-contain exemptions explicit",

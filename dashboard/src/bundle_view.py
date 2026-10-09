@@ -574,6 +574,16 @@ def child_parent_id(job):
     return jm.group(1) if jm else None
 
 
+def outstanding_heal(rows):
+    """PURE. The heal/escalation rows in `rows` that can still advance a failed/needs_opus job:
+    an esc-review (any label form) or self-heal queue row that is pending/held/queued/paused/
+    running. THE terminal definition for a job-form card: `failed` (red) only when this is
+    empty, i.e. the heal ladder is exhausted (its reviews finished, watcher parked final-rung)
+    or never started a review; any outstanding row makes the job non-terminal ("healing")."""
+    return [j for j in rows or []
+            if esc_review_ref(j.get("label")) and j.get("status") in _LIVE]
+
+
 def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None):
     """PURE. A bundle made of directly-enqueued JOBS (`--bundle <key>`, no slicer plan):
     one pseudo-slice per non-child job (header "Job . <label>"), with its gate/regate/
@@ -634,20 +644,30 @@ def build_job_view(key, jobs, now=None, verdict_of=None, result_of=None):
         st = str(m.get("status") or "pending")
         running = [j for j in mine if j.get("status") == "running"]
         waiting = [j for j in mine if j.get("status") in _WAITING]
+        heal_wait = outstanding_heal(mine)
         if running:
             phase = job_kind(running[0])[1] if job_kind(running[0])[0] != "coding" else "coding"
         elif st in ("pending", "queued", "scheduled", "held", "paused", "planned"):
             phase = "queued"
         elif st in ("done", "done_unconverged"):
             phase = "done"
+        elif heal_wait:
+            # NOT terminal: the heal/escalation ladder still has a pending/held review that can
+            # advance this job (the owner 2026-10-09, needs-opus-auto-rt-bg-getcommitments-status
+            # read red `failed` beside its own pending `escalation / heal` row). `failed` is
+            # reserved for a job nothing can still advance (see outstanding_heal).
+            phase = "escalation-review"
         else:
             phase = "failed"
         if phase == "done":
             through += 1
         since = _ts((running or [m])[0].get("launched_at"))
         hist = slice_history(m.get("id"), {}, mine, verdict_of, result_of, None, None, now)
+        detail = ""
+        if heal_wait and phase == "escalation-review":
+            detail = f"{st}: healing -- escalation review {heal_wait[0].get('status')}"
         rows.append({"sid": m.get("id"), "title": m.get("label") or "", "job": True,
-                     "status": st, "phase": phase, "detail": "", "since": since,
+                     "status": st, "phase": phase, "detail": detail, "since": since,
                      "elapsed_s": round(now - since, 1) if since and running else None,
                      "active": phase in ACTIVE_PHASES, "attention": phase == "failed",
                      "history": hist, "sub": None})
