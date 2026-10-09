@@ -323,7 +323,6 @@ hooks|~/.claude/hooks/session-start-live-validation.sh
 hooks|~/.claude/hooks/vault-agent-dispatch-reminder.sh
 docs|~/.ollama-dispatch/proposals/bundle-triage-2026-10-06.md
 docs|~/.ollama-dispatch/proposals/unattended-signoff-by-exception.md
-docs|~/Desktop/GitHub Projects/llm-dispatch/docs/MIGRATION.md
 dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/src
 dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/tests
 dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/docs
