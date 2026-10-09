@@ -82,6 +82,23 @@ an entry launches once, a vanished driver reconciles to `done`/`failed` and is n
 (`requeue` is explicit). Launched like self-heal does: detached `start_new_session`, log
 `auto-runs/logs/<label>-prefetch-<ts>.log`.
 
+## Feeding the backlog (2026-10-09, what registers and what must not)
+
+Registration is explicit and conservative; `cpu-prefetch.register()` is the one entry point (idempotent, never raises,
+never resurrects a done/failed/cancelled entry; `requeue` or `force=True` re-arms). The launch-time gates above stay the
+single authority on whether a registered entry may START.
+
+| New unit of work | Registers? | How |
+|---|---|---|
+| (a) new `ollama-dispatch-auto` run (bundle intent exists, nothing running yet) | YES, on request | `ollama-dispatch-auto <same args> --prefetch` registers the invocation (kind=start) and exits without running a driver. A plain launch registers nothing (it is already running; nothing to prefetch). Needs `--label`. |
+| (b) `dispatch-self-heal.resume_auto_driver` after a passed needs_opus continuation | NO normally; YES only if its immediate launch raised | The resume stays IMMEDIATE: it is a stuck chain whose GPU authoring is already spent, it is capped (2/label/day, 6/day) and a prefetch admission/headroom wait could only make it wait longer. If `launch` raises, the converged harness is handed to the backlog as kind=resume (`deferred:registered`) instead of being lost. |
+| (c) driver died with an authored harness | Operator-vetted | `cpu-prefetch.py candidates` lists argv-recorded runs with an authored harness, no live driver and no `exit 0` chain record (ADVISORY: many have landed; vet each), then `cpu-prefetch.py add --label L --resume`. Never auto-registered: records outlive their work. |
+| (d) slicer-plan slice N+1 | NEVER | N+1 is cut from N's landed tree; the slicer owns the bundle (`slicer_owns` also blocks at launch). |
+
+Never started regardless of registration: held READY-TO-LAND/HARNESS-GO labels (rt-giftcard-ocr-ingest, rt-costco-receipt-attach),
+parked / needs_opus bundles, chains that ended `exit 0` (entry terminal, record gate). Tests: `test-prefetch-register.py`
+(`PREFETCH_REGISTER_OK`), canary seam `prefetchfeed` (6 revert proofs).
+
 ## Operating
 - Deploy: already installed (`~/Library/LaunchAgents/com.example.cpu-prefetch.plist`, StartInterval 60). Nothing
   to restart: not the queue daemon, not the API. After editing the script, nothing either (each pass is a fresh process).

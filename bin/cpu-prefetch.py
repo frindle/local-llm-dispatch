@@ -75,7 +75,11 @@ DEFAULTS = {"max_prep": 2, "target_ready": 3, "load_frac": 0.75, "lane_busy_max"
 BENIGN_PARKS = ("cpu_wait", "yielded")
 HARNESS_FILES = ("TASK.md", "refimpl.py", "verify.sh")
 LIVE_ROW = ("running", "pending", "paused", "needs_opus")
-DRIVER_RE = re.compile(r"ollama-dispatch-auto")
+# The DRIVER process: `[interpreter [-flags]] [dir/]ollama-dispatch-auto ...` -- the script must be what
+# is being EXECUTED. A bare substring match also hit any shell/grep/tail whose command line merely
+# mentioned the tool and a label (found 2026-10-09: the agent shell that registered an entry blocked its
+# own launch as "a driver is already alive").
+DRIVER_RE = re.compile(r"^\s*(?:\S*/)?(?:[Pp]ython[\d.]*(?:\s+-\S+)*\s+)?(?:\S*/)?ollama-dispatch-auto(?:\s|$)")
 
 
 def now_iso(t=None):
@@ -170,6 +174,60 @@ def add_entry(label, argv=None, kind="start", bundle=None, priority=0, cwd=None,
     return e
 
 
+TERMINAL = ("done", "failed", "cancelled")
+
+
+def register(label, argv=None, kind="start", bundle=None, priority=0, source="manual", force=False, **kw):
+    """The ONE registration entry point for automatic callers (ollama-dispatch-auto --prefetch,
+    dispatch-self-heal). Idempotent and failure-tolerant: NEVER raises, returns a status string.
+      registered   new entry written
+      already:<s>  a queued/launched entry exists (second call is a no-op)
+      skip:<s>     entry already finished (done/failed/cancelled): a finished entry is never resurrected
+                   by an automatic caller -- only `requeue` (explicit) or force=True re-arms it
+      error:<why>  could not register (caller must carry on)
+    The launch-time gates in block_reason stay the single authority on whether it may START."""
+    try:
+        old = _read_json(entry_path(label))
+        if isinstance(old, dict):
+            st = old.get("status")
+            if st in ("queued", "launched"):
+                return "already:%s" % st
+            if st in TERMINAL and not force:
+                return "skip:%s" % st
+        e = add_entry(label, argv, kind, bundle, priority, **kw)
+        e["source"] = source
+        _write_json(entry_path(label), e)
+        log_decision({"label": label, "action": "registered", "why": "%s kind=%s bundle=%s"
+                      % (source, kind, e.get("bundle"))})
+        return "registered"
+    except BaseException as ex:    # SystemExit from add_entry's validation included
+        if isinstance(ex, KeyboardInterrupt):
+            raise
+        return "error:%s" % (ex if isinstance(ex, SystemExit) else "%s: %s" % (type(ex).__name__, ex))
+
+
+def candidates():
+    """Read-only advisory: argv-recorded runs whose authored harness sits in an existing worktree, with
+    no live driver, no backlog entry and a chain record that did not end clean (exit 0). Nothing is
+    registered from this list automatically (a record outliving its work is exactly how landed work
+    would be resurrected); the operator vets it and runs `add --label L --resume`."""
+    rows, out = ps_rows() or [], []
+    have = {e["label"] for e in load_entries()}
+    for f in sorted((RUNS / "argv").glob("*.json")) if (RUNS / "argv").is_dir() else []:
+        r = _read_json(f)
+        if not isinstance(r, dict) or not r.get("label") or r["label"] in have:
+            continue
+        wt = r.get("worktree")
+        if not wt or not all((Path(wt) / n).exists() for n in HARNESS_FILES):
+            continue
+        ch = _read_json(RUNS / (safe(r.get("bundle") or r["label"]) + ".json")) or {}
+        rec = (ch.get("runs") or {}).get(r["label"]) or ch
+        if str(rec.get("outcome") or "") == "exit 0" or live_driver(r["label"], r.get("bundle"), rows):
+            continue
+        out.append(r["label"])
+    return out
+
+
 def set_entry(label, **kw):
     p = entry_path(label)
     e = _read_json(p)
@@ -197,7 +255,7 @@ def ps_rows():
 
 
 def _cmd_is_driver(cmd, label=None):
-    if not DRIVER_RE.search(cmd or ""):
+    if not DRIVER_RE.match(cmd or ""):
         return False
     if label is None:
         return True
@@ -553,6 +611,7 @@ def main(argv=None):
     for n in ("hold", "unhold", "cancel", "requeue"):
         sub.add_parser(n).add_argument("label")
     sub.add_parser("status")
+    sub.add_parser("candidates")
     po = sub.add_parser("once")
     po.add_argument("--dry-run", action="store_true")
     ap.add_argument("--once", action="store_true")
@@ -567,6 +626,11 @@ def main(argv=None):
         set_entry(a.label, status="cancelled"); print("cancelled", a.label)
     elif a.cmd == "requeue":
         set_entry(a.label, status="queued"); print("requeued", a.label)
+    elif a.cmd == "candidates":
+        print("# ADVISORY: records outlive their work -- many of these have landed. Vet each, then "
+              "`add --label L --resume`.", file=sys.stderr)
+        for l in candidates():
+            print(l)
     elif a.cmd == "status":
         for e in load_entries():
             print("%-9s %-6s p=%-3s %-40s hold=%s" % (e["status"], e["kind"], e.get("priority"), e["label"], e.get("hold")))

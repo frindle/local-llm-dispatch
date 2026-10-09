@@ -430,6 +430,8 @@ bin|~/bin/cpu_job.py
 bin|~/bin/cpu_lane.py
 bin|~/bin/cpu_stage.py
 bin|~/bin/cpu-prefetch.py
+bin|~/bin/dispatch_env_fixture.py
+bin|~/bin/triage-panel-hook.sh
 bin|~/bin/escalation_verdict.py
 bin|~/bin/cpu_vr_measure.py
 bin|~/bin/dispatch_harness_gates.py
@@ -447,6 +449,9 @@ tests|~/bin/test-bloom-control.py
 tests|~/bin/test-cpu-lane-api.py
 tests|~/bin/test-cpu-lane-queue.py
 tests|~/bin/test-cpu-prefetch.py
+tests|~/bin/test-prefetch-register.py
+tests|~/bin/test-dispatch-env-fixture.py
+tests|~/bin/test-triage-packets.py
 tests|~/bin/test-cpu-stage.py
 tests|~/bin/test-darkbloom-apply.py
 tests|~/bin/test-gate-harness-refine.py

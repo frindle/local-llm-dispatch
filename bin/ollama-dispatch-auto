@@ -6916,6 +6916,12 @@ def main():
                          "self-check (its driver died mid-author) continues AUTHORING on "
                          "the same tree (continuation ladder) instead of being refused. "
                          "The slicer passes this when it resumes such a slice.")
+    ap.add_argument("--prefetch", action="store_true",
+                    help="do NOT run the driver now: register this exact invocation with the CPU "
+                         "prefetch backlog (cpu-prefetch.py) and exit. The prefetcher starts it "
+                         "(scaffold/author/self-check/preflight/relevance) when the GPU runway is short and "
+                         "CPU has headroom, unless the bundle is held/parked/slicer-owned. With "
+                         "--resume-harness it registers a resume (harness already authored).")
     ap.add_argument("--no-auto-continue", action="store_true",
                     help="restore the old human stop at 'HARNESS GO': do NOT confirm + "
                          "re-check + enqueue automatically (default: auto-continue when "
@@ -6925,10 +6931,39 @@ def main():
                     help="do NOT park a failed run in the queue's needs_opus lane "
                          "(tests/interactive use only)")
     a = ap.parse_args()
+    if getattr(a, "prefetch", False):
+        sys.exit(prefetch_register(a, sys.argv[1:]))
     for tool in (SCAFFOLD, PREFLIGHT):
         if not tool.exists():
             die(f"{tool} not found next to this script")
     sys.exit(run_chain(a))
+
+
+def prefetch_register(a, argv, mod=None):
+    """--prefetch: hand this invocation to the CPU-prefetch backlog instead of running it. Returns the
+    exit code (0 registered / already queued / already finished; 2 unusable; 1 registration error).
+    cpu-prefetch.register is the idempotent, never-raising entry point; the launch-time gates there
+    (hold / park / slicer / READY-TO-LAND / live driver / tree lock) stay the only authority on START."""
+    if not getattr(a, "label", None):
+        print("[auto] --prefetch needs --label (the backlog key)", file=sys.stderr)
+        return 2
+    av = [x for x in argv if x != "--prefetch"]
+    resume = RESUME_FLAG in av
+    try:
+        if mod is None:
+            import importlib.util as _ilu
+            _s = _ilu.spec_from_file_location("cpu_prefetch", str(BIN / "cpu-prefetch.py"))
+            mod = _ilu.module_from_spec(_s)
+            _s.loader.exec_module(mod)
+        if resume:
+            st = mod.register(a.label, None, "resume", getattr(a, "bundle", None), source="auto --prefetch")
+        else:
+            st = mod.register(a.label, av, "start", getattr(a, "bundle", None), source="auto --prefetch",
+                              cwd=os.getcwd())
+    except Exception as e:   # pragma: no cover
+        st = "error:%s" % e
+    print(f"[auto] prefetch {a.label}: {st}")
+    return 1 if st.startswith("error") else 0
 
 
 def run_chain(a, do=None, park=None):

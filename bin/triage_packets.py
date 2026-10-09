@@ -134,7 +134,7 @@ def build_packet(sig, rows, entry):
          + (f"   reopened: {entry['reopened_ts']}" if entry.get("reopened_ts") else ""),
          f"- failed jobs with this signature: **{len(rows)}** (first {first.get('ts')}, last {last.get('ts')})",
          "- affected (plan / slice, jobs): " + ", ".join(
-             "`%s / %s` x%d" % (k[0], k[1], n) for k, n in sorted(_where(rows).items())),
+             "`%s / %s` x%d" % (k[0], k[1], n) for k, n in sorted(_where(rows).items(), key=lambda kv: (str(kv[0][0] or ""), str(kv[0][1] or "")))),
          f"- newest: bundle `{bundle}` plan `{plan}` slice `{sid}`", ""]
     L += ["## Why this needs eyes",
           "A repeated signature means the earlier fix (if any) did not address the cause, or the "

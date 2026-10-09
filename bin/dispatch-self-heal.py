@@ -1735,6 +1735,22 @@ def resume_budget(ledger, label, now=None):
     return True, "ok"
 
 
+def prefetch_register(label, kind, why, bundle=None, mod=None):
+    """Register `label` with cpu-prefetch's backlog. Idempotent, never raises; returns a status string."""
+    try:
+        if mod is None:
+            import importlib.util as _ilu
+            _s = _ilu.spec_from_file_location(
+                "cpu_prefetch", str(Path(__file__).resolve().parent / "cpu-prefetch.py"))
+            mod = _ilu.module_from_spec(_s)
+            _s.loader.exec_module(mod)
+        return mod.register(label, None, kind, bundle, source="self-heal: " + why)
+    except BaseException as e:
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        return "error:%s" % type(e).__name__
+
+
 def resume_auto_driver(job, cid, ledger_path=None, runs_dir=None, launch=None, now=None,
                        decisions=None, slice_runs=None, alive=None, notifier=None):
     """After continuation `cid` of needs_opus auto-author `job` PASSED: relaunch its
@@ -1797,7 +1813,19 @@ def resume_auto_driver(job, cid, ledger_path=None, runs_dir=None, launch=None, n
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
     log = Path(runs_dir or AUTO_RUNS) / "logs" / ("%s-resume-%s.log" % (run_label, ts))
     cwd = rec.get("cwd") if rec.get("cwd") and Path(rec["cwd"]).is_dir() else str(Path.home())
-    pid = launch(cmd, cwd, log)
+    try:
+        pid = launch(cmd, cwd, log)
+    except Exception as e:
+        # The immediate relaunch failed (fork/disk/permission). Do not lose the converged harness:
+        # hand it to the CPU-prefetch backlog, which retries it under its own gates (single authority
+        # on whether it may start). Never raises into the sweep.
+        st = prefetch_register(run_label, "resume", "self-heal resume launch failed: %s" % e,
+                               bundle=job.get("bundle"))
+        log_decision(job.get("bundle") or "job", lbl, "resume-driver", "deferred",
+                     "relaunch of %s failed (%s: %s); prefetch backlog: %s"
+                     % (run_label, type(e).__name__, e, st), path=decisions)
+        return "deferred:%s" % st
+    # the immediate path stays the default: a stuck chain must not wait on prefetch admission/headroom
 
     def _add(jl):
         jl.setdefault("resumes", []).append({
