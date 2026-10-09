@@ -2141,6 +2141,11 @@ def drop_gate_hook(job_id, hooks=None):
         pass
 
 
+class _SettlingIds(list):
+    """Job ids of a bundle's settling gate hooks; `.since` = the earliest hook start (epoch)."""
+    since = None
+
+
 def gate_hooks_settling(now=None, hooks=None, spawn_grace=None, ceiling=None):
     """{bundle: [job_id, ...]} of gate-on-complete hooks still running (or registered
     and about to spawn). Reaps finished ones (poll() also collects the zombie) and
@@ -2168,7 +2173,11 @@ def gate_hooks_settling(now=None, hooks=None, spawn_grace=None, ceiling=None):
             hooks.pop(jid, None)
             continue
         if rec.get("bundle") is not None:
-            out.setdefault(rec["bundle"], []).append(jid)
+            _l = out.setdefault(rec["bundle"], _SettlingIds())
+            _l.append(jid)
+            _at = float(rec.get("at") or 0.0) or None
+            if _at and (_l.since is None or _at < _l.since):
+                _l.since = _at
     return out
 
 
@@ -2442,8 +2451,17 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
         return "waiting", (f"waiting on {len(cpu_wait)} CPU stage(s) "
                            f"({', '.join(str(x)[:12] for x in list(cpu_wait)[:3])}) -- holds no GPU lane"), False
     if settling:
-        return "working", (f"gate-on-complete still writing the verdict for "
-                           f"{', '.join(str(x) for x in list(settling)[:3])}"), True
+        # GATE-SETTLE GAP (2026-10-09, rt-bg-commitments-guard): the verdict hook runs OFF the
+        # Studio lane (Unraid/CPU). Past SLICER_GAP_YIELD_S with no GPU row the bundle holds no
+        # lane: bundle_commit_step parks it (cpu_wait) and it is re-committed FIRST the moment
+        # its verdict enqueues a refine/next row (or unparked when it completes).
+        _ids = ', '.join(str(x) for x in list(settling)[:3])
+        _gs = getattr(settling, "since", None)
+        _gg = ((time.time() if now is None else now) - _gs) if _gs else 0.0
+        if SLICER_GAP_YIELD_S > 0 and _gs and _gg >= SLICER_GAP_YIELD_S:
+            return "waiting", (f"waiting for gate verdict of {_ids} ({_gg:.0f}s, runs off-lane) "
+                               f"-- holds no GPU lane"), False
+        return "working", f"waiting for gate verdict of {_ids} (runs off-lane)", True
     if plan.get("driver_live"):
         # SLICER GAP (2026-10-09): nothing running, no live row, no gate settling -- the advance is
         # CPU/driver work. Past SLICER_GAP_YIELD_S it holds no GPU lane (the owner: the GPU must not wait on
@@ -3113,10 +3131,15 @@ def wait_note(code, short, sentence=None, waiting_on=None):
             "waiting_on": waiting_on or {"kind": code, "detail": short}}
 
 
-def focus_wait_note(active, why, committed, backfill_ok_note="", next_job=None):
+def focus_wait_note(active, why, committed, backfill_ok_note="", next_job=None, holder=None):
     """PURE. The note for a job skipped because a bundle owns the lanes, built from the
     SAME `_active_why` string the focus log line uses (bundle_incomplete's text)."""
     why = str(why or "")
+    if why.startswith("complete") and not next_job:
+        # bundle_incomplete says "complete" (no queued rows left): never print that bare -- say
+        # what the commitment is really waiting for (gate verdict / grace), or that nothing is.
+        _h = str(holder or "").strip()
+        why = (_h + " (no queued rows)") if _h else "no queued rows -- commitment releasing"
     kind = "slicer" if why.startswith(("slicer advance", "chain driver", "chain ")) \
         or "slice(s) still owned by the slicer" in why else "bundle"
     if kind == "slicer":
@@ -13952,7 +13975,10 @@ def cmd_run(args):
                                     None) if _active is not None else None
             _focus_wait_note = (focus_wait_note(_active, _active_why, _commit_key is not None,
                                                 backfill_focus_note(_backfill_ok, _commit_key),
-                                                _next_launchable) if _active is not None else None)
+                                                _next_launchable,
+                                                holder=(state.get("_bundle_commit") or {}).get("holder")
+                                                if _commit_key is not None else None)
+                                 if _active is not None else None)
             # WIP-minimizing priority: consider follow-ups (gate/regate/auto-refine/
             # auto-fix rounds) before fresh work. Within a tier this is the SAME
             # order the loop used to walk, so model-swap minimization and lane

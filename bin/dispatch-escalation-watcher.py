@@ -200,8 +200,29 @@ def is_superseded(plan, sid, known_plans):
     return bool(plan) and bool(sid) and ("%s-%s" % (plan, sid)) in (known_plans or set())
 
 
-def detect_slice_escalations(state, plan, known_plans=None):
-    """Sources A and B over one loaded slice-run state. Pure; no I/O."""
+_AUTHOR_LABEL_PREFIXES = ("auto-author-", "auto-refine-", "auto-fix-", "auto-")
+_LIVE_ROW_STATUSES = ("running", "queued", "pending", "scheduled", "held", "paused", "planned")
+
+
+def has_active_author_row(plan, sid, queue_rows):
+    """True when the queue holds a LIVE (pending/running/held...) authoring/refine row for
+    this slice -- i.e. a replacement is already healing it. `queue_rows` = parse_queue_status
+    dicts. esc-review-/gate-/regate- rows never count (a review is not a replacement)."""
+    stem = "%s-%s" % (plan, sid)
+    for r in queue_rows or ():
+        lab = str(r.get("label") or "")
+        st = str(r.get("status") or "").strip().lower()
+        if st in _LIVE_ROW_STATUSES and lab.startswith(_AUTHOR_LABEL_PREFIXES) and stem in lab:
+            return True
+    return False
+
+
+def detect_slice_escalations(state, plan, known_plans=None, queue_rows=None):
+    """Sources A and B over one loaded slice-run state. Pure; no I/O.
+    `queue_rows` (optional, parse_queue_status dicts): source B (attempt-count heuristic) is
+    SUPPRESSED while a live authoring row for the slice exists -- the cumulative attempt count
+    is not reset by a re-spec/resolve, so 2026-10-09 aw-codec-floor/s2 was reviewed while its
+    replacement job sat pending (the old failed rows already resolved)."""
     found = []
     slices = (state or {}).get("slices") or {}
     if not isinstance(slices, dict):
@@ -228,6 +249,8 @@ def detect_slice_escalations(state, plan, known_plans=None):
                 "slice": s,
             })
         elif status in UNSATISFIED_LOOPABLE and attempts >= ATTEMPTS_ESCALATE:
+            if queue_rows is not None and has_active_author_row(plan, sid, queue_rows):
+                continue
             found.append({
                 "source": "B",
                 "kind": "slice",
@@ -2390,7 +2413,9 @@ def run_once(dry_run=False):
             continue    # a HUMAN cancel is terminal: nothing to review or self-heal
         if isinstance(st, dict):
             try:
-                found += detect_slice_escalations(st, p.stem, known)
+                found += detect_slice_escalations(
+                    st, p.stem, known,
+                    queue_rows=(parse_queue_status(_qtext) if _qtext else None))
             except Exception:
                 pass
             # Contained separately: source E must not be able to take source A
@@ -2787,6 +2812,13 @@ def self_test():
     st = {"slices": {"s5": {"status": "pending", "author_attempts": ATTEMPTS_ESCALATE - 1}}}
     check("B silent below threshold", detect_slice_escalations(st, "p") == [])
     st = {"slices": {"s5": {"status": "done", "author_attempts": 99}}}
+    _bst = {"slices": {"s2-x": {"status": "pending", "author_attempts": 9}}}
+    check("B fires with no queue info", len(detect_slice_escalations(_bst, "aw")) == 1)
+    check("B suppressed while an auto-author replacement is pending", detect_slice_escalations(
+        _bst, "aw", queue_rows=[{"status": "pending", "label": "auto-author-aw-s2-x-s1"}]) == [])
+    check("B NOT suppressed by an esc-review row or a finished author row", len(detect_slice_escalations(
+        _bst, "aw", queue_rows=[{"status": "pending", "label": "esc-review-2026-aw-s2-x"},
+                                {"status": "failed", "label": "auto-author-aw-s2-x-s1"}])) == 1)
     check("B never fires on a satisfied slice", detect_slice_escalations(st, "p") == [])
     st = {"slices": {"s5": {"status": "skipped", "author_attempts": 99}}}
     check("B never fires on a skipped slice", detect_slice_escalations(st, "p") == [])

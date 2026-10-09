@@ -118,6 +118,7 @@ tests|~/bin/test-auto-park-escalate.py
 tests|~/bin/test-auto-refine-batching.py
 tests|~/bin/test-auto-routing-fallback.py
 tests|~/bin/test-slicer-gap-yield.py
+tests|~/bin/test-gate-settle-yield.py
 tests|~/bin/test-auto-resume-driver.py
 tests|~/bin/test-auto-skip.py
 tests|~/bin/test-auto-stale-restart.py
