@@ -258,6 +258,16 @@ def eligibility(wt, cmd, cwd_rel=None, shipped_extra=()):
                 texts[n] = p.read_text(errors="replace")
             except OSError:
                 pass
+    for _ft in sorted(wt.glob("verify.test.*")):
+        try:
+            _s = _ft.read_text(errors="replace")
+        except OSError:
+            continue
+        if re.search(r"\bmock\.module\(", _s):
+            # 2026-10-09 (rt-walmart-cancel-import): the runner has node 22, whose mock.module takes
+            # namedExports/defaultExport; these fixtures use the node 23+ `{ exports }` shape, so every
+            # case 500s on the runner while passing on the host (node 26). Keep these stages local.
+            return False, "%s uses node:test mock.module (runner node 22 API differs from host node 26)" % _ft.name
     for n, t in texts.items():
         # comments are not behaviour: drop whole-line comments before scanning
         t = "\n".join(l for l in t.splitlines() if not l.lstrip().startswith(("#", "//")))
@@ -336,6 +346,12 @@ def remote_cmd(cmd, rewrite=True, group=False, harness=False):
         # diff" (rc=3) for every creation task. Restore the shipped copy at the checkout root.
         pre += ('_r=$(git rev-parse --show-toplevel 2>/dev/null); [ -n "$_r" ] && [ ! -e "$_r/.dispatch-harness.json" ] '
                 '&& cp "$JOB_TOOLS/bin/dispatch-harness.json" "$_r/.dispatch-harness.json"; ')
+    if "auto-harness-check.py" in (cmd if isinstance(cmd, str) else " ".join(cmd)):
+        # auto-harness-check.py is git-excluded too (info/exclude), so the snapshot never carries it:
+        # on the runner `python3 auto-harness-check.py` died "No such file" (rc=2) and --resume-harness
+        # refused a converged harness. Restore the shipped copy at the checkout root.
+        pre += ('_r=$(git rev-parse --show-toplevel 2>/dev/null); [ -n "$_r" ] && [ ! -e "$_r/auto-harness-check.py" ] '
+                '&& cp "$JOB_TOOLS/bin/auto-harness-check.py" "$_r/auto-harness-check.py"; ')
     if rewrite:
         hb = shlex.quote(HOST_BIN + "/")
         pre += ('for _f in $(grep -lIsF %s ./* 2>/dev/null); do '
@@ -435,6 +451,12 @@ def run_stage(wt, cmd, timeout_s, stage, bundle_id, local_fn, *, tools=None, env
             if hf.is_file() and "bin/dispatch-harness.json" not in xt:
                 try:
                     xt["bin/dispatch-harness.json"] = hf.read_bytes()
+                except OSError:
+                    pass
+            ahc = Path(wt) / "auto-harness-check.py"
+            if ahc.is_file() and "bin/auto-harness-check.py" not in xt and "auto-harness-check.py" in str(cmd):
+                try:
+                    xt["bin/auto-harness-check.py"] = ahc.read_bytes()
                 except OSError:
                     pass
             full = pre + remote_cmd(cmd, group=gzb64, harness="bin/dispatch-harness.json" in xt) + (GZB64_SUFFIX if gzb64 else "")
