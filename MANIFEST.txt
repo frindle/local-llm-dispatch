@@ -462,6 +462,7 @@ tests|~/bin/test-sampling-ladder.py
 tests|~/bin/test-esc-review-bounds.py
 tests|~/bin/test-phase2-replay-corpus.py
 tests|~/bin/test-preflight-harness-gates.py
+tests|~/bin/test-worker-fanout-guard.py
 tests|~/bin/test-selfcheck-hang.py
 tests|~/bin/test-slice-spec-satisfiability.py
 tests|~/bin/test-worker-robust.py

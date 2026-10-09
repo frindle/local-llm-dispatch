@@ -6788,6 +6788,8 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             "2 aborts on the same failing check -> spec_defect_repeat_abort.")
     _ladder_exit = None
     _rev_abort = None             # (named reason, detail) once a review bound trips; ends the run at the next turn top
+    _fan_guard = _wr.TurnFanoutGuard(cap=MAX_TOOL_CALLS_PER_TURN)   # ALL task kinds (job c8f4f6ed95c1)
+    _fan_abort = None             # (named reason, detail) once the fan-out / past-EOF guard says stop
     _stop_gate_fails = 0
     _STOP_GATE_MAX = int(_rb.get("stop_gate_max", 3))
     _stop_gate_exhausted = False
@@ -7836,7 +7838,23 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         if isinstance(tool_calls, list) and len(tool_calls) > MAX_TOOL_CALLS_PER_TURN:
             log(f"[worker] per-turn tool-call fan-out cap: {len(tool_calls)} calls in "
                 f"one turn, truncating to {MAX_TOOL_CALLS_PER_TURN}")
+            _fan_v = _fan_guard.on_turn(len(tool_calls))
             tool_calls = tool_calls[:MAX_TOOL_CALLS_PER_TURN]
+            # Keep the stored assistant message consistent with what actually ran (tool results exist
+            # only for the executed calls), then name the offence and hand the model a corrective.
+            if isinstance(msg.get("tool_calls"), list) and len(msg["tool_calls"]) > MAX_TOOL_CALLS_PER_TURN:
+                msg["tool_calls"] = msg["tool_calls"][:MAX_TOOL_CALLS_PER_TURN]
+            _dispatch_metrics["tool_fanout_offences"] = _fan_guard.offences
+            if _fan_v:
+                if _fan_v[0] == "warn":
+                    loop_break_notes.append(_fan_v[2])
+                elif _fan_abort is None:
+                    _fan_abort = (_fan_v[1], _fan_v[2])
+                # Sampling ladder (A/B arm, default OFF): a runaway turn is an abort step. Inert when
+                # the arm is off (on_abort returns ("off", None)).
+                _lad = _ladder.on_abort("tool_fanout")
+                if _lad[0] == "exit" and _fan_abort is None:
+                    _fan_abort = (_lad[1], "sampling ladder: " + _fan_v[2])
         for tc in tool_calls:
             fn = tc.get("function", {})
             name = fn.get("name")
@@ -8238,6 +8256,18 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                                f'{{"path":"{args.get("path")}","offset":{_nxt},"length":300}} '
                                f"to advance, or use run_bash with grep to find a specific line "
                                f"number first and read around that offset.]")
+            # Past-EOF read counter (all task kinds): the refusal itself is in _paginate_read; here the
+            # consecutive occurrences are counted toward the named stop (read_past_eof_loop).
+            try:
+                _eof_v = _fan_guard.on_call(name, _wr.is_past_eof_result(result))
+            except Exception:
+                _eof_v = None
+            if _eof_v:
+                _dispatch_metrics["read_past_eof_streak"] = _fan_guard.eof_streak
+                if _eof_v[0] == "warn":
+                    loop_break_notes.append(_eof_v[2])
+                elif _fan_abort is None or _fan_abort[0] == _wr.REASON_TOOL_FANOUT:
+                    _fan_abort = (_eof_v[1], _eof_v[2])    # the more specific label wins
             # Tell the model what it sent that the tool does not accept. Appended
             # AFTER the call so the result is unchanged when nothing is unknown,
             # and so a stray key never costs the call itself.
@@ -8439,6 +8469,15 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 f"{_stop_gate_fails} times by the stop-gate (required file / must-contain literal "
                 f"still missing) -- {_wr.REASON_STOPGATE}.")
             _dispatch_metrics["early_abort"] = _wr.REASON_STOPGATE
+            break
+
+        # PER-TURN FAN-OUT / PAST-EOF STOP (worker_robust.TurnFanoutGuard), every task kind. Checked
+        # BEFORE the loop detector so a runaway turn is labelled specifically, not as a generic nav_loop.
+        if _fan_abort and not paused_for_review:
+            log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: {_fan_abort[1]} -- {_fan_abort[0]}. "
+                f"Stopping instead of burning iterations; the scheduler should re-sample / re-spec, "
+                f"not blind-retry.")
+            _dispatch_metrics["early_abort"] = _fan_abort[0]
             break
 
         # LOOP DETECTOR (worker_robust.LoopDetector): repeated identical reads / writes, A->B->A

@@ -5837,6 +5837,7 @@ def _log_tail(log_path, nbytes=_FAILURE_SCAN_BYTES):
     """The last `nbytes` of a job log as text, '' when unreadable."""
     if not log_path:
         return ""
+                                      "tool_fanout_loop", "read_past_eof_loop",
     try:
         with open(log_path, "rb") as f:
             f.seek(0, 2)
