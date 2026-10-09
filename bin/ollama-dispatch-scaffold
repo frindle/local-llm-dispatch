@@ -3560,6 +3560,19 @@ def freeze_literals(root: Path):
     for fpath, l in lits:
         where = f" (in {fpath})" if fpath else ""
         print(f"  {l!r}{where}")
+    # HARNESS LINT at TASK authoring (2026-10-09): flag a literal the base code spells differently
+    # ("did you mean") before any model round is spent on it. Advisory here (exit stays 0): the
+    # authoring driver re-runs the same lint at every stage / continuation entry and stops on it.
+    try:
+        import importlib.util as _ilu
+        _sp = _ilu.spec_from_file_location("harness_lint", Path(__file__).resolve().parent / "harness_lint.py")
+        _m = _ilu.module_from_spec(_sp)
+        _sp.loader.exec_module(_m)
+        _fs = _m.run_lint(root, quick=True)
+        for _line in (_m.format_findings(_fs).split("; SPEC_DEFECT: ") if _fs else []):
+            print("  LINT: " + (_line if _line.startswith("SPEC_DEFECT") else "SPEC_DEFECT: " + _line))
+    except Exception as _e:                                  # noqa: BLE001 - lint must never fail a freeze
+        print(f"  (harness-lint skipped: {type(_e).__name__}: {_e})", file=sys.stderr)
     return 0
 
 

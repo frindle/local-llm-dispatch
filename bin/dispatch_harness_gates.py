@@ -524,6 +524,148 @@ def refimpl_base_anchor_findings(wt, target, refimpl_text: str, ref: str = "HEAD
             for a in anchors if a not in blob]
 
 
+# ---------------------------------------------------------------------------
+# LITERAL LINT (2026-10-09, rt-walmart-cancel-import)
+# ---------------------------------------------------------------------------
+# A `## Must contain` literal that the base file spells slightly differently
+# (`normalize(orderNumber)` vs the real `normalize(r.orderNumber)` /
+# `normalize(s.orderNumber)`) can never be satisfied by a refimpl that edits the real
+# call sites, and the authoring model burns whole rounds chasing it. Three pure gates:
+#   (a) literal_near_miss / literal_near_miss_findings -- at authoring (s1) and on stage
+#       entry: a literal ABSENT from the file at HEAD whose nearest existing line equals it
+#       up to INSERTED/DROPPED characters (a qualifier like `r.`) is a spec defect, with a
+#       "did you mean" message. Substitutions (`= true` vs `= false`) are NOT near-misses:
+#       that is exactly the shape of a legitimate new literal.
+#   (b) refimpl_literal_gap_findings -- with the refimpl applied, every literal must be
+#       present; otherwise the stage failure is a spec defect, not nonconvergence.
+#   (c) missing_literals_in_text / repeat_missing_literals -- two consecutive failed rounds
+#       carrying the IDENTICAL non-empty missing-literal set: re-spec/park, no third round.
+LITERAL_NEAR_MISS = "LITERAL_NEAR_MISS"
+REFIMPL_LITERAL_ABSENT = "REFIMPL_LITERAL_ABSENT"
+REPEAT_MISSING_LITERALS = "REPEAT_MISSING_LITERALS"
+_NEAR_MISS_MIN_LEN = 8
+_NEAR_MISS_MIN_RATIO = 0.8
+_NEAR_MISS_MAX_EDIT = 16        # inserted/dropped chars tolerated between literal and line
+
+
+def literal_near_miss(lit: str, body: str):
+    """PURE. (line_no, line_text, window) of the existing line that contains `lit` up to a
+    pure insertion/deletion of characters (never a substitution), else None. A literal that
+    occurs verbatim is not a near miss. Short literals (<8 chars) never qualify: a short
+    token is too likely to be a coincidental subsequence."""
+    import difflib
+    lit = str(lit or "")
+    if len(lit.strip()) < _NEAR_MISS_MIN_LEN or not body or count_occurrences(lit, body):
+        return None
+    best = None
+    for i, line in enumerate(body.splitlines(), 1):
+        if len(line) < _NEAR_MISS_MIN_LEN // 2 or len(line) > 4000:
+            continue
+        # cheap prefilter: the literal's first and last significant char must occur
+        if lit[0] not in line or lit[-1] not in line:
+            continue
+        sm = difflib.SequenceMatcher(None, lit, line, autojunk=False)
+        # candidate windows start where the literal's opening run matches
+        for a0 in sorted({b.b for b in sm.get_matching_blocks() if b.size >= 3})[:12]:
+            win = line[a0:a0 + len(lit) + _NEAR_MISS_MAX_EDIT]
+            w = difflib.SequenceMatcher(None, lit, win, autojunk=False)
+            ops = [o for o in w.get_opcodes() if o[0] != "equal"]
+            if not ops or any(o[0] == "replace" for o in ops):
+                continue
+            # trailing text of the window beyond the last match is not part of the miss
+            last_eq = max((o[4] for o in w.get_opcodes() if o[0] == "equal"), default=0)
+            first_eq = min((o[3] for o in w.get_opcodes() if o[0] == "equal"), default=0)
+            used = win[first_eq:last_eq]
+            if lit[0] != used[:1] or lit[-1] != used[-1:]:
+                continue
+            ed = sum(max(o[2] - o[1], o[4] - o[3]) for o in w.get_opcodes()
+                     if o[0] in ("insert", "delete") and o[3] >= first_eq and o[4] <= last_eq)
+            if ed == 0 or ed > _NEAR_MISS_MAX_EDIT:
+                continue
+            ratio = difflib.SequenceMatcher(None, lit, used, autojunk=False).ratio()
+            if ratio < _NEAR_MISS_MIN_RATIO:
+                continue
+            # the literal must be an ordered subsequence of the used window (insert-only)
+            it = iter(used)
+            if not all(ch in it for ch in lit):
+                if not (len(used) < len(lit)):
+                    continue
+            cand = (ratio, i, line.strip(), used)
+            if best is None or cand[0] > best[0]:
+                best = cand
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
+
+
+def literal_near_miss_findings(wt, task_text: str, target, refimpl_text: str = "", ref: str = "HEAD"):
+    """[finding] -- (a) every REAL `## Must contain` literal absent from its file at `ref`
+    whose nearest existing line is a near miss. A literal the refimpl text itself spells
+    (it introduces it on purpose) is skipped."""
+    out = []
+    for f, lit in must_contain_literals(task_text):
+        path = f or target or ""
+        if not path:
+            continue
+        body = blob_at(wt, path, ref)
+        if body is None or count_occurrences(lit, body):
+            continue
+        if refimpl_text and lit in refimpl_text:
+            continue
+        nm = literal_near_miss(lit, body)
+        if nm is None:
+            continue
+        ln, line, win = nm
+        out.append(_finding(
+            LITERAL_NEAR_MISS, "Must-contain literal near-misses the base code", path,
+            f"`{lit}` occurs 0 times in {path} @ {ref}, but line {ln} has `{win}` -- did you "
+            f"mean `{win}`? Fix the literal in TASK.md (the real call sites are spelled that "
+            f"way) or drop it; no refimpl that edits the real code can add the "
+            f"misspelled form. Line {ln}: {line[:140]}"))
+    return out
+
+
+def refimpl_literal_gap_findings(pairs, texts_by_file, default_text: str = ""):
+    """[finding] -- (b) literals absent from the refimpl-APPLIED tree. `pairs` =
+    must_contain_literals(); `texts_by_file` {path: applied text}; unpinned literals are
+    checked against `default_text`."""
+    gap = []
+    for f, lit in pairs or []:
+        body = texts_by_file.get(f, "") if f else default_text
+        if not count_occurrences(lit, body or ""):
+            gap.append((f, lit))
+    if not gap:
+        return []
+    names = ", ".join(repr(l) for _f, l in gap[:6])
+    return [_finding(
+        REFIMPL_LITERAL_ABSENT, "Must-contain literal absent after the refimpl is applied", "TASK.md",
+        f"{len(gap)} literal(s) are absent from the refimpl-applied tree: {names}. The spec and "
+        f"the reference impl disagree; another model round cannot fix a literal the refimpl "
+        f"never writes -- correct the spec (or the refimpl) deterministically.")]
+
+
+_MISSING_LIT_RE = re.compile(r"MISSING literal in (\S+) \([^\n]*?\):\s*>>>(.*?)<<<")
+
+
+def missing_literals_in_text(text: str):
+    """PURE. frozenset of (file, literal) from check_literals.py's `MISSING literal in <file>
+    (... >>>LIT<<<)` lines in a self-check / worker log."""
+    return frozenset((m.group(1), m.group(2)) for m in _MISSING_LIT_RE.finditer(text or ""))
+
+
+def repeat_missing_literals(prev, cur):
+    """PURE. True when two consecutive failed rounds carry the identical NON-EMPTY missing-literal
+    set: the same literal(s) defeated a whole model round twice -- stop spending rounds."""
+    return bool(prev) and bool(cur) and frozenset(map(tuple, prev)) == frozenset(map(tuple, cur))
+
+
+def format_repeat_missing(cur) -> str:
+    names = ", ".join(repr(l) for _f, l in sorted(cur)[:6])
+    return (f"{SPEC_DEFECT_PREFIX}Must-contain literal(s) never satisfied: two consecutive "
+            f"rounds failed on the identical missing-literal set ({names}) -- re-spec or park; "
+            f"another model round will not change it")
+
+
 def spec_defects(wt, target=None, creation=None, intent_text="", task_text="", refimpl_text=None,
                  verify_green=None, ref: str = "HEAD"):
     """THE CONTRADICTION GATE. [finding] where each finding is
@@ -548,6 +690,7 @@ def spec_defects(wt, target=None, creation=None, intent_text="", task_text="", r
     if creation and refimpl_text:
         out += refimpl_base_anchor_findings(wt, target, refimpl_text, ref)
     out += already_satisfied_findings(wt, task, target, verify_green, ref)
+    out += literal_near_miss_findings(wt, task, target, refimpl_text or "", ref)
     return out
 
 

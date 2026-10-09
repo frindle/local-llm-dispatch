@@ -475,3 +475,8 @@ bin|~/bin/budget-policy-ab.md
 tests|~/bin/test-worker-budget-policy.py
 tests|~/bin/test-esc-review-bundle.py
 docs|~/Desktop/GitHub Projects/machine-config/docs/budget-policies.md
+bin|~/bin/harness_lint.py
+bin|~/bin/harness-lint
+tests|~/bin/test-literal-lint.py
+tests|~/bin/test-harness-lint.py
+tests|~/bin/test-harness-operator-edit-survives.py

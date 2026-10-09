@@ -1043,7 +1043,59 @@ for _f in (git("diff", "--name-only", "HEAD").stdout.splitlines()):
         pass
 
 
+# OPERATOR EDITS SURVIVE THE CHECK (2026-10-09, rt-walmart-cancel-import): this check
+# runs for minutes (refimpl + npm test) and revert() replayed the pre-check bytes of
+# EVERY untracked/dirty file it had snapshotted -- including TASK.md / check_literals.py /
+# refimpl.py / verify.sh, which the check never modifies. A hand-edit made in that window
+# (the owner removed the unsatisfiable literal `normalize(orderNumber)` and re-froze) was
+# silently reverted at the end of the check, two rounds running. The harness files are now
+# restored ONLY when their on-disk bytes are still what the check itself last left there
+# (_known, refreshed by _note() after each step that can clobber them); a file that changed
+# since is somebody else's edit and is left alone. Non-harness files (the target, a
+# creation stub, a dirty schema) keep the unconditional restore.
+import fnmatch as _pfnm
+import hashlib
+_PROTECT_NAMES = {"TASK.md", "verify.sh", "refimpl.py", "check_literals.py",
+                  "auto-harness-check.py", "AUTO-TASK.md", ".dispatch-harness.json",
+                  "dispatch-env.ts", "dispatch_env.py"}
+
+
+def _protected(f):
+    return (Path(f).name in _PROTECT_NAMES
+            or any(_pfnm.fnmatch(f, _g) for _g in _FIXTURE_GLOBS))
+
+
+def _sha_of(p):
+    try:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+# every protected file present NOW (tracked-and-clean ones too: a sealed slice tree commits the
+# harness, and `git checkout -- .` would wipe an operator's uncommitted edit to a tracked file)
+_known = {}
+for _f in set(pre_tracked) | set(pre_snap) | set(git("ls-files").stdout.splitlines()):
+    if _protected(_f) and (WT / _f).is_file():
+        _known[_f] = _sha_of(WT / _f)
+
+
+def _note():
+    for _f in list(_known):
+        _known[_f] = _sha_of(WT / _f)
+
+
 def revert():
+    # A protected file whose bytes are no longer what the check last left was edited by
+    # somebody else: capture it BEFORE `git checkout -- .` and put it back last.
+    _keep = {}
+    for _f, _h in _known.items():
+        _p = WT / _f
+        if _p.is_file() and _sha_of(_p) != _h:
+            try:
+                _keep[_f] = _p.read_bytes()
+            except OSError:
+                pass
     # Restore tracked files (the stub target); delete only files the refimpl
     # created (untracked and not present before). The untracked HARNESS files
     # are in `pre`, so they are preserved.
@@ -1064,6 +1116,8 @@ def revert():
     # restore is irrelevant to ordering, but keep it here so both snapshots are
     # replayed after the checkout.
     for f, data in pre_tracked.items():
+        if f in _keep:
+            continue
         p = WT / f
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -1072,10 +1126,17 @@ def revert():
             pass
     # Restore pre-existing untracked files refimpl clobbered (creation-task stub).
     for f, data in pre_snap.items():
+        if f in _keep:
+            continue
         p = WT / f
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(data)
+        except OSError:
+            pass
+    for f, data in _keep.items():
+        try:
+            (WT / f).write_bytes(data)
         except OSError:
             pass
 
@@ -1142,6 +1203,7 @@ for _f in list(pre_tracked):
             _fnm.fnmatch(_f, _g) for _g in _FIXTURE_GLOBS):
         continue
     git("checkout", "HEAD", "--", _f)
+_note()
 r = sh("bash verify.sh")
 if _hung(r):
     revert()
@@ -1171,6 +1233,7 @@ if r.returncode == 0 and "VERIFY_OK" in r.stdout:
 _secf = []
 try:
     r = sh("python3 refimpl.py")
+    _note()
     if r.returncode != 0:
         fail("refimpl.py errored: " + (r.stderr.strip()[-400:] or r.stdout.strip()[-400:]))
     r = sh("bash verify.sh")
@@ -3929,6 +3992,11 @@ def survivors_of(data):
 # the fail-loud behaviour the contamination refusal was added to provide.
 # Non-convergence IS a legitimate slicing signal and still routes as before.
 CONTAMINATED_PREFIX = "CONTAMINATED: "
+# A SPEC_DEFECT found mid-authoring (literal lint: a Must-contain literal that near-misses the
+# base code, or the identical missing-literal set two rounds running) is the SPEC's fault: it
+# dies with the `SPEC_DEFECT: ` line the slicer re-specs on -- never auto-sliced, never a
+# further model round (same destination as the pre-dispatch contradiction gate).
+SPEC_DEFECT_ROUTE_PREFIX = "SPEC_DEFECT: "
 
 
 def _failure_route(why: str) -> str:
@@ -3949,7 +4017,8 @@ def _failure_route(why: str) -> str:
     # BASELINE-GREEN: an already-true property does not get truer in smaller
     # pieces -- park visibly; the slicer reads the self-check's own FAIL line.
     return ("die" if (why or "").startswith((CONTAMINATED_PREFIX, HARNESS_ENV_PREFIX,
-                                             BASELINE_GREEN_PREFIX, PLAN_SUSPECT_PREFIX))
+                                             BASELINE_GREEN_PREFIX, PLAN_SUSPECT_PREFIX,
+                                             SPEC_DEFECT_ROUTE_PREFIX))
             else "autoslice")
 
 
@@ -4463,6 +4532,83 @@ def harness_env_failure(check):
     return None
 
 
+def literal_lint_precheck(wt, target, stage=None):
+    """HARNESS LINT at authoring / every stage + continuation entry (2026-10-09): '' or a
+    `SPEC_DEFECT: ...` line from ~/bin/harness_lint.py (QUICK mode: literal near-miss "did you
+    mean", scope/literal consistency, stale spec in the pending prompt, identical-failure retry
+    accounting) so a failing spec never costs a model run. The refimpl-applied literal proof and the
+    contract run live in preflight / `harness-lint --full`. Fail-open."""
+    try:
+        import importlib.util as _ilu
+        _sp = _ilu.spec_from_file_location("harness_lint", BIN / "harness_lint.py")
+        _m = _ilu.module_from_spec(_sp)
+        _sp.loader.exec_module(_m)
+        fs = _m.run_lint(wt, target=target, quick=True)
+        return _m.format_findings(fs) if fs else ""
+    except Exception:
+        return ""
+
+
+def _stamp_attempt(a, job, **kv):
+    """Merge `kv` into the attempt record keyed `job` (no-op when absent). Never raises."""
+    try:
+        p = attempts_path(a, None)
+        if not p or not job:
+            return
+        hist = load_attempts(a, None)
+        for h in hist:
+            if h.get("job") == job:
+                h.update(kv)
+                tmp = p.with_name(p.name + ".tmp")
+                tmp.write_text(json.dumps(hist, indent=1))
+                os.replace(tmp, p)
+                return
+    except Exception:
+        pass
+
+
+def missing_literal_round(a, job, text):
+    """LITERAL LINT (c): note the missing-literal set of the round that just failed on its
+    attempt record and say whether the PREVIOUS failed round carried the identical non-empty
+    set. Returns (repeat: bool, cur: frozenset). `text` = the self-check output / worker log."""
+    hg = _hg()
+    if hg is None:
+        return False, frozenset()
+    cur = hg.missing_literals_in_text(text)
+    prev = None
+    try:
+        for h in reversed(load_attempts(a, None)):
+            if h.get("job") != job:
+                prev = h.get("missing_literals")
+                break
+    except Exception:
+        prev = None
+    _stamp_attempt(a, job, missing_literals=sorted([list(x) for x in cur]))
+    return hg.repeat_missing_literals(prev or [], cur), cur
+
+
+def last_verify_block(log_text):
+    """PURE. The text of the LAST `[worker] verify stdout:` block of a worker log (up to the next
+    `[worker]` line): the worker's own final run of the self-check, i.e. the refimpl-APPLIED
+    verdict. The model's mid-run `bash verify.sh` tool calls (baseline: every to-be-added literal
+    is MISSING by design) are deliberately NOT read."""
+    i = (log_text or "").rfind("[worker] verify stdout:")
+    if i < 0:
+        return ""
+    blk = log_text[i + len("[worker] verify stdout:"):]
+    m = re.search(r"^\[worker\] ", blk, re.M)
+    return blk[:m.start()] if m else blk
+
+
+def _job_log_tail(a, limit=200000):
+    """The last worker verify block of the job that just ended ('' when unreadable)."""
+    lp = (getattr(a, "_last_job_outcome", None) or {}).get("log_path")
+    try:
+        return last_verify_block(Path(lp).read_text(errors="replace")[-limit:]) if lp else ""
+    except OSError:
+        return ""
+
+
 def _author_with_continuations(a, wt: Path, target: str, verify_cmd: str,
                                resumed_why=None):
     """Author the harness, then -- if it ran out of ITERATIONS rather than ideas --
@@ -4504,11 +4650,21 @@ def _author_with_continuations(a, wt: Path, target: str, verify_cmd: str,
               f"discarding it. "
               f"{escalation_point_note(getattr(a, 'slice_plan', None), getattr(a, 'slice_id', None))}")
         chain_state_write(a, "advancing", step=f"author continuation c{rnd} self-check")
+        _ll = literal_lint_precheck(wt, target)
+        if _ll:
+            log_decision("spec-defect", a, "literal near-miss at continuation entry (no round)", _ll[:300])
+            return False, _ll
         last_check, contaminated = _harness_check_output(wt, verify_cmd, target, chain_key(a))
         if not contaminated:
             # the attempt that just failed, with its real self-check output (see
             # record_attempt): the next prompt and should_escalate both read it
             record_attempt(a, getattr(a, "_chain_last_job", None), why, last_check)
+            _rep, _cur = missing_literal_round(a, getattr(a, "_chain_last_job", None),
+                                               str(last_check or "") + "\n" + _job_log_tail(a))
+            if _rep:
+                _m = _hg().format_repeat_missing(_cur)
+                log_decision("spec-defect", a, "same missing literals two rounds running", _m[:300])
+                return False, _m
         if contaminated:
             return False, (
                 f"{CONTAMINATED_PREFIX}{why} -- and refusing a continuation round because the "
@@ -5039,6 +5195,10 @@ def _author_staged(a, wt, target, cls):
     prior = None
     for stage in plan:
         files = stage_files(stage, a.lang)
+        _ll = literal_lint_precheck(wt, target)
+        if _ll:
+            log_decision("spec-defect", a, f"literal near-miss at stage `{stage}` entry (no round)", _ll[:300])
+            return False, _ll
         ok_pre, msg_pre = (stage_check(stage, wt, a.lang, target, getattr(a, "require", ()))
                            if stage != "refimpl" else (False, ""))
         if ok_pre:
@@ -5071,6 +5231,12 @@ def _author_staged(a, wt, target, cls):
             after = _sha_files(wt, files)
             runaway = prose_runaway_in_log((getattr(a, "_last_job_outcome", None) or {}).get("log_path"))
             record_attempt(a, getattr(a, "_chain_last_job", None), f"stage {stage}: {why}", None)
+            _rep, _cur = missing_literal_round(a, getattr(a, "_chain_last_job", None),
+                                               str(why or "") + "\n" + _job_log_tail(a))
+            if _rep:
+                _m = _hg().format_repeat_missing(_cur)
+                log_decision("spec-defect", a, f"stage `{stage}`: same missing literals two rounds running", _m[:300])
+                return False, _m
             if wrote_nothing(before, after) or runaway:
                 if attempt < reprompts:
                     print(f"[auto] staged: stage `{stage}` ended with "
@@ -5170,6 +5336,8 @@ def _author_entry(a, wt, target, verify_cmd):
         return ok, why
     if last_job_non_attempt(a):
         return False, why
+    if (why or "").startswith(SPEC_DEFECT_ROUTE_PREFIX):
+        return False, why           # the SPEC is wrong: the continuation ladder cannot fix it
     print(f"\n[auto] staged authoring did not finish ({why[:300]}). Falling back to the "
           f"continuation ladder on the SAME tree.")
     return _author_with_continuations(a, wt, target, verify_cmd, resumed_why=why)
@@ -5200,7 +5368,8 @@ def _author_escalate(a, wt, target, verify_cmd, why):
     the last two attempts share a class, run exactly ONE escalation round.
     Returns (ok, why)."""
     if (why or "").startswith((CONTAMINATED_PREFIX, HARNESS_ENV_PREFIX,
-                               BASELINE_GREEN_PREFIX, PLAN_SUSPECT_PREFIX)) or a.drafter_cmd:
+                               BASELINE_GREEN_PREFIX, PLAN_SUSPECT_PREFIX,
+                               SPEC_DEFECT_ROUTE_PREFIX)) or a.drafter_cmd:
         return False, why
     last_check, contaminated = _harness_check_output(wt, verify_cmd, target, chain_key(a))
     if contaminated:
@@ -6221,7 +6390,9 @@ def spec_defect_from_preflight(data):
     else ''."""
     msgs = []
     for b in (data.get("blockers") or []):
-        if b.get("check") in ("spec-defect", "already-satisfied"):
+        if b.get("check") in ("spec-defect", "already-satisfied") or (
+                b.get("check") == "refimpl-satisfies"
+                and str(b.get("message") or "").startswith(SPEC_DEFECT_ROUTE_PREFIX)):
             msgs.append(" -- ".join(x for x in (b.get("message"), b.get("detail")) if x))
     return "; ".join(msgs)
 

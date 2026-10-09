@@ -38,7 +38,7 @@ Top level: `MANIFEST.txt` (live path for every tracked piece), `SYNC.sh`, `scrub
                       dispatch-ack-reconcile.py + dispatch-worktree-reap keep it moving unattended
    dashboard/src/ollama-queue-api.py ── reads queue state + bundle_view.py; web UI on :7684
 ```
-Supporting: `pipeline-canary.py` (end-to-end canary), `live-validation-ledger.py`, `dispatch-diagnostics.py`,
+Supporting: `harness_lint.py` (pre-run spec validator, docs/harness-lint.md), `pipeline-canary.py` (end-to-end canary), `live-validation-ledger.py`, `dispatch-diagnostics.py`,
 `diagnosis-*` (root-cause harness), `goose-queue-proxy.py` (Goose through the queue), bake-off tools, `unraid-*.sh`.
 `hooks/` enforce "troubleshoot/author through the queue (qwen), not by hand".
 

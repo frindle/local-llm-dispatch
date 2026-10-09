@@ -128,7 +128,7 @@ REPO_FILES = {
 FMT_IMPL = ("export function formatRange(lo: number, hi: number): string {\n"
             "  return `[${lo}, ${hi}]`;\n}\n")
 HIGH_IMPL = ("\nexport function clampHigh(x: number, hi: number): number {\n"
-             "  return x > hi ? hi : x;\n}\n")
+             "  return x >= hi ? hi - 1 : x;\n}\n")
 
 SLICES = {
     "s1-lower": dict(
@@ -154,14 +154,14 @@ SLICES = {
         sym="formatRange", imp="./lib/fmt.ts"),
     "s3-upper": dict(
         target="lib/calc.ts", title="upper clamp helper",
-        intent=("clampHigh(x, hi) must return hi when x > hi, else x -- "
+        intent=("clampHigh(x, hi) must return hi - 1 when x >= hi, else x -- "
                 "export function clampHigh(x: number, hi: number): number"),
         literal="export function clampHigh(", depends_on=["s1-lower"],
         verify_shape="CANARY-VS-S3: node:test unit test calling clampHigh() directly with plain numbers; no mocks",
-        cases=[("above hi clamps down", "clampHigh(9, 3)", "3"),
+        cases=[("above hi clamps down", "clampHigh(9, 3)", "2"),
                ("below hi unchanged", "clampHigh(2, 3)", "2"),
-               ("exactly hi stays hi", "clampHigh(3, 3)", "3"),
-               ("negative hi", "clampHigh(0, -1)", "-1")],
+               ("exactly hi is capped below hi", "clampHigh(3, 3)", "2"),
+               ("negative hi", "clampHigh(0, -1)", "-2")],
         sym="clampHigh", imp="./lib/calc.ts"),
 }
 
@@ -460,6 +460,12 @@ def plan_agent_turn(stub: StubState, msgs):
             # NON-CONVERGENCE: burn to the iteration cap with DISTINCT actions (an
             # identical re-read is a different failure shape: read thrash)
             return "run_bash", {"command": f"node -e 'console.log({n} * 7)'"}
+        if role == "refine" and n == 1:
+            # MUTFB survivor-feedback round (2026-10-09): the gate now feeds a surviving mutant
+            # back to the author, and the refine self-check refuses "nothing changed yet". The
+            # canary's s3 target is now `x >= hi ? hi - 1 : x` (NOT a clamp: a clamp's `>` vs `>=` is an equivalent, unkillable mutant that escalates, correctly), so a real, harmless edit of the
+            # fixture is the faithful answer; the next preflight then stops on no-new-kills.
+            return "run_bash", {"command": "printf '\\n// refined: equivalent boundary mutant reviewed\\n' >> verify.test.ts"}
         return "task_complete", {"summary": "harness authored"}
     # coding / autofix
     tgt = wt / c["target"]
@@ -997,6 +1003,21 @@ class Sandbox:
             # speed (poll intervals only)
             "CANARY_POLL_S": "2", "AUTO_OPERATIONAL_POLL_S": "2",
             "LANE_RESTART_WAIT_S": "60",
+            # SCENARIO PINS (2026-10-09 drift fix): this 3-slice script predates (a) staged
+            # authoring (ODS_STAGED_AUTHOR: one job per TASK/fixture/refimpl stage -- the
+            # scripted stub answers the single legacy author round, and the stage-1 enqueue was
+            # refused by the ctx gate, so rounds/labels no longer matched; the w3staged seam
+            # covers the staged flow itself) and (b) the mutant-feedback refine loop (MUTFB:
+            # s3's fixture leaves an equivalent surviving mutant, so an `auto-refine` round the
+            # stub answered with a no-op was enqueued and paused 'verify_uninformative', leaving the
+            # canary bundle with no live job so the foreign decoy launched; the stub now edits).
+            "ODS_STAGED_AUTHOR": "0",
+            # (c) the queue's CONTEXT GATE: the sandbox's AUTO-TASK names auto-harness-check.py
+            # (~75KB) and dispatch-env.ts (~60KB), so the char estimate (~45k tokens) is refused against
+            # the stub model's 65536 ceiling and the first author round was never enqueued (every slice
+            # started at a -c1 continuation, so the scripted jest round never ran). A real host's ceiling
+            # is larger; pin one here.
+            "DARKBLOOM_CTX": "131072",
         })
         self.procs = []
         self.label = f"{LABEL_PREFIX}-{int(time.time()) % 100000:05d}{os.getpid() % 100:02d}"
@@ -2021,6 +2042,32 @@ def check_invariants(sb: Sandbox, R: Result, mon: Monitor, chaos: Chaos, before,
 # `proof_fail` (optional): a substring the RED output must contain, so a revert
 # proves the RIGHT assertion went red (not an import error).
 SEAMS = (
+    dict(id="harnesslint",
+         name="harness-lint: a failing spec (near-miss literal, literal the refimpl never writes, scope contradiction, stale prompt, repeat failure) is a named SPEC_DEFECT before any model run",
+         tool="test-harness-lint.py", marker="HARNESS_LINT_OK",
+         proofs=[[{"mut": "harness_lint.py", "old": "        nm = hg.literal_near_miss(lit, base)\n        if nm:",
+                   "new": "        nm = None\n        if nm:", "why": "near-miss 'did you mean' disabled"}],
+                 [{"mut": "harness_lint.py", "old": "    if hg.repeat_missing_literals(ma, mb):",
+                   "new": "    if False:", "why": "repeat missing-literal set never parks"}],
+                 [{"mut": "harness_lint.py", "old": "    if task_mtime is not None and tb is not None and task_mtime > tb:\n        return []",
+                   "new": "    if False:\n        return []", "why": "an operator re-spec no longer lifts the retry block"}]]),
+    dict(id="literallint",
+         name="literal lint gates: near-miss (insert/drop only, never a substitution), refimpl-absent, identical missing set twice -> SPEC_DEFECT, routed to die not auto-slice",
+         tool="test-literal-lint.py", marker="LITERAL_LINT_OK",
+         proofs=[[{"mut": "dispatch_harness_gates.py", "old": "    return best[1], best[2], best[3]", "new": "    return None", "why": "near-miss detection returns nothing (no did-you-mean)"}],
+                 [{"mut": "dispatch_harness_gates.py", "old": "    return bool(prev) and bool(cur) and frozenset(map(tuple, prev)) == frozenset(map(tuple, cur))",
+                   "new": "    return False", "why": "repeat never detected"}],
+                 [{"mut": "ollama-dispatch-auto", "old": "BASELINE_GREEN_PREFIX, PLAN_SUSPECT_PREFIX,\n                                             SPEC_DEFECT_ROUTE_PREFIX))",
+                   "new": "BASELINE_GREEN_PREFIX, PLAN_SUSPECT_PREFIX))", "why": "a SPEC_DEFECT why is auto-sliced again"}]]),
+    dict(id="opedit",
+         name="a hand-edit to a harness file made while the self-check / preflight refimpl step runs survives the revert",
+         tool="test-harness-operator-edit-survives.py", marker="OPERATOR_EDIT_OK",
+         proofs=[[{"mut": "ollama-dispatch-auto", "old": "    for f, data in _keep.items():\n        try:\n            (WT / f).write_bytes(data)",
+                   "new": "    for f, data in {}.items():\n        try:\n            (WT / f).write_bytes(data)", "why": "operator edit overwritten by the check's revert"}],
+                 [{"mut": "ollama-dispatch-preflight", "old": "            if rel in _keep:\n                continue\n            try:\n                p.parent.mkdir",
+                   "new": "            if False:\n                continue\n            try:\n                p.parent.mkdir", "why": "preflight revert replays pre-check bytes over the operator edit"},
+                  {"mut": "ollama-dispatch-preflight", "old": "        for rel, data in _keep.items():\n            try:\n                (self.wt / rel).write_bytes(data)",
+                   "new": "        for rel, data in {}.items():\n            try:\n                (self.wt / rel).write_bytes(data)", "why": "kept edits not rewritten"}]]),
     dict(id="lockrace", name="advance lock: a driver paused mid-acquire never lets a second one in",
          tool="test-slice-advance-lock-race.py", args=["--slice", "{bin}/ollama-dispatch-slice"],
          marker="ALL PASS",

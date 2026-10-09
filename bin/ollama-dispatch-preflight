@@ -2414,6 +2414,50 @@ class Preflight:
             return False, f"--refimpl-cmd exited {rc}: {out.strip()[-300:]}"
         return True, "refimpl command ran"
 
+    _PROTECT_HARNESS = {"TASK.md", "AUTO-TASK.md", "verify.sh", "refimpl.py",
+                        "check_literals.py", "auto-harness-check.py",
+                        ".dispatch-harness.json", "verify.test.ts", "test_fixture.py",
+                        "verify_impl.mts", "verify_impl.mjs", "verify_impl.js",
+                        "dispatch-env.ts", "dispatch_env.py"}
+
+    def _harness_paths(self):
+        """Protected harness files present now: untracked-snapshotted ones plus tracked ones
+        (a sealed slice tree commits the harness; `git checkout -- .` wipes uncommitted edits)."""
+        rels = set(getattr(self, "_pre_refimpl_bytes", {}) or {})
+        try:
+            rc, out, _ = self.git("ls-files")
+            if rc == 0:
+                rels |= set(out.split())
+        except Exception:
+            pass
+        return {r for r in rels
+                if Path(r).name in self._PROTECT_HARNESS and (self.wt / r).is_file()}
+
+    def _note_post_refimpl(self):
+        """Record the sha of every protected harness file as the refimpl step left it."""
+        self._post_refimpl_sha = {}
+        for rel in self._harness_paths():
+            try:
+                self._post_refimpl_sha[rel] = hashlib.sha256(
+                    (self.wt / rel).read_bytes()).hexdigest()
+            except OSError:
+                pass
+
+    def _foreign_harness_edits(self):
+        """{rel: bytes} of protected files whose bytes are NOT what the refimpl step left: a
+        hand-edit made while the preflight ran. Captured BEFORE `git checkout -- .`."""
+        keep = {}
+        for rel, sha in (getattr(self, "_post_refimpl_sha", None) or {}).items():
+            p = self.wt / rel
+            try:
+                if p.is_file():
+                    b = p.read_bytes()
+                    if hashlib.sha256(b).hexdigest() != sha:
+                        keep[rel] = b
+            except OSError:
+                pass
+        return keep
+
     def revert_refimpl(self):
         """Restore tracked files; delete only files the refimpl itself added.
 
@@ -2421,6 +2465,7 @@ class Preflight:
         and .venv with it. The untracked set is diffed against the pre-refimpl
         snapshot so exactly the refimpl's own new files go and nothing else does.
         """
+        _keep = self._foreign_harness_edits()
         self.sh("git checkout -- .", timeout=120)
         rc, out, _ = self.git("status", "--porcelain")
         after = {l[3:].strip() for l in out.splitlines() if l[:2] == "??"}
@@ -2442,11 +2487,22 @@ class Preflight:
                 pass
         # Restore pre-existing untracked files the refimpl clobbered (a creation-
         # task target stub); `git checkout` cannot, since they are untracked.
+        # OPERATOR EDITS SURVIVE (2026-10-09, rt-walmart-cancel-import): a HARNESS file
+        # (TASK.md, check_literals.py, ...) is replayed only if its bytes are still what
+        # the refimpl step left (_post_refimpl_sha); a hand-edit made while the preflight
+        # ran (tracked or not) must not be reverted to the pre-check bytes.
         for rel, data in getattr(self, "_pre_refimpl_bytes", {}).items():
             p = self.wt / rel
+            if rel in _keep:
+                continue
             try:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_bytes(data)
+            except Exception:
+                pass
+        for rel, data in _keep.items():
+            try:
+                (self.wt / rel).write_bytes(data)
             except Exception:
                 pass
 
@@ -2623,6 +2679,7 @@ class Preflight:
                 pass
         self._journal_open()
         ok, why = self.apply_refimpl()
+        self._note_post_refimpl()
         if not ok:
             self.add("refimpl-passes", FAIL, "could not apply the reference impl",
                      detail=why)
@@ -2698,11 +2755,20 @@ class Preflight:
                             "property behaviourally (a whole literal cannot match "
                             "its own negation).")
                 elif absent:
-                    self.add("refimpl-satisfies", WARN,
-                             f"{len(absent)} required literal(s) absent from the "
-                             f"reference impl's change",
+                    # LITERAL LINT (b), 2026-10-09 (rt-walmart-cancel-import): with the refimpl
+                    # APPLIED a required literal is still absent -> the spec and the refimpl
+                    # disagree and no further model round changes that. Classified as a
+                    # SPEC_DEFECT (auto stops, the slicer re-specs) instead of left as a WARN
+                    # the author chases for rounds as "nonconvergence".
+                    _hgx = _hg()
+                    _pfx = _hgx.SPEC_DEFECT_PREFIX if _hgx is not None else "SPEC_DEFECT: "
+                    self.add("refimpl-satisfies", FAIL,
+                             f"{_pfx}Must-contain literal absent after the refimpl is applied: "
+                             f"{len(absent)} literal(s)",
                              detail="; ".join(repr(l) for l in absent[:4])
-                                    + " -- the refimpl and the spec disagree")
+                                    + " -- the refimpl and the spec disagree; correct TASK.md "
+                                      "`## Must contain` (or have refimpl.py write it)",
+                             fix="re-spec: the literal is not producible by the reference impl")
                 else:
                     self.add("refimpl-satisfies", PASS,
                              f"reference impl contains all {len(lits)} required "
