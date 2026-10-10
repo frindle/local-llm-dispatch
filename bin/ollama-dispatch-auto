@@ -3562,6 +3562,12 @@ def hand_abort_reason(a, wt):
     if taken:
         return (f"TAKEN ELSEWHERE (slice {a.slice_plan}/{a.slice_id} is {taken!r} on disk -- "
                 f"another driver, e.g. a --regate, owns this worktree)")
+    # An orphaned driver must not enqueue/write either (single-flight per worktree):
+    # the slicer's completion hook drives the chain now, a further round from here is
+    # a SECOND author on the same tree.
+    gone = driver_gone(a)
+    if gone:
+        return f"DRIVER GONE ({gone})"
     return None
 
 
@@ -3852,9 +3858,16 @@ def dispatch_model(wt: Path, prompt: str, label: str, verify_cmd: str, a, max_it
         # result would be a second driver on the worktree.
         gone = driver_gone(a)
         if gone:
-            return False, (f"ORPHANED while polling {job}: {gone}. The job stays "
-                           f"live in the queue and the slicer's completion hook "
-                           f"owns it from here; this poller stops.")
+            # SINGLE-FLIGHT (2026-10-09, rt-costco-receipt-attach-s1): this used to
+            # `return False, "ORPHANED ..."`. The staged-authoring caller read that as a
+            # failed attempt (record_attempt) and RE-PROMPTED: _stop_for_hand did not
+            # know the driver was gone, so it enqueued -s1-r1, -s1-r2 and a -c1
+            # continuation back to back, all on one worktree, each counted as a model
+            # failure. An orphan is not an attempt outcome: stop the whole run now.
+            print(f"\n[auto] ORPHANED while polling {job}: {gone}. The job stays "
+                  f"live in the queue and the slicer's completion hook owns it from "
+                  f"here; this poller stops and enqueues NOTHING further.")
+            raise SystemExit(EXIT_ORPHANED)
         row = job_row(job)
         if not row:
             # The row can be gone for two very different reasons: (a) the job

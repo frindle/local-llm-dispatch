@@ -539,6 +539,29 @@ _LIVE_LABEL_STATES = ("pending", "queued", "scheduled", "running", "paused", "he
 # from a real enqueue error.
 _DUPLICATE_LABEL_RC = 7
 
+def slice_worktree_live_owner(jobs, cwd):
+    """PURE. The LIVE queue row that already owns the SLICE worktree `cwd`, or None.
+
+    Only dispatch slice worktrees (a directory named wt-slice-*, not the shared
+    -chain checkout) are single-flight: other cwds (a repo root, $HOME for
+    read-only research) are legitimately shared. Live = _LIVE_LABEL_STATES, which
+    excludes planned placeholders and every terminal/parked state."""
+    try:
+        mine = Path(cwd).resolve()
+    except Exception:
+        return None
+    if not mine.name.startswith("wt-slice-") or mine.name.endswith("-chain"):
+        return None
+    for j in (jobs.values() if isinstance(jobs, dict) else jobs):
+        if not isinstance(j, dict) or j.get("status") not in _LIVE_LABEL_STATES:
+            continue
+        try:
+            if j.get("cwd") and Path(j["cwd"]).resolve() == mine:
+                return j
+        except Exception:
+            continue
+    return None
+
 _RETRY_SUFFIX_RE = re.compile(r"-(?:r|round|retry)\d+$", re.IGNORECASE)
 # needs-opus-auto-/auto-author-: the PIPELINE-STAGE rows of the same work. Live
 # 2026-10-02 (BFMR replace-tracking): the parked `auto-author-X` and
@@ -9813,6 +9836,25 @@ def cmd_enqueue(args):
                   f"duplicate. Poll/adopt that job, wait for it to reach a "
                   f"terminal state, or pass --allow-duplicate-label if you "
                   f"really do want two jobs under one label.", file=sys.stderr)
+            sys.exit(_DUPLICATE_LABEL_RC)
+        # --- SINGLE-FLIGHT PER SLICE WORKTREE (2026-10-09) --------------------
+        # rt-costco-receipt-attach-s1 had FOUR author rows (-s1, -s1-r1, -s1-r2,
+        # -c1) on ONE worktree: every round carries a DIFFERENT label, so the
+        # duplicate-label guard above never fired. An orphaned AUTO driver
+        # enqueued them back to back before the first had run; the slicer's
+        # preflight then NO-GO'd on cwd-exclusive for a slice that was fine. A
+        # slice worktree has exactly one live owner: refuse a second row on it
+        # and name the owner on the first stdout line (same protocol as
+        # duplicate-label, so ollama-dispatch-auto ADOPTS and polls the owner
+        # rather than counting a failed attempt).
+        _owner = slice_worktree_live_owner(state["jobs"], args.cwd)
+        if _owner and not getattr(args, "allow_duplicate_label", False):
+            print(f"duplicate-label {_owner['id']} {_label}")
+            print(f"[queue] REFUSED: slice worktree {args.cwd} is already owned by "
+                  f"LIVE job {_owner['id']} ({_owner.get('status')}, "
+                  f"{_owner.get('label')}) -- NOT enqueuing a second row on it "
+                  f"(single-flight per worktree). Poll/adopt that job or wait for "
+                  f"it to reach a terminal state.", file=sys.stderr)
             sys.exit(_DUPLICATE_LABEL_RC)
         job_id = uuid.uuid4().hex[:12]
         after_id = None
