@@ -305,6 +305,24 @@ MAX_IDENTICAL_AUTHOR_FAILURES = 2  # identical recorded failures before escalati
 # storms on record ran to 8 and 11.
 MAX_AUTHOR_ATTEMPTS = 5
 
+# THIRD budget (2026-10-09, aw-codec-floor s2: launched 6+ times over a CHANGING reason).
+# author_attempts is zeroed by every re-spec, so on its own a slice that is re-spec'd
+# can burn RESPEC_CAP+1 windows of MAX_AUTHOR_ATTEMPTS launches. author_launches_total
+# counts EVERY authoring launch for the slice regardless of failure signature and is
+# NOT reset by a re-spec or the self-heal retry (only a human --retry-slice, a
+# deliberate fresh start, zeroes it). At the cap the slice parks, no further re-spec.
+MAX_AUTHOR_LAUNCHES_TOTAL = 10
+SHAPES_KEEP = 8   # distinct recent failure shapes remembered (class detection)
+# A changing failure reason (this many DISTINCT shapes in the window) is the signature of
+# a harness that is not converging for a reason the retries cannot see.
+CHANGING_SHAPES_MIN = 3
+# Failure/escalation text that names the non-discriminating-fixture problem class.
+FIXTURE_CLASS_PATTERNS = (
+    "unexercised", "never exercised", "survivor", "low relevance", "verify-relevance",
+    "non-discriminating", "passes at baseline", "green at baseline", "no case distinguishes",
+    "concerns(regate)", "read-loop:test_fixture", "scaffold_incomplete",
+)
+
 # VERIFY-SANDBOX (2026-10-05): env for every verify.sh this slicer runs itself --
 # code under test must never reach the REAL queue (ollama-queue.py refuses any
 # mutating subcommand when DISPATCH_VERIFY_SANDBOX is set). See ollama-queue.py.
@@ -688,7 +706,30 @@ def note_author_failure(s, wt):
         s["author_fail_streak"] = 1
     s["author_fail_sig"] = sig
     s["author_attempts"] = int(s.get("author_attempts") or 0) + 1
+    # Signature-blind launch counter + the distinct shapes seen (see MAX_AUTHOR_LAUNCHES_TOTAL).
+    s["author_launches_total"] = int(s.get("author_launches_total") or 0) + 1
+    _sh = _sig_shape(sig)
+    _shapes = [x for x in (s.get("author_fail_shapes") or []) if x != _sh]
+    s["author_fail_shapes"] = (_shapes + ([_sh] if _sh else []))[-SHAPES_KEEP:]
     return s["author_fail_streak"], sig
+
+
+def respec_class(s, sig):
+    """PURE. Name the problem class behind an author-attempt cap trip.
+      'spec_defect' -- the spec contradicts the base tree;
+      'fixture'     -- the harness never converges and the reason keeps CHANGING (or the
+                       text names unexercised lines / relevance survivors / a fixture that
+                       passes at baseline): the suspect is a NON-DISCRIMINATING FIXTURE;
+      'generic'     -- anything else."""
+    if is_spec_defect(sig):
+        return "spec_defect"
+    blob = " ".join([str(sig or ""), str(s.get("escalation_reason") or ""),
+                     " ".join(str(n) for n in (s.get("review_notes") or []))]).lower()
+    if any(p in blob for p in FIXTURE_CLASS_PATTERNS):
+        return "fixture"
+    if len(s.get("author_fail_shapes") or []) >= CHANGING_SHAPES_MIN:
+        return "fixture"
+    return "generic"
 
 
 RESPEC_CAP = 1   # bounded: one re-spec per slice, then the old ESCALATED park applies
@@ -703,9 +744,17 @@ def respec_on_cap(s, sig, streak, attempts):
     the RESPEC_CAP is spent (caller parks). Counts attempts regardless of failure signature
     (the cap trigger is `attempts >= MAX_AUTHOR_ATTEMPTS`, signature-blind)."""
     n = int(s.get("respec_count") or 0)
-    if n >= RESPEC_CAP:
+    cls = respec_class(s, sig)
+    classes = list(s.get("respec_classes") or [])
+    if int(s.get("author_launches_total") or 0) >= MAX_AUTHOR_LAUNCHES_TOTAL:
+        return False      # hard, signature-blind lifetime cap: no re-spec can reopen it
+    if n >= RESPEC_CAP and not (cls == "fixture" and "fixture" not in classes):
+        # the one generic re-spec is spent, but a fixture-class failure gets ONE re-spec of
+        # its own class (aw-codec-floor s2: the first re-spec was burned on an unrelated
+        # context-ceiling error and the real problem was never named).
         return False
     s["respec_count"] = n + 1
+    s["respec_classes"] = classes + [cls]
     note = (f"RE-SPEC NOTE (auto, {attempts} prior author attempt(s) failed, last streak "
             f"{streak}): the previous harness attempts ended on: {str(sig)[:300]}. Do NOT repeat "
             f"that; keep TASK.md must_contain literals real and present in the target or "
@@ -714,6 +763,15 @@ def respec_on_cap(s, sig, streak, attempts):
         note += (" The failure was a SPEC_DEFECT: the spec contradicts the BASE tree. Do not "
                  "'create' files that already exist at base (modify/extend them instead) and "
                  "do not demand literals the base already satisfies.")
+    if cls == "fixture":
+        note += (" PROBLEM CLASS: NON-DISCRIMINATING FIXTURE. The attempts kept failing for "
+                 "changing reasons because the fixture does not separate the original code "
+                 "from the fix (preflight: unexercised changed lines / relevance survivors). "
+                 "Author at least one case where the ORIGINAL code FAILS and the reference "
+                 "implementation PASSES -- run test_fixture.py at baseline first and confirm "
+                 "it is RED -- narrowed to the ONE property in the intent; every line the "
+                 "refimpl adds must be exercised by some case, and do not add a redundant "
+                 "line (e.g. re-initialising a variable already set) no case can observe.")
     s["intent"] = (s.get("intent") or "").rstrip() + "\n\n" + note
     s["respec_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     s["respec_history"] = (s.get("respec_history") or []) + [{"sig": str(sig)[:300], "attempts": attempts}]
@@ -4442,6 +4500,10 @@ def retry_slice(st, sid, notes=None):
         s["author_jobs_at_retry"] = len(s.get("author_job_ids") or [])
     for _k in ("author_fail_streak", "author_fail_sig"):
         s.pop(_k, None)
+    if not os.environ.get("DISPATCH_SELF_HEAL"):
+        # a human retry is a deliberate fresh start: the lifetime launch cap counts from here
+        for _k in ("author_launches_total", "author_fail_shapes", "respec_classes"):
+            s.pop(_k, None)
     if notes and notes.strip():
         s["review_notes"] = ((s.get("review_notes") or []) + [notes.strip()[:REVIEW_NOTES_MAX]]
                              )[-REVIEW_NOTES_KEEP:]
@@ -6291,8 +6353,9 @@ def bound_stale_worktree_retry(st, sid, s, wt, cwt, origin):
               f"baseline with the failure folded into the slice intent. Latest: {sig}")
         remove_worktree(cwt, wt)
         return True
-    if (streak >= MAX_IDENTICAL_AUTHOR_FAILURES
-            or attempts >= MAX_AUTHOR_ATTEMPTS or _budget_why):
+    _launches = int(s.get("author_launches_total") or 0)
+    if (streak >= MAX_IDENTICAL_AUTHOR_FAILURES or attempts >= MAX_AUTHOR_ATTEMPTS
+            or _budget_why or _launches >= MAX_AUTHOR_LAUNCHES_TOTAL):
         s["status"] = ESCALATED
         s["escalation_reason"] = (
             f"authoring made no progress across {streak} consecutive "
@@ -6302,10 +6365,10 @@ def bound_stale_worktree_retry(st, sid, s, wt, cwt, origin):
             f"{_budget_why} "
             f"across {attempts} attempt(s) without a landable harness. Latest: {sig}"
             if _budget_why else
-            f"authoring has now been launched {attempts} times for this "
+            f"authoring has now been launched {max(attempts, _launches)} times for this "
             f"slice without ever producing a complete harness. The failure "
             f"reason kept CHANGING, so the identical-failure streak never "
-            f"tripped -- but a slice that has burned {attempts} dispatches "
+            f"tripped -- but a slice that has burned {max(attempts, _launches)} dispatches "
             f"is not converging, whatever the reasons. Latest: {sig}")
         save_state(st)
         # print the reason that actually tripped (2026-10-02: Rivian s5 hit the

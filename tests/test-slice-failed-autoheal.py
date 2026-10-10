@@ -217,15 +217,18 @@ def test_bound_escalates(m):
         run_scenario(m, {"s2": s2}, sig=f"FAIL: distinct reason {i}")
     ok("a slice failing for a DIFFERENT reason each time is still retried",
        s2["status"] == m.PENDING and s2["author_attempts"] == 2)
-    for i in range(2, 9):
+    for i in range(2, 16):
         if s2["status"] == m.ESCALATED:
             break
         s2["status"] = m.FAILED
         run_scenario(m, {"s2": s2}, sig=f"FAIL: distinct reason {i}")
+    # 2026-10-09: a changing-reason stall earns ONE fixture-class re-spec at the attempt cap
+    # (author_attempts is zeroed by it); the signature-blind LIFETIME launch cap is what stops it.
     ok("...but the TOTAL-attempts cap still stops it "
-       f"(MAX_AUTHOR_ATTEMPTS={m.MAX_AUTHOR_ATTEMPTS})",
+       f"(MAX_AUTHOR_ATTEMPTS={m.MAX_AUTHOR_ATTEMPTS}, lifetime {m.MAX_AUTHOR_LAUNCHES_TOTAL})",
        s2["status"] == m.ESCALATED
-       and s2["author_attempts"] <= m.MAX_AUTHOR_ATTEMPTS + 1)
+       and s2["author_attempts"] <= m.MAX_AUTHOR_ATTEMPTS + 1
+       and s2["author_launches_total"] <= m.MAX_AUTHOR_LAUNCHES_TOTAL)
 
 
 def test_green_at_baseline_is_not_retried(m):
