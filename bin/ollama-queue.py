@@ -18104,15 +18104,24 @@ def _self_test():
         _cst["jobs"] = [_c1]                          # B finished
         _hk = {"hB": {"bundle": "bB", "at": 400.0,
                       "proc": type("P", (), {"poll": lambda self: None})()}}
-        _k, _ev = _apply_bundle_commit(
-            _cst, _cpk, None, ["bC"], 400.0 + BUNDLE_COMMIT_GRACE + 1, runs_dir=_crd,
+        # f57ce5e contract: a FRESH hook (inside SLICER_GAP_YIELD_S) holds the lane; past it the
+        # bundle yields (parks cpu_wait, no alert) and parked A resumes; never complete by a timer.
+        _hkw = lambda now_: _apply_bundle_commit(
+            _cst, _cpk, None, ["bC"], now_, runs_dir=_crd,
             chain_dir=_crd, kick=lambda l, p: True,
             alert=lambda k_, w_, n_: _alerts.append((k_, w_)), hooks=_hk, log_dir=_crd)
-        check("commit: B's rows done but its gate hook is still RUNNING -> B holds (no "
-              "timer: even past the old 90s grace)", (_k, [e[0] for e in _ev]), ("bB", []))
-        _k, _ev = _tick(400.0 + BUNDLE_COMMIT_GRACE + 2, cands=["bC"])
-        check("commit: hook exited -> B complete at once and parked A RESUMES before the "
-              "new bundle C", (_k, "resume" in _ev and "complete" in _ev), ("bA", True))
+        _k, _ev = _hkw(400.0 + 5.0)
+        check("commit: B's rows done but its gate hook is still RUNNING and fresh -> B holds "
+              "(no timer completes it)", (_k, [e[0] for e in _ev]), ("bB", []))
+        _k, _ev = _hkw(400.0 + max(SLICER_GAP_YIELD_S, 1.0) + 1)
+        check("commit: ...hook still running past SLICER_GAP_YIELD_S -> B yields the lane "
+              "(cpu_wait, not complete) and parked A RESUMES before the new bundle C",
+              (_k, "cpu_wait" in [e[0] for e in _ev], "resume" in [e[0] for e in _ev],
+               "complete" in [e[0] for e in _ev]), ("bA", True, True, False))
+        _k, _ev = _tick(400.0 + max(SLICER_GAP_YIELD_S, 1.0) + 2, cands=["bC"])
+        check("commit: hook exited -> B (parked cpu_wait, nothing left) is dropped and A "
+              "stays committed ahead of C",
+              (_k, "bB" in (_cst.get("_bundle_parked") or {})), ("bA", False))
         # a HEAL of s2 in flight keeps A committed even with nothing else runnable
         _wA(s4="done", s2_reason="authoring failed DETERMINISTICALLY (AUTO rc=2)")
         _rh = slice_plan_runnability("bA", runs_dir=_crd, now=500.0, esc_seen={},
