@@ -98,6 +98,24 @@ def host_mismatch(queue_host: str, driver_text: str) -> str:
 DEFAULT_ROSTER_ONLY = ("qwen3:32b qwen3:32b-q8_0 qwen2.5-coder:32b devstral-small-2:24b "
                        "davidau-qwen38-mtp:q4_K_M rombos-coder-v2.5:q4_K_M")
 
+def parse_max_s(task_text: str, env_val=None) -> int:
+    """Wall-clock cap (seconds) for the driver: a `MAX_S=<n>` line in the task file, else
+    $BAKEOFF_RUNNER_MAX_S, else 0 (= no cap, the old behaviour). PURE. A driver that
+    finished its work but then hung (v12 qwen36-debug-r4: DONE at 16:26, still 'running'
+    at 0% CPU 2h52 later until killed by hand) otherwise holds the Studio lane forever."""
+    for line in (task_text or "").splitlines():
+        s = line.strip()
+        if s.startswith("MAX_S="):
+            try:
+                return max(0, int(s[len("MAX_S="):].strip()))
+            except ValueError:
+                return 0
+    try:
+        return max(0, int(env_val or 0))
+    except ValueError:
+        return 0
+
+
 def _self_test() -> int:
     """Unit-test the lane resolution + the mismatch guard. No GPU, no network."""
     ok = True
@@ -133,6 +151,10 @@ def _self_test() -> int:
           host_mismatch("studio", _pinned), "")
     check("...and a deferring driver is fine on the unraid lane",
           host_mismatch("unraid", _defers), "")
+    check("MAX_S line in the task file sets the cap", parse_max_s("DRIVER=x\nMAX_S=14400\n"), 14400)
+    check("no MAX_S -> env value", parse_max_s("ROSTER_ONLY=a", "90"), 90)
+    check("neither -> 0 (no cap)", parse_max_s("ROSTER_ONLY=a", None), 0)
+    check("garbage -> 0", parse_max_s("MAX_S=abc"), 0)
     check("an unresolvable lane does not abort (the driver's host stands)",
           host_mismatch("nosuchbox", _pinned), "")
     print("SELF_TEST_OK" if ok else "SELF_TEST_FAILED")
@@ -157,6 +179,7 @@ def main():
     # `DRIVER=<path>` and `ROSTER_ONLY=<space-separated tags>` override the
     # defaults below. Absent (the original bulk enqueue), behaviour is unchanged.
     driver = DRIVER
+    max_s = 0
     roster = os.environ.get("BAKEOFF_ROSTER_ONLY", DEFAULT_ROSTER_ONLY)
     if args.task_file and Path(args.task_file).is_file():
         for line in Path(args.task_file).read_text().splitlines():
@@ -166,6 +189,11 @@ def main():
             elif s.startswith("ROSTER_ONLY="):
                 roster = s[len("ROSTER_ONLY="):].strip()
 
+    try:
+        max_s = parse_max_s(Path(args.task_file).read_text() if args.task_file else "",
+                            os.environ.get("BAKEOFF_RUNNER_MAX_S"))
+    except OSError:
+        max_s = 0
     if not Path(driver).exists():
         print(f"[bakeoff-runner] driver not found: {driver}", file=sys.stderr)
         return 1
@@ -213,7 +241,20 @@ def main():
     signal.signal(signal.SIGTERM, _forward)
     signal.signal(signal.SIGINT, _forward)
 
-    return proc.wait()
+    if not max_s:
+        return proc.wait()
+    try:
+        return proc.wait(timeout=max_s)
+    except subprocess.TimeoutExpired:
+        print(f"[bakeoff-runner] driver still running after MAX_S={max_s}s -- SIGTERM "
+              f"(hung post-run step?); the queue row fails with exit 124", file=sys.stderr, flush=True)
+        _forward(signal.SIGTERM, None)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        return 124
 
 if __name__ == "__main__":
     sys.exit(main())

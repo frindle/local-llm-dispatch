@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 EVICT_WAIT_S = 90
-VRAM_WAIT_S = 60
+VRAM_WAIT_S = 180   # was 60: one ssh timeout alone is ~75 s; allow a retry
 WATCH_INTERVAL_S = 30
 KILL_GRACE_S = 30
 ON_ABORT_TIMEOUT_S = 180
@@ -103,7 +103,7 @@ def evict_all(host, wait_s=EVICT_WAIT_S, poll=2.0, sleep=time.sleep, clock=time.
         sleep(poll)
 
 
-def vram_used_mib(check_cmd, timeout=60):
+def vram_used_mib(check_cmd, timeout=90):
     out = subprocess.run(["bash", "-c", check_cmd], capture_output=True, text=True,
                          timeout=timeout, stdin=subprocess.DEVNULL)
     if out.returncode != 0:
@@ -119,7 +119,16 @@ def wait_vram_free(check_cmd, max_mib, wait_s=VRAM_WAIT_S, poll=5.0, sleep=time.
         try:
             last = reader(check_cmd)
         except Exception as e:  # noqa: BLE001
-            return False, None, f"vram_check failed ({type(e).__name__}: {e})"
+            # A check that can't run (ssh to the card's host timed out -- live 2026-10-09,
+            # bo-v12-strata-bulk-r3: "connect to host ... port 22: Operation timed out")
+            # is not "the GPU is busy": retry until the deadline instead of failing the
+            # whole exclusive job on one transient network blip. Still fail closed: the
+            # command never runs unless a reading <= max_mib is obtained.
+            if clock() >= deadline:
+                return False, None, f"vram_check failed ({type(e).__name__}: {e})"
+            log(f"vram: check failed ({type(e).__name__}: {str(e)[:120]}) -- retrying")
+            sleep(poll)
+            continue
         if last <= max_mib:
             return True, last, f"GPU shows {last} MiB used (<= {max_mib})"
         if clock() >= deadline:
@@ -366,6 +375,26 @@ def _self_test():
         # 6. vram gate
         check("vram: reader under the limit -> ok",
               wait_vram_free("x", 500, reader=lambda c: 100)[0], True)
+        _calls = []
+
+        def _flaky(c):
+            _calls.append(1)
+            if len(_calls) < 3:
+                raise RuntimeError("ssh: connect to host x port 22: Operation timed out")
+            return 4
+        check("vram: transient reader failures are retried, then ok",
+              wait_vram_free("x", 500, poll=0, sleep=lambda s: None, reader=_flaky)[0], True)
+        _t = [0]
+
+        def _dead(c):
+            raise RuntimeError("down")
+
+        def _clk():
+            _t[0] += 50
+            return _t[0]
+        check("vram: a reader that never works still fails closed at the deadline",
+              wait_vram_free("x", 500, wait_s=120, poll=0, sleep=lambda s: None, clock=_clk,
+                             reader=_dead)[0], False)
         check("vram: reader stays over the limit -> not ok",
               wait_vram_free("x", 500, wait_s=0, reader=lambda c: 9000)[0], False)
         # 7. SIGTERM -> abort path
