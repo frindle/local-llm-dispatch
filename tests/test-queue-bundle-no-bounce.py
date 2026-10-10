@@ -206,6 +206,11 @@ def main():
     guarded("2 waiting on failure", s2)
 
     # --- 3. Settlement is the tracked gate hook, not a 90s timer --------------------
+    # GATE-SETTLE YIELD (f57ce5e, 2026-10-09): the hook runs OFF the GPU lane, so a committed
+    # bundle holds the lane only while the hook is FRESH (< SLICER_GAP_YIELD_S), then parks
+    # cpu_wait (no alert, never "complete") and resumes FIRST on its verdict row. What must
+    # never happen: the bundle is dropped as complete by a timer, or a foreign job runs while
+    # the hook is fresh (the original bounce window).
     proc = Proc()
 
     def s3():
@@ -215,14 +220,24 @@ def main():
             "job_id": "c228c9eb80fe", "verdict": "concerns", "regate": "done",
             "auto_fix_action": "none", "ts": iso(T0 + 590)}))
         if hasattr(q, "register_gate_hook"):
-            q.register_gate_hook("regate-c228c9eb80fe-x", LF, proc=proc)
+            # on the TEST clock (tick() runs at T0+600), not wall time
+            q.register_gate_hook("regate-c228c9eb80fe-x", LF, proc=proc, now=T0 + 600)
         k, ev = tick(state, T0 + 600, [PG, GC])
         check("3 regate finished, its gate-on-complete hook still running -> LF holds",
               (k, "complete" in ev), (LF, False))
+        check("3 ...and no foreign job takes the idle lane while the hook is fresh", launched(state, k), [])
+        k, ev = tick(state, T0 + 600 + 20, [PG, GC])
+        check("3 ...still holding 20s later (inside the yield window)",
+              (k, "complete" in ev, "cpu_wait" in ev), (LF, False, False))
         k, ev = tick(state, T0 + 600 + 91, [PG, GC])
-        check("3 ...still holding 91s later while the hook runs (no timer releases it)",
-              (k, "complete" in ev), (LF, False))
-        check("3 ...and nothing else launched meanwhile", launched(state, k), [])
+        check("3 ...91s into the hook: LF yields the idle lane (parked cpu_wait), NEVER "
+              "'complete' (no timer drops it)",
+              ("complete" in ev, "cpu_wait" in ev, LF in state.get("_bundle_parked", {}),
+               (state.get("_bundle_parked", {}).get(LF) or {}).get("kind")),
+              (False, True, True, "cpu_wait"))
+        check("3 ...and a yielded LF is not alerted on (a wait is not a failure)",
+              any(x[0] == LF for x in alerts), False)
+        check("3 ...the yield goes to a bundle with real work", k in (PG, GC), True)
     guarded("3 tracked settlement", s3)
 
     # --- 4. Final CONCERNS parks loudly, never COMPLETE -----------------------------
@@ -230,7 +245,7 @@ def main():
         proc.rc = 0                                     # the hook wrote the verdict and exited
         n0 = len(alerts)
         k, ev = tick(state, T0 + 700, [PG, GC])
-        check("4 hook exited, final verdict CONCERNS -> LF PARKED (not complete)",
+        check("4 hook exited, final verdict CONCERNS -> LF PARKED loudly even after yielding (not complete; parks loudly)",
               ("park" in ev, "complete" in ev, LF in state.get("_bundle_parked", {})),
               (True, False, True))
         check("4 ...with a LOUD alert naming LF and the verdict",
