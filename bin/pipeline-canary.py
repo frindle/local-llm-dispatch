@@ -2039,7 +2039,7 @@ def check_invariants(sb: Sandbox, R: Result, mon: Monitor, chaos: Chaos, before,
 # every set in a scratch copy and requires the replay to go RED there, and green
 # on the unmodified copy. The result is ~/.ollama-dispatch/canary/coverage.json,
 # which --status reports ("N seam checks, M historical fixes proven").
-# `proof_fail` (optional): a substring the RED output must contain, so a revert
+# `proof_fail` (optional): a substring (or a list: any one) the RED output must contain, so a revert
 # proves the RIGHT assertion went red (not an import error).
 SEAMS = (
     dict(id="ctxscaffold",
@@ -2116,10 +2116,19 @@ SEAMS = (
          tool="test-queue-bundle-no-bounce.py",
          args=["--queue", "{bin}/ollama-queue.py", "--plan", "{bin}/ollama-dispatch-plan",
                "--gate", "{bin}/gate-on-complete.py"], marker="NO_BOUNCE_TEST_OK",
-         proof_fail="takes the idle lane",
+         # 2026-10-09 contract (f57ce5e gate-settle yield): a committed bundle HOLDS the lane while
+         # its gate hook is fresh (< SLICER_GAP_YIELD_S) and no timer ever drops it; past that it
+         # parks cpu_wait (silent) and a non-pass verdict landing meanwhile must park it LOUDLY.
+         proof_fail=["takes the idle lane", "yields the idle lane", "parks loudly"],
          # whole pre-fix queue (the test is built to take --queue <bak>); the fix's own
          # diff overlaps later edits (2 of 26 hunks reject -> NameError, wrong reason)
-         proofs=[["swap:ollama-queue.py=ollama-queue.py.bak-20261005T110942-nobounce"]]),
+         proofs=[["swap:ollama-queue.py=ollama-queue.py.bak-20261005T110942-nobounce"],
+                 [{"mut": "ollama-queue.py", "old": "        if SLICER_GAP_YIELD_S > 0 and _gs and _gg >= SLICER_GAP_YIELD_S:\n            return \"waiting\", (f\"waiting for gate verdict",
+                   "new": "        if True:\n            return \"waiting\", (f\"waiting for gate verdict",
+                   "why": "gate-settle yields the lane immediately: a foreign job takes it between a committed bundle's steps"}],
+                 [{"mut": "ollama-queue.py", "old": "        elif (_st == \"blocked\" and (parked.get(_pk) or {}).get(\"kind\") == \"cpu_wait\"",
+                   "new": "        elif (False and (parked.get(_pk) or {}).get(\"kind\") == \"cpu_wait\"",
+                   "why": "a cpu_wait-yielded bundle whose gate verdict is non-pass is never parked loudly"}]]),
     dict(id="gateprio", name="gates: committed bundle's gates first, others' only on idle non-conflicting lanes; studio-db coding+gate slots",
          tool="test-queue-gate-priority.py", args=["--queue", "{bin}/ollama-queue.py"],
          marker="GATE_PRIORITY_TEST_OK",
@@ -3525,7 +3534,8 @@ def prove(args) -> int:
             ok_rev, note_rev, _ = run_seam(s, bin_dir, env, h)
             for name, b in saved.items():
                 (bin_dir / name).write_bytes(b)
-            right = (not s.get("proof_fail")) or s["proof_fail"] in note_rev
+            _pf = s.get("proof_fail")
+            right = (not _pf) or any(x in note_rev for x in ([_pf] if isinstance(_pf, str) else _pf))
             reds.append({"revert": proof, "applied": notes, "partial": partial,
                          "red": (not ok_rev) and right, "note": note_rev[:300]})
         proven = ok_now and bool(reds) and all(r["red"] and not r["partial"] for r in reds)

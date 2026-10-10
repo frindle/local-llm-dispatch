@@ -3518,6 +3518,16 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
         if _st == "complete" and not degraded_this_tick():
             parked.pop(_pk, None)
             events.append(("unpark", _pk, _why))
+        elif (_st == "blocked" and (parked.get(_pk) or {}).get("kind") == "cpu_wait"
+              and not degraded_this_tick()):
+            # GATE-SETTLE YIELD (f57ce5e) parks a bundle `cpu_wait` (silent: a wait is not a
+            # failure) while its off-lane gate hook runs. If that wait ENDS in a non-pass (final
+            # CONCERNS/FAIL verdict, stuck slice, ...) the bundle must be parked LOUDLY like any
+            # other blocked bundle -- otherwise it sits "cpu_wait" with no alert, and the
+            # non-pass verdict is silently lost behind whichever bundle took the lane.
+            parked[_pk] = {"since": now, "why": _why, "kind": "blocked",
+                           "commit_since": parked[_pk].get("commit_since")}
+            events.append(("park", _pk, _why))
     for ev, k, why in events:
         if ev == "park":
             print(f"[queue] bundle-commit: PARKED bundle {k} -- nothing in it can run: {why}. "
