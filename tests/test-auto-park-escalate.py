@@ -139,6 +139,9 @@ def main():
     check("park: orphaned -> no", m.park_decision(a, m.EXIT_ORPHANED, "j"), False)
     check("park: failure with a job -> yes", m.park_decision(a, 1, "j"), True)
     check("park: refusal before any job -> no", m.park_decision(a, 2, None), False)
+    for kc in (129, 137, 143):
+        check(f"park: driver killed by signal (exit {kc}) with a job -> no (external kill, not harness)",
+              m.park_decision(a, kc, "j"), False)
     check("park: under a slicer -> no (slicer owns it)",
           m.park_decision(args(m, tmp, slice_plan="p", slice_id="s1"), 1, "j"), False)
 
@@ -204,6 +207,7 @@ MUTATIONS = [
      "    return False"),
     ("park_decision always False", "    if code == 2 and not last_job:\n        return False\n    return True",
      "    return False"),
+    ("external-kill codes parked as harness", "    if code in EXTERNAL_KILL_CODES:\n", "    if False:\n"),
     ("run_chain stops parking", "                (park or park_visible)(a, code, reason)", "                pass"),
     ("prior failure not carried", "{fake_browser_section(a, target)}{prior_failure_section(load_attempts(a))}",
      "{fake_browser_section(a, target)}"),

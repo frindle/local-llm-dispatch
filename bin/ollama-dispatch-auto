@@ -5525,12 +5525,23 @@ def _stdout_log_path():
         return None
 
 
+EXTERNAL_KILL_CODES = frozenset({128 + 1, 128 + 9, 128 + 15})   # SIGHUP, SIGKILL, SIGTERM
+
+
 def park_decision(a, code, last_job):
     """PURE. Whether a finished run must park visibly. Under a slicer the slicer's
     own FAILED/ESCALATED state (+ the watcher) owns the surface; an orphaned
     driver handed the chain to someone else; a clean exit has nothing to park;
     a pre-job refusal (exit 2, no job) was printed to the caller synchronously."""
     if code in (0, None) or code == EXIT_ORPHANED:
+        return False
+    if code in EXTERNAL_KILL_CODES:
+        # The DRIVER itself was signalled (SIGHUP 129 / SIGKILL 137 / SIGTERM 143: a
+        # session close, a task time limit, a daemon restart, an orphan cleanup). That
+        # is an external kill, not an authoring failure: parking it as "authoring
+        # stuck: needs harness help" mislabels it and burns an Opus escalation
+        # (rt-amazon-cardlink 2026-10-10: exit 143 from a background-task time limit).
+        # The chain record still closes `ended`; re-running with --resume-author continues.
         return False
     if _under_slicer(a) or getattr(a, "drafter_cmd", None) or getattr(a, "no_park", False):
         return False
