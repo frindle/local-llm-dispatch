@@ -2042,6 +2042,18 @@ def check_invariants(sb: Sandbox, R: Result, mon: Monitor, chaos: Chaos, before,
 # `proof_fail` (optional): a substring the RED output must contain, so a revert
 # proves the RIGHT assertion went red (not an import error).
 SEAMS = (
+    dict(id='autoland', name='gate auto-land: a coding PASS lands on the origin repo ONLY when the verdict is a clean PASS, the second opinion agrees, the diff is code-only, the repo HEAD is still the chain baseline and the repo validate passes before push; any miss leaves it ready-to-apply untouched; AUTO_LAND=0 opts out; push failure rewinds',
+         tool='test-auto-land.py', args=['--bin', '{bin}'], marker='AUTO_LAND_OK', timeout=300,
+         proofs=[[{'mut': 'gate-on-complete.py', 'old': '    if not _gate_is_clean(payload):\n        why.append(f"gate verdict', 'new': '    if False:\n        why.append(f"gate verdict', 'why': 'a concerns / code-finding verdict is auto-landed'}],
+                 [{'mut': 'gate-on-complete.py', 'old': '    elif ag != "agree":\n', 'new': '    elif False:\n', 'why': 'a PASS with no (or unfinished) second opinion is auto-landed'}],
+                 [{'mut': 'gate-on-complete.py', 'old': '    if payload.get("second_opinion_disagreement") or ag == "disagree":\n', 'new': '    if False:\n', 'why': 'a PASS the cross-family reviewer disagrees with is auto-landed'}],
+                 [{'mut': 'gate-on-complete.py', 'old': '    if leaked or stage.get("scaffold_leaked"):\n', 'new': '    if False:\n', 'why': 'scaffold files in the deliverable diff are landed'}],
+                 [{'mut': 'gate-on-complete.py', 'old': '    extra = sorted(set(files) - set(targets or []))\n', 'new': '    extra = []\n', 'why': 'files the gate never judged are landed'}],
+                 [{'mut': 'gate-on-complete.py', 'old': '    if not mb or not tip or mb != tip or int(cls.get("behind") or 0) != 0:\n', 'new': '    if False:\n', 'why': 'a chain lands on a repo whose HEAD moved off its baseline'}],
+                 [{'mut': 'gate-on-complete.py', 'old': '        if vr is None or vr.returncode != 0:\n', 'new': '        if False:\n', 'why': 'a failing validate command does not block the land'}],
+                 [{'mut': 'gate-on-complete.py', 'old': '        if not _auto_land_enabled():\n', 'new': '        if False:\n', 'why': 'AUTO_LAND=0 opt-out is ignored'}],
+                 [{'mut': 'gate-on-complete.py', 'old': '                _al_git(repo_root, "reset", "--keep", base_full)\n', 'new': '                pass\n', 'why': 'a rejected push leaves main advanced locally (partial land)'}],
+                 [{'mut': 'gate-on-complete.py', 'old': '    return AUTO_LAND_VALIDATE_DEFAULTS.get(Path(repo_root).name)\n', 'new': '    return AUTO_LAND_VALIDATE_DEFAULTS.get(Path(repo_root).name) or "true"\n', 'why': 'a repo with no known validate command lands unvalidated'}]]),
     dict(id="ctxscaffold",
          name="queue ctx estimate: harness scaffold files (auto-harness-check.py etc.) named in AUTO-TASK.md are not counted as named files; real target files still are",
          tool="test-queue-ctx-scaffold-files.py", marker="ALL PASS",

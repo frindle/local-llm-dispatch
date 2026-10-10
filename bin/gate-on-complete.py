@@ -38,7 +38,7 @@ TWO DESIGN RULES, both learned the hard way today:
    break a dispatch is worse than no gate: the dispatch is the real work, this is
    commentary on it.
 """
-import argparse, importlib.util, json, os, re, shutil, subprocess, sys, time
+import argparse, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 
 
@@ -1455,6 +1455,7 @@ def _finalize_review(parent: str, payload: dict, gate_json: Path, out_dir: Path)
         # SUCCESS-path mirror (Task C): a CLEAN pass advances the pipeline (an
         # authoring harness -> coding job; a coding PASS -> apply). OFF by default.
         auto_pipeline_consider(parent, payload, gate_json)
+        auto_land_consider(parent, payload, gate_json)
         # Obligations deferred onto this slice are discharged by its green PASS.
         discharge_slice_obligations(parent, payload, gate_json)
         # SLICE AUTO-FEED: a completed slice job advances its own plan (detached).
@@ -1839,6 +1840,11 @@ def merge_second_opinion(a, out_dir: Path) -> int:
           f"({payload.get('verdict')})"
           + (f" -- {len(med_plus)} med+ finding(s) FLAGGED for the coordinator"
              if disagrees else ""))
+    # The second opinion is the LAST condition auto-land waits on: re-evaluate now.
+    try:
+        auto_land_consider(parent, payload, gate_json)
+    except Exception:
+        pass
     return 0
 
 
@@ -4711,6 +4717,280 @@ def apply_fix(job_id: str, payload: dict, gate_json: Path, policy: str) -> None:
 
 
 # ==============================================================================
+# AUTO-LAND (the owner 2026-10-09). A SEPARATE step from AUTO_PIPELINE_MODE: shadow mode
+# keeps recording 'ready-to-apply' and never lands anything; this lands a coding
+# job's code-only diff on the origin repo's default branch ONLY when every one of
+# these holds, else it does NOTHING and the job stays ready-to-apply (never partial):
+#   1. the gate verdict is a clean PASS (no concerns / code findings / untrusted)
+#   2. the cross-family second opinion has finished and AGREES
+#   3. the deliverable is a code-only diff (ollama-dispatch-integrate strips and
+#      verifies no scaffold file; staged files are a subset of the judged targets)
+#   4. the origin repo HEAD still matches the chain's baseline (integrate classifies
+#      the branch `clean`, merge-base == main tip, 0 behind, default branch checked out)
+#   5. the repo's validate command passes on the staged tree BEFORE anything is
+#      moved or pushed (fail-closed: no known validate command -> no landing)
+# Landing is `ollama-dispatch-integrate --stage` (scratch integrate/* branch) then a
+# fast-forward-only advance of the default branch to that branch -- NEVER a merge of
+# the worktree branch. A failed push rewinds the default branch. Opt-out: AUTO_LAND=0.
+# Every decision is printed, recorded on the gate payload (auto_land) and appended
+# to AUTO-FIX-QUEUE.md. Evaluated after the gate verdict, after the second opinion
+# lands, and on the daemon sweep (all idempotent).
+# ==============================================================================
+AUTO_LAND_VALIDATE_TIMEOUT_S = int(os.environ.get("AUTO_LAND_VALIDATE_TIMEOUT_S", "900"))
+# repo basename -> validate command, when the repo carries no .dispatch-validate file.
+AUTO_LAND_VALIDATE_DEFAULTS = {
+    "resell-tracker": "npx prisma generate && npx tsc --noEmit && npm test",
+    "local-llm-dispatch": "./run-tests.sh",
+}
+
+
+def _auto_land_enabled() -> bool:
+    """AUTO_LAND=0 (or off/false/no) opts out; read per call so it can flip live."""
+    return os.environ.get("AUTO_LAND", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def auto_land_gate_reasons(payload: dict) -> list:
+    """PURE. Conditions 1+2: why this record may NOT auto-land yet ([] = both hold).
+    A missing key counts against landing (fail-closed)."""
+    why = []
+    if str(payload.get("auto_pipeline_action")) != "apply":
+        why.append(f"not an apply-stage coding PASS (auto_pipeline_action="
+                   f"{payload.get('auto_pipeline_action')!r})")
+    if not _gate_is_clean(payload):
+        why.append(f"gate verdict {payload.get('verdict')!r} is not a clean PASS")
+    if payload.get("regate") == "pending":
+        why.append("authoritative re-gate still pending")
+    so = payload.get("second_opinion") or {}
+    ag = payload.get("second_opinion_agreement")
+    if payload.get("second_opinion_disagreement") or ag == "disagree":
+        why.append("second opinion DISAGREES")
+    elif ag != "agree":
+        why.append(f"second opinion has not agreed (review={so.get('review')!r}, "
+                   f"agreement={ag!r})")
+    return why
+
+
+def auto_land_stage_reasons(cls: dict, stage: dict, targets: list) -> list:
+    """PURE. Conditions 3+4 from integrate's classify + --stage JSON."""
+    why = []
+    if not isinstance(cls, dict) or cls.get("error"):
+        return [f"integrate classify failed: {(cls or {}).get('error') if isinstance(cls, dict) else cls}"]
+    if cls.get("overall") != "clean":
+        why.append(f"integrate verdict is {cls.get('overall')!r}, not 'clean'")
+    if cls.get("scope_inferred"):
+        why.append("deliverable scope is inferred, not a recorded contract")
+    mb, tip = str(cls.get("merge_base") or ""), str(cls.get("main_tip") or "")
+    if not mb or not tip or mb != tip or int(cls.get("behind") or 0) != 0:
+        why.append(f"target HEAD moved off the chain baseline (merge-base {mb[:12] or '?'}, "
+                   f"main {tip[:12] or '?'}, behind {cls.get('behind')})")
+    if cls.get("dirty_scope_files") or cls.get("dirty_out_of_scope_files"):
+        why.append("worktree has uncommitted changes")
+    if not isinstance(stage, dict) or not stage.get("staged"):
+        why.append(f"stage refused: {stage if not isinstance(stage, dict) else stage.get('refuse')}")
+        return why
+    files = list(stage.get("diff_files") or [])
+    if not files:
+        why.append("staged diff is empty")
+    leaked = [f for f in files if f.rsplit("/", 1)[-1] in _SCAFFOLD_BASENAMES]
+    if leaked or stage.get("scaffold_leaked"):
+        why.append(f"scaffold file(s) in the deliverable diff: "
+                   f"{sorted(set(leaked) | set(stage.get('scaffold_leaked') or []))}")
+    extra = sorted(set(files) - set(targets or []))
+    if extra:
+        why.append(f"staged file(s) the gate never judged: {extra}")
+    return why
+
+
+def auto_land_validate_cmd(repo_root) -> str | None:
+    """The repo's validate command: <repo>/.dispatch-validate (first non-comment line),
+    else the built-in table, else None (=> no landing; fail-closed)."""
+    try:
+        f = Path(repo_root) / ".dispatch-validate"
+        if f.is_file():
+            for ln in f.read_text().splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    return ln
+    except Exception:
+        pass
+    return AUTO_LAND_VALIDATE_DEFAULTS.get(Path(repo_root).name)
+
+
+def _al_git(repo, *args, timeout=120):
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def _al_json(cmd):
+    """Run an integrate command that prints JSON; (rc, parsed-or-text)."""
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    out = r.stdout or ""
+    try:
+        return r.returncode, json.loads(out[out.index("{"):])
+    except Exception:
+        return r.returncode, (out + r.stderr)[-300:]
+
+
+def _auto_land_record(job_id: str, payload: dict, gate_json: Path, status: str,
+                      reasons: list, out_dir: Path | None = None, **extra) -> None:
+    """Record + log ONE decision. Quiet when nothing changed since the last
+    evaluation (the sweep re-evaluates every tick)."""
+    prev = payload.get("auto_land") or {}
+    rec = {"status": status, "reasons": [str(r)[:240] for r in reasons][:8], **extra}
+    sig = (status, tuple(rec["reasons"]))
+    payload["auto_land"] = {**rec, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    try:
+        gate_json.write_text(json.dumps(payload, indent=1))
+    except Exception:
+        pass
+    if sig == (prev.get("status"), tuple(prev.get("reasons") or ())):
+        return
+    print(f"[gate] {job_id} auto-land {status}" + (": " + "; ".join(rec["reasons"][:3]) if reasons else ""))
+    try:
+        od = out_dir or gate_json.parent
+        row = f"- `{job_id}` **auto-land {status}** - {payload['auto_land']['at']}\n"
+        for r in rec["reasons"][:4]:
+            row += f"    - {r}\n"
+        with (od / "AUTO-FIX-QUEUE.md").open("a") as fh:
+            fh.write(row)
+    except Exception:
+        pass
+
+
+def auto_land_consider(job_id: str, payload: dict, gate_json: Path) -> None:
+    """Evaluate (and, if every condition holds, perform) the auto-land. Advisory:
+    never raises, never changes the verdict or exit code. See the block comment."""
+    try:
+        if payload.get("auto_land", {}).get("status") == "landed":
+            return
+        if not _auto_land_enabled():
+            if payload.get("auto_pipeline_action") == "apply":
+                _auto_land_record(job_id, payload, gate_json, "disabled", ["AUTO_LAND=0"])
+            return
+        if str(payload.get("auto_pipeline_action")) != "apply":
+            return                       # not a coding apply-stage record: nothing to say
+        why = auto_land_gate_reasons(payload)
+        if why:
+            return _auto_land_record(job_id, payload, gate_json, "held", why)
+        if TEST_MODE:
+            return _auto_land_record(job_id, payload, gate_json, "held", ["GATE_TEST_MODE"])
+        cwd = _job_field(job_id, "cwd") or payload.get("cwd") or job_facts(job_id).get("job_cwd")
+        if not cwd or not Path(cwd).is_dir():
+            return _auto_land_record(job_id, payload, gate_json, "held",
+                                     [f"worktree cwd missing/gone: {cwd!r}"])
+        ok, idw = _verdict_identity_check(payload, cwd)
+        if not ok:
+            return _auto_land_record(job_id, payload, gate_json, "held",
+                                     ["verdict identity: " + "; ".join(idw)[:200]])
+        targets = _apply_target_files(payload, job_id)
+        if not targets:
+            return _auto_land_record(job_id, payload, gate_json, "held", ["no target files"])
+        repo_name = _origin_repo_name(cwd)
+        gc = _al_git(cwd, "rev-parse", "--git-common-dir")
+        common = Path(gc.stdout.strip()) if gc.returncode == 0 else None
+        if common is None:
+            return _auto_land_record(job_id, payload, gate_json, "held", ["cannot resolve origin repo"])
+        if not common.is_absolute():
+            common = (Path(cwd) / common).resolve()
+        repo_root = common.parent
+        vcmd = auto_land_validate_cmd(repo_root)
+        if not vcmd:
+            return _auto_land_record(job_id, payload, gate_json, "held",
+                                     [f"no validate command known for {repo_name} "
+                                      f"(add <repo>/.dispatch-validate)"])
+        # one lander per repo at a time (non-blocking: the next sweep retries)
+        import fcntl
+        lockf = (gate_json.parent / f".auto-land-{repo_name}.lock").open("w")
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        integ = [sys.executable, str(BIN / "ollama-dispatch-integrate"), "--json"]
+        rc, cls = _al_json(integ + [str(cwd)])
+        pre = auto_land_stage_reasons(cls, {"staged": True, "diff_files": list(targets)}, targets)
+        if pre:
+            return _auto_land_record(job_id, payload, gate_json, "held", pre)
+        # default branch must be the one checked out in the origin tree, and its tip
+        # still the baseline just classified
+        head = _al_git(repo_root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        dref = str(cls.get("default_ref") or "")
+        if not dref or head != dref.split("/")[-1]:
+            return _auto_land_record(job_id, payload, gate_json, "held",
+                                     [f"origin repo has {head!r} checked out, not {dref!r}"])
+        base_full = _al_git(repo_root, "rev-parse", "HEAD").stdout.strip()
+        if not base_full.startswith(str(cls.get("main_tip") or "?")):
+            return _auto_land_record(job_id, payload, gate_json, "held",
+                                     ["origin HEAD differs from the classified main tip"])
+        rc, st = _al_json(integ + ["--stage", str(cwd)])
+        why = auto_land_stage_reasons(cls, st, targets)
+        branch = st.get("target_branch") if isinstance(st, dict) else None
+
+        def _drop_branch():
+            if branch:
+                _al_git(repo_root, "branch", "-D", branch)
+        if why:
+            _drop_branch()
+            return _auto_land_record(job_id, payload, gate_json, "held", why)
+        # (5) validate the STAGED tree in a scratch worktree, before main moves
+        scratch = Path(tempfile.mkdtemp(prefix="auto-land-"))
+        vr = None
+        try:
+            wa = _al_git(repo_root, "worktree", "add", "--detach", str(scratch / "t"), branch)
+            if wa.returncode != 0:
+                _drop_branch()
+                return _auto_land_record(job_id, payload, gate_json, "held",
+                                         ["scratch worktree failed: " + (wa.stderr or "")[-160:]])
+            nm = repo_root / "node_modules"
+            if nm.is_dir() and not (scratch / "t" / "node_modules").exists():
+                (scratch / "t" / "node_modules").symlink_to(nm)
+            vr = subprocess.run(vcmd, shell=True, cwd=str(scratch / "t"), capture_output=True,
+                                text=True, timeout=AUTO_LAND_VALIDATE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            vr = None
+        finally:
+            _al_git(repo_root, "worktree", "remove", "--force", str(scratch / "t"))
+            shutil.rmtree(scratch, ignore_errors=True)
+        if vr is None or vr.returncode != 0:
+            _drop_branch()
+            tail = "timeout" if vr is None else ((vr.stdout or "") + (vr.stderr or ""))[-200:]
+            return _auto_land_record(job_id, payload, gate_json, "held",
+                                     [f"validate `{vcmd}` failed: {tail}"])
+        # land: fast-forward only, over a clean target set, then push; rewind on push failure
+        dirty = [t for t in targets if _target_dirty_in_main(repo_root, t)]
+        if dirty or _al_git(repo_root, "rev-parse", "HEAD").stdout.strip() != base_full:
+            _drop_branch()
+            return _auto_land_record(job_id, payload, gate_json, "held",
+                                     [f"origin tree moved/dirty during validation: {dirty or 'HEAD advanced'}"])
+        mg = _al_git(repo_root, "merge", "--ff-only", branch)
+        if mg.returncode != 0:
+            _drop_branch()
+            return _auto_land_record(job_id, payload, gate_json, "held",
+                                     ["ff-only advance refused: " + (mg.stderr or mg.stdout)[-160:]])
+        pushed = "no-remote"
+        if _al_git(repo_root, "remote").stdout.strip():
+            pu = _al_git(repo_root, "push", "origin", f"HEAD:{head}", timeout=180)
+            if pu.returncode != 0:
+                _al_git(repo_root, "reset", "--keep", base_full)
+                _drop_branch()
+                return _auto_land_record(job_id, payload, gate_json, "held",
+                                         ["push failed, default branch rewound: "
+                                          + (pu.stderr or "")[-160:]])
+            pushed = "pushed"
+        new_tip = _al_git(repo_root, "rev-parse", "HEAD").stdout.strip()
+        _drop_branch()
+        _auto_land_record(job_id, payload, gate_json, "landed", [],
+                          repo=str(repo_root), commit=new_tip[:12], base=base_full[:12],
+                          files=st.get("diff_files"),
+                          push=pushed, validate=vcmd)
+    except Exception as e:
+        try:
+            _auto_land_record(job_id, payload, gate_json, "error",
+                              [f"{type(e).__name__}: {str(e)[:180]}"])
+        except Exception:
+            pass
+
+
+# ==============================================================================
 # SLICE AUTO-FEED (the owner 2026-09-18: "auto needs to auto ... one job creates the
 # next"). A slice plan used to advance only when a human re-ran
 # `ollama-dispatch-slice <plan> --execute`: the converged coding job sat done, its
@@ -5474,6 +5754,7 @@ def main() -> int:
         if not _pl.get("job_label"):
             _pl["job_label"] = a.job_label or None
         auto_pipeline_consider(a.job_id, _pl, _gj)
+        auto_land_consider(a.job_id, _pl, _gj)
         slice_pipeline_consider(a.job_id, _pl, _gj)
         # Daemon per-tick sweep also drives the run-status janitor (idempotent).
         runstatus_janitor_consider(a.job_id, _pl, _gj)
@@ -5627,6 +5908,7 @@ def main() -> int:
                 autofix_consider(a.job_id, payload, gate_json, out_dir)
                 escalation_triage_consider(a.job_id, payload, gate_json)
                 auto_pipeline_consider(a.job_id, payload, gate_json)
+                auto_land_consider(a.job_id, payload, gate_json)
                 slice_pipeline_consider(a.job_id, payload, gate_json)
                 runstatus_janitor_consider(a.job_id, payload, gate_json)
                 land_ingest_consider(a.job_id, payload)

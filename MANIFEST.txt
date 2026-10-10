@@ -107,6 +107,7 @@ bin|~/bin/ollama-dispatch-plan.fixtures
 tests|~/bin/test-author-burn-guards.py
 tests|~/bin/test-author-continuation.py
 tests|~/bin/test-auto-author-prompt.py
+tests|~/bin/test-auto-land.py
 tests|~/bin/test-auto-ctx-and-split.py
 tests|~/bin/test-auto-driver-gone.py
 tests|~/bin/test-auto-gate-preempt-pause.py
