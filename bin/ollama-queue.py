@@ -6211,6 +6211,53 @@ def _stamp_progress(job, cls, detail):
         f"headway, not a flat-lined model failure (continuation_allowance recorded)")
 
 
+_RUNNER_ARM_LINE_RE = re.compile(r"^(?:\[[0-9:]+\] )?(ABORT[^\n]*|driver exit \d+|WARN[^\n]*)$", re.M)
+
+
+def classify_runner_failure(job, log_tail, sidecar=None):
+    """PURE. (failure_class, failure_detail) for a FAILED wrapper-runner row
+    (gpu-exclusive-runner.py / bakeoff-runner.py), or None for a normal worker row.
+
+    These rows run a shell DRIVER, not ollama-worker.py: there is no `--- iteration`
+    block and no verify line in their log BY DESIGN, so classify_failure()'s "no
+    iterations ever ran" fallback labelled every one of them 'worker produced no
+    iterations' -- which hid what actually happened (live 2026-10-09, the v12 Strata
+    h2h rows: a SIGTERM from a daemon restart, a sandbox ssh timeout in the VRAM
+    check, the Strata engine's own no-progress abort surfacing as driver exit 4, and a
+    driver that hung after its last row). The cause is in the runner's result sidecar
+    (gpu-exclusive) or the driver's exit code (bakeoff-runner); say that. Class stays
+    'harness' (nothing here is a model verdict), so auto-fix routing is unchanged."""
+    runner = os.path.basename(str((job or {}).get("runner") or ""))
+    if runner not in RUNNER_DRIVER_WRAPPERS:
+        return None
+    tail = log_tail or ""
+    rc = (job or {}).get("exit_code")
+    hints = [m.group(1).strip() for m in _RUNNER_ARM_LINE_RE.finditer(tail)]
+    hint = f"; last driver line: {hints[-1][:160]}" if hints else ""
+    sig = ""
+    if isinstance(rc, int) and rc > 128:
+        sig = f" (killed by signal {rc - 128 if rc <= 159 else 256 - rc})"
+    if runner == "gpu-exclusive-runner.py":
+        rec = sidecar if isinstance(sidecar, dict) else {}
+        phase = rec.get("phase")
+        if phase in ("evict", "vram", "spec", "pre-run"):
+            return "harness", (f"gpu-exclusive job never started its command: {phase} step failed -- "
+                               f"{rec.get('why') or 'no reason recorded'}")
+        if rec.get("aborted"):
+            return "harness", (f"gpu-exclusive command aborted ({rec.get('abort_reason') or 'unknown'}) after "
+                               f"{rec.get('duration_s')}s; on_abort rc={rec.get('on_abort_rc')} -- a daemon "
+                               f"stop/restart or operator kill, not a model result{hint}")
+        if phase == "finished":
+            return "harness", (f"gpu-exclusive command exited rc={rec.get('rc')} after "
+                               f"{rec.get('duration_s')}s (a driver exit 4 = infrastructure end, no result row "
+                               f"written, re-enqueue resumes){hint}")
+        return "harness", (f"gpu-exclusive runner left no finished result sidecar (phase "
+                           f"{phase!r}, exit {rc}){hint}")
+    return "harness", (f"bake-off driver exited {rc}{sig} (driver job: no worker iterations by design; "
+                       f"exit 4 = infrastructure end, no result row written, re-enqueue resumes; "
+                       f"a signal exit after the driver's DONE line = a hang in its post-run step){hint}")
+
+
 def _stamp_failure_class(job):
     """Set job['failure_class'] / job['failure_detail'] from the job's own
     terminal_reason + log tail. Idempotent; never raises (a classification failure
@@ -6220,6 +6267,17 @@ def _stamp_failure_class(job):
         cls, detail = classify_failure(job.get("terminal_reason"),
                                        _log_tail(job.get("log_path")),
                                        job.get("exit_code"), authoring=authoring)
+        if cls == "harness" and str(detail).startswith("worker produced no iterations"):
+            side = None
+            if _is_gpu_exclusive_job(job):
+                try:
+                    side = json.loads(gpu_job_result_path(job).read_text())
+                except (OSError, ValueError):
+                    side = None
+            _rf = classify_runner_failure(
+                job, _log_tail(job.get("log_path")) or _log_tail(job.get("live_log_path")), side)
+            if _rf:
+                cls, detail = _rf
         # A convergence failure on a worktree whose default branch has since moved
         # is a STALE BASE until proven otherwise -- retrying it unchanged repeats
         # the run; the fix is to re-seed (or rebase) the worktree first.
@@ -17842,6 +17900,21 @@ def _self_test():
     check("harness: no iterations ever ran",
           classify_failure("nonconvergence", "[worker] warming up qwen...\n", exit_code=2),
           ("harness", "worker produced no iterations (exit 2)"))
+    _gj = {"runner": GPU_JOB_RUNNER, "exit_code": 1}
+    check("runner: gpu-exclusive SIGTERM abort is named, not 'no iterations'",
+          "signal 15" in (classify_runner_failure(_gj, "", {"phase": "finished", "aborted": True,
+              "abort_reason": "signal 15", "duration_s": 1787.7, "rc": 130}) or ("", ""))[1], True)
+    check("runner: gpu-exclusive vram-step failure carries the ssh timeout",
+          "Operation timed out" in (classify_runner_failure(_gj, "", {"phase": "vram",
+              "why": "vram_check failed (ssh: Operation timed out)"}) or ("", ""))[1], True)
+    check("runner: gpu-exclusive driver exit 4 explains infra end + last arm line",
+          (lambda r: ("rc=4" in r[1] and "driver exit 4" in r[1]))(classify_runner_failure(_gj,
+              "[09:03:51] driver exit 4\n", {"phase": "finished", "rc": 4, "duration_s": 2113.4})), True)
+    check("runner: bakeoff-runner signal exit names the signal and the post-DONE hang",
+          (lambda r: ("signal 15" in r[1] and "hang" in r[1]))(classify_runner_failure(
+              {"runner": "/x/bakeoff-runner.py", "exit_code": 241}, "")), True)
+    check("runner: a plain worker row is not touched", classify_runner_failure(
+          {"runner": "/x/ollama-worker.py", "exit_code": 2}, ""), None)
     check("harness beats context when both are present",
           classify_failure("context_starved", _it + "[worker] VERIFY TIMED OUT (300s)")[0], "harness")
     check("context: context_starved", classify_failure("context_starved", _it)[0], "context")

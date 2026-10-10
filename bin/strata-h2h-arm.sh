@@ -51,7 +51,7 @@ chmod 600 "$KEYF"
 # 2. server (its guard writes preflight-guard.txt = what was resident on the card)
 mkdir -p "$RUN/remote"
 if ! "${SSH[@]}" "mkdir -p \$HOME/$RRUN && STRATA_RUN_DIR=\$HOME/$RRUN STRATA_REASONING_BUDGET=$BUDGET STRATA_WATCHDOG_S=${STRATA_WATCHDOG_S:-600} STRATA_PLE_IO=${STRATA_PLE_IO:-ram} STRATA_MAX_S=${STRATA_MAX_S:-14400} ~/strata/strata-serve.sh start" >> "$RUN/arm.txt" 2>&1; then
-  say "ABORT: strata-serve.sh start failed (guard or load) -- see arm.txt / remote/preflight-guard.txt"
+  say "ABORT: strata-serve.sh start failed (guard or load) -- see arm.txt / remote/preflight-guard.txt; last output: $(tail -n 3 "$RUN/arm.txt" | tr '\n' '|' | cut -c1-300)"
   exit 1
 fi
 
