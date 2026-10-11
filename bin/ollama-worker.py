@@ -71,6 +71,10 @@ try:
     import worker_budget as _bb   # switchable budget policies (2026-10-09); every use is gated on a non-empty policy set
 except Exception:                 # a missing/broken module must never break a default run
     _bb = None
+try:
+    import worker_levers as _wl   # opt-in convergence levers VERIFY_ON_EDIT / PROTECT_HARNESS / READ_MIN_WINDOW (2026-10-10); all default OFF
+except Exception:                 # a missing/broken module must never break a default run
+    _wl = None
 import worker_robust as _wr   # Phase 3 (2026-10-08): layered tool-call repair, format requery, loop detector, stop-gate
 
 try:
@@ -1345,6 +1349,8 @@ def tool_list_files(cwd: Path, args: dict) -> str:
     entries = []
     try:
         _all = sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name))
+        if _wl is not None:   # PROTECT_HARNESS: the reference solution is invisible (no-op unless armed)
+            _all = [c for c in _all if not _wl.ph_hidden(cwd, c)]
         if len(_all) > _wr.LIST_FILES_MAX_ENTRIES:
             # HUGE DIRECTORY (2026-10-09: a review listed `.` = $HOME, 2149 entries / 82 KB, and
             # every later turn re-read that). Refuse with a short sample and a way forward.
@@ -1376,6 +1382,10 @@ def tool_read_file(cwd: Path, args: dict, max_chars: int = None,
     # the same explicit-check-with-clear-message pattern to all three file tools here.
     if "path" not in args:
         return 'ERROR: read_file requires a "path" argument.'
+    if _wl is not None:
+        _ph = _wl.ph_file_verdict(cwd, args["path"], "read")      # PROTECT_HARNESS (no-op unless armed)
+        if _ph:
+            return _ph
     p = resolve_path(cwd, args["path"])
     if not p.exists():
         return f"ERROR: file not found: {args['path']} -- use list_files to see what exists."
@@ -1437,6 +1447,9 @@ def _paginate_read(text: str, args: dict, shown_path: str,
     start = max(1, off) if off else 1
     if _READ_WINDOW[0] and (ln is None or ln < _READ_WINDOW[0]):
         ln = _READ_WINDOW[0]
+    _mw_asked = ln
+    if _wl is not None:      # READ_MIN_WINDOW=1: 0 < length < 120 is widened (default OFF = unchanged)
+        ln = _wl.min_window_length(ln)
     if total_lines and start > total_lines:
         return (f"ERROR: offset {start} is past the end of {shown_path} -- the file has "
                 f"{total_lines} lines. Call read_file with "
@@ -1455,8 +1468,10 @@ def _paginate_read(text: str, args: dict, shown_path: str,
     body = "".join(kept)
     last = start - 1 + len(kept)
     complete = (start == 1 and last >= total_lines)
+    _mw_note = (_wl.min_window_note(_mw_asked, start, last, total_lines)
+                if (_wl is not None and ln != _mw_asked) else "")
     if complete:
-        return body          # small file, unchanged behaviour -- no notice noise
+        return body + (("\n" + _mw_note) if _mw_note else "")   # small file, unchanged behaviour -- no notice noise
 
     nxt = last + 1
     header = (f"[read_file {shown_path}: lines {start}-{last} of {total_lines} "
@@ -1471,6 +1486,8 @@ def _paginate_read(text: str, args: dict, shown_path: str,
         suggest = max(1, len(kept)) if kept else 300
         footer = (f"\n[{total_lines - last} more line(s) not shown. To continue, call "
                   f'read_file with {{"path":"{shown_path}","offset":{nxt},"length":{suggest}}}]')
+    if _mw_note:
+        footer += "\n" + _mw_note
     return header + body + footer
 
 
@@ -1525,6 +1542,10 @@ def tool_write_file(cwd: Path, args: dict) -> str:
         return 'ERROR: write_file requires a "path" argument.'
     if "content" not in args:
         return 'ERROR: write_file requires a "content" argument.'
+    if _wl is not None:
+        _ph = _wl.ph_file_verdict(cwd, args["path"], "write")     # PROTECT_HARNESS (no-op unless armed)
+        if _ph:
+            return _ph
     p = resolve_path(cwd, args["path"])
     content = _fix_literal_escapes(args["content"])
     before = None
@@ -1598,6 +1619,10 @@ def tool_edit_file(cwd: Path, args: dict) -> str:
     for required in ("path", "old_string", "new_string"):
         if required not in args:
             return f'ERROR: edit_file requires a "{required}" argument.'
+    if _wl is not None:
+        _ph = _wl.ph_file_verdict(cwd, args["path"], "write")     # PROTECT_HARNESS (no-op unless armed)
+        if _ph:
+            return _ph
     p = resolve_path(cwd, args["path"])
     if not p.exists():
         return f"ERROR: file not found: {args['path']}"
@@ -1857,8 +1882,15 @@ def tool_run_bash(cwd: Path, args: dict) -> str:
     # surface as the bare KeyError text "ERROR running command: 'command'".
     if not isinstance(args, dict) or "command" not in args:
         return 'ERROR: run_bash requires a "command" argument (the shell command to run).'
+    if _wl is not None:
+        _ph = _wl.ph_bash_verdict(cwd, args["command"])           # PROTECT_HARNESS (no-op unless armed)
+        if _ph:
+            return _ph
     try:
         rc, out, err = _run_shell_group(args["command"], cwd, BASH_TIMEOUT_S)
+        if _wl is not None:
+            out, err = _wl.ph_scrub(cwd, out), _wl.ph_scrub(cwd, err)
+            _wl.ph_note_bash(cwd, args["command"], rc)
         if rc == 0:
             # EDIT_CHECKPOINT: the model ran the task's own verify command itself and it PASSED.
             _edit_checkpoint_on_bash_pass(cwd, args["command"], out)
@@ -2427,6 +2459,10 @@ def make_tool_request_diagnostics(verify: str = None):
                 return "ERROR: `requests` must be a JSON list of request objects, e.g. [{\"kind\":\"git\",\"args\":[\"log\",\"--oneline\",\"-n\",\"10\"]}]"
         if not isinstance(reqs, list) or not reqs:
             return "ERROR: `requests` must be a non-empty list of request objects (kinds: git, file, ls, grep, verify, docker_logs)."
+        if _wl is not None:
+            _pd = _wl.ph_diag_verdict(cwd, reqs)                  # PROTECT_HARNESS (no-op unless armed)
+            if _pd:
+                return _pd
         res = mod.run_requests(reqs, cwd, budget=budget, verify=verify)
         return json.dumps(res, ensure_ascii=False)
 
@@ -5191,10 +5227,15 @@ def _quick_verify(verify: str, cwd) -> tuple:
     cost for a dispatch that needed the retries -- acceptable next to burning the
     rest of the iteration budget on a task the model already believes is done.
     """
+    _qv_t0 = time.monotonic()
     try:
         rc, out, err = _run_shell_group(verify, cwd, 300)
     except _GroupTimeout:
+        if _wl is not None:
+            _wl.note_verify_secs(time.monotonic() - _qv_t0)
         return False, "(verify command timed out after 300s)"
+    if _wl is not None:
+        _wl.note_verify_secs(time.monotonic() - _qv_t0)
     if rc in (126, 127):
         return False, (f"(verify command itself could not run, exit {rc} -- "
                         f"check the --verify string)\n{err}")
@@ -6444,6 +6485,8 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
     if _sp_m and not os.environ.get("DISPATCH_SAMPLING"):
         os.environ["DISPATCH_SAMPLING"] = _sp_m.group(1).lower()
         log(f"[worker] SAMPLING PROFILE {_sp_m.group(1).lower()} (from the task's Sampling-profile line).")
+    if _wl is not None:     # per-job opt-in levers via a `Worker-flags:` task line (allow-listed; none = unchanged)
+        _wl.apply_task_flags(task, log=log)
     _prof = _mp.get_profile(model, role)
     log(f"[worker] model profile: {_prof['profile_key']} mode={_prof['mode']} (role={role}) "
         f"temp={_prof['temperature']} top_p={_prof['top_p']} top_k={_prof['top_k']} "
@@ -6978,6 +7021,8 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                                           if _edit_checkpoint_enabled() else None),
                       files=tuple(_sg_files or ()), lits=tuple(_sg_lits_raw or ()),
                       info=None, passes=0, verify=verify)
+    if _wl is not None:     # convergence levers (default OFF): arm per-run state; PROTECT_HARNESS only for a sealed coding job
+        _wl.arm_run(cwd, task, task_kind, verify, log=log)
     _sg_entry = _wr.parse_entry_point(task)
     _next_turn_think = None   # one-turn override of `think` (runaway-reasoning / think-cap recovery)
     _REASONING_BUDGET[0] = _reasoning_budget_chars
@@ -8462,6 +8507,11 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                            f"{', '.join(repr(u) for u in _unknown)} -- "
                            f"{'that argument was' if len(_unknown) == 1 else 'those arguments were'} "
                            f"IGNORED, not applied. {name} accepts: {', '.join(_decl) or '(none)'}.]")
+            # VERIFY_ON_EDIT (default OFF): append the compact verify verdict to a successful edit's result.
+            if (_wl is not None and name in ("write_file", "edit_file") and isinstance(result, str)
+                    and isinstance(args, dict)):
+                result += _wl.after_edit(cwd, verify, args.get("path"), result, _quick_verify,
+                                         task_kind=task_kind, log=log)
             # Vacuous-verify-pass tracking (see the counters' own init comment above).
             if isinstance(result, str):
                 if name in ("write_file", "edit_file") and result.startswith("OK: "):

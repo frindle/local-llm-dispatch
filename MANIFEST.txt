@@ -503,3 +503,5 @@ bin|~/bin/harness-lint
 tests|~/bin/test-literal-lint.py
 tests|~/bin/test-harness-lint.py
 tests|~/bin/test-harness-operator-edit-survives.py
+bin|~/bin/worker_levers.py
+tests|~/bin/test-worker-levers.py

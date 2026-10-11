@@ -100,3 +100,15 @@ CPU lane fixes (relevance stage now eligible and correct on the runner: shipped 
 
 ## Added in the 2026-10-08 update
 Worker robustness (`worker_robust.py`, `model_profile.py` + `model_profiles.yaml`), harness gates (`dispatch_harness_gates.py`), BloomGauge/Darkbloom queue hooks (`bloom_control.py`), the CPU lane (`cpu_lane.py`, `cpu_dispatch.py`, `cpu_job.py`, `cpu_stage.py`, `cpu_vr_measure.py`), CPU prefetch (`cpu-prefetch.py`: starts queued work's CPU prep early on free CPU so the GPU never waits; `docs/cpu-prefetch.md`), `handoff-triage.py`, and their tests and docs (`docs/`). The CPU runner container is its own public repo: https://github.com/frindle/dispatch-cpu-runner (image `ghcr.io/frindle/dispatch-cpu-runner`).
+
+## Worker convergence levers (`bin/worker_levers.py`, test `test-worker-levers.py`, canary seam `workerlevers`)
+
+Three opt-in levers for local-model CODING runs, all default OFF (unset = byte-identical to the pre-lever worker,
+asserted by replaying a scripted tool loop through the real `run_task`): `VERIFY_ON_EDIT=1` (verify every 2nd successful
+non-harness edit, max 6 runs, skipped once a verify took >120 s; appends a <=1500-char failing-cases summary, or a PASS
+note that says to `task_complete`; rides `_quick_verify`, so the `EDIT_CHECKPOINT` snapshot hook still fires),
+`PROTECT_HARNESS=1` (sealed coding harness only: `refimpl.py` hidden/unreadable/unrunnable, harness files un-editable,
+harness / whole-tree / after-PASS `git checkout|restore|stash` refused), `READ_MIN_WINDOW=1` (read_file length <120
+is served >=120 lines, real range noted). Per-job passthrough with no queue change: a `Worker-flags: K=1 K=1` line in
+the task text (allow-listed names, 0/1 only; an env var already set wins). A/B: arm `F` in
+`~/.ollama-dispatch/ab-sampling/v2/submit.py` = arm A + all three.
