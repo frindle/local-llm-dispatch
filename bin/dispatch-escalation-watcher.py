@@ -1470,6 +1470,26 @@ unsupervised 3am agent that "fixes" a stuck loop is how loops get worse.
 Answer in under 400 words, plain markdown, starting with a one-line verdict of
 the form: VERDICT: <a|b|c|d> -- <one sentence>.
 
+GROUNDING (mandatory; a script verifies it -- escalation_grounding.py, policy v1).
+Every causal claim behind your verdict must cite `path:LINE` AND quote the exact text
+from that line in backticks, on the same line, e.g.
+  - refimpl.py:42 `session = target.session` -- reads an attribute the fixture never sets
+The script opens the cited file (absolute path, or relative to the worktree named in the
+context file) and drops any claim whose quote is not within 2 lines of LINE. A verdict
+with NO surviving claim is marked UNVERIFIED and the pipeline will NOT act on it. Never
+quote from memory: copy from a tool result you just saw.
+Also RUN the cheapest reproducing command ONCE (e.g. `python3 auto-harness-check.py`, or
+`bash verify.sh`, or the refimpl against the fixture) and record, verbatim, before the
+verdict is finalised:
+REPRO CMD: <the command>
+REPRO OUTPUT:
+```
+<its output, including the FIRST traceback / exception if there is one>
+```
+If that output shows an exception, your claims must name it: a claim such as "every case
+returns (0, [])" is checked against the real first exception (a swallowed NameError behind
+a bare `except` is the usual cause), not accepted on prose.
+
 MACHINE-CHECKABLE OUTPUT (mandatory, the pipeline ACTS on it with nobody reading
 this file). Your FIRST line is the VERDICT line -- do not narrate your plan or
 "let me analyze" first; read the evidence, then write the answer. Your LAST line
@@ -2570,6 +2590,16 @@ def run_once(dry_run=False):
             prompt=(INTEGRATION_REVIEW_PROMPT if e.get("kind") == "integration"
                     else REVIEW_PROMPT),
             bundle=review_bundle(e))
+        # GROUNDING POLICY STAMP (the watcher stamps, never the model): only a review spawned
+        # under the grounded prompt is enforced; the stamp is what self-heal keys on. A
+        # blocked / capped review is not a verdict and is not stamped.
+        if (e.get("kind") != "integration" and not is_review_blocked(review)
+                and not _verdict_mod().is_no_verdict_review(review)):
+            try:
+                import escalation_grounding as _eg
+                review = _eg.stamp(review)
+            except Exception:
+                pass
         try:
             (ESC_DIR / ("%s.review.md" % stem)).write_text(review + "\n")
         except Exception:
@@ -2633,6 +2663,19 @@ def run_once(dry_run=False):
         # `git apply --check`. A diff that does not apply is NOT written out.
         review = ensure_verdict(e, ctx, stem, review)
         vline = verdict_line(review, e.get("reason"))
+        # GROUNDING CHECK: verify every cited file:line + quote; record what was dropped on
+        # the review file and make UNVERIFIED visible on the index row. Advisory here -- the
+        # ACTION gate lives in dispatch-self-heal.py (it re-derives the same report).
+        try:
+            import escalation_grounding as _eg
+            if _eg.enforced(review):
+                _gr = _eg.assess(review, Path(ctx).read_text(errors="replace"))
+                with (ESC_DIR / ("%s.review.md" % stem)).open("a") as fh:
+                    fh.write(_eg.report_md(_gr))
+                if _gr["status"] == "UNVERIFIED":
+                    vline = "[%s] %s" % (_eg.label(_gr), vline)
+        except Exception:
+            pass
         repo = (state or {}).get("repo")
         # A slice's harness lives in its OWN worktree (fixture/refimpl are not in
         # the plan repo at all), so a slice proposal is validated there.

@@ -724,6 +724,20 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
     _vd = _ev_.resolve(review_text, None, reason, cache_path=getattr(heal, "_verdict_cache", None),
                        key_parts=(plan, sid))
     verdict = _vd["verdict"]
+    if verdict in ("b", "c", "d") and _vd["source"] in GROUNDING_REVIEW_SOURCES:
+        try:
+            _cx = Path(ctx).read_text(errors="replace") if ctx else ""
+        except OSError:
+            _cx = ""
+        _ga, review_text, _gr = grounding_gate(
+            review_text, _cx, "slice:%s:%s" % (plan, sid), "slice:%s:%s:" % (plan, sid),
+            _vd["source"], review_path=getattr(heal, "_review_path", None),
+            ledger_path=ledger_path, esc_dir=Path(ledger_path).parent if ledger_path else None,
+            label_="%s/%s" % (plan, sid))
+        if _ga and _ga.startswith("wait:"):
+            return _ga
+        if _ga and _ga.startswith("park:"):
+            return final_rung(plan, sid, _ga[5:], ctx, ledger_path, getattr(heal, "_notifier", None))
     # a verdict that is only the DEFAULT (no evidence either way) must not turn a plain
     # authoring-class retry into a notes retry; but it also never leaves a
     # non-authoring escalation without an action.
@@ -1418,6 +1432,85 @@ def verified_close(job, runner=None):
         return False, "auto-harness-check error %s" % type(exc).__name__
 
 
+# --- GROUNDING GATE (2026-10-11) ------------------------------------------------------
+# The reviewer's b/c/d verdict used to be acted on as-is. Two wrong ones were (2f4d18945f75:
+# "bare names resolve to the original function" -- really a NameError swallowed by a bare
+# except; cardlink s2: a byte-literal mismatch already removed). escalation_grounding.py
+# verifies every cited file:line + quote. An UNVERIFIED reviewer verdict is NOT acted on:
+#   1st time -> ONE fresh re-diagnosis (the stale review is set aside, the watcher's
+#               announce-once key is dropped so its next pass re-reviews with the grounded
+#               prompt; nothing else is touched), action "wait:UNVERIFIED ...";
+#   2nd time -> park for a human (needs-opus) with the UNVERIFIED label in the reason/ctx.
+# Only reviews carrying the watcher's policy stamp are enforced; older review files, mechanical
+# / default / reason verdicts and (a) behave exactly as before. ESC_GROUNDING=off disables.
+GROUNDING_REVIEW_SOURCES = ("structured", "verdict-line", "inferred", "keyword")
+
+
+def _eg():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import escalation_grounding as eg
+    return eg
+
+
+def _unannounce_prefix(prefix, esc_dir=None):
+    """Drop the watcher's announced keys starting with `prefix` so its next pass re-reviews."""
+    lp = Path(esc_dir or ESC_DIR) / "ledger.json"
+    led = _load(lp)
+    if not isinstance(led, dict):
+        return 0
+    before = list(led.get("announced") or [])
+    led["announced"] = [k for k in before if not str(k).startswith(prefix)]
+    n = len(before) - len(led["announced"])
+    if n:
+        tmp = lp.with_suffix(".tmp")
+        tmp.write_text(json.dumps(led, indent=1))
+        tmp.replace(lp)
+    return n
+
+
+def grounding_gate(review_text, ctx_text, scope, prefix, source, review_path=None,
+                   ledger_path=None, esc_dir=None, decisions=None, label_=None):
+    """-> (action_or_None, review_text_to_use, report). action None = proceed (the review is
+    exempt / grandfathered / grounded; ungrounded claim lines are stripped from the text).
+    'wait:...' = re-diagnosis requested; 'park:UNVERIFIED ...' = the caller parks for a human."""
+    eg = _eg()
+    if source not in GROUNDING_REVIEW_SOURCES or not eg.enforced(review_text):
+        return None, review_text, None
+    rep = eg.assess(review_text, ctx_text or "")
+    if rep["status"] != "UNVERIFIED":
+        return None, eg.sanitize(review_text, rep), rep
+    lp = Path(ledger_path or HEAL_LEDGER)
+    led = _load(lp) or {}
+    g = led.setdefault("grounding", {}).setdefault(scope, {"rediag": 0})
+    why = eg.label(rep)
+    if int(g.get("rediag") or 0) < 1:
+        g["rediag"] = 1
+        g["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            lp.parent.mkdir(parents=True, exist_ok=True)
+            tmp = lp.with_suffix(".tmp")
+            tmp.write_text(json.dumps(led, indent=1))
+            tmp.replace(lp)
+        except OSError:
+            pass
+        moved = None
+        if review_path:
+            try:
+                rp = Path(review_path)
+                moved = rp.with_name(rp.name[:-3] + ".unverified-1.md")
+                rp.rename(moved)
+            except OSError:
+                moved = None
+        n = _unannounce_prefix(prefix, esc_dir)
+        log_decision(scope, label_ or scope, "grounding-gate", "rediagnose",
+                     "%s; stale review set aside (%s), %d watcher key(s) re-armed" % (why, moved, n),
+                     path=decisions)
+        return ("wait:%s -- not acted on; ONE fresh re-diagnosis requested (%d key re-armed)"
+                % (why, n), review_text, rep)
+    log_decision(scope, label_ or scope, "grounding-gate", "parked-unverified", why, path=decisions)
+    return "park:%s after a fresh re-diagnosis -- needs-opus, label UNVERIFIED" % why, review_text, rep
+
+
 def _heal_job(job, review_text, jobs=None, ledger_path=None, slice_runs=None, now=None,
              enqueue=None, notifier=None, decisions=None, log_dir=None, ctx=None,
              respec=None, closer=None, verdict_cache=None, config=None, runs_dir=None,
@@ -1451,6 +1544,22 @@ def _heal_job(job, review_text, jobs=None, ledger_path=None, slice_runs=None, no
                     (job.get("escalation") or {}).get("reason"),
                     cache_path=verdict_cache, key_parts=(job.get("id"),))
     verdict = vd["verdict"]
+    if verdict in ("b", "c", "d") and vd["source"] in GROUNDING_REVIEW_SOURCES:
+        try:
+            _cx = Path(ctx).read_text(errors="replace") if ctx else ""
+        except OSError:
+            _cx = ""
+        _ga, review_text, _gr = grounding_gate(
+            review_text, _cx, "job:%s" % job.get("id"), "job:%s:" % job.get("id"), vd["source"],
+            review_path=getattr(_heal_job, "_review_path", None)
+            or _find_job_review(job, Path(ledger_path).parent if ledger_path else None),
+            ledger_path=ledger_path, esc_dir=Path(ledger_path).parent if ledger_path else None,
+            decisions=decisions,
+            label_=job.get("label"))
+        if _ga and _ga.startswith("wait:"):
+            return _ga
+        if _ga and _ga.startswith("park:"):
+            return _park_final(job, job_chain_key(job), _ga[5:], notifier, decisions, ledger_path, now)
     key = job_chain_key(job)
     rec = ((led.get("jobs") or {}).get("chains") or {}).get(key) or {}
     _root = label_base(job.get("label"))
@@ -1653,6 +1762,15 @@ def job_row_state(job, jobs, ledger=None, now=None, log_dir=None, slice_runs=Non
     except Exception:
         return None
     return None
+
+
+def _find_job_review(job, esc_dir=None):
+    """The newest watcher review FILE (path) for a job escalation, or None."""
+    try:
+        c = sorted(Path(esc_dir or ESC_DIR).glob("*-job-%s.review.md" % job.get("id")))
+        return str(c[-1]) if c else None
+    except OSError:
+        return None
 
 
 def _job_review(job, esc_dir=None):
@@ -2582,6 +2700,7 @@ def main():
             if row is None:
                 print("skip:job is not a slice of any plan, and no needs_opus row for it")
                 return 0
+            _heal_job._review_path = a.review
             print(heal_job(row, review, jobs=jobs, ctx=a.context))
             return 0
         # A job escalation: only the verified 'already satisfied' path applies.

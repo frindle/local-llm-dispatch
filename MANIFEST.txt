@@ -442,6 +442,7 @@ bin|~/bin/cpu-prefetch.py
 bin|~/bin/dispatch_env_fixture.py
 bin|~/bin/triage-panel-hook.sh
 bin|~/bin/escalation_verdict.py
+bin|~/bin/escalation_grounding.py
 bin|~/bin/cpu_vr_measure.py
 bin|~/bin/dispatch_harness_gates.py
 bin|~/bin/failure_ledger.py
@@ -470,6 +471,7 @@ tests|~/bin/test-model-profile-conformance.py
 tests|~/bin/test-sampling-ladder.py
 tests|~/bin/test-worker-fanout-guard.py
 tests|~/bin/test-esc-review-bounds.py
+tests|~/bin/test-escalation-grounding.py
 tests|~/bin/test-phase2-replay-corpus.py
 tests|~/bin/test-preflight-harness-gates.py
 tests|~/bin/test-selfcheck-hang.py
