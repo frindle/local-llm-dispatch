@@ -47,11 +47,27 @@ class T(Base):
         self.assertNotIn("--temperature", a)  # card profile applies; no hardcoded sampling
         self.assertIn("MUST NOT create, edit", Path(a[a.index("--task-file") + 1]).read_text())
 
+    def test_readonly_carries_worker_marker_and_iters(self):
+        self.q("run", "--readonly", "--label", "x", "investigate")
+        a = self.argv()
+        txt = Path(a[a.index("--task-file") + 1]).read_text()
+        self.assertIn("Worker-flags: READONLY_JOB=1", txt.splitlines()[0])
+        self.assertEqual(a[a.index("--max-iters") + 1], "40")
+        self.assertIn("FINAL ANSWER", txt)
+        self.q("run", "--readonly", "--max-iters", "7", "y")
+        self.assertEqual(self.argv()[self.argv().index("--max-iters") + 1], "7")
+
+    def test_non_readonly_has_no_marker_and_default_iters_12(self):
+        self.q("run", "--label", "x", "do a thing")
+        a = self.argv()
+        self.assertNotIn("READONLY_JOB", Path(a[a.index("--task-file") + 1]).read_text())
+        self.assertEqual(a[a.index("--max-iters") + 1], "12")
+
     def test_bounds_always_set_and_no_sampling(self):
         self.q("run", "--readonly", "x")
         a = self.argv()
         self.assertEqual(a[a.index("--max-tokens") + 1], "12000")
-        self.assertEqual(a[a.index("--max-iters") + 1], "12")
+        self.assertEqual(a[a.index("--max-iters") + 1], "40")
         self.assertEqual(a[a.index("--chat-timeout") + 1], "900")
         for f in ("--temperature", "--top-p", "--num-ctx"):
             self.assertNotIn(f, a)

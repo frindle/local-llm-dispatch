@@ -37,6 +37,11 @@ never overrides an env var that is already set).
                      in ~50 tokens, the next thinking-ON turn loops again. Turns before the first abort and every
                      non-author role are untouched; the worker owns the two gated call sites.
 
+  READONLY_JOB=1     (2026-10-11) a read-only investigation job (qagent run --readonly stamps this in its task preamble):
+                     worker_robust.loop_config disables the nav_streak detector ("N navigation calls and still no
+                     edit"), which is meaningless when the job must never edit. Identical-call loops, prose runaway,
+                     no_progress, the wall cap and max-iters are untouched. Default off = coding runs unchanged.
+
 PURE apart from the module-level state dicts (reset per run by arm_run) and the one `git log` in
 sealed_coding_harness. No import of the worker; the worker owns the (tiny, gated) call sites."""
 import fnmatch
@@ -47,7 +52,7 @@ import subprocess
 import time
 from pathlib import Path
 
-FLAGS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK")
+FLAGS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK", "READONLY_JOB")
 MIN_WINDOW_LINES = 120
 VOE_EVERY = 2
 VOE_MAX_RUNS = 6

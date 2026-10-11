@@ -33,7 +33,7 @@ Isolation
                            by (a) task-kind research, (b) a prompt preamble forbidding
                            edits, (c) throwaway worktree/scratch cwd, and (d) `result`
                            reports any diff it finds as a READONLY VIOLATION.
-Bounds (always set; override with flags): --max-tokens 12000/turn, --max-iters 12,
+Bounds (always set; override with flags): --max-tokens 12000/turn, --max-iters 12 (40 with --readonly),
   --chat-timeout 900s, --max-wall 1800s active time (aborted by the detached watchdog `run` spawns,
   and also by status/wait).
   Sampling is never set -- the model-card profile applies.  NOTE the queue may serve a
@@ -73,6 +73,7 @@ DEFAULT_MODEL = "qwen3.8:27b-q4_K_M"
 # which let a first real run emit a >1500-line single generation).  Sampling is NOT touched.
 DEF_MAX_TOKENS = 12000    # per-turn output cap (thinking + answer)
 DEF_MAX_ITERS = 12        # tool-loop iterations
+RO_DEF_MAX_ITERS = 40     # read-only investigation navigates a lot; 12 cut real-repo runs off (2ee1420aa901)
 FIX_DEF_MAX_ITERS = 30    # fix mode edits + verifies; 12 cut c8f4 off mid-edit twice (verify never ran)
 DEF_CHAT_TIMEOUT = 900    # seconds per chat call
 DEF_MAX_WALL = 1800       # seconds of ACTIVE run time; enforced by status/wait (abort)
@@ -81,11 +82,15 @@ BANNER = ("=" * 72 + "\n  UNVERIFIED local-model output -- produced by a local L
           "  no verify, no review. Check every claim/id/number against the source.\n" + "=" * 72)
 
 READONLY_PREAMBLE = (
+    "Worker-flags: READONLY_JOB=1\n"
     "READ-ONLY TASK. You may read files and run read-only shell commands (cat, ls, grep, "
     "python3 ... status/list/show style queries). You MUST NOT create, edit, delete or move "
     "any file, and must not run anything that mutates state. Put your whole answer in your "
     "final message as plain text. Keep the final answer concise (under ~60 lines); never repeat "
     "yourself or pad.\n"
+    "Investigate as many steps as you need, but BUDGET them: by your last ~5 iterations stop exploring and "
+    "WRITE THE FINAL ANSWER (findings, evidence with file:line, and what is still unknown). A progress note "
+    "like 'Let me look at...' is NOT an answer; always end with the written answer itself.\n"
     "Tool output may be truncated: narrow queries with grep/cut/head/sort|uniq -c, state it if any "
     "result was cut, and never claim completeness you did not verify.\n\n")
 GENERAL_PREAMBLE = (
@@ -165,7 +170,7 @@ def build_enqueue(args, prompt, qid_hint):
         argv += ["--task-kind", "research"]
     else:
         argv += ["--task-kind", "coding", "--allow-no-verify"]
-    argv += ["--max-iters", str(args.max_iters or DEF_MAX_ITERS),
+    argv += ["--max-iters", str(args.max_iters or (RO_DEF_MAX_ITERS if args.readonly else DEF_MAX_ITERS)),
              "--max-tokens", str(args.max_tokens or DEF_MAX_TOKENS),
              "--chat-timeout", str(args.chat_timeout or DEF_CHAT_TIMEOUT)]
     (workdir / "META.json").write_text(json.dumps({"max_wall": args.max_wall or DEF_MAX_WALL}))

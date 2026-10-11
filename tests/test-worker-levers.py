@@ -22,7 +22,7 @@ LEVERS = Path(os.environ.get("LEVERS_SRC") or HERE / "worker_levers.py")
 FAILS = []
 LAST_ENV = []
 SEQ, REQS = [], []
-FLAG_KEYS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK")
+FLAG_KEYS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK", "READONLY_JOB")
 BYFLAG = {"mode": None, "tools": []}      # L4 stub: mode "think" = prose runaway iff thinking is ON; "always" = every turn
 LOOP_TEXT = "\n".join(["Let me analyze the function. Let me read the function again and plan the change carefully."] * 3000)
 
@@ -208,7 +208,10 @@ def main():
     env = {}
     got = wl.apply_task_flags("x\nWorker-flags: VERIFY_ON_EDIT=1 PROTECT_HARNESS=1 READ_MIN_WINDOW=1 PROSE_STICKY_NOTHINK=1\ny", env)
     check("Worker-flags line sets exactly the 4 allow-listed names", (sorted(env), got.__len__()),
-          (sorted(FLAG_KEYS), 4))
+          (sorted(k for k in FLAG_KEYS if k != "READONLY_JOB"), 4))
+    env = {}
+    wl.apply_task_flags("Worker-flags: READONLY_JOB=1", env)
+    check("READONLY_JOB is an allow-listed task flag", env, {"READONLY_JOB": "1"})
     env = {"READ_MIN_WINDOW": "0"}
     wl.apply_task_flags("Worker-flags: READ_MIN_WINDOW=1 EVIL=1 PATH=/x VERIFY_ON_EDIT=2", env)
     check("pre-set env wins; unknown names / non-0/1 values ignored", env, {"READ_MIN_WINDOW": "0"})
