@@ -548,8 +548,8 @@ class LandMode(Base):
     def g(self, *x, cwd=None):
         return subprocess.run(["git", "-C", str(cwd or self.repo), *x], capture_output=True, text=True, check=True, env=self.env)
 
-    def mkfix(self, verify=None, content=None):
-        r = self.q("fix", "--repo", str(self.repo), "--verify", verify or self.verify, "add is wrong")
+    def mkfix(self, verify=None, content=None, problem="add is wrong"):
+        r = self.q("fix", "--repo", str(self.repo), "--verify", verify or self.verify, problem)
         self.assertEqual(r.stdout.strip(), "abc123def456", r.stderr)
         wt = self.wt(); (wt / "calc.py").write_text(content or self.FIXED); self.finish(wt)
         return self.q("result", "abc123").stdout
@@ -665,7 +665,7 @@ class LandMode(Base):
     def test_commit_message_no_attribution(self):
         self.mkfix(); self.land()
         msg = self.g("log", "-1", "--format=%B").stdout
-        self.assertEqual(msg.strip(), "add is wrong")
+        self.assertEqual(msg.splitlines()[0], "add is wrong: dispatched fix")
         for bad in ("Co-Authored", "Claude", "claude.ai", "Generated", "session"):
             self.assertNotIn(bad, msg)
 
@@ -724,7 +724,7 @@ class LandAuto(Attempts):
         r = self.run_fix(["fix"], 1, extra=("--land",))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertRegex(r.stdout, r"LANDED [0-9a-f]{40} on " + br + r" \(pushed\)")
-        self.assertEqual(self.g("log", "-1", "--format=%s").stdout.strip(), "add is wrong")
+        self.assertEqual(self.g("log", "-1", "--format=%s").stdout.strip(), "add is wrong: dispatched fix")
 
 
 class IncidentGuards(LandMode):
@@ -999,6 +999,53 @@ class IncidentGuards(LandMode):
         self.mkfix(); r = self.land(); self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.strip().splitlines()[-1].split()[1]
 
+    def test_land_message_meaningful_no_task_header(self):
+        self.mkfix(problem="# TASK: rt-add-fix\n\nlong spec text here")
+        (self.logs / "abc123def456.answer.md").write_text("## Root Cause\nadd() subtracted instead of adding. More detail.\n\nChanged calc.py.\n")
+        r = self.land(); self.assertEqual(r.returncode, 0, r.stderr)
+        msg = self.g("log", "-1", "--format=%B").stdout
+        self.assertEqual(msg.splitlines()[0], "rt-add-fix: add() subtracted instead of adding.")
+        self.assertNotIn("# TASK", msg); self.assertNotIn("TASK:", msg)
+        self.assertIn("Verified by: python3 test_calc.py (before exit 1, after exit 0)", msg)
+        self.assertIn("Job: abc123def456", msg)
+        for bad in ("Co-Authored-By", "Claude", "Generated with", "claude.ai"):
+            self.assertNotIn(bad, msg)
+        self.assertLessEqual(len(msg.splitlines()[0]), 72)
+
+    def test_land_message_fallback_and_unland_subject(self):
+        self.landed()
+        self.assertEqual(self.g("log", "-1", "--format=%s").stdout.strip(), "add is wrong: dispatched fix")
+        self.unl()
+        self.assertEqual(self.g("log", "-1", "--format=%s").stdout.strip(), 'Revert "add is wrong: dispatched fix"')
+
+    def local_landed(self):
+        self.mkfix(); r = self.land("--no-push"); self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("(local)", r.stdout); return r.stdout.strip().splitlines()[-1].split()[1]
+
+    def test_land_push_only_happy_path(self):
+        sha = self.local_landed(); self.assertNotEqual(self.bare_head(), sha)
+        r = self.land("--push"); self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn(f"PUSHED {sha}", r.stdout)
+        self.assertEqual(self.bare_head(), sha)
+        self.assertEqual(self.g("rev-list", "--count", "main").stdout.strip(), "2")      # not re-applied
+        self.assertEqual(self.meta()["landed"]["mode"], "pushed")
+
+    def test_land_push_only_diverged_refused(self):
+        sha = self.local_landed()
+        other = self.d / "other"; subprocess.run(["git", "clone", "-q", str(self.bare), str(other)], check=True, env=self.env)
+        (other / "x.txt").write_text("x\n"); self.g("add", "-A", cwd=other); self.g("commit", "-qm", "theirs", cwd=other)
+        self.g("push", "-q", "origin", "main", cwd=other); theirs = self.bare_head()
+        r = self.land("--push"); self.assertEqual(r.returncode, 1)
+        self.assertIn("diverged", r.stderr); self.assertEqual(self.bare_head(), theirs)
+        self.assertEqual(self.meta()["landed"]["mode"], "local")
+
+    def test_land_push_only_already_pushed_noop(self):
+        sha = self.local_landed()
+        self.assertEqual(self.land("--push").returncode, 0); head = self.bare_head()
+        r = self.land("--push"); self.assertEqual(r.returncode, 0)
+        self.assertIn("already landed", r.stdout); self.assertEqual(self.bare_head(), head)
+        # landed locally, but someone else already pushed it by hand: no-op success, mode recorded
+
     def test_unland_clean_reverts_pushes_no_attribution(self):
         sha = self.landed()
         r = self.unl(); self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
@@ -1007,7 +1054,7 @@ class IncidentGuards(LandMode):
         self.assertEqual(self.g("rev-parse", "HEAD~1").stdout.strip(), sha)         # fast-forward, nothing rewritten
         self.assertIn("return a - b", (self.repo / "calc.py").read_text())
         msg = self.g("log", "-1", "--format=%B").stdout
-        self.assertEqual(msg.splitlines()[0], 'Revert "add is wrong"')
+        self.assertEqual(msg.splitlines()[0], 'Revert "add is wrong: dispatched fix"')
         for bad in ("Co-Authored-By", "Claude", "Generated with", "claude.ai"):
             self.assertNotIn(bad, msg)
         self.assertEqual(self.g("status", "--porcelain").stdout, "")

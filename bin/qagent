@@ -12,7 +12,7 @@ authoring.  Output is UNVERIFIED local-model text; the caller must check it.
   qagent wait <id> [--timeout S]                        exit 0 done, 1 failed, 2 timeout
   qagent result <id>                                    summary + diff + banner + log path
   qagent followup <id> "<msg>" [--dry-run]              new job seeded from the prior one
-  qagent land <job-id|group-id> [--push|--no-push] [--branch B]
+  qagent land <job-id|group-id> [--push|--no-push] [--branch B]   (--push on a locally-landed job = ff-only push-only)
                                                         land a VERIFIED fix (see LANDING below); prints `LANDED <sha> on <branch> (pushed|local)`
   qagent abort <id>                                     via ~/bin/queue-abort (fix jobs: also removes the worktree)
   qagent fix --repo R --verify "<cmd>" [--base REF] [--land] [--wait] "<problem>"
@@ -1118,6 +1118,102 @@ def _land_once(m, branch, push, remote):
         git(repo, "worktree", "prune")
 
 
+def _clean_md(t):
+    t = re.sub(r"[`*_#>]+", "", t or "")
+    return re.sub(r"\s+", " ", t).strip(" -:\t")
+
+
+def _answer_summary(m):
+    """First sentence of the model's final answer (prefer the line after a 'Root Cause' heading); '' if none."""
+    try:
+        jid = m["job"]
+        j = find_job(jid) or done_sidecar(jid) or {}
+        j.setdefault("id", jid)
+        ap = LOG_DIR / f"{jid}.answer.md"
+        if ap.exists() and ap.read_text().strip():
+            ans = ap.read_text()
+        else:
+            ans = final_answer(j)[0]
+            if ans.startswith("(no transcript answer found"):
+                return ""
+    except Exception:
+        return ""
+    lines = [l.strip() for l in ans.splitlines()]
+    for i, l in enumerate(lines):
+        if re.match(r"^[#*\s_-]*root\s*cause\b", l, re.I):
+            rest = _clean_md(re.sub(r"^[#*\s_-]*root\s*cause[*_:\s-]*", "", l, flags=re.I))
+            cand = rest or next((_clean_md(x) for x in lines[i + 1:] if _clean_md(x)), "")
+            if cand:
+                return re.split(r"(?<=[.!?])\s", cand)[0]
+    for l in lines:
+        c = _clean_md(l)
+        if c and not c.lower().startswith("# task"):
+            return re.split(r"(?<=[.!?])\s", c)[0]
+    return ""
+
+
+def land_message(m):
+    """Meaningful commit message: '<name>: <summary>' (<=72) + body + 'Verified by' + job id.  Never the '# TASK:' header."""
+    jid = m["job"]
+    plines = [l.strip() for l in (m.get("problem") or "").splitlines() if l.strip()]
+    name = ""
+    for l in plines:
+        mm = re.match(r"^#\s*TASK:\s*(.*)$", l, re.I)
+        if mm:
+            name = mm.group(1).strip(); break
+    if not name:
+        name = next((l for l in plines if not l.startswith("#")), "") or f"qagent fix {jid[:8]}"
+    name = _clean_md(name)[:40] or f"qagent fix {jid[:8]}"
+    summ = _answer_summary(m)
+    subject = f"{name}: {summ}" if summ else f"{name}: dispatched fix"
+    if len(subject) > 72:
+        subject = subject[:69].rstrip() + "..."
+    rep = m.get("report") or {}
+    body = [f"Dispatched fix for {name}." + (f" {summ}" if summ else ""),
+            "", f"Verified by: {m.get('verify')} (before exit {(m.get('baseline') or {}).get('exit')}, after exit {rep.get('after')})",
+            f"Job: {jid}"]
+    return subject + "\n\n" + "\n".join(body) + "\n"
+
+
+def _push_landed(m):
+    """Push-only for a job landed locally: ff-only, never re-applies.  Returns exit code."""
+    L, repo = m["landed"], m["repo"]
+    sha, branch = L["sha"], L["branch"]
+    remotes = git(repo, "remote").stdout.split()
+    if not remotes:
+        print("qagent land: --push but the repo has no remote", file=sys.stderr); return 1
+    remote = "origin" if "origin" in remotes else remotes[0]
+    f = git(repo, "fetch", "-q", remote)
+    if f.returncode != 0:
+        print(f"qagent land: fetch failed, not pushing: {(f.stderr or f.stdout).strip()[-300:]}", file=sys.stderr); return 1
+    tip = git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}")
+    if tip.returncode != 0:
+        print(f"qagent land: branch {branch} does not exist in {repo}", file=sys.stderr); return 1
+    tip = tip.stdout.strip()
+    if git(repo, "cat-file", "-e", f"{sha}^{{commit}}").returncode != 0 or git(repo, "merge-base", "--is-ancestor", sha, tip).returncode != 0:
+        print(f"qagent land: REFUSED, nothing pushed. landed commit {sha[:12]} is not the tip or an ancestor of {branch} ({tip[:12]}) (rebased away?)", file=sys.stderr)
+        return 1
+    rr = f"refs/remotes/{remote}/{branch}"
+    rt = git(repo, "rev-parse", "--verify", "-q", rr)
+    rt = rt.stdout.strip() if rt.returncode == 0 else None
+    if rt and git(repo, "merge-base", "--is-ancestor", sha, rt).returncode == 0:
+        note = "already on remote, nothing to push"
+    elif rt and git(repo, "merge-base", "--is-ancestor", rt, tip).returncode != 0:
+        print(f"qagent land: REFUSED, nothing pushed. local {branch} and {remote}/{branch} have diverged; reconcile first", file=sys.stderr)
+        return 1
+    else:
+        p = git(repo, "push", remote, f"{tip}:refs/heads/{branch}", timeout=300)   # no force: ff-only
+        if p.returncode != 0:
+            print(f"qagent land: push failed (nothing forced): {(p.stderr + p.stdout).strip()[-500:]}", file=sys.stderr); return 1
+        git(repo, "fetch", "-q", remote)
+        note = "pushed"
+    m = fix_meta(m["job"])
+    m["landed"] = dict(m["landed"], mode="pushed", pushed_when=time.strftime("%F %T"))
+    fix_save(m["job"], m)
+    print(f"PUSHED {sha} on {branch} to {remote}" + ("" if note == "pushed" else f"   ({note})"))
+    return 0
+
+
 def _land_in(m, lw, tip, branch, push, remote, patch, files):
     repo, jid = m["repo"], m["job"]
     r = git(lw, "apply", "--3way", patch)
@@ -1152,9 +1248,7 @@ def _land_in(m, lw, tip, branch, push, remote, patch, files):
     extra = staged - set(files)
     if extra:
         return ("fail", f"job {jid}: refusing to commit files outside the patch: {sorted(extra)}")
-    first = (m.get("problem") or "").strip().splitlines()
-    title = (first[0].strip()[:72] if first and first[0].strip() else f"qagent fix {jid}")
-    c = git(lw, "commit", "-q", "-m", title)
+    c = git(lw, "commit", "-q", "-m", land_message(m))
     if c.returncode != 0:
         return ("fail", f"commit failed: {(c.stderr or c.stdout).strip()[-800:]}")
     sha = git(lw, "rev-parse", "HEAD").stdout.strip()
@@ -1201,6 +1295,8 @@ def cmd_land(a):
     if not m:
         print(f"qagent land: {err}", file=sys.stderr); return 1
     if m.get("landed"):
+        if a.push is True and m["landed"].get("mode") != "pushed":
+            return _push_landed(m)
         print(landed_line(m["landed"]) + "   (already landed)"); return 0
     why = land_guard(m, getattr(a, "allow_new_files", False))
     if why:
