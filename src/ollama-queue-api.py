@@ -6265,11 +6265,45 @@ _RESP_CACHE_LOCKS = {}    # key -> threading.Lock (single-flight per key)
 _RESP_CACHE_GUARD = threading.Lock()
 
 
+_LL_INDEX = {}            # dir -> (dir mtime_ns, {job id: [filenames]}); see _dir_index
+_LL_INDEX_LOCK = threading.Lock()
+
+
+def _dir_index(d):
+    """{job id: [filename]} for every `<id>-*` file directly in `d`. The log dirs hold
+    ~14k files; globbing them on EVERY /livelog request (3 globs + a stat per hit) was
+    a measurable slice of the 2026-10-10 pile-up. The index is rebuilt only when the
+    directory's mtime moves (a file was created/removed), so a lookup is one stat."""
+    try:
+        mt = os.stat(d).st_mtime_ns
+    except OSError:
+        return {}
+    key = str(d)
+    with _LL_INDEX_LOCK:
+        hit = _LL_INDEX.get(key)
+        if hit and hit[0] == mt:
+            return hit[1]
+    idx = {}
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                n = e.name
+                k = n.find("-")
+                if k > 0:
+                    idx.setdefault(n[:k], []).append(n)
+    except OSError:
+        return {}
+    with _LL_INDEX_LOCK:
+        _LL_INDEX[key] = (mt, idx)
+    return idx
+
+
 def _livelog_path(job, job_id, live_dir=None, log_dir=None):
     """The transcript to show for `job_id`: its recorded live log, else (the row was
     reaped, or never recorded one) the durable files by id -- LIVE_LOG_DIR's
     <id>-*.livelog, then LOG_DIR's <id>-*.log run transcript (and LOG_DIR/archive).
-    Only a plain hex id is globbed, so a crafted id can never escape the log dirs."""
+    Only a plain hex id is looked up, so a crafted id can never escape the log dirs.
+    Lookups go through _dir_index (no per-request directory glob)."""
     p = (job or {}).get("live_log_path")
     if p and os.path.isfile(p):
         return p
@@ -6277,14 +6311,17 @@ def _livelog_path(job, job_id, live_dir=None, log_dir=None):
         return None
     live_dir = Path(live_dir) if live_dir else q.LIVE_LOG_DIR
     log_dir = Path(log_dir) if log_dir else q.LOG_DIR
-    for d, pat in ((live_dir, f"{job_id}-*.livelog"), (log_dir, f"{job_id}-*.log"),
-                   (log_dir / "archive", f"{job_id}-*.log")):
-        try:
-            hits = sorted(d.glob(pat), key=lambda x: x.stat().st_mtime, reverse=True)
-        except OSError:
-            hits = []
+    jid = str(job_id)
+    for d, ext in ((live_dir, ".livelog"), (log_dir, ".log"), (log_dir / "archive", ".log")):
+        names = [n for n in _dir_index(d).get(jid, ()) if n.endswith(ext)]
+        hits = []
+        for n in names:
+            try:
+                hits.append((os.stat(d / n).st_mtime, d / n))
+            except OSError:
+                pass        # listed, then reaped: the index refreshes on the next dir change
         if hits:
-            return str(hits[0])
+            return str(max(hits)[1])
     return None
 
 
@@ -6680,25 +6717,65 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
     return out
 
 
-def _cached_response(key, fn, ttl=_RESP_CACHE_TTL):
+_RESP_CACHE_GEN = [0]       # bumped by _invalidate_response_cache; a computation that started
+_RESP_REFRESHING = set()    # before a bump never stores its (now stale) value
+
+
+def _cache_store(key, gen, val):
+    if gen == _RESP_CACHE_GEN[0]:
+        _RESP_CACHE[key] = (time.monotonic(), val)
+
+
+def _refresh_async(key, fn, lock):
+    """One background recompute per key (stale-while-revalidate). Never raises."""
+    with _RESP_CACHE_GUARD:
+        if key in _RESP_REFRESHING:
+            return
+        _RESP_REFRESHING.add(key)
+
+    def _run():
+        try:
+            with lock:
+                gen = _RESP_CACHE_GEN[0]
+                _cache_store(key, gen, fn())
+        except Exception as e:  # noqa: BLE001 -- the stale value keeps being served
+            sys.stderr.write(f"[queue-api] background refresh of {key!r} failed: {e!r}\n")
+        finally:
+            with _RESP_CACHE_GUARD:
+                _RESP_REFRESHING.discard(key)
+
+    threading.Thread(target=_run, name=f"refresh-{key}", daemon=True).start()
+
+
+def _cached_response(key, fn, ttl=_RESP_CACHE_TTL, stale=0):
     """fn() at most once per `ttl` seconds per key; concurrent callers share the
-    one in-flight computation instead of each running their own."""
+    one in-flight computation instead of each running their own.
+
+    `stale` (seconds) turns on stale-while-revalidate for the slow endpoints: once the
+    entry is older than `ttl` but younger than ttl+stale it is served AT ONCE and one
+    background thread recomputes it, so no poll ever waits on a multi-second rebuild
+    (only the very first call, or one after an invalidation, computes inline)."""
     now = time.monotonic()
     hit = _RESP_CACHE.get(key)
     if hit and now - hit[0] < ttl:
         return hit[1]
     with _RESP_CACHE_GUARD:
         lock = _RESP_CACHE_LOCKS.setdefault(key, threading.Lock())
+    if hit and stale and now - hit[0] < ttl + stale:
+        _refresh_async(key, fn, lock)
+        return hit[1]
     with lock:
         hit = _RESP_CACHE.get(key)
         if hit and time.monotonic() - hit[0] < ttl:
             return hit[1]
+        gen = _RESP_CACHE_GEN[0]
         val = fn()
-        _RESP_CACHE[key] = (time.monotonic(), val)
+        _cache_store(key, gen, val)
         return val
 
 
 def _invalidate_response_cache():
+    _RESP_CACHE_GEN[0] += 1
     _RESP_CACHE.clear()
 
 
@@ -6739,7 +6816,53 @@ def _chat_module():
     return importlib.import_module("dashboard_chat")
 
 
+# Concurrency cap (2026-10-10 pile-up: ~170 stacked request threads, load avg ~80). The server
+# is thread-per-request; once the in-flight count reaches the cap a new request is answered
+# with a fast 503 + Retry-After instead of joining the pile. /api/cpu/* (the Unraid runner's
+# claim / heartbeat / result calls) draws from its OWN pool so dashboard load can never starve
+# it, and a runner burst can never eat the dashboard's slots.
+try:
+    MAX_INFLIGHT = max(1, int(os.environ.get("OLLAMA_QUEUE_API_MAX_INFLIGHT", "48")))
+    MAX_INFLIGHT_CPU = max(1, int(os.environ.get("OLLAMA_QUEUE_API_MAX_INFLIGHT_CPU", "32")))
+except ValueError:
+    MAX_INFLIGHT, MAX_INFLIGHT_CPU = 48, 32
+RETRY_AFTER_S = 2
+_API_SLOTS = threading.BoundedSemaphore(MAX_INFLIGHT)
+_CPU_SLOTS = threading.BoundedSemaphore(MAX_INFLIGHT_CPU)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    _slot = None
+
+    def parse_request(self):
+        """Admission control, run once the request line + headers are parsed and before any
+        do_* handler: take a slot from the right pool or refuse with 503 + Retry-After."""
+        if not super().parse_request():
+            return False
+        pool = _CPU_SLOTS if self.path.startswith("/api/cpu/") else _API_SLOTS
+        if not pool.acquire(blocking=False):
+            body = b"server busy, retry shortly"
+            self.send_response(503)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Retry-After", str(RETRY_AFTER_S))
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            self.close_connection = True
+            return False
+        self._slot = pool
+        return True
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        finally:
+            slot, self._slot = self._slot, None
+            if slot is not None:
+                slot.release()
+
     # A client that connects and then stalls (a backgrounded phone tab, a proxy
     # holding the socket) otherwise pins a thread and a descriptor forever --
     # part of the same fd pile-up. The server speaks HTTP/1.0 (no keep-alive), so
@@ -6822,6 +6945,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._cpu_lane("PUT")
         self._text("not found", 404)
 
+    def _build_jobs_payload(self):
+        with q._Locked() as lock:
+            state = lock.load()
+        # The rendered order follows the daemon's OWN focused bundle (read from the
+        # same state we just loaded), so a bundle that is first stays first across
+        # the gap where its next slice has not been enqueued yet.
+        _rows = _annotate_plan_rollup(
+            _annotate_display_seq(
+                _annotate_job_groups([_job_summary(j, state["jobs"])
+                                      for j in state["jobs"]]),
+                focus_key=_focus_bundle_key(state)))
+        try:    # fold the live slice view into the rollup (see _apply_view_activity)
+            _apply_view_activity(_rows, (_cached_response("bundle-views", _bundle_views, ttl=3, stale=60)
+                                         or {}).get("views") or {})
+        except Exception:
+            pass
+        return _annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_rows, state), state))
+
     def do_GET(self):
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("GET")
@@ -6838,26 +6979,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/" or self.path == "/index.html":
             self._html(FRONTEND_HTML)
         elif self.path == "/api/jobs":
-            with q._Locked() as lock:
-                state = lock.load()
-            # The rendered order follows the daemon's OWN focused bundle (read from the
-            # same state we just loaded), so a bundle that is first stays first across
-            # the gap where its next slice has not been enqueued yet.
-            _rows = _annotate_plan_rollup(
-                _annotate_display_seq(
-                    _annotate_job_groups([_job_summary(j, state["jobs"])
-                                          for j in state["jobs"]]),
-                    focus_key=_focus_bundle_key(state)))
-            try:    # fold the live slice view into the rollup (see _apply_view_activity)
-                _apply_view_activity(_rows, (_cached_response("bundle-views", _bundle_views, ttl=3)
-                                             or {}).get("views") or {})
-            except Exception:
-                pass
-            self._json(_annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_rows, state), state)))
+            # Whole payload is single-flight cached: it costs ~6s of CPU to build (load_history, darkbloom_status,
+            # plan rollup), and uncached each dashboard poll recomputed it -> 100+ stacked threads, GIL-starved API.
+            self._json(_cached_response("api-jobs", self._build_jobs_payload, ttl=3, stale=120))
         elif self.path == "/api/triage":
             # Open failure-signature triage packets (triage_packets.open_summary; read-only,
             # fail-open: an unreadable index is {"open": 0}).
-            self._json(_triage_summary())
+            self._json(_cached_response("triage", _triage_summary, ttl=10))
         elif self.path == "/api/queue-wait":
             # Lane-level "what is the queue waiting on" (daemon queue-wait.json, or the
             # clearly-labelled daemon-log fallback until the daemon is restarted).
@@ -6865,7 +6993,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/bundle-views":
             # Dashboard B: one line per slice with its LIVE phase + history, per plan
             # in the queue, and the live off-GPU activity row (see _bundle_views).
-            self._json(_cached_response("bundle-views", _bundle_views, ttl=3))
+            self._json(_cached_response("bundle-views", _bundle_views, ttl=3, stale=60))
         elif self.path == "/api/bundle-history" or self.path.startswith("/api/bundle-history?"):
             # FINISHED bundles with their full per-slice history, newest first, paged
             # (see _finished_bundle_views). ?days=N (0 = all ages) &limit= &offset=
@@ -6878,33 +7006,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._text("days/limit/offset must be numbers", 400)
             self._json(_cached_response(
                 "bundle-history:" + json.dumps(a, sort_keys=True),
-                lambda: _finished_bundle_views(**a), ttl=15))
+                lambda: _finished_bundle_views(**a), ttl=15, stale=120))
         elif self.path == "/api/jobs/completed":
-            self._json(_cached_response("completed", _completed_jobs))
+            self._json(_cached_response("completed", _completed_jobs, ttl=10, stale=120))
         elif self.path == "/api/runs":
             # Unified run-status list (see _run_status_jobs). Supersedes the split
             # between /api/jobs/completed and /api/handoff; those endpoints remain
             # for any other consumer, but the dashboard front-end now reads this one.
-            self._json(_cached_response("runs", _run_status_jobs))
+            self._json(_cached_response("runs", _run_status_jobs, ttl=10, stale=120))
         elif self.path == "/api/runs/retention":
             # Retention preview: every row the auto-retention predicate would archive,
             # with the reason (never clears). See runstatus_retention.py.
-            self._json(_retention_preview())
+            self._json(_cached_response("runs/retention", _retention_preview, ttl=30, stale=300))
         elif self.path == "/api/runs/tree":
             # The same rows as /api/runs, pre-nested project > slice > run with the
             # worst-of rollup already computed (see _build_run_tree). The panel reads
             # THIS; /api/runs stays exactly as it was for any other consumer.
             self._json(_cached_response("runs/tree",
-                                        lambda: _build_run_tree(_run_status_jobs())))
+                                        lambda: _build_run_tree(_run_status_jobs()), ttl=10, stale=120))
         elif self.path == "/api/hosts":
-            self._json(_hosts_summary())
+            self._json(_cached_response("hosts", _hosts_summary, ttl=10, stale=60))
         elif self.path == "/api/settings/hosts":
             # The editable host table behind the Settings panel. Reads through
             # ollama-worker.py's live config loader, so it never disagrees with
             # what the dispatcher/fit-router is actually using.
-            self._json(_hosts_settings())
+            self._json(_cached_response("settings/hosts", _hosts_settings, ttl=5))
         elif self.path == "/api/web-search-usage":
-            self._json(_web_search_usage())
+            self._json(_cached_response("web-search-usage", _web_search_usage, ttl=15, stale=120))
         elif self.path == "/api/handoff":
             # Read the handoff data from handoff-emit.py --json. Bounded: an
             # untimed child here held a request thread (and its socket) for as long
@@ -7341,6 +7469,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+    # socketserver's default listen backlog is 5: a burst of dashboard tabs/polls overflowed it and
+    # clients saw ECONNRESET / SYN retries (1s+ stalls) before a request ever reached a handler.
+    request_queue_size = 128
 
 
 def _self_test():
