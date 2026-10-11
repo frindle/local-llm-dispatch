@@ -334,11 +334,11 @@ class FixMode(Base):
         (wt / "calc.py").write_text("garbage")   # later tampering must not change the recorded report
         self.assertIn("verdict: VERIFIED", self.result())
 
-    def test_land_prints_manual_command_only(self):
+    def test_result_points_to_qagent_land(self):
         self.fix(extra=["--land"]); wt = self.wt(); (wt / "calc.py").write_text(self.FIXED); self.finish(wt)
         out = self.result()
-        self.assertIn("no automated landing entry", out); self.assertIn("git -C", out)
-        self.assertEqual(self.g("log", "--oneline").stdout.count("\n"), 1)   # no commit made on R
+        self.assertIn("land it: qagent land abc123def456", out); self.assertNotIn("apply by hand", out)
+        self.assertEqual(self.g("log", "--oneline").stdout.count("\n"), 1)   # result itself makes no commit on R
 
     def test_abort_removes_worktree_and_only_under_root(self):
         self.fix(); wt = self.wt(); self.assertTrue(wt.is_dir())
@@ -520,6 +520,211 @@ class Attempts(Base):
         mp = self._mutant('        if r["verdict"] == "VERIFIED":\n            x = type', '        if False:\n            x = type')
         self.run_fix(["fix", "wrong", "wrong"], 3, bin=mp)
         self.assertEqual(len(self.calls()), 3)             # mutant keeps going; stop test expects 2 calls
+
+
+class LandMode(Base):
+    """qagent land: fresh worktree at the current tip, 3-way apply, verify + repo suite, commit only the patch."""
+    g = FixMode.g; _mutant = FixMode._mutant; wt = FixMode.wt; finish = FixMode.finish; FIXED = FixMode.FIXED
+
+    def setUp(self):
+        super().setUp()
+        self.env.update(GIT_AUTHOR_NAME="a", GIT_AUTHOR_EMAIL="a@b", GIT_COMMITTER_NAME="a", GIT_COMMITTER_EMAIL="a@b")
+        self.wts = self.d / "wts"; self.env["QAGENT_WT_ROOT"] = str(self.wts)
+        self.repo = self.d / "R"; self.repo.mkdir()
+        self.bare = self.d / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.bare)], check=True, env=self.env)
+        (self.repo / "calc.py").write_text("def add(a, b):\n    return a - b\n\n\n# tail\n")
+        (self.repo / "test_calc.py").write_text("from calc import add\nassert add(2, 3) == 5, 'add broken'\nprint('ok')\n")
+        (self.repo / "suite.py").write_text("print('suite ok')\n")
+        (self.repo / "package.json").write_text('{"scripts": {"test": "python3 suite.py"}}\n')
+        self.g("init", "-q", "-b", "main"); self.g("add", "-A"); self.g("commit", "-qm", "init")
+        self.g("remote", "add", "origin", str(self.bare)); self.g("push", "-q", "-u", "origin", "main")
+        self.base = self.g("rev-parse", "HEAD").stdout.strip()
+        self.verify = "python3 test_calc.py"
+
+    def q(self, *a, bin=None):
+        return subprocess.run([sys.executable, str(bin or QAGENT), *a], capture_output=True, text=True, env=self.env)
+
+    def g(self, *x, cwd=None):
+        return subprocess.run(["git", "-C", str(cwd or self.repo), *x], capture_output=True, text=True, check=True, env=self.env)
+
+    def mkfix(self, verify=None, content=None):
+        r = self.q("fix", "--repo", str(self.repo), "--verify", verify or self.verify, "add is wrong")
+        self.assertEqual(r.stdout.strip(), "abc123def456", r.stderr)
+        wt = self.wt(); (wt / "calc.py").write_text(content or self.FIXED); self.finish(wt)
+        return self.q("result", "abc123").stdout
+
+    def mkharness_fix(self):
+        (self.repo / "verify.sh").write_text("python3 test_calc.py\n")          # untracked: NOT in HEAD
+        r = self.q("fix", "--repo", str(self.repo), "--verify", "sh verify.sh", "--harness-from", str(self.repo), "add is wrong")
+        self.assertEqual(r.stdout.strip(), "abc123def456", r.stderr)
+        wt = self.wt(); (wt / "calc.py").write_text(self.FIXED); self.finish(wt)
+        return self.q("result", "abc123").stdout
+
+    def land(self, *a, bin=None):
+        return self.q("land", "abc123", *a, bin=bin)
+
+    def bare_git(self, *x):
+        return subprocess.run(["git", "-C", str(self.bare), *x], capture_output=True, text=True).stdout.strip()
+
+    def bare_head(self):
+        return self.bare_git("rev-parse", "main")
+
+    def drift(self, fname, text, msg="drift", push=True):
+        (self.repo / fname).write_text(text); self.g("add", "-A"); self.g("commit", "-qm", msg)
+        if push:
+            self.g("push", "-q", "origin", "main")
+
+    def no_leftovers(self):
+        left = [p for p in self.wts.iterdir() if p.name.startswith("land-")] if self.wts.exists() else []
+        self.assertEqual(left, [])
+        self.assertEqual(self.g("worktree", "list").stdout.count("\n"), 2)   # R + the (still existing) fix worktree
+
+    def test_clean_land_pushes_and_fast_forwards(self):
+        self.mkfix(); r = self.land()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertRegex(r.stdout, r"LANDED [0-9a-f]{40} on main \(pushed\)")
+        sha = r.stdout.strip().splitlines()[-1].split()[1]
+        self.assertEqual(self.bare_head(), sha); self.assertEqual(self.g("rev-parse", "HEAD").stdout.strip(), sha)
+        self.assertIn("return a + b", (self.repo / "calc.py").read_text())
+        self.assertEqual(self.g("status", "--porcelain").stdout, ""); self.no_leftovers()
+        self.assertEqual(self.g("show", "--name-only", "--format=", "HEAD").stdout.split(), ["calc.py"])
+
+    def test_land_after_head_drifted_past_base(self):
+        self.mkfix()
+        self.drift("README.md", "hello\n")
+        self.drift("calc.py", "# header\ndef add(a, b):\n    return a - b\n\n\n# tail\n")
+        r = self.land()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        txt = (self.repo / "calc.py").read_text()
+        self.assertIn("# header", txt); self.assertIn("return a + b", txt)       # 3-way merged both
+        self.assertEqual(self.bare_head(), self.g("rev-parse", "HEAD").stdout.strip())
+
+    def test_conflict_aborts_cleanly(self):
+        self.mkfix(); self.drift("calc.py", "def add(a, b):\n    return a * b\n\n\n# tail\n")
+        head = self.g("rev-parse", "HEAD").stdout.strip(); rem = self.bare_head()
+        r = self.land()
+        self.assertNotEqual(r.returncode, 0); self.assertIn("calc.py", r.stderr); self.assertIn("abc123def456", r.stderr)
+        self.assertNotIn("LANDED", r.stdout)
+        self.no_leftovers()
+        self.assertEqual(self.g("rev-parse", "HEAD").stdout.strip(), head); self.assertEqual(self.bare_head(), rem)
+        self.assertEqual(self.g("status", "--porcelain").stdout, "")
+        self.assertIsNone(json.loads((self.d / "home/fix/abc123def456.json").read_text()).get("landed"))
+
+    def test_failing_verify_aborts(self):
+        self.mkfix()   # drift makes the verify fail even with the fix applied
+        self.drift("test_calc.py", "from calc import add\nassert add(2, 3) == 5\nassert add(1, 1) == 3, 'driftboom'\n")
+        rem = self.bare_head(); r = self.land()
+        self.assertNotEqual(r.returncode, 0); self.assertIn("verify FAILED", r.stderr); self.assertIn("driftboom", r.stderr)
+        self.assertEqual(self.bare_head(), rem); self.no_leftovers()
+
+    def test_failing_repo_suite_aborts(self):
+        self.mkfix(); self.drift("suite.py", "import sys\nprint('SUITEBOOM'); sys.exit(1)\n")
+        rem = self.bare_head(); r = self.land()
+        self.assertNotEqual(r.returncode, 0); self.assertIn("repo suite", r.stderr); self.assertIn("SUITEBOOM", r.stderr)
+        self.assertEqual(self.bare_head(), rem); self.no_leftovers()
+
+    def test_harness_missing_at_base_explained_then_harness_from(self):
+        (self.repo / "verify.sh").write_text("python3 test_calc.py\n")
+        r = self.q("fix", "--repo", str(self.repo), "--verify", "sh verify.sh", "add is wrong")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("verify.sh", r.stderr); self.assertIn("--harness-from", r.stderr)
+        self.assertFalse(self.log.exists())
+        self.assertEqual(list(self.wts.iterdir()) if self.wts.exists() else [], [])
+        out = self.mkharness_fix()
+        self.assertIn("verdict: VERIFIED", out)
+        self.assertNotIn("verify.sh", (self.d / "home/fix/abc123def456.patch").read_text())   # harness never in the patch
+
+    def test_harness_not_committed(self):
+        self.mkharness_fix()
+        r = self.land()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)      # verify.sh WAS available to the landing verify
+        self.assertEqual(self.bare_git("show", "--name-only", "--format=", "main").split(), ["calc.py"])
+        self.assertNotIn("verify.sh", self.bare_git("ls-tree", "-r", "--name-only", "main"))
+
+    def test_dirty_patched_file_not_clobbered_remote_updated(self):
+        self.mkfix(); rem = self.bare_head()
+        (self.repo / "calc.py").write_text("def add(a, b):\n    return a - b\n\n\n# tail\n# MY UNCOMMITTED WORK\n")
+        head = self.g("rev-parse", "HEAD").stdout.strip()
+        r = self.land()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertNotEqual(self.bare_head(), rem)                                   # remote updated
+        self.assertIn("MY UNCOMMITTED WORK", (self.repo / "calc.py").read_text())    # not clobbered
+        self.assertEqual(self.g("rev-parse", "HEAD").stdout.strip(), head)
+        self.assertIn("pull --ff-only", r.stdout); self.assertIn("(pushed)", r.stdout)
+        self.assertEqual(self.g("stash", "list").stdout, "")
+
+    def test_idempotent_reland(self):
+        self.mkfix(); r1 = self.land(); r2 = self.land()
+        self.assertEqual(r2.returncode, 0)
+        line = [l for l in r1.stdout.splitlines() if l.startswith("LANDED")][0]
+        self.assertIn(line, r2.stdout)
+        self.assertEqual(self.g("log", "--oneline").stdout.count("\n"), 2)
+        self.assertEqual(json.loads((self.d / "home/fix/abc123def456.json").read_text())["landed"]["sha"], line.split()[1])
+
+    def test_commit_message_no_attribution(self):
+        self.mkfix(); self.land()
+        msg = self.g("log", "-1", "--format=%B").stdout
+        self.assertEqual(msg.strip(), "add is wrong")
+        for bad in ("Co-Authored", "Claude", "claude.ai", "Generated", "session"):
+            self.assertNotIn(bad, msg)
+
+    def test_unverified_job_refused(self):
+        self.mkfix(content="def add(a, b):\n    return a * b\n\n\n# tail\n"); rem = self.bare_head()
+        r = self.land()
+        self.assertNotEqual(r.returncode, 0); self.assertIn("UNVERIFIED", r.stderr); self.assertIn("refusing", r.stderr)
+        self.assertEqual(self.bare_head(), rem)
+
+    def test_no_push_is_local_only(self):
+        self.mkfix(); rem = self.bare_head(); r = self.land("--no-push")
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("(local)", r.stdout)
+        self.assertEqual(self.bare_head(), rem)
+        self.assertEqual(self.g("log", "--oneline").stdout.count("\n"), 2)
+
+    def test_remote_moved_lands_on_new_tip(self):
+        self.mkfix()
+        c = self.d / "clone"; subprocess.run(["git", "clone", "-q", str(self.bare), str(c)], check=True, env=self.env)
+        (c / "other.txt").write_text("x\n"); self.g("add", "-A", cwd=c); self.g("commit", "-qm", "other", cwd=c)
+        self.g("push", "-q", "origin", "main", cwd=c)
+        r = self.land(); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.g("log", "--oneline").stdout.count("\n"), 3)   # init, other, fix (linear)
+
+    # ---- mutant proofs: the gates must be able to FAIL (mutant lands where the real code refuses)
+    def test_mutant_verify_gate_bites(self):
+        self.mkfix(); self.drift("test_calc.py", "from calc import add\nassert add(1, 1) == 3, 'drift'\n")
+        mp = self._mutant("    if vc != 0:\n        return", "    if False:\n        return")
+        self.assertEqual(self.land(bin=mp).returncode, 0)      # real code: nonzero (test_failing_verify_aborts)
+
+    def test_mutant_suite_gate_bites(self):
+        self.mkfix(); self.drift("suite.py", "import sys; sys.exit(1)\n")
+        mp = self._mutant("        if sc != 0:\n", "        if False:\n")
+        self.assertEqual(self.land(bin=mp).returncode, 0)
+
+    def test_mutant_harness_committed_bites(self):
+        self.mkharness_fix()
+        mp = self._mutant('    for f in files:\n        git(lw, "add", "-A", "--", f)', '    git(lw, "add", "-A")')
+        src = mp.read_text().replace("    if extra:\n        return", "    if False:\n        return"); mp.write_text(src)
+        self.assertEqual(self.land(bin=mp).returncode, 0)
+        self.assertIn("verify.sh", self.bare_git("show", "--name-only", "--format=", "main").split())   # real code: not
+
+    def test_mutant_unverified_gate_bites(self):
+        self.mkfix(content="def add(a, b):\n    return a * b\n\n\n# tail\n")
+        mp = self._mutant('    if v != "VERIFIED":\n        return None', '    if False:\n        return None')
+        self.assertEqual(self.land(bin=mp).returncode, 1)      # still refused downstream by verify, but via a different reason
+        self.assertNotIn("refusing to land", self.land(bin=mp).stderr)
+
+
+class LandAuto(Attempts):
+    """qagent fix --land --wait lands automatically after VERIFIED."""
+    def test_fix_land_wait_lands(self):
+        self.env.update(GIT_AUTHOR_NAME="a", GIT_AUTHOR_EMAIL="a@b", GIT_COMMITTER_NAME="a", GIT_COMMITTER_EMAIL="a@b")
+        bare = self.d / "o.git"; subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        br = self.g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        self.g("remote", "add", "origin", str(bare)); self.g("push", "-q", "-u", "origin", br)
+        r = self.run_fix(["fix"], 1, extra=("--land",))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"LANDED [0-9a-f]{40} on " + br + r" \(pushed\)")
+        self.assertEqual(self.g("log", "-1", "--format=%s").stdout.strip(), "add is wrong")
 
 
 if __name__ == "__main__":

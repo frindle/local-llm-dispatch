@@ -12,6 +12,8 @@ authoring.  Output is UNVERIFIED local-model text; the caller must check it.
   qagent wait <id> [--timeout S]                        exit 0 done, 1 failed, 2 timeout
   qagent result <id>                                    summary + diff + banner + log path
   qagent followup <id> "<msg>" [--dry-run]              new job seeded from the prior one
+  qagent land <job-id|group-id> [--push|--no-push] [--branch B]
+                                                        land a VERIFIED fix (see LANDING below); prints `LANDED <sha> on <branch> (pushed|local)`
   qagent abort <id>                                     via ~/bin/queue-abort (fix jobs: also removes the worktree)
   qagent fix --repo R --verify "<cmd>" [--base REF] [--land] [--wait] "<problem>"
                                                         WRITE/FIX mode (see below); prints job id
@@ -53,13 +55,21 @@ FIX mode (qagent fix) -- local-model code is NEVER trusted
   lands in it.  Verdicts: VERIFIED (fail->pass), UNVERIFIED (anything else), REJECTED (touches a
   test/verify file, a symlink/escaping path, or R's own checkout changed), NO-CHANGE.  R's branch is
   never committed to; output = <QAGENT_HOME>/fix/<jobid>.patch + the worktree path.
-  --land is opt-in but there is NO clean automated landing entry (ollama-land ingest needs a gate
-  verdict on a queue job, and qagent jobs are advisory/no-verify), so it only prints the manual command.
+  --land (with --wait) runs `qagent land` automatically on a VERIFIED result.
+  --harness-from DIR       copy the verify files (verify.sh, verify.test.ts, files named in --verify) that are absent
+                           at --base from DIR into the new fix worktree as protected, never-committed files.
+LANDING (qagent land)
+  Needs a VERIFIED report.  Cuts a fresh worktree at the CURRENT tip of the target branch (fetch first), applies
+  the patch with `git apply --3way` (conflict -> abort, list files, leave nothing), copies the protected harness in
+  as UNTRACKED files, re-runs the fix's verify AND the repo suite (npm test, if package.json has one); both must
+  pass.  Commits ONLY the patch's files (no add -A; title = problem's first line; no attribution), pushes
+  fast-forward-only (one retry after a rejection), then fast-forwards the user's checkout only if that cannot
+  clobber anything (never reset/stash/force/checkout over their changes).  Idempotent (`landed` in the fix JSON).
 Env: QAGENT_WT_ROOT (worktree root), QAGENT_VERIFY_TIMEOUT (s, default 600), QAGENT_QUEUE_PY (queue script), QAGENT_STATE (state json), QAGENT_HOME (scratch root),
      QAGENT_ABORT (queue-abort path), QAGENT_DRY_ID (dry-run fake id),
      QAGENT_WATCHER (script `run` spawns as `<script> watch <id>`; default this file).
 """
-import argparse, json, os, re, subprocess, sys, time
+import argparse, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 HOME = Path.home()
@@ -568,7 +578,8 @@ def fix_finalize(jid, force=False):
     if rs != m["repo_snapshot"]:
         reasons.append("R's own checkout changed while the job ran (HEAD/status differ) -- worker wrote outside the worktree")
     # capture the patch BEFORE running verify (verify litter must not land in the patch)
-    git(wt, "add", "-A", "--", ".", *JUNK_EXCLUDES)
+    hx = [f":(exclude){h}" for h in m.get("harness", [])]
+    git(wt, "add", "-A", "--", ".", *JUNK_EXCLUDES, *hx)
     ns = git(wt, "diff", "--cached", "--name-status", "--no-renames", m["base"]).stdout
     files = [tuple(l.split("\t", 1)) for l in ns.splitlines() if "\t" in l]
     files = [(a, b.strip()) for a, b in files]
@@ -607,10 +618,10 @@ def fix_print_report(m):
     print(f"worktree: {m['worktree']}   (base {m['base'][:12]} of {m['repo']}; R was not modified)")
     if r["verdict"] != "VERIFIED":
         print(f"after-verify tail:\n{r.get('after_tail', '')}")
-    print(f"apply by hand (reviewed): git -C {m['repo']} apply --check {r['patch']} && git -C {m['repo']} apply {r['patch']}")
-    if m.get("land"):
-        print("--land: no automated landing entry exists (ollama-land ingest needs a gate verdict on a queue job; "
-              "qagent jobs are advisory). NOT landed -- use the apply command above after review.")
+    if r["verdict"] == "VERIFIED":
+        print(f"land it: qagent land {m['job']}")
+        if m.get("landed"):
+            print(landed_line(m["landed"]))
     print(f"cleanup: qagent abort <jobid>   (removes the worktree)")
     if m.get("group"):
         print(group_summary(m["group"]))
@@ -687,7 +698,8 @@ def fix_group(a, repo, base):
         r = m["report"]
         if r["verdict"] == "VERIFIED":
             x = type("X", (), {})(); x.id = jid
-            return cmd_result(x)
+            rc = cmd_result(x)
+            return land_after(a, jid, rc)
         if k < n:
             note = (f"\n\nThis is attempt {k + 1} of {n}. The previous attempt did not make the verify command pass. "
                     f"Raw verify output from that attempt (last 1500 chars):\n{(r.get('after_tail') or '')[-1500:]}")
@@ -711,9 +723,21 @@ def fix_start(a, repo, base, note="", group=None, attempt=1):
         if r.returncode != 0:
             die(f"worktree add failed: {(r.stderr or r.stdout).strip()}", 1)
     cleanup = lambda: git(repo, "worktree", "remove", "--force", str(wt)) if (not a.dry_run and under(wt, WT_ROOT)) else None
+    harness = []
     if not a.dry_run:
+        hf = getattr(a, "harness_from", None)
+        if hf:
+            harness = copy_harness(a.verify, hf, wt)
+        else:
+            miss = missing_harness(a.verify, wt, repo, a.problem)
+            if miss:
+                cleanup()
+                die("verify names file(s) absent at base " + base[:12] + ": " + ", ".join(sorted(miss)) +
+                    "  (present in " + "; ".join(sorted({v for v in miss.values()})) + ").\n"
+                    "They are not in the base commit.  Re-run with  --harness-from <dir>  (e.g. --harness-from "
+                    + str(next(iter(miss.values()))) + ")  to copy them in as protected, never-committed files.", 1)
         code, out = run_verify(a.verify, wt)
-        git(wt, "clean", "-fdxq")   # baseline litter (pycache etc.) must not enter the diff
+        git(wt, "clean", "-fdxq", *[x for h in harness for x in ("-e", h)])   # baseline litter must not enter the diff
         git(wt, "checkout", "-q", "--", ".")
         if code == 0:
             cleanup()
@@ -739,13 +763,13 @@ def fix_start(a, repo, base, note="", group=None, attempt=1):
     protected = sorted(verify_protected(a.verify, wt))
     fix_save(jid, {"job": jid, "fixid": fixid, "repo": str(repo), "worktree": str(wt), "base": base,
                    "verify": a.verify, "baseline": {"exit": code, "tail": out[-1500:]}, "land": bool(a.land),
-                   "protected": protected, "repo_snapshot": repo_snapshot(repo), "problem": a.problem,
+                   "protected": sorted(set(protected) | set(harness)), "harness": harness, "repo_snapshot": repo_snapshot(repo), "problem": a.problem,
                    **({"group": group, "attempt": attempt} if group else {})})
     print(jid)
     print(f"qagent: fix job {jid}; worktree {wt}; baseline verify exit {code} (fails, as required). "
           f"`qagent wait {jid}` then `qagent result {jid}`.", file=sys.stderr)
-    if a.land:
-        print("qagent: --land noted: there is no clean automated landing entry; result will print the manual command.",
+    if a.land and not a.wait:
+        print(f"qagent: --land noted: without --wait, run `qagent land {jid}` once `qagent result {jid}` says VERIFIED.",
               file=sys.stderr)
     return 0, jid
 
@@ -773,9 +797,251 @@ def cmd_fix(a):
         if rw == 2:
             return 2
         x = type("X", (), {})(); x.id = jid
-        return cmd_result(x)
+        rc = cmd_result(x)
+        return land_after(a, jid, rc)
     return 0
 
+
+# ---------------------------------------------------------------- harness helpers
+def _verify_paths(cmd):
+    import shlex
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        toks = cmd.split()
+    out = []
+    for t in toks:
+        t = t.split("::")[0]
+        if t and not t.startswith("-") and not t.startswith("/") and ".." not in Path(t).parts:
+            out.append(t)
+    return out
+
+
+def missing_harness(cmd, wt, repo, problem):
+    """{path: where-found} for verify-named files absent in wt but present in the repo working tree or an earlier
+    fix worktree for the same problem (the 'verify.sh is not in HEAD' case)."""
+    found = {}
+    prior = []
+    try:
+        for fp in fix_dir().glob("*.json"):
+            if fp.name.endswith(".group.json"):
+                continue
+            pm = json.loads(fp.read_text())
+            if pm.get("repo") == str(repo) and pm.get("problem") == problem and Path(pm.get("worktree", "")).is_dir():
+                prior.append(Path(pm["worktree"]))
+    except Exception:
+        pass
+    for t in _verify_paths(cmd):
+        if (Path(wt) / t).exists():
+            continue
+        for d in [Path(repo)] + prior:
+            if (d / t).is_file() and under(d / t, d):
+                found[t] = str(d); break
+    return found
+
+
+def copy_harness(cmd, src, wt):
+    """Copy verify files (named in cmd, plus verify.sh / verify.test.ts) that are absent in wt from src."""
+    src = Path(src).expanduser().resolve()
+    if not src.is_dir():
+        die(f"--harness-from {src} is not a directory", 1)
+    names = set(_verify_paths(cmd)) | {"verify.sh", "verify.test.ts"}
+    done = []
+    for n in sorted(names):
+        s, d = src / n, Path(wt) / n
+        if s.is_file() and under(s, src) and not d.exists():
+            d.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, d); done.append(n)
+    return done
+
+
+# ---------------------------------------------------------------- LAND
+def landed_line(L):
+    return f"LANDED {L['sha']} on {L['branch']} ({L['mode']})"
+
+
+def _resolve_fix_job(ident):
+    """-> (meta, error).  A group id picks its first VERIFIED attempt."""
+    g = group_load(ident) if ident.startswith("grp-") else None
+    if g:
+        for at in g["attempts"]:
+            m = fix_finalize(at["job"])
+            if m and (m.get("report") or {}).get("verdict") == "VERIFIED":
+                return m, None
+        return None, f"group {ident}: no VERIFIED attempt -- refusing to land"
+    m = fix_meta(ident)
+    if not m:
+        return None, f"{ident}: not a qagent fix job or group (no {fix_dir()}/{ident}*.json)"
+    m = fix_finalize(m["job"])
+    v = (m.get("report") or {}).get("verdict")
+    if v != "VERIFIED":
+        return None, f"job {m['job']}: verdict is {v}, not VERIFIED -- refusing to land"
+    return m, None
+
+
+def _pkg_has_test(wt):
+    try:
+        t = json.loads((Path(wt) / "package.json").read_text()).get("scripts", {}).get("test", "")
+    except Exception:
+        return False
+    return bool(t) and "no test specified" not in t
+
+
+def _land_once(m, branch, push, remote):
+    """One landing attempt.  Returns ('ok', sha, mode) | ('rejected',) | ('fail', msg)."""
+    repo, jid = m["repo"], m["job"]
+    patch = m["report"]["patch"]
+    files = [x.split("\t", 1)[1] for x in m["report"]["files"]]
+    if remote:
+        git(repo, "fetch", "-q", remote)
+    tip = git(repo, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
+    if tip.returncode != 0:
+        return ("fail", f"branch {branch} does not exist in {repo}")
+    tip = tip.stdout.strip()
+    if remote and git(repo, "rev-parse", "--verify", "-q", f"refs/remotes/{remote}/{branch}").returncode == 0:
+        rt = git(repo, "rev-parse", f"refs/remotes/{remote}/{branch}").stdout.strip()
+        if rt != tip:
+            if git(repo, "merge-base", "--is-ancestor", tip, rt).returncode == 0:
+                tip = rt                        # remote is ahead: land on the newer tip
+            elif push and git(repo, "merge-base", "--is-ancestor", rt, tip).returncode == 0:
+                return ("fail", f"local {branch} has commits not on {remote}/{branch}; push them (or use --no-push) first")
+            elif push:
+                return ("fail", f"local {branch} and {remote}/{branch} have diverged; reconcile first")
+    WT_ROOT.mkdir(parents=True, exist_ok=True)
+    lw = WT_ROOT / ("land-" + jid[:12] + "-" + os.urandom(2).hex())
+    r = git(repo, "worktree", "add", "--detach", str(lw), tip)
+    if r.returncode != 0:
+        return ("fail", f"worktree add failed: {(r.stderr or r.stdout).strip()}")
+    try:
+        return _land_in(m, lw, tip, branch, push, remote, patch, files)
+    finally:
+        git(repo, "worktree", "remove", "--force", str(lw))
+        git(repo, "worktree", "prune")
+
+
+def _land_in(m, lw, tip, branch, push, remote, patch, files):
+    repo, jid = m["repo"], m["job"]
+    r = git(lw, "apply", "--3way", patch)
+    if r.returncode != 0:
+        conf = git(lw, "diff", "--name-only", "--diff-filter=U").stdout.split()
+        return ("fail", f"job {jid}: patch does not apply at {branch} tip {tip[:12]} (3-way)"
+                        + (f"; conflicting files: {', '.join(conf)}" if conf else f"\n{(r.stderr or r.stdout).strip()[-800:]}"))
+    # protected harness: untracked, uncommitted, only where the tip does not already have the file
+    fwt = Path(m["worktree"])
+    for h in m.get("protected", []):
+        s, d = fwt / h, lw / h
+        if s.exists() and not d.exists():
+            d.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(s, d) if s.is_dir() else shutil.copy2(s, d)
+    if (Path(repo) / "node_modules").is_dir() and not (lw / "node_modules").exists():
+        os.symlink(Path(repo) / "node_modules", lw / "node_modules")   # env parity for npm test (untracked)
+    vc, vo = run_verify(m["verify"], lw)
+    if vc != 0:
+        return ("fail", f"job {jid}: fix verify FAILED at the current {branch} tip (exit {vc}): {m['verify']}\n{vo[-1500:]}")
+    if _pkg_has_test(lw):
+        sc, so = run_verify("npm test", lw)
+        if sc != 0:
+            return ("fail", f"job {jid}: repo suite (npm test) FAILED with the patch applied (exit {sc})\n{so[-1500:]}")
+    else:
+        print("qagent land: no package.json test script -- repo-suite step skipped", file=sys.stderr)
+    # commit ONLY the patch's files
+    for f in files:
+        git(lw, "add", "-A", "--", f)
+    staged = set(git(lw, "diff", "--cached", "--name-only").stdout.split())
+    if not staged:
+        return ("fail", f"job {jid}: patch is a no-op at the current {branch} tip (already applied?)")
+    extra = staged - set(files)
+    if extra:
+        return ("fail", f"job {jid}: refusing to commit files outside the patch: {sorted(extra)}")
+    first = (m.get("problem") or "").strip().splitlines()
+    title = (first[0].strip()[:72] if first and first[0].strip() else f"qagent fix {jid}")
+    c = git(lw, "commit", "-q", "-m", title)
+    if c.returncode != 0:
+        return ("fail", f"commit failed: {(c.stderr or c.stdout).strip()[-800:]}")
+    sha = git(lw, "rev-parse", "HEAD").stdout.strip()
+    if push:
+        p = git(lw, "push", remote, f"{sha}:refs/heads/{branch}", timeout=300)
+        if p.returncode != 0:
+            txt = (p.stderr + p.stdout)
+            if "rejected" in txt or "non-fast-forward" in txt or "fetch first" in txt:
+                return ("rejected",)
+            return ("fail", f"push failed: {txt.strip()[-800:]}")
+        git(repo, "fetch", "-q", remote)
+    # keep the commit reachable regardless (the worktree is about to be removed)
+    git(repo, "update-ref", f"refs/qagent/landed/{jid}", sha)
+    return ("ok", sha, "pushed" if push else "local", files, tip)
+
+
+def _advance_checkout(m, sha, tip, branch, files, mode):
+    """Fast-forward the user's checkout WITHOUT touching anything of theirs.  Prints at most one notice."""
+    repo, jid = m["repo"], m["job"]
+    cur = git(repo, "symbolic-ref", "-q", "--short", "HEAD").stdout.strip()
+    if cur == branch:
+        dirty = git(repo, "status", "--porcelain", "--", *files).stdout.strip()
+        if dirty:
+            if mode != "pushed":
+                git(repo, "branch", f"qagent/{jid}", sha)
+            return ("notice: your checkout has uncommitted changes to patched files; NOT touching it. " +
+                    (f"Commit is on the remote -- pull with: git -C {repo} pull --ff-only" if mode == "pushed" else
+                     f"Commit is on branch qagent/{jid}: git -C {repo} merge qagent/{jid}"))
+        r = git(repo, "merge", "--ff-only", sha)
+        if r.returncode != 0:
+            if mode != "pushed":
+                git(repo, "branch", f"qagent/{jid}", sha)
+            return ("notice: could not fast-forward your checkout without risk (" + (r.stderr or r.stdout).strip().splitlines()[-1][:120] + "); " +
+                    (f"commit is on the remote -- pull with: git -C {repo} pull --ff-only" if mode == "pushed"
+                     else f"commit is on branch qagent/{jid}"))
+        return None
+    # branch not checked out here: compare-and-swap the ref
+    r = git(repo, "update-ref", f"refs/heads/{branch}", sha, tip)
+    return None if r.returncode == 0 else f"notice: could not advance local {branch}; commit {sha[:12]} is on refs/qagent/landed/{jid}"
+
+
+def cmd_land(a):
+    m, err = _resolve_fix_job(a.id)
+    if not m:
+        print(f"qagent land: {err}", file=sys.stderr); return 1
+    if m.get("landed"):
+        print(landed_line(m["landed"]) + "   (already landed)"); return 0
+    repo = m["repo"]
+    branch = a.branch or git(repo, "symbolic-ref", "-q", "--short", "HEAD").stdout.strip() or "main"
+    remotes = git(repo, "remote").stdout.split()
+    remote = ("origin" if "origin" in remotes else (remotes[0] if remotes else None))
+    tracks = bool(remote) and git(repo, "config", f"branch.{branch}.remote").returncode == 0
+    push = a.push if a.push is not None else tracks
+    if push and not remote:
+        print("qagent land: --push but the repo has no remote", file=sys.stderr); return 1
+    res = None
+    for attempt in (1, 2):
+        res = _land_once(m, branch, push, remote if (push or remote) else None)
+        if res[0] != "rejected":
+            break
+        print(f"qagent land: push rejected (remote moved); re-landing from the new tip (attempt {attempt}/2)", file=sys.stderr)
+    if res[0] == "rejected":
+        print(f"qagent land: job {m['job']}: push rejected twice -- giving up cleanly (nothing pushed, nothing changed locally)", file=sys.stderr)
+        return 1
+    if res[0] == "fail":
+        print(f"qagent land: ABORTED, nothing landed. {res[1]}", file=sys.stderr); return 1
+    _, sha, mode, files, tip = res
+    note = _advance_checkout(m, sha, tip, branch, files, mode)
+    if note:
+        print(f"qagent land: {note}")
+    m = fix_meta(m["job"])
+    m["landed"] = {"sha": sha, "branch": branch, "mode": mode, "when": time.strftime("%F %T")}
+    fix_save(m["job"], m)
+    print(landed_line(m["landed"]))
+    return 0
+
+
+def land_after(a, jid, rc):
+    """qagent fix --land: land automatically once the --wait result is VERIFIED."""
+    if not getattr(a, "land", False):
+        return rc
+    m = fix_meta(jid)
+    if not m or (m.get("report") or {}).get("verdict") != "VERIFIED":
+        return rc
+    x = type("X", (), {})(); x.id = jid; x.push = None; x.branch = None
+    return cmd_land(x) or rc
 
 
 
@@ -806,7 +1072,12 @@ def main(argv=None):
     fx.add_argument("--wait", action="store_true", help="block until done, then print the result report")
     fx.add_argument("--attempts", type=int, default=1, help="verify-gated retries in fresh worktrees (needs --wait)")
     fx.add_argument("--wait-timeout", type=int, default=2400)
+    fx.add_argument("--harness-from", help="dir holding verify files absent at --base (copied in as protected, uncommitted)")
     fx.add_argument("problem"); fx.set_defaults(f=cmd_fix)
+    ld = sp.add_parser("land"); ld.add_argument("id")
+    ld.add_argument("--push", dest="push", action="store_true", default=None)
+    ld.add_argument("--no-push", dest="push", action="store_false")
+    ld.add_argument("--branch"); ld.set_defaults(f=cmd_land)
     ab = sp.add_parser("abort"); ab.add_argument("id"); ab.set_defaults(f=cmd_abort)
     a = p.parse_args(argv)
     return a.f(a)
