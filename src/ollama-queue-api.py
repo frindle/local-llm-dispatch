@@ -1560,6 +1560,7 @@ FRONTEND_HTML = r"""<!doctype html>
   .lane-card { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; padding: 5px 8px; border: 1px solid var(--line);
                border-radius: 6px; font-size: .83rem; min-width: 0; overflow-wrap: anywhere; }
   .lane-card.idle { color: var(--muted); }
+  .lane-card.idle .lane-wait { color: var(--warn); }
   .lane-card.run { border-left: 3px solid var(--run); }
   .lane-name { font-weight: 650; text-transform: uppercase; font-size: .72rem; letter-spacing: .05em; color: var(--muted); }
   .lane-meta, .lane-line { color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -2327,12 +2328,68 @@ function renderWaitBanner(w, jobs) {
   el.innerHTML = lines.join('');
 }
 
+// Why ONE queue row is waiting: the daemon's own reason (queue_wait.short) beats the API's derived
+// wait_reason. '' when the row carries neither (or is not a waiting row).
+function jobWaitText(j) {
+  if (!j || (j.status !== 'pending' && j.status !== 'held')) return '';
+  return (j.queue_wait && j.queue_wait.short) || j.wait_reason || '';
+}
+// Slices a bundle DRIVER is actively working (authoring/refining/preflight/...) that have NO live
+// queue row yet, so no queue count can see them. [{key, sid, phase}]
+function driverActiveSlices(views, jobs) {
+  const out = [];
+  for (const [key, v] of Object.entries((views && views.views) || {})) {
+    for (const sl of (v && v.slices) || []) {
+      if (!sl.active || sl.attention) continue;
+      if ((sl.history || []).some(h => h.live)) continue;
+      out.push({key, sid: sl.sid, phase: sl.phase});
+    }
+  }
+  return out;
+}
+// A slice whose only live queue row(s) are PENDING is waiting, not "authoring": {reason} or null.
+function sliceWaitInfo(sl, children) {
+  let pend = null;
+  for (const h of (sl.history || [])) {
+    if (!h.live) continue;
+    const c = (children || []).find(x => x.id === h.id);
+    if (!c) continue;
+    if (c.status === 'running') return null;
+    if (c.status === 'pending' && !pend) pend = c;
+  }
+  return pend ? {reason: jobWaitText(pend) || 'queued', id: pend.id} : null;
+}
+// Chip + sub-line of one slice row: 'waiting' + the reason when its only live queue row is pending,
+// else the slice's own phase/detail.
+function sliceChipInfo(sl, children) {
+  const wi = sliceWaitInfo(sl, children);
+  if (wi) return {phase: 'waiting', cls: 'queued', detail: 'waiting: ' + wi.reason};
+  return {phase: sl.phase, cls: sl.phase, detail: (sl.detail || '').replace(/^refining \(round \d+\)( -- )?/, '')};
+}
+// Queue tile suffix for slices a driver is working that have no queue row yet.
+function driverNote(n) { return n ? ' &middot; ' + n + ' driver-active (no queue row yet)' : ''; }
+// Idle lane card text: "waiting - <why>" when the lane has pending work blocked (infra wait, held
+// behind a bundle, ...), else '' (plain idle). Daemon lane reason first, then the pending rows.
+function laneWaitText(lane, w, jobs, cpuPending) {
+  if (lane === 'cpu') return cpuPending ? 'waiting - ' + cpuPending + ' stage' + (cpuPending === 1 ? '' : 's') + ' for a runner' : '';
+  const ln = w && w.source === 'state' && w.lanes && w.lanes[lane];
+  const s = ln && ln.state === 'idle' && ln.pending && ln.reason && ln.reason.sentence;
+  if (s) return 'waiting - ' + String(s).replace(/^INFRA WAIT:\s*/i, '');
+  const pj = (jobs || []).find(j => j.status === 'pending' && laneOfJob(j) === lane);
+  return pj ? 'waiting - ' + (jobWaitText(pj) || 'queued') : '';
+}
+
 // "Running now" tile, idle case: ONE short plain line saying what the queue is waiting on.
 // Daemon state reason when it is live; else derived from API data (the committed bundle, the
 // pending count). NEVER daemon-log text (the log's HELD/focus lines can be stale).
-function idleWaitText(w, jobs, activeKey) {
+function idleWaitText(w, jobs, activeKey, views) {
   const pend = (jobs || []).filter(j => j.status === 'pending' || j.status === 'held');
   if (!pend.length) {
+    // A bundle driver (slicer/chain) can be authoring a slice with NO queue row yet: the queue is
+    // not "empty" then, work is in flight (Penn 2026-10-10, rt-amazon-cardlink read "Queue empty").
+    const dr = typeof driverActiveSlices === 'function' ? driverActiveSlices(views, jobs) : [];
+    if (dr.length) return 'Bundle ' + dr[0].key + ': ' + dr[0].phase + ' in progress (driver working, queue job not enqueued yet)'
+      + (dr.length > 1 ? ' +' + (dr.length - 1) + ' more' : '');
     const cn = typeof cpuQueueCounts === 'function' ? cpuQueueCounts(window.cpuLaneData) : {total: 0};
     return cn.total ? 'GPU queue empty - CPU lane busy (' + cn.running + ' running' + (cn.pending ? ', ' + cn.pending + ' pending' : '') + ')' : 'Queue empty';
   }
@@ -2344,6 +2401,8 @@ function idleWaitText(w, jobs, activeKey) {
     }
     if (out.length) return 'Waiting on: ' + out.join(' | ');
   }
+  const jw = typeof jobWaitText === 'function' ? jobWaitText(pend.find(jobWaitText)) : '';
+  if (jw && jw !== 'next in line') return 'Waiting on: ' + jw;
   if (activeKey) return 'Waiting on: bundle ' + activeKey + ' to finish';
   return 'Waiting on: queued work (reason shows after the next daemon restart)';
 }
@@ -2371,7 +2430,7 @@ function laneStatusLine(j) {
   if (j.tok_s != null) bits.push(j.tok_s.toFixed(1) + ' tok/s');
   return bits.length ? bits.join(' - ') : 'running';
 }
-function laneNowRows(jobs, acts, cpuRunning) {
+function laneNowRows(jobs, acts, cpuRunning, cpuLocal, wv) {
   const by = {};
   for (const [k] of NOW_LANES) by[k] = [];
   const actOf = id => (acts || []).find(a => a.kind === 'gpu' && a.id === id) || {};
@@ -2386,11 +2445,14 @@ function laneNowRows(jobs, acts, cpuRunning) {
     by.cpu.push({label: c.label || String(c.id || '').slice(0, 8), model: c.stage || 'cpu', host: c.runner || 'cpu',
       elapsed_s: c.running_s, bundle: c.bundle || null, line: c.stage ? 'stage ' + c.stage : 'running', id: c.id});
   }
-  return NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k]}));
+  if (wv === undefined) wv = (typeof queueWait !== 'undefined') ? queueWait : null;
+  const cpuPend = (typeof cpuQueueCounts === 'function' && typeof window !== 'undefined') ? cpuQueueCounts(window.cpuLaneData).pending : 0;
+  return NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k],
+    wait: (by[k].length || typeof laneWaitText !== 'function') ? '' : laneWaitText(k, wv, jobs, cpuPend)}));
 }
 function laneNowHtml(rows) {
   return '<div class="lane-now">' + rows.map(r => {
-    if (r.idle) return `<div class="lane-card idle" data-lane="${r.lane}"><span class="lane-name">${escapeHtml(r.name)}</span>: idle</div>`;
+    if (r.idle) return `<div class="lane-card idle" data-lane="${r.lane}"><span class="lane-name">${escapeHtml(r.name)}</span>: ${r.wait ? '<span class="lane-wait">' + escapeHtml(r.wait) + '</span>' : 'idle'}</div>`;
     return r.jobs.map(x => `<div class="lane-card run" data-lane="${r.lane}"><span class="lane-name">${escapeHtml(r.name)}</span>`
       + ` <b>${escapeHtml(x.label)}</b> <span class="lane-meta">model ${escapeHtml(x.model)} &middot; host ${escapeHtml(x.host)}`
       + ` &middot; ${formatElapsed(x.elapsed_s)}${x.bundle ? ' &middot; bundle ' + escapeHtml(x.bundle) : ''}</span>`
@@ -2545,7 +2607,7 @@ function renderSummary(jobs, acts, attnStats, q) {
   } else {
     now.innerHTML = `<div class="k"><span class="idle-dot"></span>Running now</div>
       <div class="now-job" style="color:var(--muted);font-weight:500">Nothing on the GPU${cpuQueueCounts(window.cpuLaneData).running ? ' - CPU lane active (' + cpuQueueCounts(window.cpuLaneData).running + ' running)' : ''}</div>
-      <div class="now-more" id="idleWait">${escapeHtml(idleWaitText(queueWait, jobs, bundleViews.active))}</div>
+      <div class="now-more" id="idleWait">${escapeHtml(idleWaitText(queueWait, jobs, bundleViews.active, bundleViews))}</div>
       ${other.length ? `<div class="now-more">Off-GPU, live now: ${other.map(fmtAct).join(' &middot; ')}</div>` : ''}
       ${laneNowHtml(laneNowRows(jobs, acts, window.cpuLaneRunning))}`;
     now.style.cursor = ''; now.onclick = null; now.title = '';
@@ -2553,9 +2615,10 @@ function renderSummary(jobs, acts, attnStats, q) {
   const cnt = st => jobs.filter(j => j.status === st).length;
   const pend = cnt('pending'), paused = cnt('paused'), planned = cnt('planned');
   const cpuN = cpuQueueCounts(window.cpuLaneData);
+  const drv = driverActiveSlices(bundleViews, jobs);
   document.getElementById('sumQueue').innerHTML = `<div class="k">Queue</div>
     <div class="v">${pend + paused + planned + cpuN.pending}</div>
-    <div class="s">${pend} pending${paused ? ' &middot; ' + paused + ' paused' : ''} &middot; ${planned} planned${cpuN.total ? ' &middot; CPU lane: ' + cpuN.running + ' running' + (cpuN.pending ? ', ' + cpuN.pending + ' pending' : '') : ''}</div>`;
+    <div class="s">${pend} pending${paused ? ' &middot; ' + paused + ' paused' : ''} &middot; ${planned} planned${cpuN.total ? ' &middot; CPU lane: ' + cpuN.running + ' running' + (cpuN.pending ? ', ' + cpuN.pending + ' pending' : '') : ''}${driverNote(drv.length)}</div>`;
   const nA = attnStats.failed + attnStats.parked + attnStats.blocked + (attnStats.stalled || 0);
   const nList = nA - (attnStats.stalled || 0);
   const brk = ['failed', 'parked', 'blocked', 'stalled'].filter(k => attnStats[k]).map(k => attnStats[k] + ' ' + k).join(' &middot; ');
@@ -3039,11 +3102,12 @@ async function refresh() {
       str.className = 'queue-child slice-line' + (sl.phase === 'done' ? ' queue-done' : '');
       str.style.cursor = 'pointer';
       str.dataset.open = open ? '1' : '0';
-      const sDetail = (sl.detail || '').replace(/^refining \(round \d+\)( -- )?/, '');
+      const sc = sliceChipInfo(sl, g.children);   // only-pending live row: say WAITING + why, not "authoring"
+      const sPhase = sc.phase, sCls = sc.cls, sDetail = sc.detail;
       str.innerHTML = `
         <td class="slice-caret">${sl.history && sl.history.length ? (open ? '&#9662;' : '&#9656;') : ''}</td>
-        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sl.phase}">${sl.phase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}${(sp.cause || sl.summary) ? '<div class="slice-cause" title="' + escapeHtml(sp.cause || sl.summary) + '">' + escapeHtml(sp.cause || sl.summary) + '</div>' : ''}</td>
-        <td class="st"><span class="chip ph ph-${sl.phase}">${sl.phase}</span></td>
+        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sCls}">${sPhase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}${(sp.cause || sl.summary) ? '<div class="slice-cause" title="' + escapeHtml(sp.cause || sl.summary) + '">' + escapeHtml(sp.cause || sl.summary) + '</div>' : ''}</td>
+        <td class="st"><span class="chip ph ph-${sCls}">${sPhase}</span></td>
         <td class="when slice-facts" colspan="2" title="${escapeHtml(sliceSuffix(sl))}">${sp.facts.map(f => '<span class="slice-fact">' + escapeHtml(f.replace(/^author jobs /, 'jobs ')) + '</span>').join('')}</td>`;
       str.addEventListener('click', () => {
         sliceExpanded[skey] = !open; saveExpandState(); refresh();
