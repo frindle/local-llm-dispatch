@@ -52,6 +52,10 @@ qagent status <id> | wait <id> [--timeout S] | result <id> | followup <id> "<msg
 - No verify: coding runs pass the queue's `--allow-no-verify` (advisory/scope-only); `--readonly` uses `--task-kind research`.
 - Isolation: `--repo` => queue's throwaway worktree; otherwise a scratch dir under `~/.qagent/`. The worker has no
   edit-disable flag, so read-only = research kind + prompt preamble + throwaway cwd + `result` flags any diff as a violation.
+- Bounds always set (flags override): `--max-tokens 12000`/turn, `--max-iters 12`, `--chat-timeout 900`, `--max-wall 1800`s active
+  (enforced by `status`/`wait`, which abort via queue-abort; only while someone polls). Sampling is never set (card profile applies).
+  `result` prints the SERVED model (the queue aliases qwen3.8 -> qwen3.6 on the Darkbloom lane). Worker truncates large tool
+  output (~4k chars): tell the model to `| head`/`| grep` rather than trust a full dump.
 - `followup` enqueues a NEW job seeded with the prior prompt + answer (the queue has no enqueue-with-resume flag).
 - Tests: `tests/test-qagent.py` (stub queue, includes a revert-proof). Source of truth stays live `~/bin/qagent`; `SYNC.sh` mirrors it here.
 

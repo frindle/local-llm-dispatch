@@ -6,6 +6,7 @@ model call) WITHOUT the ollama-dispatch-auto harness/gate/TASK-scaffold/verify
 authoring.  Output is UNVERIFIED local-model text; the caller must check it.
 
   qagent run [--repo PATH] [--readonly] [--model M] [--label L] [--max-iters N]
+             [--max-tokens N] [--chat-timeout S] [--max-wall S]
              [--dry-run] "<prompt>"                     -> prints job id
   qagent status <id>
   qagent wait <id> [--timeout S]                        exit 0 done, 1 failed, 2 timeout
@@ -26,6 +27,11 @@ Isolation
                            by (a) task-kind research, (b) a prompt preamble forbidding
                            edits, (c) throwaway worktree/scratch cwd, and (d) `result`
                            reports any diff it finds as a READONLY VIOLATION.
+Bounds (always set; override with flags): --max-tokens 12000/turn, --max-iters 12,
+  --chat-timeout 900s, --max-wall 1800s active time (aborted by status/wait when exceeded).
+  Sampling is never set -- the model-card profile applies.  NOTE the queue may serve a
+  different model than requested (profile alias qwen3.8 -> qwen3.6 on the Darkbloom lane);
+  `result` prints the served model parsed from the worker log.
 Followup
   The worker's --resume only works on a paused/failed job's own transcript and the
   queue exposes no enqueue flag for it, so followup enqueues a NEW job whose prompt
@@ -43,6 +49,12 @@ LOG_DIR = Path(os.environ.get("QAGENT_LOGDIR", str(HOME / "bin" / "ollama-queue-
 QHOME = Path(os.environ.get("QAGENT_HOME", str(HOME / ".qagent")))
 ABORT = os.environ.get("QAGENT_ABORT", str(HOME / "bin" / "queue-abort"))
 DEFAULT_MODEL = "qwen3.8:27b-q4_K_M"
+# Bounds for freeform tasks (the model-card profile otherwise allows 32768 tokens/turn, 30 iters,
+# which let a first real run emit a >1500-line single generation).  Sampling is NOT touched.
+DEF_MAX_TOKENS = 12000    # per-turn output cap (thinking + answer)
+DEF_MAX_ITERS = 12        # tool-loop iterations
+DEF_CHAT_TIMEOUT = 900    # seconds per chat call
+DEF_MAX_WALL = 1800       # seconds of ACTIVE run time; enforced by status/wait (abort)
 TERMINAL = {"done", "failed", "blocked", "cancelled", "canceled"}
 BANNER = ("=" * 72 + "\n  UNVERIFIED local-model output -- produced by a local LLM with no gate,\n"
           "  no verify, no review. Check every claim/id/number against the source.\n" + "=" * 72)
@@ -51,7 +63,8 @@ READONLY_PREAMBLE = (
     "READ-ONLY TASK. You may read files and run read-only shell commands (cat, ls, grep, "
     "python3 ... status/list/show style queries). You MUST NOT create, edit, delete or move "
     "any file, and must not run anything that mutates state. Put your whole answer in your "
-    "final message as plain text.\n\n")
+    "final message as plain text. Keep the final answer concise (under ~60 lines); never repeat "
+    "yourself or pad.\n\n")
 GENERAL_PREAMBLE = (
     "You are a general-purpose local agent. Complete the task below, then end with a short "
     "plain-text summary of what you did/found. Do not ask clarifying questions.\n\n")
@@ -122,8 +135,10 @@ def build_enqueue(args, prompt, qid_hint):
         argv += ["--task-kind", "research"]
     else:
         argv += ["--task-kind", "coding", "--allow-no-verify"]
-    if args.max_iters:
-        argv += ["--max-iters", str(args.max_iters)]
+    argv += ["--max-iters", str(args.max_iters or DEF_MAX_ITERS),
+             "--max-tokens", str(args.max_tokens or DEF_MAX_TOKENS),
+             "--chat-timeout", str(args.chat_timeout or DEF_CHAT_TIMEOUT)]
+    (workdir / "META.json").write_text(json.dumps({"max_wall": args.max_wall or DEF_MAX_WALL}))
     return argv, tf, label
 
 
@@ -146,6 +161,8 @@ def enqueue(args, prompt):
     if not jid:
         die(f"enqueued but could not parse job id:\n{out.strip()}", 1)
     (tf.parent / "JOB").write_text(jid)
+    m = json.loads((tf.parent / "META.json").read_text()); m["job"] = jid
+    (tf.parent / "META.json").write_text(json.dumps(m))
     print(jid)
     return 0
 
@@ -154,8 +171,26 @@ def cmd_run(a):
     return enqueue(a, a.prompt)
 
 
+def max_wall_for(j):
+    try:
+        return json.loads((Path(j["task_file"]).parent / "META.json").read_text())["max_wall"]
+    except Exception:
+        return DEF_MAX_WALL
+
+
+def enforce_wall(j):
+    """Abort a RUNNING job whose active time exceeds its wall cap. Only runs while someone polls."""
+    cap = max_wall_for(j)
+    if j.get("status") == "running" and (j.get("active_s") or 0) > cap:
+        print(f"qagent: {j['id']} exceeded wall cap {cap}s (active {int(j['active_s'])}s) -- aborting", file=sys.stderr)
+        subprocess.run([ABORT, j["id"], "--yes"])
+        return True
+    return False
+
+
 def cmd_status(a):
     j = job_or_sidecar(a.id)
+    enforce_wall(j)
     print(f"{j.get('id')} status={j.get('status')} host={j.get('host_pref')} lane={j.get('lane')} "
           f"exit={j.get('exit_code')} model={j.get('model')} label={j.get('label')}")
     for k in ("failure_reason", "reason", "pause_reason"):
@@ -170,6 +205,7 @@ def cmd_wait(a):
     t0 = time.time()
     while True:
         j = job_or_sidecar(a.id)
+        enforce_wall(j)
         st = j.get("status")
         if st in TERMINAL:
             print(f"{a.id} {st} after {int(time.time()-t0)}s")
@@ -187,11 +223,18 @@ def transcript_path(log_text):
 
 def final_answer(j):
     """Last assistant text from the saved transcript; falls back to the log tail."""
+    if not j.get("log_path"):  # pruned row: recover from the durable sidecars
+        g = sorted(LOG_DIR.glob(f"{j.get('id')}-*.log"))
+        if g:
+            j["log_path"] = str(g[-1])
+    ap = LOG_DIR / f"{j.get('id')}.answer.md"
     lp = j.get("log_path")
     log_text = ""
     if lp and Path(lp).exists():
         log_text = Path(lp).read_text(errors="replace")
     tp = j.get("resume_transcript") or transcript_path(log_text)
+    if ap.exists() and ap.read_text().strip():
+        return ap.read_text().strip(), tp, log_text
     if tp and Path(tp).exists():
         try:
             d = json.loads(Path(tp).read_text())
@@ -203,6 +246,11 @@ def final_answer(j):
             pass
     return ("(no transcript answer found; log tail follows)\n" + "\n".join(log_text.splitlines()[-40:]),
             tp, log_text)
+
+
+def _log_text(j):
+    lp = j.get("log_path")
+    return Path(lp).read_text(errors="replace") if lp and Path(lp).exists() else ""
 
 
 def collect_diff(j):
@@ -231,6 +279,9 @@ def cmd_result(a):
         print(diff)
     elif diff == "":
         print("--- diff: none (working tree clean) ---")
+    sm = re.search(r"\[worker\] model=(\S+) host=(\S+)", _log_text(j))
+    if sm:
+        print(f"served model: {sm.group(1)} (requested {j.get('model')}) host={sm.group(2)}")
     print(f"worker log: {j.get('log_path')}")
     if tp:
         print(f"transcript: {tp}")
@@ -251,6 +302,7 @@ def cmd_followup(a):
     class NS: pass
     n = NS(); n.readonly = ro; n.model = a.model or j.get("model") or DEFAULT_MODEL
     n.label = f"followup-{a.id[:6]}"; n.max_iters = a.max_iters; n.dry_run = a.dry_run
+    n.max_tokens = n.chat_timeout = n.max_wall = None
     n.repo = None
     cwd = j.get("cwd")
     if cwd and not ro and (Path(cwd) / ".git").exists():
@@ -268,7 +320,9 @@ def main(argv=None):
     sp = p.add_subparsers(dest="cmd", required=True)
     r = sp.add_parser("run"); r.add_argument("--repo"); r.add_argument("--readonly", action="store_true")
     r.add_argument("--model", default=DEFAULT_MODEL); r.add_argument("--label")
-    r.add_argument("--max-iters", type=int); r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--max-iters", type=int); r.add_argument("--max-tokens", type=int)
+    r.add_argument("--chat-timeout", type=int); r.add_argument("--max-wall", type=int)
+    r.add_argument("--dry-run", action="store_true")
     r.add_argument("prompt"); r.set_defaults(f=cmd_run)
     s = sp.add_parser("status"); s.add_argument("id"); s.set_defaults(f=cmd_status)
     w = sp.add_parser("wait"); w.add_argument("id"); w.add_argument("--timeout", type=int, default=0)

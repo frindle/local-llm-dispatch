@@ -43,6 +43,30 @@ class T(unittest.TestCase):
         self.assertNotIn("--temperature", a)  # card profile applies; no hardcoded sampling
         self.assertIn("MUST NOT create, edit", Path(a[a.index("--task-file") + 1]).read_text())
 
+    def test_bounds_always_set_and_no_sampling(self):
+        self.q("run", "--readonly", "x")
+        a = self.argv()
+        self.assertEqual(a[a.index("--max-tokens") + 1], "12000")
+        self.assertEqual(a[a.index("--max-iters") + 1], "12")
+        self.assertEqual(a[a.index("--chat-timeout") + 1], "900")
+        for f in ("--temperature", "--top-p", "--num-ctx"):
+            self.assertNotIn(f, a)
+        self.q("run", "--max-tokens", "500", "x"); a = self.argv()
+        self.assertEqual(a[a.index("--max-tokens") + 1], "500")
+
+    def test_wall_cap_aborts_running_job(self):
+        self.q("run", "--readonly", "--max-wall", "60", "x")
+        tf = self.argv()[self.argv().index("--task-file") + 1]
+        self.state.write_text(json.dumps({"jobs": [{"id": "abc123def456", "status": "running",
+                              "active_s": 61, "task_file": tf}]}))
+        self.q("status", "abc123")
+        self.assertIn("abc123", (self.d / "abort.out").read_text())
+        (self.d / "abort.out").unlink()
+        self.state.write_text(json.dumps({"jobs": [{"id": "abc123def456", "status": "running",
+                              "active_s": 59, "task_file": tf}]}))
+        self.q("status", "abc123")
+        self.assertFalse((self.d / "abort.out").exists())
+
     def test_write_run_with_repo(self):
         self.q("run", "--repo", str(self.d), "fix it")
         a = self.argv()
