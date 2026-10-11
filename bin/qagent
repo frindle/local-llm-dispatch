@@ -15,6 +15,8 @@ authoring.  Output is UNVERIFIED local-model text; the caller must check it.
   qagent abort <id>                                     via ~/bin/queue-abort (fix jobs: also removes the worktree)
   qagent fix --repo R --verify "<cmd>" [--base REF] [--land] [--wait] "<problem>"
                                                         WRITE/FIX mode (see below); prints job id
+                                                        --attempts N (needs --wait): retry in a FRESH worktree with the prior verify tail,
+                                                        stop at first VERIFIED, else write <group>.escalation.md
   qagent watch <id> [--poll S]                          foreground watchdog: enforce --max-wall until the job
                                                         is terminal (`run` auto-spawns one, detached; --no-watch)
 
@@ -141,6 +143,9 @@ def build_enqueue(args, prompt, qid_hint):
     """Return (argv, task_file, cwd_note). Pure except for creating scratch + task file."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
     workdir = QHOME / f"{stamp}-{qid_hint}"
+    n = 1
+    while workdir.exists() and (workdir / "TASK.txt").exists():   # same-second enqueues (fix retries) must not clobber
+        n += 1; workdir = QHOME / f"{stamp}-{qid_hint}{n}"
     workdir.mkdir(parents=True, exist_ok=True)
     pre = READONLY_PREAMBLE if args.readonly else GENERAL_PREAMBLE
     tf = workdir / "TASK.txt"
@@ -601,6 +606,8 @@ def fix_print_report(m):
         print("--land: no automated landing entry exists (ollama-land ingest needs a gate verdict on a queue job; "
               "qagent jobs are advisory). NOT landed -- use the apply command above after review.")
     print(f"cleanup: qagent abort <jobid>   (removes the worktree)")
+    if m.get("group"):
+        print(group_summary(m["group"]))
 
 
 def remove_fix_worktree(m):
@@ -615,16 +622,79 @@ def remove_fix_worktree(m):
     return True, f"removed worktree {wt}"
 
 
-def cmd_fix(a):
-    repo = Path(a.repo).expanduser().resolve()
-    top = git(repo, "rev-parse", "--show-toplevel")
-    if top.returncode != 0:
-        die(f"--repo is not a git repository: {repo}")
-    repo = Path(top.stdout.strip()).resolve()
-    br = git(repo, "rev-parse", "--verify", (a.base or "HEAD") + "^{commit}")
-    if br.returncode != 0:
-        die(f"bad --base {a.base}")
-    base = br.stdout.strip()
+def group_load(gid):
+    try:
+        return json.loads((fix_dir() / f"{gid}.group.json").read_text())
+    except Exception:
+        return None
+
+
+def group_rows(g):
+    rows = []
+    for at in g["attempts"]:
+        m = fix_meta(at["job"]) or {}
+        r = m.get("report") or {}
+        rows.append({"attempt": at["attempt"], "job": at["job"], "verdict": r.get("verdict", "PENDING"),
+                     "tail": r.get("after_tail", ""), "patch": r.get("patch", "-"), "worktree": m.get("worktree", "-")})
+    return rows
+
+
+def group_summary(gid):
+    g = group_load(gid)
+    if not g:
+        return ""
+    out = [f"--- ATTEMPT GROUP {gid} ({len(g['attempts'])} of {g['max']} attempts) ---"]
+    for r in group_rows(g):
+        out.append(f"  attempt {r['attempt']}: job {r['job']}  {r['verdict']}  patch {r['patch']}")
+    return "\n".join(out)
+
+
+def write_escalation(g):
+    gid = g["group"]
+    L = [f"# qagent fix UNFIXED after {len(g['attempts'])} attempts -- escalate", "",
+         f"group: {gid}", f"repo: {g['repo']}", f"base: {g['base']}", f"verify: {g['verify']}", "",
+         "## Problem", "", g["problem"], "", "## Attempts", ""]
+    for r in group_rows(g):
+        L += [f"### Attempt {r['attempt']}", f"- job: {r['job']}", f"- outcome: {r['verdict']}",
+              f"- patch: {r['patch']}", f"- worktree: {r['worktree']}", "- verify tail:", "", "```", r["tail"], "```", ""]
+    p = fix_dir() / f"{gid}.escalation.md"
+    p.write_text("\n".join(L))
+    return p
+
+
+def fix_group(a, repo, base):
+    """--attempts N>1: sequential attempts, each a normal queue job in a FRESH worktree; stop at first VERIFIED."""
+    n = a.attempts
+    gid = "grp-" + time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+    g = {"group": gid, "max": n, "repo": str(repo), "base": base, "verify": a.verify, "problem": a.problem, "attempts": []}
+    note = ""
+    for k in range(1, n + 1):
+        rc, jid = fix_start(a, repo, base, note=note, group=gid if not a.dry_run else None, attempt=k)
+        if jid is None:
+            return rc
+        g["attempts"].append({"job": jid, "attempt": k})
+        (fix_dir() / f"{gid}.group.json").write_text(json.dumps(g, indent=1))
+        w = type("W", (), {})(); w.id = jid; w.timeout = a.wait_timeout; w.poll = 15
+        if cmd_wait(w) == 2:
+            return 2
+        m = fix_finalize(jid)
+        r = m["report"]
+        if r["verdict"] == "VERIFIED":
+            x = type("X", (), {})(); x.id = jid
+            return cmd_result(x)
+        if k < n:
+            note = (f"\n\nThis is attempt {k + 1} of {n}. The previous attempt did not make the verify command pass. "
+                    f"Raw verify output from that attempt (last 1500 chars):\n{(r.get('after_tail') or '')[-1500:]}")
+    p = write_escalation(g)
+    x = type("X", (), {})(); x.id = jid
+    cmd_result(x)
+    print(f"escalation: {p}")
+    print(f"UNFIXED after {n} attempts -- escalate")
+    return 1
+
+
+def fix_start(a, repo, base, note="", group=None, attempt=1):
+    """Cut a FRESH worktree at base, baseline-verify, enqueue one normal queue job. Returns (rc, jid); jid None = stop."""
     fixid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
     wt = WT_ROOT / fixid
     if a.dry_run:
@@ -643,12 +713,12 @@ def cmd_fix(a):
             cleanup()
             print("qagent: verify already passes on the base -- nothing to fix (nothing enqueued, worktree removed).",
                   file=sys.stderr)
-            return 3
+            return 3, None
         if code in (124, 127):
             cleanup(); die(f"baseline verify did not run cleanly (exit {code}): {out.strip()}", 1)
     else:
         code, out = 1, ""
-    prompt = (FIX_PREAMBLE + f"PROBLEM:\n{a.problem}\n\nVERIFY COMMAND (must exit 0 when fixed; currently exit {code}):\n"
+    prompt = (FIX_PREAMBLE + f"PROBLEM:\n{a.problem}{note}\n\nVERIFY COMMAND (must exit 0 when fixed; currently exit {code}):\n"
               f"  {a.verify}\n" + (f"\nCurrent verify output (tail):\n{out[-1500:]}\n" if out else ""))
     n = type("N", (), {})()
     n.readonly = False; n.model = a.model; n.label = a.label or "fix-" + slug(a.problem, 20)
@@ -656,20 +726,41 @@ def cmd_fix(a):
     n.max_wall = a.max_wall; n.dry_run = a.dry_run; n.watch = a.watch; n.repo = None; n.cwd = str(wt)
     rc = enqueue(n, prompt, quiet=True)
     if a.dry_run:
-        return rc
+        return rc, None
     jid = getattr(n, "job_id", None)
     if rc != 0 or not jid:
-        cleanup(); return rc or 1
+        cleanup(); return (rc or 1), None
     protected = sorted(verify_protected(a.verify, wt))
     fix_save(jid, {"job": jid, "fixid": fixid, "repo": str(repo), "worktree": str(wt), "base": base,
                    "verify": a.verify, "baseline": {"exit": code, "tail": out[-1500:]}, "land": bool(a.land),
-                   "protected": protected, "repo_snapshot": repo_snapshot(repo), "problem": a.problem})
+                   "protected": protected, "repo_snapshot": repo_snapshot(repo), "problem": a.problem,
+                   **({"group": group, "attempt": attempt} if group else {})})
     print(jid)
     print(f"qagent: fix job {jid}; worktree {wt}; baseline verify exit {code} (fails, as required). "
           f"`qagent wait {jid}` then `qagent result {jid}`.", file=sys.stderr)
     if a.land:
         print("qagent: --land noted: there is no clean automated landing entry; result will print the manual command.",
               file=sys.stderr)
+    return 0, jid
+
+
+def cmd_fix(a):
+    repo = Path(a.repo).expanduser().resolve()
+    top = git(repo, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        die(f"--repo is not a git repository: {repo}")
+    repo = Path(top.stdout.strip()).resolve()
+    br = git(repo, "rev-parse", "--verify", (a.base or "HEAD") + "^{commit}")
+    if br.returncode != 0:
+        die(f"bad --base {a.base}")
+    base = br.stdout.strip()
+    if a.attempts and a.attempts > 1:
+        if not a.wait and not a.dry_run:
+            die("--attempts > 1 needs --wait (retries are decided from each attempt's verify result)")
+        return fix_group(a, repo, base)
+    rc, jid = fix_start(a, repo, base)
+    if jid is None:
+        return rc
     if a.wait:
         w = type("W", (), {})(); w.id = jid; w.timeout = a.wait_timeout; w.poll = 15
         rw = cmd_wait(w)
@@ -678,6 +769,8 @@ def cmd_fix(a):
         x = type("X", (), {})(); x.id = jid
         return cmd_result(x)
     return 0
+
+
 
 
 def main(argv=None):
@@ -705,6 +798,7 @@ def main(argv=None):
     fx.add_argument("--chat-timeout", type=int); fx.add_argument("--max-wall", type=int)
     fx.add_argument("--dry-run", action="store_true"); fx.add_argument("--no-watch", dest="watch", action="store_false")
     fx.add_argument("--wait", action="store_true", help="block until done, then print the result report")
+    fx.add_argument("--attempts", type=int, default=1, help="verify-gated retries in fresh worktrees (needs --wait)")
     fx.add_argument("--wait-timeout", type=int, default=2400)
     fx.add_argument("problem"); fx.set_defaults(f=cmd_fix)
     ab = sp.add_parser("abort"); ab.add_argument("id"); ab.set_defaults(f=cmd_abort)

@@ -374,5 +374,137 @@ class FixMode(Base):
         self.assertIn("verdict: VERIFIED", self.result(bin=mp))
 
 
+RSTUB = """#!/usr/bin/env python3
+# stub queue that also plays the model: attempt k (1-based, from the log) applies behaviour SCRIPT[k-1]
+import sys, json, os
+log = os.environ['STUB_LOG']
+open(log, 'a').write(json.dumps(sys.argv[1:]) + '\\n')
+k = len(open(log).read().splitlines())
+a = sys.argv[1:]; cwd = a[a.index('--cwd') + 1]
+beh = json.loads(os.environ['STUB_SCRIPT'])[min(k, len(json.loads(os.environ['STUB_SCRIPT']))) - 1]
+if beh == 'fix':
+    open(cwd + '/calc.py', 'w').write('def add(a, b):\\n    return a + b\\n')
+elif beh == 'wrong':
+    open(cwd + '/calc.py', 'w').write('def add(a, b):\\n    return a * b  # WRONGTRY%d\\n' % k)
+    open(cwd + '/calc.py', 'a').write('print("AFTERMARK%d")\\n' % k)
+jid = '%012x' % (0xabc000000000 + k)
+st = os.environ['QAGENT_STATE']
+try: d = json.load(open(st))
+except Exception: d = {'jobs': []}
+d['jobs'].append({'id': jid, 'status': 'done', 'exit_code': 0, 'task_kind': 'coding', 'cwd': cwd})
+json.dump(d, open(st, 'w'))
+print('enqueued job ' + jid)
+"""
+
+
+class Attempts(Base):
+    """qagent fix --attempts N: verify-gated retry loop against a stub queue that plays the model."""
+    g = FixMode.g; _mutant = FixMode._mutant; wt = FixMode.wt   # shared helpers (not the FixMode tests)
+
+    def setUp(self):
+        Base.setUp(self)
+        self.wts = self.d / "wts"
+        self.env["QAGENT_WT_ROOT"] = str(self.wts)
+        self.repo = self.d / "R"; self.repo.mkdir()
+        (self.repo / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+        (self.repo / "test_calc.py").write_text(
+            "from calc import add\nassert add(2, 3) == 5, 'add broken'\nprint('ok')\n")
+        self.g("init", "-q"); self.g("add", "-A")
+        self.g("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "init")
+        self.verify = "python3 test_calc.py"
+        (self.d / "stubq.py").write_text(RSTUB)
+
+    def run_fix(self, script, n, bin=None, extra=()):
+        self.env["STUB_SCRIPT"] = json.dumps(script)
+        return self.q("fix", "--repo", str(self.repo), "--verify", self.verify, "--wait", "--attempts", str(n),
+                      *extra, "add is wrong", bin=bin)
+
+    def calls(self):
+        return [json.loads(l) for l in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def prompts(self):
+        return [Path(c[c.index("--task-file") + 1]).read_text() for c in self.calls()]
+
+    def cwds(self):
+        return [c[c.index("--cwd") + 1] for c in self.calls()]
+
+    def test_n1_unchanged(self):
+        r = self.run_fix(["wrong"], 1, extra=["--wait-timeout", "30"])
+        self.assertEqual(len(self.calls()), 1)
+        self.assertNotIn("attempt", self.prompts()[0].lower().replace("attempts", ""))
+        self.assertIn("verdict: UNVERIFIED", r.stdout)
+        self.assertNotIn("ATTEMPT GROUP", r.stdout); self.assertNotIn("UNFIXED", r.stdout)
+        self.assertEqual(list((self.d / "home" / "fix").glob("*.group.json")), [])
+        self.assertEqual(list((self.d / "home" / "fix").glob("*.escalation.md")), [])
+        self.assertNotIn("group", json.loads((self.d / "home" / "fix" / "abc000000001.json").read_text()))
+
+    def test_attempts_requires_wait(self):
+        r = self.q("fix", "--repo", str(self.repo), "--verify", self.verify, "--attempts", "2", "add is wrong")
+        self.assertNotEqual(r.returncode, 0); self.assertFalse(self.log.exists())
+
+    def test_retry_then_verified_stops(self):
+        r = self.run_fix(["wrong", "fix", "wrong"], 3)
+        self.assertEqual(len(self.calls()), 2, r.stdout + r.stderr)      # stopped at first VERIFIED
+        self.assertIn("verdict: VERIFIED", r.stdout)
+        self.assertIn("ATTEMPT GROUP", r.stdout)
+        self.assertNotIn("UNFIXED", r.stdout)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(list((self.d / "home" / "fix").glob("*.escalation.md")), [])
+        # any attempt's result shows the group summary
+        out = self.q("result", "abc000000001").stdout
+        self.assertIn("ATTEMPT GROUP", out); self.assertIn("abc000000002", out)
+
+    def test_exhausted_writes_escalation(self):
+        r = self.run_fix(["wrong", "wrong"], 2)
+        self.assertEqual(len(self.calls()), 2)
+        self.assertIn("UNFIXED after 2 attempts -- escalate", r.stdout)
+        self.assertNotEqual(r.returncode, 0)
+        esc = list((self.d / "home" / "fix").glob("*.escalation.md"))
+        self.assertEqual(len(esc), 1); self.assertIn(str(esc[0]), r.stdout)
+        t = esc[0].read_text()
+        for s in ("add is wrong", str(self.repo), self.g("rev-parse", "HEAD").stdout.strip(), "abc000000001",
+                  "abc000000002", "UNVERIFIED", "add broken", "abc000000001.patch", "abc000000002.patch"):
+            self.assertIn(s, t)
+
+    def test_fresh_worktree_each_attempt(self):
+        self.run_fix(["wrong", "wrong", "wrong"], 3)
+        cw = self.cwds()
+        self.assertEqual(len(cw), 3); self.assertEqual(len(set(cw)), 3)
+        # attempt 2 started from the base, not from attempt 1's edit (its WRONGTRY1 edit is absent at enqueue time)
+        self.assertIn("WRONGTRY2", (Path(cw[1]) / "calc.py").read_text())
+        self.assertNotIn("WRONGTRY1", (Path(cw[1]) / "calc.py").read_text())
+        self.assertIn("WRONGTRY1", (Path(cw[0]) / "calc.py").read_text())
+
+    def test_previous_verify_tail_in_next_prompt(self):
+        self.run_fix(["wrong", "fix"], 2)
+        p = self.prompts()
+        self.assertNotIn("attempt 2 of 2", p[0])
+        self.assertIn("attempt 2 of 2", p[1])
+        self.assertIn("AFTERMARK1", p[1].split("attempt 2 of 2", 1)[1])   # raw after-verify output of attempt 1
+        self.assertNotIn("AFTERMARK1", p[0])
+        self.assertIn("add is wrong", p[1])                               # same problem text
+
+    # ---- mutant proofs for the retry loop
+    def _mut_run(self, old, new, script, n):
+        mp = self._mutant(old, new)
+        return self.run_fix(script, n, bin=mp)
+
+    def test_mutant_reuse_worktree_caught(self):
+        # mutant: every attempt reuses the first worktree path
+        mp = self._mutant('    wt = WT_ROOT / fixid\n    if a.dry_run:', '    wt = WT_ROOT / (getattr(a, "_w", None) or fixid); a._w = wt.name\n    if a.dry_run:')
+        self.run_fix(["wrong", "wrong"], 2, bin=mp)
+        self.assertLess(len(set(self.cwds())), 2)          # mutant really reuses; the fresh-tree test would fail
+
+    def test_mutant_skip_tail_caught(self):
+        mp = self._mutant("{(r.get('after_tail') or '')[-1500:]}", "")
+        self.run_fix(["wrong", "fix"], 2, bin=mp)
+        self.assertNotIn("AFTERMARK1", self.prompts()[1])
+
+    def test_mutant_no_stop_at_verified_caught(self):
+        mp = self._mutant('        if r["verdict"] == "VERIFIED":\n            x = type', '        if False:\n            x = type')
+        self.run_fix(["fix", "wrong", "wrong"], 3, bin=mp)
+        self.assertEqual(len(self.calls()), 3)             # mutant keeps going; stop test expects 2 calls
+
+
 if __name__ == "__main__":
     unittest.main()
