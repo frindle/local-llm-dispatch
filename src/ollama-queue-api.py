@@ -2469,19 +2469,25 @@ function cpuQueueRows(d) {
   d = d || {};
   const rows = [];
   for (const c of (d.running || [])) rows.push({kind: 'running', status: 'running', stage: c.stage || 'cpu',
-    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', where: c.runner || 'runner', secs: c.running_s,
+    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', owner: c.owner || '', where: c.runner || 'runner', secs: c.running_s,
     reason: '', id: c.id || ''});
   for (const c of (d.local_running || [])) rows.push({kind: 'local_running', status: 'running', stage: c.stage || 'cpu',
-    label: c.stage || 'cpu stage', bundle: c.bundle || '', where: 'local (Mac)', secs: c.running_s,
+    label: c.stage || 'cpu stage', bundle: c.bundle || '', owner: c.owner || '', where: 'local (Mac)', secs: c.running_s,
     reason: c.reason || 'fallback', id: ''});
   for (const c of (d.pending || [])) rows.push({kind: 'pending', status: 'pending', stage: c.stage || 'cpu',
-    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', where: 'waiting for a runner', secs: c.waiting_s,
+    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', owner: c.owner || '', where: 'waiting for a runner', secs: c.waiting_s,
     reason: '', id: c.id || ''});
   return rows;
 }
 function cpuQueueRowHtml(r, nested) {
   const secs = r.secs == null ? '?' : Math.round(r.secs) + 's';
-  const bundle = (r.bundle && !nested) ? ` <a href="#" class="cpu-bundle" data-bundle="${escapeHtml(r.bundle)}" title="Jump to the owning bundle in the queue">bundle ${escapeHtml(r.bundle)}</a>` : '';
+  // A bare 12-hex "bundle" is a snapshot/worktree hash of a harness that is NOT a queue bundle (standalone
+  // preflight, A/B replay set...): show WHO owns it (r.owner) + a muted tag instead of a fake bundle link.
+  const standaloneHash = !r.bundle || /^[0-9a-f]{12}$/.test(r.bundle);
+  const owner = (r.owner && !nested) ? ` <span class="cpu-owner" title="Submitted by">${escapeHtml(r.owner)}</span>` : '';
+  const bundle = nested ? '' : (standaloneHash
+    ? `${owner} <span class="cpu-standalone" style="opacity:.6;font-size:.85em" title="Not a queue bundle: a preflight/harness running on its own">standalone preflight</span>`
+    : `${owner} <a href="#" class="cpu-bundle" data-bundle="${escapeHtml(r.bundle)}" title="Jump to the owning bundle in the queue">bundle ${escapeHtml(r.bundle)}</a>`);
   const why = r.reason ? ` <span class="cpu-reason">RUNNING LOCALLY - local: ${escapeHtml(r.reason)}</span>` : '';
   return `<td>CPU</td><td><b>${escapeHtml(r.stage)}</b> ${escapeHtml(r.label)}${bundle}`
     + ` <span class="cpu-where">on ${escapeHtml(r.where)}</span>${why}</td>`
