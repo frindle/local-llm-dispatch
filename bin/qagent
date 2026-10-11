@@ -12,7 +12,9 @@ authoring.  Output is UNVERIFIED local-model text; the caller must check it.
   qagent wait <id> [--timeout S]                        exit 0 done, 1 failed, 2 timeout
   qagent result <id>                                    summary + diff + banner + log path
   qagent followup <id> "<msg>" [--dry-run]              new job seeded from the prior one
-  qagent abort <id>                                     via ~/bin/queue-abort
+  qagent abort <id>                                     via ~/bin/queue-abort (fix jobs: also removes the worktree)
+  qagent fix --repo R --verify "<cmd>" [--base REF] [--land] [--wait] "<problem>"
+                                                        WRITE/FIX mode (see below); prints job id
   qagent watch <id> [--poll S]                          foreground watchdog: enforce --max-wall until the job
                                                         is terminal (`run` auto-spawns one, detached; --no-watch)
 
@@ -39,7 +41,19 @@ Followup
   The worker's --resume only works on a paused/failed job's own transcript and the
   queue exposes no enqueue flag for it, so followup enqueues a NEW job whose prompt
   carries the original prompt, the prior final answer and the new message.
-Env: QAGENT_QUEUE_PY (queue script), QAGENT_STATE (state json), QAGENT_HOME (scratch root),
+FIX mode (qagent fix) -- local-model code is NEVER trusted
+  qagent cuts its OWN detached git worktree of R at --base (default HEAD) under
+  ~/.ollama-dispatch/qagent-worktrees/<fixid>/ and enqueues ONE coding job with --cwd <worktree> (the worker
+  already confines every file tool to its cwd: resolve_path "escapes working directory"; no new pin
+  mechanism).  qagent -- not the model -- runs --verify in the worktree BEFORE (must FAIL, else
+  "verify already passes -- nothing to fix" and nothing is enqueued) and, once the job is terminal
+  (`result`/`fix --wait`), AFTER.  The patch is captured before the after-verify so verify litter never
+  lands in it.  Verdicts: VERIFIED (fail->pass), UNVERIFIED (anything else), REJECTED (touches a
+  test/verify file, a symlink/escaping path, or R's own checkout changed), NO-CHANGE.  R's branch is
+  never committed to; output = <QAGENT_HOME>/fix/<jobid>.patch + the worktree path.
+  --land is opt-in but there is NO clean automated landing entry (ollama-land ingest needs a gate
+  verdict on a queue job, and qagent jobs are advisory/no-verify), so it only prints the manual command.
+Env: QAGENT_WT_ROOT (worktree root), QAGENT_VERIFY_TIMEOUT (s, default 600), QAGENT_QUEUE_PY (queue script), QAGENT_STATE (state json), QAGENT_HOME (scratch root),
      QAGENT_ABORT (queue-abort path), QAGENT_DRY_ID (dry-run fake id),
      QAGENT_WATCHER (script `run` spawns as `<script> watch <id>`; default this file).
 """
@@ -134,7 +148,9 @@ def build_enqueue(args, prompt, qid_hint):
     label = f"qagent-{slug(args.label or prompt)}-{stamp[-6:]}"
     argv = [sys.executable, QUEUE_PY, "enqueue", "--model", args.model, "--host", "auto",
             "--task-file", str(tf), "--label", label, "--bundle", label, "--no-preflight"]
-    if args.repo:
+    if getattr(args, "cwd", None):
+        argv += ["--cwd", str(args.cwd)]   # fix mode: qagent-owned linked worktree
+    elif args.repo:
         argv += ["--repo", str(Path(args.repo).expanduser().resolve())]
     else:
         scratch = workdir / "scratch"; scratch.mkdir(exist_ok=True)
@@ -150,7 +166,7 @@ def build_enqueue(args, prompt, qid_hint):
     return argv, tf, label
 
 
-def enqueue(args, prompt):
+def enqueue(args, prompt, quiet=False):
     argv, tf, label = build_enqueue(args, prompt, "q")
     if args.dry_run:
         print(json.dumps({"argv": argv, "task_file": str(tf), "label": label}, indent=1))
@@ -173,7 +189,9 @@ def enqueue(args, prompt):
         spawn_watchdog(jid)
     m = json.loads((tf.parent / "META.json").read_text()); m["job"] = jid
     (tf.parent / "META.json").write_text(json.dumps(m))
-    print(jid)
+    if not quiet:
+        print(jid)
+    args.job_id = jid
     return 0
 
 
@@ -351,12 +369,17 @@ def cmd_result(a):
               f"incomplete data (verify counts/lists) ---")
         for h in tn[:5]:
             print("  " + h)
-    diff = collect_diff(j)
+    fm = fix_meta(j.get("id"))
+    if fm:
+        fix_print_report(fix_finalize(j.get("id")))
+        diff = None
+    else:
+        diff = collect_diff(j)
     if diff:
         ro = (j.get("task_kind") == "research")
         print("--- diff / changed files" + (" (READONLY VIOLATION: read-only job changed files!)" if ro else "") + " ---")
         print(diff)
-    elif diff == "":
+    elif diff == "" and not fm:
         print("--- diff: none (working tree clean) ---")
     sm = re.search(r"\[worker\] model=(\S+) host=(\S+)", _log_text(j))
     if sm:
@@ -391,7 +414,270 @@ def cmd_followup(a):
 
 def cmd_abort(a):
     r = subprocess.run([ABORT, a.id, "--yes"])
+    j = find_job(a.id) or done_sidecar(a.id) or {}
+    fm = fix_meta(j.get("id") or a.id)
+    if fm:
+        ok, msg = remove_fix_worktree(fm)
+        print(f"qagent: {msg}")
+        return r.returncode if ok else 1
     return r.returncode
+
+
+# ---------------------------------------------------------------- FIX mode
+WT_ROOT = Path(os.environ.get("QAGENT_WT_ROOT", str(HOME / ".ollama-dispatch" / "qagent-worktrees")))
+VERIFY_TIMEOUT = int(os.environ.get("QAGENT_VERIFY_TIMEOUT", "600"))
+# files a fix must never touch: tests / verify inputs (test-file protection), checked against base.
+TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec|specs)/|(^|/)test_[^/]*\.py$|_test\.[a-z]+$|"
+                     r"\.(test|spec)\.[a-z]+$|(^|/)conftest\.py$", re.I)
+JUNK_EXCLUDES = [":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.pyc", ":(exclude,glob)**/.pytest_cache/**",
+                 ":(exclude,glob)**/node_modules/**", ":(exclude,glob)**/.DS_Store"]
+FIX_PREAMBLE = (
+    "FIX TASK. You are working in an isolated git worktree (your working directory); edit files ONLY there. "
+    "Make the SMALLEST source change that fixes the problem. You MUST NOT modify, delete, rename or add "
+    "any test file or anything the verify command reads as its check (tests/, test_*.py, *_test.*, "
+    "*.test.*, conftest.py, fixtures) -- such a change is detected and REJECTED. Do not commit. "
+    "Run the verify command yourself after editing and iterate until it exits 0. End with a short "
+    "plain-text summary: root cause, what you changed, the verify result.\n"
+    "Tool output may be truncated: narrow queries with grep/cut/head, and never claim completeness you did "
+    "not verify.\n\n")
+
+
+def git(repo, *a, check=False, timeout=120):
+    return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=timeout, check=check)
+
+
+def under(path, root):
+    try:
+        rp, rr = Path(path).resolve(), Path(root).resolve()
+    except Exception:
+        return False
+    return rr in rp.parents
+
+
+def run_verify(cmd, cwd, timeout=None):
+    """Run the verify command in cwd. Returns (exit_code, output_tail). Timeout -> 124."""
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=str(cwd), capture_output=True, text=True,
+                           timeout=timeout or VERIFY_TIMEOUT)
+        out = (r.stdout or "") + (r.stderr or "")
+        return r.returncode, out[-3000:]
+    except subprocess.TimeoutExpired as e:
+        return 124, f"(verify timed out after {timeout or VERIFY_TIMEOUT}s)"
+    except Exception as e:
+        return 127, f"(verify could not run: {e})"
+
+
+def fix_dir():
+    d = QHOME / "fix"; d.mkdir(parents=True, exist_ok=True); return d
+
+
+def fix_meta(jid):
+    if not jid:
+        return None
+    try:
+        fp = fix_dir() / f"{jid}.json"
+        if not fp.exists():   # accept a unique id prefix (abort/result are often called with 6 chars)
+            g = list(fix_dir().glob(f"{jid}*.json"))
+            fp = g[0] if len(g) == 1 else fp
+        return json.loads(fp.read_text())
+    except Exception:
+        return None
+
+
+def fix_save(jid, m):
+    jid = m.get("job", jid)
+    (fix_dir() / f"{jid}.json").write_text(json.dumps(m, indent=1))
+
+
+def repo_snapshot(repo):
+    return {"head": git(repo, "rev-parse", "HEAD").stdout.strip(),
+            "status": git(repo, "status", "--porcelain", "--untracked-files=all").stdout}
+
+
+def verify_protected(cmd, wt):
+    """Paths (relative to the worktree) named by the verify command that exist at base: they are the check."""
+    import shlex
+    out = set()
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        toks = cmd.split()
+    for t in toks:
+        t = t.split("::")[0]
+        if not t or t.startswith("-"):
+            continue
+        p = (Path(wt) / t)
+        if p.exists() and under(p, wt):
+            rel = str(p.resolve().relative_to(Path(wt).resolve()))
+            if rel != ".":   # `pytest .` must not protect the whole tree (test-file regex still applies)
+                out.add(rel)
+    return out
+
+
+def check_patch(files, protected, wt):
+    """Reasons a diff must be REJECTED. `files` = [(status, path)] vs base."""
+    bad = []
+    for st, f in files:
+        if f.startswith("/") or ".." in Path(f).parts:
+            bad.append(f"path outside repo: {f}")
+            continue
+        fp = Path(wt) / f
+        if fp.is_symlink() or (fp.exists() and not under(fp, wt)):
+            bad.append(f"symlink / escaping path: {f}")
+        if TEST_RE.search(f):
+            bad.append(f"modifies test file: {f}")
+        elif any(f == p or f.startswith(p.rstrip("/") + "/") for p in protected):
+            bad.append(f"modifies verify target: {f}")
+    return bad
+
+
+def fix_verdict(before, after, files, bad):
+    if bad:
+        return "REJECTED"
+    if not files:
+        return "NO-CHANGE"
+    if before != 0 and after == 0:
+        return "VERIFIED"
+    return "UNVERIFIED"
+
+
+def fix_finalize(jid, force=False):
+    m = fix_meta(jid)
+    if not m:
+        return None
+    if m.get("report") and not force:
+        return m
+    wt = Path(m["worktree"])
+    if not wt.is_dir() or not under(wt, WT_ROOT):
+        m["report"] = {"verdict": "UNVERIFIED", "reasons": ["worktree missing or not under qagent-worktrees"],
+                       "files": [], "before": m["baseline"]["exit"], "after": None}
+        fix_save(jid, m); return m
+    rs = repo_snapshot(m["repo"])
+    reasons = []
+    if rs != m["repo_snapshot"]:
+        reasons.append("R's own checkout changed while the job ran (HEAD/status differ) -- worker wrote outside the worktree")
+    # capture the patch BEFORE running verify (verify litter must not land in the patch)
+    git(wt, "add", "-A", "--", ".", *JUNK_EXCLUDES)
+    ns = git(wt, "diff", "--cached", "--name-status", "--no-renames", m["base"]).stdout
+    files = [tuple(l.split("\t", 1)) for l in ns.splitlines() if "\t" in l]
+    files = [(a, b.strip()) for a, b in files]
+    patch = git(wt, "diff", "--cached", "--binary", "--no-renames", m["base"]).stdout
+    pp = fix_dir() / f"{jid}.patch"
+    pp.write_text(patch)
+    stat = git(wt, "diff", "--cached", "--stat", "--no-renames", m["base"]).stdout
+    protected = set(m.get("protected", []))
+    bad = reasons + check_patch(files, protected, wt)
+    aft, aout = run_verify(m["verify"], wt)
+    before = m["baseline"]["exit"]
+    v = fix_verdict(before, aft, files, bad)
+    if v == "UNVERIFIED":
+        bad.append(f"verify after fix exit={aft} (needs fail->pass; before exit={before})")
+    m["report"] = {"verdict": v, "reasons": bad, "files": [f"{a}\t{b}" for a, b in files], "stat": stat,
+                   "patch": str(pp), "before": before, "after": aft, "after_tail": aout[-1500:],
+                   "when": time.strftime("%F %T")}
+    fix_save(jid, m)
+    return m
+
+
+def fix_print_report(m):
+    r = m["report"]
+    print("\n--- FIX MODE report (verify run by qagent, not the model) ---")
+    print(f"verdict: {r['verdict']}" + ("" if r["verdict"] == "VERIFIED" else "   <-- UNVERIFIED: do NOT apply unreviewed"))
+    print(f"verify:  {m['verify']}")
+    print(f"before:  exit {r['before']}   after: exit {r['after']}")
+    for x in r["reasons"]:
+        print(f"  ! {x}")
+    print(f"files touched ({len(r['files'])}):")
+    for x in r["files"]:
+        print("  " + x.replace("\t", " "))
+    if r.get("stat"):
+        print(r["stat"].rstrip())
+    print(f"full diff (patch file): {r['patch']}")
+    print(f"worktree: {m['worktree']}   (base {m['base'][:12]} of {m['repo']}; R was not modified)")
+    if r["verdict"] != "VERIFIED":
+        print(f"after-verify tail:\n{r.get('after_tail', '')}")
+    print(f"apply by hand (reviewed): git -C {m['repo']} apply --check {r['patch']} && git -C {m['repo']} apply {r['patch']}")
+    if m.get("land"):
+        print("--land: no automated landing entry exists (ollama-land ingest needs a gate verdict on a queue job; "
+              "qagent jobs are advisory). NOT landed -- use the apply command above after review.")
+    print(f"cleanup: qagent abort <jobid>   (removes the worktree)")
+
+
+def remove_fix_worktree(m):
+    wt = Path(m["worktree"])
+    if not under(wt, WT_ROOT):
+        return False, f"refusing to remove {wt}: not under {WT_ROOT}"
+    if wt.is_dir():
+        r = git(m["repo"], "worktree", "remove", "--force", str(wt))
+        if r.returncode != 0:
+            return False, f"git worktree remove failed: {(r.stderr or r.stdout).strip()}"
+    git(m["repo"], "worktree", "prune")
+    return True, f"removed worktree {wt}"
+
+
+def cmd_fix(a):
+    repo = Path(a.repo).expanduser().resolve()
+    top = git(repo, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        die(f"--repo is not a git repository: {repo}")
+    repo = Path(top.stdout.strip()).resolve()
+    br = git(repo, "rev-parse", "--verify", (a.base or "HEAD") + "^{commit}")
+    if br.returncode != 0:
+        die(f"bad --base {a.base}")
+    base = br.stdout.strip()
+    fixid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+    wt = WT_ROOT / fixid
+    if a.dry_run:
+        print(f"(dry-run) would cut worktree {wt} at {base[:12]}, baseline-run {a.verify!r}, then enqueue")
+    else:
+        WT_ROOT.mkdir(parents=True, exist_ok=True)
+        r = git(repo, "worktree", "add", "--detach", str(wt), base)
+        if r.returncode != 0:
+            die(f"worktree add failed: {(r.stderr or r.stdout).strip()}", 1)
+    cleanup = lambda: git(repo, "worktree", "remove", "--force", str(wt)) if (not a.dry_run and under(wt, WT_ROOT)) else None
+    if not a.dry_run:
+        code, out = run_verify(a.verify, wt)
+        git(wt, "clean", "-fdxq")   # baseline litter (pycache etc.) must not enter the diff
+        git(wt, "checkout", "-q", "--", ".")
+        if code == 0:
+            cleanup()
+            print("qagent: verify already passes on the base -- nothing to fix (nothing enqueued, worktree removed).",
+                  file=sys.stderr)
+            return 3
+        if code in (124, 127):
+            cleanup(); die(f"baseline verify did not run cleanly (exit {code}): {out.strip()}", 1)
+    else:
+        code, out = 1, ""
+    prompt = (FIX_PREAMBLE + f"PROBLEM:\n{a.problem}\n\nVERIFY COMMAND (must exit 0 when fixed; currently exit {code}):\n"
+              f"  {a.verify}\n" + (f"\nCurrent verify output (tail):\n{out[-1500:]}\n" if out else ""))
+    n = type("N", (), {})()
+    n.readonly = False; n.model = a.model; n.label = a.label or "fix-" + slug(a.problem, 20)
+    n.max_iters = a.max_iters; n.max_tokens = a.max_tokens; n.chat_timeout = a.chat_timeout
+    n.max_wall = a.max_wall; n.dry_run = a.dry_run; n.watch = a.watch; n.repo = None; n.cwd = str(wt)
+    rc = enqueue(n, prompt, quiet=True)
+    if a.dry_run:
+        return rc
+    jid = getattr(n, "job_id", None)
+    if rc != 0 or not jid:
+        cleanup(); return rc or 1
+    protected = sorted(verify_protected(a.verify, wt))
+    fix_save(jid, {"job": jid, "fixid": fixid, "repo": str(repo), "worktree": str(wt), "base": base,
+                   "verify": a.verify, "baseline": {"exit": code, "tail": out[-1500:]}, "land": bool(a.land),
+                   "protected": protected, "repo_snapshot": repo_snapshot(repo), "problem": a.problem})
+    print(jid)
+    print(f"qagent: fix job {jid}; worktree {wt}; baseline verify exit {code} (fails, as required). "
+          f"`qagent wait {jid}` then `qagent result {jid}`.", file=sys.stderr)
+    if a.land:
+        print("qagent: --land noted: there is no clean automated landing entry; result will print the manual command.",
+              file=sys.stderr)
+    if a.wait:
+        w = type("W", (), {})(); w.id = jid; w.timeout = a.wait_timeout; w.poll = 15
+        rw = cmd_wait(w)
+        if rw == 2:
+            return 2
+        x = type("X", (), {})(); x.id = jid
+        return cmd_result(x)
+    return 0
 
 
 def main(argv=None):
@@ -413,6 +699,14 @@ def main(argv=None):
     f.add_argument("--dry-run", action="store_true"); f.set_defaults(f=cmd_followup)
     wd = sp.add_parser("watch"); wd.add_argument("id"); wd.add_argument("--poll", type=float, default=20)
     wd.add_argument("--max-watch", type=float, default=0); wd.set_defaults(f=cmd_watch)
+    fx = sp.add_parser("fix"); fx.add_argument("--repo", required=True); fx.add_argument("--verify", required=True)
+    fx.add_argument("--base"); fx.add_argument("--land", action="store_true"); fx.add_argument("--model", default=DEFAULT_MODEL)
+    fx.add_argument("--label"); fx.add_argument("--max-iters", type=int); fx.add_argument("--max-tokens", type=int)
+    fx.add_argument("--chat-timeout", type=int); fx.add_argument("--max-wall", type=int)
+    fx.add_argument("--dry-run", action="store_true"); fx.add_argument("--no-watch", dest="watch", action="store_false")
+    fx.add_argument("--wait", action="store_true", help="block until done, then print the result report")
+    fx.add_argument("--wait-timeout", type=int, default=2400)
+    fx.add_argument("problem"); fx.set_defaults(f=cmd_fix)
     ab = sp.add_parser("abort"); ab.add_argument("id"); ab.set_defaults(f=cmd_abort)
     a = p.parse_args(argv)
     return a.f(a)

@@ -48,6 +48,7 @@ scaffold/draft/verify/gate. Output is **UNVERIFIED** local-model text (every `re
 ```
 qagent run [--repo PATH] [--readonly] [--model M] [--label L] [--max-iters N] [--dry-run] "<prompt>"   # prints job id
 qagent status <id> | wait <id> [--timeout S] | result <id> | followup <id> "<msg>" | abort <id>
+qagent fix --repo R --verify "<cmd>" [--base REF] [--land] [--wait] "<problem>"   # WRITE/FIX mode, below
 ```
 - No verify: coding runs pass the queue's `--allow-no-verify` (advisory/scope-only); `--readonly` uses `--task-kind research`.
 - Isolation: `--repo` => queue's throwaway worktree; otherwise a scratch dir under `~/.qagent/`. The worker has no
@@ -60,7 +61,19 @@ qagent status <id> | wait <id> [--timeout S] | result <id> | followup <id> "<msg
   `result` prints the SERVED model (the queue aliases qwen3.8 -> qwen3.6 on the Darkbloom lane). Worker truncates large tool
   output (~4k chars): tell the model to `| head`/`| grep` rather than trust a full dump.
 - `followup` enqueues a NEW job seeded with the prior prompt + answer (the queue has no enqueue-with-resume flag).
-- Tests: `tests/test-qagent.py` (stub queue, includes a revert-proof). Source of truth stays live `~/bin/qagent`; `SYNC.sh` mirrors it here.
+- **`qagent fix` (write/fix mode; local-model code is never trusted)**: qagent cuts its OWN detached worktree of `R` at `--base`
+  (default HEAD) under `~/.ollama-dispatch/qagent-worktrees/<fixid>/` and enqueues one coding job with `--cwd <worktree>` (same
+  bounds/bundle/`--no-preflight`/watchdog as `run`; the worker already confines file tools to its cwd). **qagent itself** runs `--verify`
+  in the worktree before (must FAIL, else "verify already passes -- nothing to fix", nothing enqueued) and, from `result`/`fix --wait`
+  once the job is terminal, after. Report (`qagent result <id>`): verdict, verify before/after exit codes, files touched, diff stat,
+  patch file (`~/.qagent/fix/<jobid>.patch`, captured before the after-verify), worktree path. Verdicts: `VERIFIED` only on verify
+  fail->pass; `UNVERIFIED` otherwise; `REJECTED` if the diff touches a test file (name/dir regex) or something the verify command
+  names, adds a symlink/escaping path, or R's own checkout changed (worker escaped); `NO-CHANGE`. R's branch is never committed
+  to. `qagent abort <id>` also `git worktree remove`s the worktree (refuses any path not under `qagent-worktrees`).
+  `--land` is accepted but only prints the manual `git apply` command: there is no clean automated landing entry (`ollama-land
+  ingest` needs a gate verdict on a gated queue job; qagent jobs are advisory/no-verify).
+- Tests: `tests/test-qagent.py` (stub queue, includes revert-proofs for the read-only guard, watchdog, fix verify-before/after logic,
+  test-file protection and verify-target protection; fix-mode cases use a throwaway git repo + stub worker, no GPU). Source of truth stays live `~/bin/qagent`; `SYNC.sh` mirrors it here.
 
 ## Where it runs from
 - Pipeline scripts: `~/bin/<name>` (real files), including `ollama-queue.py`, `ollama-worker.py`, `ollama-dispatch-*`, `gate-on-complete.py`, `handoff-emit.py`.

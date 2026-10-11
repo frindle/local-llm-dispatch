@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test-qagent.py -- qagent against a STUB queue (no real model, no real queue).
 Includes a revert-proof: mutating qagent's read-only guard makes the suite fail."""
-import json, os, subprocess, sys, tempfile, time, unittest
+import json, os, shutil, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -13,7 +13,7 @@ print('enqueued job abc123def456 (stub)')
 """
 
 
-class T(unittest.TestCase):
+class Base(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
         (self.d / "stubq.py").write_text(STUB)
@@ -34,6 +34,8 @@ class T(unittest.TestCase):
     def argv(self):
         return json.loads(self.log.read_text().splitlines()[-1])
 
+
+class T(Base):
     def test_readonly_run(self):
         r = self.q("run", "--readonly", "--label", "x", "do a thing")
         self.assertEqual(r.stdout.strip(), "abc123def456", r.stderr)
@@ -199,6 +201,177 @@ class T(unittest.TestCase):
         p = subprocess.Popen([sys.executable, str(mp), "watch", "abc123", "--poll", "0.1", "--max-watch", "1"], env=self.env)
         self.assertEqual(p.wait(timeout=10), 2)
         self.assertFalse((self.d / "abort.out").exists())
+
+
+class FixMode(Base):
+    """qagent fix: isolated worktree, qagent-run verify before/after, test-file protection, abort cleanup."""
+    def setUp(self):
+        super().setUp()
+        self.wts = self.d / "wts"
+        self.env["QAGENT_WT_ROOT"] = str(self.wts)
+        self.repo = self.d / "R"; self.repo.mkdir()
+        (self.repo / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+        (self.repo / "test_calc.py").write_text(
+            "from calc import add\nassert add(2, 3) == 5, 'add broken'\nprint('ok')\n")
+        self.g("init", "-q"); self.g("add", "-A")
+        self.g("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "init")
+        self.verify = "python3 test_calc.py"
+
+    def g(self, *x, cwd=None):
+        return subprocess.run(["git", "-C", str(cwd or self.repo), *x], capture_output=True, text=True, check=True)
+
+    def fix(self, verify=None, bin=None, extra=()):
+        r = self.q("fix", "--repo", str(self.repo), "--verify", verify or self.verify, *extra, "add is wrong", bin=bin)
+        return r
+
+    def wt(self):
+        w = list(self.wts.iterdir()) if self.wts.exists() else []
+        return w[0] if w else None
+
+    def finish(self, wt, status="done"):
+        self.state.write_text(json.dumps({"jobs": [{"id": "abc123def456", "status": status, "exit_code": 0,
+                              "task_kind": "coding", "cwd": str(wt)}]}))
+
+    def result(self, bin=None):
+        return self.q("result", "abc123", bin=bin).stdout
+
+    FIXED = "def add(a, b):\n    return a + b\n"
+
+    def test_fix_enqueue_shape_and_baseline(self):
+        r = self.fix()
+        self.assertEqual(r.stdout.strip(), "abc123def456", r.stderr)
+        a = self.argv(); wt = self.wt()
+        self.assertEqual(a[a.index("--cwd") + 1], str(wt))
+        self.assertNotIn("--repo", a)
+        self.assertEqual(a[a.index("--task-kind") + 1], "coding")
+        self.assertEqual(a[a.index("--max-tokens") + 1], "12000")
+        self.assertEqual(a[a.index("--max-iters") + 1], "12")
+        self.assertEqual(a[a.index("--chat-timeout") + 1], "900")
+        self.assertIn("--no-preflight", a); self.assertIn("--bundle", a)
+        body = Path(a[a.index("--task-file") + 1]).read_text()
+        self.assertIn("MUST NOT modify", body); self.assertIn(self.verify, body)
+        self.assertEqual(self.g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() in ("master", "main"), True)
+        self.assertEqual(self.g("status", "--porcelain").stdout, "")   # R untouched
+        self.assertTrue(wt.is_dir() and (wt / "calc.py").exists())
+        self.assertFalse((wt / "__pycache__").exists())                # baseline litter cleaned
+
+    def test_verify_already_passing_refused(self):
+        r = self.fix("true")
+        self.assertEqual(r.returncode, 3); self.assertIn("nothing to fix", r.stderr)
+        self.assertFalse(self.log.exists()); self.assertIsNone(self.wt())
+
+    def test_fail_to_pass_verified(self):
+        self.fix(); wt = self.wt()
+        (wt / "calc.py").write_text(self.FIXED); self.finish(wt)
+        out = self.result()
+        self.assertIn("verdict: VERIFIED", out); self.assertIn("before:  exit 1   after: exit 0", out)
+        self.assertIn("calc.py", out); self.assertNotIn("test_calc.py\n", out.split("files touched")[1].split("full diff")[0])
+        patch = (self.d / "home" / "fix" / "abc123def456.patch").read_text()
+        self.assertIn("+    return a + b", patch); self.assertNotIn("__pycache__", patch)
+        self.assertEqual(self.g("status", "--porcelain").stdout, "")   # R never touched
+        self.g("apply", "--check", str(self.d / "home" / "fix" / "abc123def456.patch"))
+
+    def test_still_failing_flagged_unverified(self):
+        self.fix(); wt = self.wt()
+        (wt / "calc.py").write_text("def add(a, b):\n    return a * b\n"); self.finish(wt)
+        out = self.result()
+        self.assertIn("verdict: UNVERIFIED", out); self.assertNotIn("verdict: VERIFIED", out)
+        self.assertIn("after: exit 1", out)
+
+    def test_no_change(self):
+        self.fix(); self.finish(self.wt())
+        self.assertIn("verdict: NO-CHANGE", self.result())
+
+    def test_test_file_edit_rejected_even_if_verify_passes(self):
+        self.fix(); wt = self.wt()
+        (wt / "test_calc.py").write_text("print('ok')\n"); self.finish(wt)
+        out = self.result()
+        self.assertIn("verdict: REJECTED", out); self.assertIn("modifies test file: test_calc.py", out)
+        self.assertIn("after: exit 0", out)    # verify went green -- by gutting the test; must not count
+
+    def test_verify_target_edit_rejected(self):
+        (self.repo / "check.sh").write_text("python3 -c 'from calc import add; assert add(1,1)==2'\n")
+        self.g("add", "-A"); self.g("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "c")
+        self.fix("sh check.sh"); wt = self.wt()
+        (wt / "check.sh").write_text("true\n"); self.finish(wt)
+        out = self.result()
+        self.assertIn("verdict: REJECTED", out); self.assertIn("modifies verify target: check.sh", out)
+
+    def test_symlink_escape_rejected(self):
+        self.fix(); wt = self.wt()
+        (wt / "calc.py").write_text(self.FIXED)
+        os.symlink("/etc/hosts", wt / "leak"); self.finish(wt)
+        out = self.result()
+        self.assertIn("verdict: REJECTED", out); self.assertIn("symlink / escaping path: leak", out)
+
+    def test_write_into_real_repo_rejected(self):
+        self.fix(); wt = self.wt()
+        (wt / "calc.py").write_text(self.FIXED)
+        (self.repo / "calc.py").write_text(self.FIXED)    # worker escaped the worktree and edited R
+        self.finish(wt)
+        out = self.result()
+        self.assertIn("verdict: REJECTED", out); self.assertIn("R's own checkout changed", out)
+
+    def test_result_is_idempotent_and_survives_worktree_state(self):
+        self.fix(); wt = self.wt(); (wt / "calc.py").write_text(self.FIXED); self.finish(wt)
+        self.assertIn("VERIFIED", self.result())
+        (wt / "calc.py").write_text("garbage")   # later tampering must not change the recorded report
+        self.assertIn("verdict: VERIFIED", self.result())
+
+    def test_land_prints_manual_command_only(self):
+        self.fix(extra=["--land"]); wt = self.wt(); (wt / "calc.py").write_text(self.FIXED); self.finish(wt)
+        out = self.result()
+        self.assertIn("no automated landing entry", out); self.assertIn("git -C", out)
+        self.assertEqual(self.g("log", "--oneline").stdout.count("\n"), 1)   # no commit made on R
+
+    def test_abort_removes_worktree_and_only_under_root(self):
+        self.fix(); wt = self.wt(); self.assertTrue(wt.is_dir())
+        r = self.q("abort", "abc123")
+        self.assertIn("abc123", (self.d / "abort.out").read_text())
+        self.assertFalse(wt.exists())
+        self.assertNotIn(str(wt), self.g("worktree", "list").stdout)
+        # tampered meta pointing outside the root must be refused
+        self.fix(); meta = self.d / "home" / "fix" / "abc123def456.json"
+        m = json.loads(meta.read_text()); victim = self.d / "victim"; victim.mkdir()
+        m["worktree"] = str(victim); meta.write_text(json.dumps(m))
+        r = self.q("abort", "abc123")
+        self.assertEqual(r.returncode, 1); self.assertTrue(victim.is_dir()); self.assertIn("refusing", r.stdout)
+
+    # ---- mutant / revert proofs: the real tests above must be able to FAIL
+    def _mutant(self, old, new):
+        src = QAGENT.read_text(); self.assertIn(old, src)
+        mp = self.d / "qagent_mut"; mp.write_text(src.replace(old, new)); return mp
+
+    def test_revert_proof_verify_before_after_logic_bites(self):
+        # (1) baseline check removed -> an already-passing verify gets enqueued (real test expects exit 3)
+        mp = self._mutant("        if code == 0:\n            cleanup()", "        if False:\n            cleanup()")
+        self.assertEqual(self.fix("true", bin=mp).returncode, 0)
+        # (2) after-verify ignored (treated as pass) -> a still-failing fix is called VERIFIED
+        sub = self.d / "wts2"; self.env["QAGENT_WT_ROOT"] = str(sub); self.wts = sub
+        shutil.rmtree(self.d / "home", ignore_errors=True)
+        mp2 = self._mutant("if before != 0 and after == 0:", "if before != 0:")
+        self.fix(); wt = self.wt(); (wt / "calc.py").write_text("def add(a, b):\n    return a * b\n"); self.finish(wt)
+        self.assertIn("verdict: VERIFIED", self.result(bin=mp2))     # mutant wrongly accepts; real code says UNVERIFIED
+
+    def test_revert_proof_test_file_protection_bites(self):
+        # a test file NOT named by the verify command: only the TEST_RE guard can catch it
+        (self.repo / "tests").mkdir(); (self.repo / "tests" / "test_other.py").write_text("x = 1\n")
+        self.g("add", "-A"); self.g("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "t")
+        self.fix(); wt = self.wt()
+        (wt / "calc.py").write_text(self.FIXED); (wt / "tests" / "test_other.py").write_text("x = 2\n"); self.finish(wt)
+        mp = self._mutant("        if TEST_RE.search(f):", "        if False:")
+        self.assertIn("verdict: VERIFIED", self.result(bin=mp))    # protection removed -> test edit accepted
+        meta = self.d / "home" / "fix" / "abc123def456.json"
+        m = json.loads(meta.read_text()); m.pop("report"); meta.write_text(json.dumps(m))
+        out = self.result()                                         # real code
+        self.assertIn("verdict: REJECTED", out); self.assertIn("modifies test file: tests/test_other.py", out)
+
+    def test_revert_proof_verify_target_protection_bites(self):
+        (self.repo / "check.sh").write_text("python3 -c 'from calc import add; assert add(1,1)==2'\n")
+        self.g("add", "-A"); self.g("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "c")
+        self.fix("sh check.sh"); wt = self.wt(); (wt / "check.sh").write_text("true\n"); self.finish(wt)
+        mp = self._mutant("        elif any(f == p or", "        elif False and any(f == p or")
+        self.assertIn("verdict: VERIFIED", self.result(bin=mp))
 
 
 if __name__ == "__main__":
