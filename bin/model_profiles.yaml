@@ -78,6 +78,7 @@ robust_defaults:
   format_requery_max: 3
   reasoning_budget_chars: 24000
   prose_budget_tokens: 12000
+  answer_budget_tokens: 6000   # non-coding (research/review/...) no-tool-call turn budget; same abort path
   stop_gate_max: 3
   obs_mask: true
   obs_mask_keep_turns: 8

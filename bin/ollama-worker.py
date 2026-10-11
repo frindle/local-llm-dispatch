@@ -1831,6 +1831,27 @@ def _run_shell_group(cmd: str, cwd, timeout: int):
         raise _GroupTimeout(timeout, out, err) from None
 
 
+BASH_STREAM_CLIP = 4000
+
+
+def clip_tool_stream(text, limit=BASH_STREAM_CLIP):
+    """PURE. (text, omitted_chars). Keep the last `limit` chars of a run_bash stream, but SAY so:
+    job f268674ef763 got only the tail of a 42-row `status` listing with no marker and then
+    asserted its 16-row summary was complete. The marker names how much was dropped and how to
+    narrow the command (the model cannot otherwise tell a clipped listing from a whole one)."""
+    text = text or ""
+    if len(text) <= limit:
+        return text, 0
+    kept = text[-limit:]
+    kept = kept[kept.find("\n") + 1:] if "\n" in kept[:200] else kept     # start on a whole line
+    om = len(text) - len(kept)
+    om_lines = text[:om].count("\n")
+    return (f"[OUTPUT TRUNCATED: the first {om} chars (~{om_lines} lines) of {len(text)} were omitted; "
+            f"only the LAST {len(kept)} chars are shown below, so any count/summary built from this is "
+            f"INCOMPLETE. Re-run narrowed (| grep -c / | grep PATTERN / | cut -c1-120 / | head -n N / "
+            f"| sort | uniq -c) before concluding.]\n" + kept), om
+
+
 def tool_run_bash(cwd: Path, args: dict) -> str:
     # Same explicit-check pattern as the file tools: a missing "command" used to
     # surface as the bare KeyError text "ERROR running command: 'command'".
@@ -1838,10 +1859,13 @@ def tool_run_bash(cwd: Path, args: dict) -> str:
         return 'ERROR: run_bash requires a "command" argument (the shell command to run).'
     try:
         rc, out, err = _run_shell_group(args["command"], cwd, BASH_TIMEOUT_S)
+        if rc == 0:
+            # EDIT_CHECKPOINT: the model ran the task's own verify command itself and it PASSED.
+            _edit_checkpoint_on_bash_pass(cwd, args["command"], out)
         return json.dumps({
             "exit_code": rc,
-            "stdout": out[-4000:],
-            "stderr": err[-4000:],
+            "stdout": clip_tool_stream(out)[0],
+            "stderr": clip_tool_stream(err)[0],
             # The owner 2026-09-20 (Opus root-cause, bonsai rep2 hard-zero): a `cd` in one
             # run_bash call does not persist to the next -- each call is a fresh
             # subprocess at `cwd`. Echoing it back lets a model correct a wrong belief
@@ -2725,6 +2749,58 @@ def log_dispatch_to_obsidian(model: str, task: str, converged: bool, verify_pass
 
 
 CHAT_TIMEOUT_S = 1200
+
+
+def _stream_idle_limits():
+    """(first_chunk_s, idle_s) stall limits for streaming chat reads. Env-overridable
+    (WORKER_STREAM_FIRST_S default 600, WORKER_STREAM_IDLE_S default 240); read at call
+    time. 0/invalid disables the limit (falls back to the request timeout)."""
+    def _g(k, d):
+        try:
+            return float(os.environ.get(k, d))
+        except (TypeError, ValueError):
+            return float(d)
+    return _g("WORKER_STREAM_FIRST_S", 600), _g("WORKER_STREAM_IDLE_S", 240)
+
+
+def _arm_stream_stall(resp, seconds):
+    """Set the per-recv socket timeout on an open streaming response, so a silent
+    connection raises TimeoutError (the family the request timeout raises) instead of
+    waiting out CHAT_TIMEOUT_S. Any received bytes restart the clock (per-recv timeout)."""
+    if not seconds or seconds <= 0:
+        return
+    try:
+        resp.fp.raw._sock.settimeout(seconds)
+    except Exception:
+        pass
+
+
+def _iter_stream_lines(resp):
+    """Yield lines of a streaming response with a stall limit: FIRST_S until the first
+    line (data OR keepalive/empty delta), IDLE_S between lines after. On a stall, log
+    one line, close the connection and re-raise the TimeoutError so the caller's
+    existing timeout handling (retry / non-streaming fallback / chat-failure) applies."""
+    first_s, idle_s = _stream_idle_limits()
+    got = False
+    _arm_stream_stall(resp, first_s)
+    it = iter(resp)
+    while True:
+        try:
+            line = next(it)
+        except StopIteration:
+            return
+        except TimeoutError:
+            log(f"[worker] STREAM STALL: no chunk for {int(idle_s if got else first_s)}s "
+                f"(first_chunk={not got}) -- aborting request")
+            try:
+                resp.close()
+            except Exception:
+                pass
+            raise
+        if not got:
+            got = True
+            _arm_stream_stall(resp, idle_s)
+        yield line
 WARMUP_TIMEOUT_S = 900  # cold model load (weights off disk into RAM/VRAM) can take minutes, not seconds
 CHAT_RETRIES = 2
 
@@ -2910,18 +2986,36 @@ DEFAULT_REPEAT_PENALTY = 1.1   # legacy; NOT used as a default any more (profile
 # reads only the latter -- live loops 2026-10-03/04, output_cap_loop 984db5b6a535 et al.).)
 
 
+_PROFILE_LOG_SEEN = set()
+
+
 def _profile_fields(model, role, api_style, temperature=None, num_ctx=None, top_p=None,
                     top_k=None, max_tokens=None, repeat_penalty=None, think=None,
                     sampling_step=0, seed=None):
     """The request fields for (model, role, api): the model card's profile
     (model_profiles.yaml) with explicit non-None caller values layered on top. The
     ONLY place a request body's sampling / max_tokens / thinking control is decided."""
-    return _mp.build_request_fields(
+    _fields = _mp.build_request_fields(
         model, role or "author", "openai" if api_style == "openai" else "ollama",
         overrides={"temperature": temperature, "num_ctx": num_ctx, "top_p": top_p,
                    "top_k": top_k, "max_tokens": max_tokens,
                    "repetition_penalty": repeat_penalty},
         think=think, sampling_step=sampling_step, seed=seed)
+    # MODEL_PROFILE_LOG=1 (default OFF): one line per request naming the profile + the effective
+    # params that go on the wire (so a transcript shows what each turn was actually sent).
+    # 2026-10-10: also ON by default for openai-style (Darkbloom) requests, deduped per distinct
+    # (role, fields) so each job log carries the exact wire params once (A/B temps proof). Log-only.
+    _mpl = os.environ.get("MODEL_PROFILE_LOG")
+    _sig = (model, role or "author", api_style, json.dumps(_fields, sort_keys=True, default=str))
+    if _mpl == "1" or (_mpl != "0" and api_style == "openai" and _sig not in _PROFILE_LOG_SEEN):
+        _PROFILE_LOG_SEEN.add(_sig)
+        try:
+            _pp = _mp.get_profile(model, role or "author")
+            log(f"[worker] request profile={_pp['profile_key']}:{_pp['mode']} role={role or 'author'} "
+                f"api={api_style} sent={json.dumps(_fields, sort_keys=True, default=str)}")
+        except Exception as _e:
+            log(f"[worker] request profile log failed (ignored): {_e!r}")
+    return _fields
 
 
 def _strip_inline_think(msg):
@@ -3666,7 +3760,7 @@ def call_ollama_streaming(host: str, model: str, messages: list, temperature: fl
             live.emit(line, color)
 
     with resp:
-        for line in resp:
+        for line in _iter_stream_lines(resp):
             # Bug #1 (2026-09-18): honor an external SIGTERM pause MID-GENERATION.
             # _sigterm_pause_requested is set by the signal handler the instant the
             # queue daemon SIGTERMs us for a preemption; without this check the loop
@@ -3965,7 +4059,7 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
 
     try:
         with resp:
-            for raw_line in resp:
+            for raw_line in _iter_stream_lines(resp):
                 # Honor an external SIGTERM pause MID-GENERATION, exactly as the native
                 # streaming path does (see ChatAbortedForPause): closing the response
                 # aborts the HTTP read, the server cancels the generation on client
@@ -5105,7 +5199,77 @@ def _quick_verify(verify: str, cwd) -> tuple:
         return False, (f"(verify command itself could not run, exit {rc} -- "
                         f"check the --verify string)\n{err}")
     output = (out or "") + (("\n" + err) if err else "")
+    if rc == 0:
+        _edit_checkpoint_on_pass(cwd, output)
     return rc == 0, output
+
+
+# --- EDIT CHECKPOINT (EDIT_CHECKPOINT=1, default OFF; 2026-10-09) ---------------------------------
+# Evidence: Coherence Collapse (arXiv 2603.24631) -- agents often reach a correct patch mid-run and
+# then overwrite it; an iteration cap alone does not prevent that. Convergence in this worker is
+# declared only at a task_complete claim / silent final answer whose in-loop verify (_quick_verify)
+# passes, so a passing verify that does NOT end the run happens when the stop-gate refuses the claim
+# (required files / must-contain missing), the verify-flipped pause fires, or a nudge continues the
+# loop. This hook sees EVERY passing in-loop verify: when the required files are present it snapshots
+# the working-tree diff (save_salvage_patch: tracked + untracked, outside the worktree) next to the
+# transcript. At the end of the run, if the run did NOT converge and the end-of-run verify did not pass,
+# the snapshot is REPORTED (log line + dispatch-metrics `edit_checkpoint`), never applied: restoring is a
+# `git apply` of the named file, so the tree is never mutated behind the operator's back.
+_EDIT_CKPT = {"cwd": None, "dest": None, "files": (), "lits": (), "info": None, "passes": 0,
+              "verify": None}
+
+
+def _edit_checkpoint_on_bash_pass(cwd, command, output="") -> dict:
+    """The model ran a run_bash command that exits 0 and CONTAINS the task's verify command: the
+    harness only runs the verify at a completion claim, so this is where a mid-run pass is visible
+    (the Coherence-Collapse case: a correct patch exists, then the model keeps editing)."""
+    try:
+        v = " ".join(str(_EDIT_CKPT.get("verify") or "").split())
+        if not v or not _edit_checkpoint_enabled():
+            return {}
+        if v not in " ".join(str(command or "").split()):
+            return {}
+        return _edit_checkpoint_on_pass(cwd, output)
+    except Exception:
+        return {}
+
+
+def _edit_checkpoint_enabled() -> bool:
+    return os.environ.get("EDIT_CHECKPOINT") == "1"
+
+
+def _edit_checkpoint_on_pass(cwd, verify_output="") -> dict:
+    """Called on every passing in-loop verify. -> the snapshot info dict or {} (disabled / not armed /
+    required files missing / empty diff). Never raises."""
+    try:
+        c = _EDIT_CKPT
+        if not _edit_checkpoint_enabled() or not c.get("dest"):
+            return {}
+        if str(cwd) != str(c.get("cwd")):
+            return {}
+        c["passes"] += 1
+        try:
+            changed = _git_changed_paths(cwd)
+        except Exception:
+            changed = []
+        ok, fails = _wr.check_stop_criteria(cwd, c["files"], c["lits"], verify_ok=None,
+                                            extra_files=changed)
+        if not ok:
+            log(f"[worker] EDIT-CHECKPOINT: verify passed but required criteria are unmet "
+                f"({fails}) -- no snapshot taken.")
+            return {}
+        info = save_salvage_patch(cwd, c["dest"])
+        if not info:
+            return {}      # empty diff: a pass over an unchanged tree is not a patch worth keeping
+        info = dict(info, passes=c["passes"],
+                    verify_tail=(verify_output or "")[-300:])
+        c["info"] = info
+        log(f"[worker] EDIT-CHECKPOINT: verify PASSED with required criteria met -- snapshot "
+            f"{info['files']} file(s), {info['bytes']} bytes at {info['path']} (pass #{c['passes']}).")
+        return info
+    except Exception as e:
+        log(f"[worker] EDIT-CHECKPOINT error (ignored): {e!r}")
+        return {}
 
 
 # Diagnostic-line shapes for _verify_failure_signature. Kept module-level (compiled
@@ -5400,7 +5564,12 @@ def persist_cutoff_turn(path, *, iteration, content, thinking, finish_reason, us
     return rec
 
 
-def prose_runaway_nudge(budget_tokens, reason) -> str:
+def prose_runaway_nudge(budget_tokens, reason, task_kind="coding") -> str:
+    if task_kind != "coding":
+        return (f"Your last response was STOPPED after ~{budget_tokens} tokens with no final answer "
+                f"({reason}). Do not think aloud or restate the data. Write the FINAL answer now: "
+                f"concise (under 60 lines), a short table or list, from what you already read. If you "
+                f"need more data, make ONE targeted tool call instead.")
     return (f"Your last response was STOPPED after ~{budget_tokens} tokens of prose with no tool "
             f"call ({reason}), so nothing was done. Do not write files, code or analysis as plain "
             f"text -- put file contents inside a write_file tool call. Make your next tool call "
@@ -6269,6 +6438,12 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
     # comes from the model card for (model, role); explicit CLI values win. Resolved to
     # concrete numbers here so every downstream use (budget math, recovery bumps, the
     # request builders) sees the same value.
+    # Per-job A/B control arm, no queue change: a `Sampling-profile: legacy` line in the task text sets
+    # DISPATCH_SAMPLING=legacy for this worker process (model_profile.get_profile -> pre-2026-10-08 values).
+    _sp_m = re.search(r"(?im)^[ \t]*Sampling-profile:[ \t]*(legacy|card)[ \t]*$", task or "")
+    if _sp_m and not os.environ.get("DISPATCH_SAMPLING"):
+        os.environ["DISPATCH_SAMPLING"] = _sp_m.group(1).lower()
+        log(f"[worker] SAMPLING PROFILE {_sp_m.group(1).lower()} (from the task's Sampling-profile line).")
     _prof = _mp.get_profile(model, role)
     log(f"[worker] model profile: {_prof['profile_key']} mode={_prof['mode']} (role={role}) "
         f"temp={_prof['temperature']} top_p={_prof['top_p']} top_k={_prof['top_k']} "
@@ -6788,6 +6963,8 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             "2 aborts on the same failing check -> spec_defect_repeat_abort.")
     _ladder_exit = None
     _rev_abort = None             # (named reason, detail) once a review bound trips; ends the run at the next turn top
+    _fan_guard = _wr.TurnFanoutGuard(cap=MAX_TOOL_CALLS_PER_TURN)   # ALL task kinds (job c8f4f6ed95c1)
+    _fan_abort = None             # (named reason, detail) once the fan-out / past-EOF guard says stop
     _stop_gate_fails = 0
     _STOP_GATE_MAX = int(_rb.get("stop_gate_max", 3))
     _stop_gate_exhausted = False
@@ -6796,12 +6973,22 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
     _bash_only = _bash_only_mode
     _tool_extractor = bool(_rb.get("tool_extractor"))
     _sg_files, _sg_lits_raw = _wr.parse_task_criteria(task)
+    # EDIT_CHECKPOINT=1: arm the passing-verify snapshot (see _edit_checkpoint_on_pass). Reset per run.
+    _EDIT_CKPT.update(cwd=str(cwd), dest=(Path(str(log_path)).with_suffix(".checkpoint.patch")
+                                          if _edit_checkpoint_enabled() else None),
+                      files=tuple(_sg_files or ()), lits=tuple(_sg_lits_raw or ()),
+                      info=None, passes=0, verify=verify)
     _sg_entry = _wr.parse_entry_point(task)
     _next_turn_think = None   # one-turn override of `think` (runaway-reasoning / think-cap recovery)
     _REASONING_BUDGET[0] = _reasoning_budget_chars
     _SYNTAX_GUARD_ON[0] = _wr.syntax_guard_enabled(_rb)
     _PROSE_BUDGET_TOKENS = int(_rb.get("prose_budget_tokens", 12000) or 0)
-    _PROSE_BUDGET[0] = _PROSE_BUDGET_TOKENS * 4 if task_kind == "coding" else 0
+    # Every task kind is bounded (job f268674ef763: a read-only research turn streamed >1600 lines
+    # of no-tool-call content for 4+ min because this was coding-only). Coding keeps the generous
+    # prose budget (large legit files); a research/review/other answer gets the tighter ANSWER budget.
+    _PROSE_BUDGET_TOKENS = (_PROSE_BUDGET_TOKENS if task_kind == "coding"
+                            else int(_rb.get("answer_budget_tokens", 6000) or 0))
+    _PROSE_BUDGET[0] = _PROSE_BUDGET_TOKENS * 4
     _mask_on = _wr.obs_mask_enabled(_rb)
     _mask_cfg = _wr.obs_mask_config(_rb)
     _mask_state = {}
@@ -7427,7 +7614,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         elif tool_calls or content:
             _think_cap_streak = 0
 
-        if task_kind == "coding" and output_cap_cut_prose(
+        if (task_kind == "coding" or resp.get("_prose_runaway")) and output_cap_cut_prose(
                 msg, usage, resp.get("done_reason"), _turn_max_tokens):
             # f21621ab528f: three turns of exactly 8192 tokens of prose, no tool call,
             # each read as a "final answer". A cut-off turn did not choose to stop.
@@ -7485,7 +7672,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 log(f"[worker] iteration {i}/{total_iters} was ABORTED by the prose-runaway guard "
                     f"({_pr_reason}) with no tool call -- telling the model to act and continuing.")
                 messages.append({"role": "user", "content": prose_runaway_nudge(
-                    _PROSE_BUDGET_TOKENS, _pr_reason)})
+                    _PROSE_BUDGET_TOKENS, _pr_reason, task_kind)})
             else:
                 log(f"[worker] iteration {i}/{total_iters} was CUT OFF at the {_turn_max_tokens}-token "
                     f"output cap mid-prose with no tool call -- not a final answer; telling the model "
@@ -7836,7 +8023,23 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         if isinstance(tool_calls, list) and len(tool_calls) > MAX_TOOL_CALLS_PER_TURN:
             log(f"[worker] per-turn tool-call fan-out cap: {len(tool_calls)} calls in "
                 f"one turn, truncating to {MAX_TOOL_CALLS_PER_TURN}")
+            _fan_v = _fan_guard.on_turn(len(tool_calls))
             tool_calls = tool_calls[:MAX_TOOL_CALLS_PER_TURN]
+            # Keep the stored assistant message consistent with what actually ran (tool results exist
+            # only for the executed calls), then name the offence and hand the model a corrective.
+            if isinstance(msg.get("tool_calls"), list) and len(msg["tool_calls"]) > MAX_TOOL_CALLS_PER_TURN:
+                msg["tool_calls"] = msg["tool_calls"][:MAX_TOOL_CALLS_PER_TURN]
+            _dispatch_metrics["tool_fanout_offences"] = _fan_guard.offences
+            if _fan_v:
+                if _fan_v[0] == "warn":
+                    loop_break_notes.append(_fan_v[2])
+                elif _fan_abort is None:
+                    _fan_abort = (_fan_v[1], _fan_v[2])
+                # Sampling ladder (A/B arm, default OFF): a runaway turn is an abort step. Inert when
+                # the arm is off (on_abort returns ("off", None)).
+                _lad = _ladder.on_abort("tool_fanout")
+                if _lad[0] == "exit" and _fan_abort is None:
+                    _fan_abort = (_lad[1], "sampling ladder: " + _fan_v[2])
         for tc in tool_calls:
             fn = tc.get("function", {})
             name = fn.get("name")
@@ -8238,6 +8441,18 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                                f'{{"path":"{args.get("path")}","offset":{_nxt},"length":300}} '
                                f"to advance, or use run_bash with grep to find a specific line "
                                f"number first and read around that offset.]")
+            # Past-EOF read counter (all task kinds): the refusal itself is in _paginate_read; here the
+            # consecutive occurrences are counted toward the named stop (read_past_eof_loop).
+            try:
+                _eof_v = _fan_guard.on_call(name, _wr.is_past_eof_result(result))
+            except Exception:
+                _eof_v = None
+            if _eof_v:
+                _dispatch_metrics["read_past_eof_streak"] = _fan_guard.eof_streak
+                if _eof_v[0] == "warn":
+                    loop_break_notes.append(_eof_v[2])
+                elif _fan_abort is None or _fan_abort[0] == _wr.REASON_TOOL_FANOUT:
+                    _fan_abort = (_eof_v[1], _eof_v[2])    # the more specific label wins
             # Tell the model what it sent that the tool does not accept. Appended
             # AFTER the call so the result is unchanged when nothing is unknown,
             # and so a stray key never costs the call itself.
@@ -8439,6 +8654,15 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 f"{_stop_gate_fails} times by the stop-gate (required file / must-contain literal "
                 f"still missing) -- {_wr.REASON_STOPGATE}.")
             _dispatch_metrics["early_abort"] = _wr.REASON_STOPGATE
+            break
+
+        # PER-TURN FAN-OUT / PAST-EOF STOP (worker_robust.TurnFanoutGuard), every task kind. Checked
+        # BEFORE the loop detector so a runaway turn is labelled specifically, not as a generic nav_loop.
+        if _fan_abort and not paused_for_review:
+            log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: {_fan_abort[1]} -- {_fan_abort[0]}. "
+                f"Stopping instead of burning iterations; the scheduler should re-sample / re-spec, "
+                f"not blind-retry.")
+            _dispatch_metrics["early_abort"] = _fan_abort[0]
             break
 
         # LOOP DETECTOR (worker_robust.LoopDetector): repeated identical reads / writes, A->B->A
@@ -9067,6 +9291,20 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                     f"-- exit reason {terminal_reason}.")
         except Exception as _se:
             log(f"[worker] salvage error (ignored): {_se!r}")
+    # EDIT CHECKPOINT report (EDIT_CHECKPOINT=1): the run ended WITHOUT convergence and the end-of-run
+    # verify did not pass, but a mid-run verify DID pass with the required criteria met -- the model
+    # reached a good patch and then lost it. Report the snapshot (never applied automatically).
+    if (_edit_checkpoint_enabled() and not converged and not paused_for_review
+            and verify_passed is not True and _EDIT_CKPT.get("info")):
+        _ck = _EDIT_CKPT["info"]
+        _dispatch_metrics["edit_checkpoint"] = {
+            "path": _ck["path"], "bytes": _ck["bytes"], "files": _ck["files"],
+            "passes": _ck.get("passes"), "exit": "unconverged_with_passing_checkpoint",
+            "terminal_reason": terminal_reason, "end_verify_passed": verify_passed}
+        log(f"[worker] EDIT-CHECKPOINT: run ended UNCONVERGED ({terminal_reason}) and the end-of-run "
+            f"verify did not pass, but the verify PASSED mid-run (pass #{_ck.get('passes')}). The passing "
+            f"snapshot is kept at {_ck['path']} ({_ck['files']} file(s)); restore with "
+            f"`git apply {_ck['path']}` on a clean tree. EXIT NOTE: unconverged_with_passing_checkpoint.")
     if terminal_reason:
         # Greppable marker the queue daemon parses out of the job log (same
         # channel as RESUMABLE TRANSCRIPT), so the terminal state carries WHY.
