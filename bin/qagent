@@ -73,6 +73,7 @@ DEFAULT_MODEL = "qwen3.8:27b-q4_K_M"
 # which let a first real run emit a >1500-line single generation).  Sampling is NOT touched.
 DEF_MAX_TOKENS = 12000    # per-turn output cap (thinking + answer)
 DEF_MAX_ITERS = 12        # tool-loop iterations
+FIX_DEF_MAX_ITERS = 30    # fix mode edits + verifies; 12 cut c8f4 off mid-edit twice (verify never ran)
 DEF_CHAT_TIMEOUT = 900    # seconds per chat call
 DEF_MAX_WALL = 1800       # seconds of ACTIVE run time; enforced by status/wait (abort)
 TERMINAL = {"done", "failed", "blocked", "cancelled", "canceled"}
@@ -722,7 +723,7 @@ def fix_start(a, repo, base, note="", group=None, attempt=1):
               f"  {a.verify}\n" + (f"\nCurrent verify output (tail):\n{out[-1500:]}\n" if out else ""))
     n = type("N", (), {})()
     n.readonly = False; n.model = a.model; n.label = a.label or "fix-" + slug(a.problem, 20)
-    n.max_iters = a.max_iters; n.max_tokens = a.max_tokens; n.chat_timeout = a.chat_timeout
+    n.max_iters = a.max_iters or FIX_DEF_MAX_ITERS; n.max_tokens = a.max_tokens; n.chat_timeout = a.chat_timeout
     n.max_wall = a.max_wall; n.dry_run = a.dry_run; n.watch = a.watch; n.repo = None; n.cwd = str(wt)
     rc = enqueue(n, prompt, quiet=True)
     if a.dry_run:

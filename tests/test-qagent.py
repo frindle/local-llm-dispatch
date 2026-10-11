@@ -245,7 +245,7 @@ class FixMode(Base):
         self.assertNotIn("--repo", a)
         self.assertEqual(a[a.index("--task-kind") + 1], "coding")
         self.assertEqual(a[a.index("--max-tokens") + 1], "12000")
-        self.assertEqual(a[a.index("--max-iters") + 1], "12")
+        self.assertEqual(a[a.index("--max-iters") + 1], "30")
         self.assertEqual(a[a.index("--chat-timeout") + 1], "900")
         self.assertIn("--no-preflight", a); self.assertIn("--bundle", a)
         body = Path(a[a.index("--task-file") + 1]).read_text()
