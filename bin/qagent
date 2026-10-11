@@ -580,13 +580,33 @@ def _ref_ok(n):
     return bool(n) and not n.startswith("/") and ".." not in Path(n).parts and "://" not in n
 
 
-def referenced_names(cmd, roots, depth=4):
+def _strip_comments(text):
+    """Drop shell comment lines (and trailing ' # ...') so prose in comments is not treated as file references."""
+    out = []
+    for ln in (text or "").splitlines():
+        if ln.lstrip().startswith("#"):
+            continue
+        out.append(re.sub(r"\s#\s.*$", "", ln))
+    return "\n".join(out)
+
+
+_NOT_PATH_RE = re.compile(r"(?i)^(?:next|node|vue|nuxt|react|chart|three|d3|express|nest|deno|bun)\.js$|[<>*$`{}()|]")
+
+
+def _path_like(n):
+    """A real path candidate: not a product name (Next.js) and not a placeholder (lib/X.test.ts)."""
+    return _ref_ok(n) and not _NOT_PATH_RE.search(n) and not re.search(r"(?:^|/)[A-Z]\.[\w.]+$", n)
+
+
+def referenced_names(cmd, roots, depth=4, skip_comments=False):
     """File names mentioned in the verify command and (transitively) inside any shell script it names that is
-    found under `roots`.  Names only -- they need not exist."""
+    found under `roots`.  Names only -- they need not exist.  skip_comments: ignore shell comment lines."""
     seen, queue, out = set(), [cmd], []
     for _ in range(depth + 1):
         nxt = []
         for text in queue:
+            if skip_comments:
+                text = _strip_comments(text)
             for n in REF_RE.findall(text or ""):
                 if n in seen or not _ref_ok(n):
                     continue
@@ -620,8 +640,8 @@ def invalid_baseline(code, out, verify, wt, srcs, repo):
     for ln in (out or "").splitlines():
         if INVALID_RE.search(ln):
             cand += [n.lstrip("./") if n.startswith("./") else n for n in re.findall(r"([\w@+./-]+\.\w+)", ln)]
-    cand += referenced_names(verify, [wt])
-    miss = sorted({n for n in cand if _ref_ok(n) and not (Path(wt) / n).exists()})
+    cand += referenced_names(verify, [wt], skip_comments=True)
+    miss = sorted({n for n in cand if _path_like(n) and not (Path(wt) / n).exists()})
     where = [str(d) for d in [Path(repo), *map(Path, srcs)] if any((d / n).is_file() for n in miss)]
     return ("INVALID BASELINE: the baseline verify failed (exit %s) because a file or command is missing, not because a "
             "check detected the bug -- fixing against it would let the model write the missing check itself.\n"
@@ -876,7 +896,7 @@ def fix_start(a, repo, base, note="", group=None, attempt=1):
     if not a.dry_run:
         hf = getattr(a, "harness_from", None)
         if hf:
-            harness = copy_harness(a.verify, hf, wt)
+            harness = copy_harness(a.verify, hf, wt, base)
         else:
             miss = missing_harness(a.verify, wt, repo, a.problem)
             if miss:
@@ -994,9 +1014,14 @@ def missing_harness(cmd, wt, repo, problem):
     return found
 
 
-def copy_harness(cmd, src, wt):
+HARNESS_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "dist", "build", ".next", "out", "coverage",
+                     ".turbo", ".cache", "target", ".pytest_cache"}
+
+
+def copy_harness(cmd, src, wt, base=None):
     """Copy the COMPLETE harness from src into wt (never overwriting): every untracked file of src (all files if src
-    is not a git work tree), every file named in the verify command / referenced by name inside the verify
+    is not a git work tree), every TRACKED file of src absent at `base` (a dispatch worktree commits its harness in
+    its own seal commit; files present at base are target sources and are never copied), every file named in the verify command / referenced by name inside the verify
     script(s) that exists in src, plus verify.sh / verify.test.ts.  Returns the relative paths copied."""
     src = Path(src).expanduser().resolve()
     if not src.is_dir():
@@ -1006,9 +1031,13 @@ def copy_harness(cmd, src, wt):
     top = git(src, "rev-parse", "--show-toplevel")
     if top.returncode == 0 and Path(top.stdout.strip()).resolve() == src:
         cands += [x for x in git(src, "ls-files", "-o", "--exclude-standard", "-z").stdout.split("\0") if x]
+        if base:
+            cands += [x for x in git(src, "ls-files", "-z").stdout.split("\0")
+                      if x and not (set(Path(x).parts) & HARNESS_SKIP_DIRS)
+                      and git(wt, "cat-file", "-e", f"{base}:{x}").returncode != 0]
     elif top.returncode != 0:
         for dp, dn, fn in os.walk(src):
-            dn[:] = [d for d in dn if d not in (".git", "node_modules", "__pycache__", ".venv")]
+            dn[:] = [d for d in dn if d not in HARNESS_SKIP_DIRS]
             cands += [str((Path(dp) / f).relative_to(src)) for f in fn]
     cands += _verify_paths(cmd) + ["verify.sh", "verify.test.ts"]
     done = []

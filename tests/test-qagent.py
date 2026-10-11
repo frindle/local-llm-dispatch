@@ -738,6 +738,7 @@ class IncidentGuards(LandMode):
     def harness_dir(self, files, git_init=False, exclude=""):
         h = self.d / "H"; shutil.rmtree(h, ignore_errors=True); h.mkdir()
         for n, t in files.items():
+            (h / n).parent.mkdir(parents=True, exist_ok=True)
             (h / n).write_text(t)
         if git_init:
             subprocess.run(["git", "init", "-q", str(h)], check=True)
@@ -818,6 +819,73 @@ class IncidentGuards(LandMode):
         r = self.fixp("bash verify.sh", extra=("--harness-from", str(h)), bin=mp2)
         self.assertEqual(r.stdout.strip(), "abc123def456", r.stderr)
         self.assertNotIn("fixture.json", self.meta()["harness"])   # untracked-walk removed: fixture.json missing (real: copied)
+
+    # ---- 2b. harness COMMITTED in the source dir (dispatch worktree seal commit), absent at the fix base
+    def committed_harness(self, files):
+        h = self.harness_dir(files, git_init=True)
+        env = dict(self.env, GIT_AUTHOR_NAME="a", GIT_AUTHOR_EMAIL="a@b", GIT_COMMITTER_NAME="a", GIT_COMMITTER_EMAIL="a@b")
+        subprocess.run(["git", "-C", str(h), "add", "-A"], check=True, env=env)
+        subprocess.run(["git", "-C", str(h), "commit", "-qm", "seal"], check=True, env=env)
+        return h
+
+    CVSH = "python3 check_literals.py && python3 test_calc.py\n"
+    CHECK = "print(open('TASK.md').read().strip())\n"
+
+    def committed_files(self):
+        return {"verify.sh": self.CVSH, "check_literals.py": self.CHECK, "TASK.md": "task\n",
+                "_nd/nonet.cjs": "// x\n", "calc.py": "HARNESS COPY OF TARGET\n"}
+
+    def test_harness_from_copies_committed_harness_absent_at_base(self):
+        h = self.committed_harness(self.committed_files())
+        out = self.finish_with({"calc.py": self.FIXED}, hdir=h)
+        m = self.meta()
+        for n in ("TASK.md", "check_literals.py", "verify.sh", "_nd/nonet.cjs"):
+            self.assertIn(n, m["harness"]); self.assertIn(n, m["protected"])
+        self.assertNotIn("calc.py", m["harness"])                  # exists at base: never copied/overwritten
+        self.assertIn("verdict: VERIFIED", out)
+        self.assertNotIn("HARNESS COPY", (self.d / "home/fix/abc123def456.patch").read_text())
+
+    def test_harness_from_does_not_copy_node_modules_or_build_dirs(self):
+        f = self.committed_files(); f["node_modules/x/index.js"] = "1\n"; f["dist/out.js"] = "1\n"
+        (self.d / "H").mkdir(exist_ok=True)
+        h = self.harness_dir({"verify.sh": self.CVSH, "check_literals.py": self.CHECK, "TASK.md": "t\n"}, git_init=True)
+        for n in ("node_modules/x/index.js", "dist/out.js"):
+            (h / n).parent.mkdir(parents=True, exist_ok=True); (h / n).write_text("1\n")
+        env = dict(self.env, GIT_AUTHOR_NAME="a", GIT_AUTHOR_EMAIL="a@b", GIT_COMMITTER_NAME="a", GIT_COMMITTER_EMAIL="a@b")
+        subprocess.run(["git", "-C", str(h), "add", "-Af"], check=True, env=env)
+        subprocess.run(["git", "-C", str(h), "commit", "-qm", "seal"], check=True, env=env)
+        self.finish_with({"calc.py": self.FIXED}, hdir=h)
+        self.assertEqual(sorted(self.meta()["harness"]), ["TASK.md", "check_literals.py", "verify.sh"])
+
+    def test_mutant_committed_harness_copy_bites(self):
+        h = self.committed_harness(self.committed_files())
+        mp = self._mutant("        if base:\n            cands +=", "        if False:\n            cands +=")
+        r = self.fixp("bash verify.sh", extra=("--harness-from", str(h)), bin=mp)
+        self.assertIn("INVALID BASELINE", r.stderr)               # committed harness not copied -> the reported bug
+
+    # ---- 2c. 'Missing:' lists only real paths
+    PROSE_VSH = ("# Next.js app; see lib/X.test.ts and migration.sql for background\n"
+                 "echo 'built with Next.js, lib/X.test.ts' > /dev/null\n"
+                 "python3 missing_helper.py\n")
+
+    def test_invalid_baseline_missing_list_ignores_prose_and_placeholders(self):
+        h = self.harness_dir({"verify.sh": self.PROSE_VSH})
+        r = self.fixp("bash verify.sh", extra=("--harness-from", str(h)))
+        self.assertIn("INVALID BASELINE", r.stderr)               # real missing file still aborts
+        missing = [ln for ln in r.stderr.splitlines() if ln.startswith("Missing:")][0]
+        self.assertIn("missing_helper.py", missing)
+        for tok in ("Next.js", "lib/X.test.ts", "migration.sql"):
+            self.assertNotIn(tok, missing)
+
+    def test_mutants_missing_list_filters_bite(self):
+        h = self.harness_dir({"verify.sh": self.PROSE_VSH})
+        mp = self._mutant("referenced_names(verify, [wt], skip_comments=True)", "referenced_names(verify, [wt])")
+        r = self.fixp("bash verify.sh", extra=("--harness-from", str(h)), bin=mp)
+        self.assertIn("migration.sql", [ln for ln in r.stderr.splitlines() if ln.startswith("Missing:")][0])
+        mp2 = self._mutant("{n for n in cand if _path_like(n) and not", "{n for n in cand if _ref_ok(n) and not")
+        r = self.fixp("bash verify.sh", extra=("--harness-from", str(h)), bin=mp2)
+        missing = [ln for ln in r.stderr.splitlines() if ln.startswith("Missing:")][0]
+        self.assertTrue("Next.js" in missing or "lib/X.test.ts" in missing, missing)
 
     def test_model_created_protected_name_dropped_and_unverified(self):
         vsh = "python3 test_calc.py && { [ ! -f extra_check.py ] || python3 extra_check.py; }\n"
