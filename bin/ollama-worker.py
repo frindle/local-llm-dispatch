@@ -72,7 +72,7 @@ try:
 except Exception:                 # a missing/broken module must never break a default run
     _bb = None
 try:
-    import worker_levers as _wl   # opt-in convergence levers VERIFY_ON_EDIT / PROTECT_HARNESS / READ_MIN_WINDOW (2026-10-10); all default OFF
+    import worker_levers as _wl   # opt-in convergence levers VERIFY_ON_EDIT / PROTECT_HARNESS / READ_MIN_WINDOW / PROSE_STICKY_NOTHINK (2026-10-10/11); all default OFF
 except Exception:                 # a missing/broken module must never break a default run
     _wl = None
 import worker_robust as _wr   # Phase 3 (2026-10-08): layered tool-call repair, format requery, loop detector, stop-gate
@@ -7238,13 +7238,18 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         _reasoning_loop_retries = 0
         _eff_temperature = temperature
         _turn_repeat_penalty = repeat_penalty
-        if _cap_cut_recover:
+        _l4_sticky = _wl is not None and _wl.l4_sticky()    # PROSE_STICKY_NOTHINK (default OFF): recovery profile every turn after the first abort
+        if _cap_cut_recover or _l4_sticky:
             # One recovery turn after an output-cap cut: off the near-greedy loop.
             _eff_temperature = max(temperature or 0.0, REASONING_LOOP_RETRY_TEMPERATURE)
             _turn_repeat_penalty = max(repeat_penalty or 1.0, OUTPUT_CAP_RECOVERY_REPEAT_PENALTY)
-            _cap_cut_recover = False
-            log(f"[worker] output-cap recovery turn: temperature={_eff_temperature}, "
-                f"repeat_penalty={_turn_repeat_penalty} (this turn only).")
+            if _cap_cut_recover:
+                _cap_cut_recover = False
+                log(f"[worker] output-cap recovery turn: temperature={_eff_temperature}, "
+                    f"repeat_penalty={_turn_repeat_penalty} (this turn only).")
+            else:
+                log(f"[worker] L4 sticky recovery profile: temperature={_eff_temperature}, "
+                    f"repeat_penalty={_turn_repeat_penalty}, thinking off (every turn after the first prose runaway).")
         _outer_break = False
 
         def _view():
@@ -7262,6 +7267,8 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                     pass
             return base
         _turn_think = think if _next_turn_think is None else _next_turn_think
+        if _l4_sticky:
+            _turn_think = False
         _next_turn_think = None
         _turn_sstep, _turn_seed = _ladder.take()
         if _turn_sstep:
@@ -7729,6 +7736,8 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
             # (probe 2026-10-09: enable_thinking=false answers cleanly; default thinks in content).
             if _prof.get("enable_thinking") is not None:
                 _next_turn_think = False
+            if _wl is not None:     # PROSE_STICKY_NOTHINK: the FIRST abort makes the recovery profile permanent (flag off = no-op)
+                _wl.l4_note_abort(role, _prof.get("enable_thinking"), log=log)
             continue
 
         if tool_calls:

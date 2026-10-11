@@ -7,6 +7,8 @@
                         harness files un-editable, git checkout/restore/stash of harness or whole tree refused,
                         revert refused while the last verify PASSED.
   L3 READ_MIN_WINDOW=1  read_file length < 120 is served >= 120 lines with the real range noted.
+  L4 PROSE_STICKY_NOTHINK=1  after the FIRST prose-runaway abort the recovery request profile (thinking off + recovery
+                        sampling) is kept for every later author turn; turns before it / non-author roles untouched.
 Every lever defaults OFF and must then be BYTE-IDENTICAL to the pre-lever worker: asserted by replaying the same
 scripted tool loop through the REAL run_task (stub OpenAI SSE server, no GPU) with the flags unset vs "0" and
 comparing every request body the model would have seen. --revert-check mutates the code and requires RED."""
@@ -20,7 +22,9 @@ LEVERS = Path(os.environ.get("LEVERS_SRC") or HERE / "worker_levers.py")
 FAILS = []
 LAST_ENV = []
 SEQ, REQS = [], []
-FLAG_KEYS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW")
+FLAG_KEYS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK")
+BYFLAG = {"mode": None, "tools": []}      # L4 stub: mode "think" = prose runaway iff thinking is ON; "always" = every turn
+LOOP_TEXT = "\n".join(["Let me analyze the function. Let me read the function again and plan the change carefully."] * 3000)
 
 
 def check(name, got, want):
@@ -66,6 +70,12 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         REQS.append(json.loads(self.rfile.read(n) or b"{}"))
         turn = SEQ.pop(0) if SEQ else ("task_complete", {"summary": "done"})
+        if BYFLAG["mode"]:
+            think_on = ((REQS[-1].get("chat_template_kwargs") or {}).get("enable_thinking")) is True
+            if BYFLAG["mode"] == "always" or think_on:
+                turn = ("PROSE", {})
+            else:
+                turn = BYFLAG["tools"].pop(0) if BYFLAG["tools"] else ("task_complete", {"summary": "done"})
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
@@ -73,6 +83,14 @@ class H(BaseHTTPRequestHandler):
         self.close_connection = True
         w = self.wfile
         try:
+            if turn[0] == "PROSE":
+                for j in range(0, len(LOOP_TEXT), 400):
+                    w.write(chunk({"content": LOOP_TEXT[j:j + 400]}).encode())
+                    w.flush()
+                w.write(chunk({}, finish="length").encode())
+                w.write(b"data: [DONE]\n\n")
+                w.flush()
+                return
             w.write(chunk({"tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {
                 "name": turn[0], "arguments": json.dumps(turn[1])}}]}).encode())
             w.write(chunk({}, finish="tool_calls").encode())
@@ -120,7 +138,8 @@ def setflags(**kw):
         os.environ[k] = v
 
 
-def run(m, host, seq, wt, task="Fix target.py so verify.sh passes.", verify="bash verify.sh", max_iters=12):
+def run(m, host, seq, wt, task="Fix target.py so verify.sh passes.", verify="bash verify.sh", max_iters=12,
+        model="stub-model", temperature=0.0, role="author"):
     SEQ[:] = list(seq)
     REQS.clear()
     m.ensure_model_ready = lambda *a, **k: None
@@ -130,8 +149,9 @@ def run(m, host, seq, wt, task="Fix target.py so verify.sh passes.", verify="bas
     m.log = lambda s, *a, **k: logs.append(str(s))
     lf = Path(os.environ["HOME"]) / f"live-{time.time_ns()}.log"
     try:
-        m.run_task("stub-model", host, str(wt), task, verify, max_iters, 0.0, 65536, None,
-                   api_style="openai", live_log=str(lf), dispatch_tag="t", max_tokens=32768, task_kind="coding")
+        m.run_task(model, host, str(wt), task, verify, max_iters, temperature, 65536, None,
+                   api_style="openai", live_log=str(lf), dispatch_tag="t", max_tokens=32768, task_kind="coding",
+                   role=role)
     except SystemExit:
         pass
     except Exception as e:
@@ -186,15 +206,34 @@ def main():
 
     # ================= pure unit: task-text passthrough =================
     env = {}
-    got = wl.apply_task_flags("x\nWorker-flags: VERIFY_ON_EDIT=1 PROTECT_HARNESS=1 READ_MIN_WINDOW=1\ny", env)
-    check("Worker-flags line sets exactly the 3 allow-listed names", (sorted(env), got.__len__()),
-          (sorted(FLAG_KEYS), 3))
+    got = wl.apply_task_flags("x\nWorker-flags: VERIFY_ON_EDIT=1 PROTECT_HARNESS=1 READ_MIN_WINDOW=1 PROSE_STICKY_NOTHINK=1\ny", env)
+    check("Worker-flags line sets exactly the 4 allow-listed names", (sorted(env), got.__len__()),
+          (sorted(FLAG_KEYS), 4))
     env = {"READ_MIN_WINDOW": "0"}
     wl.apply_task_flags("Worker-flags: READ_MIN_WINDOW=1 EVIL=1 PATH=/x VERIFY_ON_EDIT=2", env)
     check("pre-set env wins; unknown names / non-0/1 values ignored", env, {"READ_MIN_WINDOW": "0"})
     env = {}
     wl.apply_task_flags("no marker here", env)
     check("no marker = nothing set", env, {})
+
+    # ================= pure unit: L4 =================
+    logs4 = []
+    setflags()
+    wl.arm_run(Path(tempfile.mkdtemp()), "x", "coding", None)
+    check("L4 off: abort never engages, sticky False", (wl.l4_note_abort("author", True, log=logs4.append), wl.l4_sticky(), logs4), (False, False, []))
+    setflags(PROSE_STICKY_NOTHINK="1")
+    check("L4 on but not aborted yet: sticky False", wl.l4_sticky(), False)
+    check("L4 on: non-author role never engages", (wl.l4_note_abort("reviewer", True, log=logs4.append), wl.l4_sticky()), (False, False))
+    check("L4 on: model without a thinking switch never engages", (wl.l4_note_abort("author", None, log=logs4.append), wl.l4_sticky()), (False, False))
+    check("L4 on: first author abort engages + logs exactly once",
+          (wl.l4_note_abort("author", True, log=logs4.append), wl.l4_note_abort("author", True, log=logs4.append), wl.l4_sticky(), logs4),
+          (True, True, True, ["[worker] L4: prose runaway seen - thinking stays OFF for the rest of this run"]))
+    setflags()
+    check("L4: flag switched off again -> sticky False even though flipped", wl.l4_sticky(), False)
+    setflags(PROSE_STICKY_NOTHINK="1")
+    wl.arm_run(Path(tempfile.mkdtemp()), "x", "coding", None)
+    check("L4: arm_run resets the per-run state", wl.l4_sticky(), False)
+    setflags()
 
     # ================= pure unit: L1 summary + schedule =================
     out = ("ok: setup\nnot ok 3 - handles cancelled rows\n  ---\n  error: 'expected 1 got 0'\n  ...\n"
@@ -389,11 +428,11 @@ def main():
     # byte-identical: the SAME scripted loop with flags unset vs "0" -- every request body the model sees
     for nm, sc in (("edit loop", SCRIPT_EDITS), ("misc loop", SCRIPT_MISC)):
         l0, r0, w0 = e2e(sc)
-        l1, r1, w1 = e2e(sc, VERIFY_ON_EDIT="0", PROTECT_HARNESS="0", READ_MIN_WINDOW="0")
+        l1, r1, w1 = e2e(sc, VERIFY_ON_EDIT="0", PROTECT_HARNESS="0", READ_MIN_WINDOW="0", PROSE_STICKY_NOTHINK="0")
         check(f"e2e OFF ({nm}): request bodies identical flags-unset vs '0'", norm(r0, w0), norm(r1, w1))
         check(f"e2e OFF ({nm}): no lever text anywhere in what the model saw",
               any(t in json.dumps(r0) for t in ("VERIFY ON EDIT", "READ_MIN_WINDOW", "PROTECT_HARNESS", "sealed verification")), False)
-        check(f"e2e OFF ({nm}): no lever log lines", any(t in l0 for t in ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW")), False)
+        check(f"e2e OFF ({nm}): no lever log lines", any(t in l0 for t in ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY", "L4")), False)
     l0, r0, w0 = e2e(SCRIPT_MISC)
     tr = tool_results(r0)
     check("e2e OFF baseline really does expose refimpl + allow harness edit + stash",
@@ -443,6 +482,53 @@ def main():
           (tr[0].startswith("REFUSED"), tr[3].startswith("REFUSED"), "FIXED = True" in (w5 / "target.py").read_text(),
            "DID NOT CONVERGE" in l5), (True, True, True, False))
 
+    # ================= L4 e2e: thinking-ON turns loop in prose, thinking-OFF (recovery) turns call tools =================
+    QW = "qwen3.6-35b-a3b-vl-mtp-mxfp8"
+
+    def l4run(mode="think", task="Fix target.py so verify.sh passes.", **flags):
+        setflags(**flags)
+        BYFLAG["mode"] = mode
+        BYFLAG["tools"][:] = [E("# filler line 5\n", "# filler line 5 (touched)\n"), E("# filler line 6\n", "# filler line 6 (touched)\n"),
+                              E("FIXED = False", "FIXED = True"), ("task_complete", {"summary": "done"})]
+        w = make_repo()
+        try:
+            lg, rq = run(m, host, [], w, task=task, model=QW, temperature=None, max_iters=14)
+        finally:
+            BYFLAG["mode"] = None
+            os.environ.pop("PROSE_STICKY_NOTHINK", None)
+            setflags()
+        return lg, rq, w
+
+    def thinking(rq):
+        return [(r.get("chat_template_kwargs") or {}).get("enable_thinking") for r in rq]
+
+    def nomsg(r):
+        return {k: v for k, v in r.items() if k != "messages"}
+
+    la, ra, wa = l4run()                                   # flag unset
+    lz, rz, wz = l4run(PROSE_STICKY_NOTHINK="0")
+    check("L4 e2e OFF: flag unset == '0' request bodies", norm(ra, wa), norm(rz, wz))
+    check("L4 e2e OFF: today's alternation (ON,off,ON,off,...) then the 'looping in prose' early abort",
+          (thinking(ra)[:7], "looping in prose" in la, "L4" in la), ([True, False, True, False, True, False, True], True, False))
+    lb, rb, wb = l4run(PROSE_STICKY_NOTHINK="1")
+    tb = thinking(rb)
+    check("L4 e2e ON: turn 1 thinking ON, every later author turn thinking OFF", (tb[0], set(tb[1:])), (True, {False}))
+    check("L4 e2e ON: inert before the first abort (request 1 identical to OFF)", norm(rb[:1], wb), norm(ra[:1], wa))
+    check("L4 e2e ON: the first recovery request is byte-identical to OFF's recovery request",
+          json.dumps(norm(rb[1:2], wb), sort_keys=True), json.dumps(norm(ra[1:2], wa), sort_keys=True))
+    check("L4 e2e ON: recovery sampling differs from turn 1 (repetition penalty 1.2 vs 1.0)",
+          (rb[1]["temperature"], rb[1]["repetition_penalty"], rb[0]["temperature"], rb[0]["repetition_penalty"]), (0.6, 1.2, 0.6, 1.0))
+    check("L4 e2e ON: every post-flip request equals the recovery body except the messages",
+          [nomsg(r) for r in rb[2:]], [nomsg(rb[1])] * len(rb[2:]))
+    check("L4 e2e ON: one flip line, run converges, the early-abort counter is NOT tripped by the good turns",
+          (lb.count("L4: prose runaway seen - thinking stays OFF for the rest of this run"), "VERIFY PASSED" in lb,
+           "looping in prose" in lb, "EARLY ABORT" in lb, lb.count("[worker] cut-off turn ")), (1, True, False, False, 1))
+    lc, rc, wc = l4run(mode="always", PROSE_STICKY_NOTHINK="1")
+    check("L4 e2e ON, model still loops with thinking off: the early-abort guard still fires",
+          ("EARLY ABORT" in lc, set(thinking(rc)[1:])), (True, {False}))
+    lt, rt, wt_ = l4run(task="Fix it.\n\nWorker-flags: PROSE_STICKY_NOTHINK=1\n")
+    check("L4 e2e: task-text Worker-flags line engages it", (set(thinking(rt)[1:]), "L4: prose runaway seen" in lt), ({False}, True))
+
     print("\nALL PASS" if not FAILS else f"\n{len(FAILS)} FAILED: {FAILS}")
     return 0 if not FAILS else 1
 
@@ -473,6 +559,16 @@ MUTATIONS = [
     ("L3: window not widened", "worker_levers.py", "    if flag(\"READ_MIN_WINDOW\") and ln is not None and 0 < ln < MIN_WINDOW_LINES:\n        return MIN_WINDOW_LINES", "    if False:\n        return MIN_WINDOW_LINES"),
     ("L3: widened when flag off", "worker_levers.py", "    if flag(\"READ_MIN_WINDOW\") and ln is not None and 0 < ln < MIN_WINDOW_LINES:", "    if ln is not None and 0 < ln < MIN_WINDOW_LINES:"),
     ("L3: no range note", "ollama-worker.py", "    if _mw_note:\n        footer += \"\\n\" + _mw_note\n", ""),
+    ("L4: sticky never engages", "worker_levers.py", "        _L4[\"sticky\"] = True\n        if log:", "        if log:"),
+    ("L4: engages with the flag off", "worker_levers.py", "        if not flag(\"PROSE_STICKY_NOTHINK\") or role != \"author\" or enable_thinking is None:\n            return False", "        if role != \"author\" or enable_thinking is None:\n            return False"),
+    ("L4: engages for non-author roles", "worker_levers.py", "or role != \"author\" or enable_thinking is None:", "or enable_thinking is None:"),
+    ("L4: sticky ignores the flag", "worker_levers.py", "    return bool(_L4[\"sticky\"] and flag(\"PROSE_STICKY_NOTHINK\"))", "    return bool(_L4[\"sticky\"])"),
+    ("L4: sticky from turn 1 (not after the first abort)", "worker_levers.py", "    return bool(_L4[\"sticky\"] and flag(\"PROSE_STICKY_NOTHINK\"))", "    return flag(\"PROSE_STICKY_NOTHINK\")"),
+    ("L4: state not reset per run", "worker_levers.py", "        _L4[\"sticky\"] = False\n        if flag(\"PROTECT_HARNESS\"):", "        if flag(\"PROTECT_HARNESS\"):"),
+    ("L4: not in the Worker-flags allow-list", "worker_levers.py", ", \"READ_MIN_WINDOW\", \"PROSE_STICKY_NOTHINK\")", ", \"READ_MIN_WINDOW\")"),
+    ("L4: worker never reports the abort", "ollama-worker.py", "                _wl.l4_note_abort(role, _prof.get(\"enable_thinking\"), log=log)", "                pass"),
+    ("L4: later turns think again", "ollama-worker.py", "        if _l4_sticky:\n            _turn_think = False\n", ""),
+    ("L4: later turns lose the recovery sampling", "ollama-worker.py", "        if _cap_cut_recover or _l4_sticky:", "        if _cap_cut_recover:"),
     ("task line: any env name accepted", "worker_levers.py", "            if k not in FLAGS or v not in (\"0\", \"1\") or k in environ:", "            if v not in (\"0\", \"1\"):"),
     ("task line not parsed by worker", "ollama-worker.py", "        _wl.apply_task_flags(task, log=log)", "        pass"),
     ("run not armed by worker", "ollama-worker.py", "        _wl.arm_run(cwd, task, task_kind, verify, log=log)", "        pass"),

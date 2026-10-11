@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""worker_levers.py -- three OPT-IN convergence levers for ollama-worker.py CODING runs (2026-10-10).
+"""worker_levers.py -- four OPT-IN convergence levers for ollama-worker.py CODING runs (2026-10-10).
 
 WHY. Two failed A/B-baseline jobs (absamp-10102153-aA-s1, qwen3.6-35b-a3b via Darkbloom):
   * 1f9ef6805037 (30 iters): 20 read_file calls on a 521-line file in 10-40 line windows, never ran the
@@ -30,7 +30,14 @@ never overrides an env var that is already set).
   READ_MIN_WINDOW=1  read_file with 0 < length < 120 is served >= 120 lines (or to EOF) and the result notes the
                      real range.
 
-PURE apart from the three module-level state dicts (reset per run by arm_run) and the one `git log` in
+  PROSE_STICKY_NOTHINK=1  (L4, 2026-10-11) after the FIRST prose-runaway abort / output-cap cut-off with no tool call in a
+                     run, the recovery request profile (thinking OFF + the recovery sampling) is kept for ALL
+                     remaining author turns instead of one. Evidence: absamp aA-s1 a0be9/c8f4f (prose_loop at ~9/20):
+                     thinking-ON turns loop ~3000 tokens in a planning block, the one-shot recovery turn succeeds
+                     in ~50 tokens, the next thinking-ON turn loops again. Turns before the first abort and every
+                     non-author role are untouched; the worker owns the two gated call sites.
+
+PURE apart from the module-level state dicts (reset per run by arm_run) and the one `git log` in
 sealed_coding_harness. No import of the worker; the worker owns the (tiny, gated) call sites."""
 import fnmatch
 import os
@@ -40,7 +47,7 @@ import subprocess
 import time
 from pathlib import Path
 
-FLAGS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW")
+FLAGS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK")
 MIN_WINDOW_LINES = 120
 VOE_EVERY = 2
 VOE_MAX_RUNS = 6
@@ -96,10 +103,35 @@ def min_window_note(asked, start, last, total) -> str:
             f"{MIN_WINDOW_LINES} lines per read, or use run_bash `grep -n` to locate a line first.]")
 
 
+# --------------------------------------------------------------------------- L4 PROSE_STICKY_NOTHINK
+def l4_note_abort(role, enable_thinking, log=None) -> bool:
+    """Called by the worker on every prose-runaway abort / output-cap cut-off with no tool call (after the
+    one-shot recovery is queued). The FIRST one in a run engages the sticky recovery profile -- only when the
+    flag is on, the role is the author, and the model profile has a thinking switch (enable_thinking is not
+    None). -> True when sticky is (now or already) engaged."""
+    try:
+        if _L4["sticky"]:
+            return True
+        if not flag("PROSE_STICKY_NOTHINK") or role != "author" or enable_thinking is None:
+            return False
+        _L4["sticky"] = True
+        if log:
+            log("[worker] L4: prose runaway seen - thinking stays OFF for the rest of this run")
+        return True
+    except Exception:
+        return False
+
+
+def l4_sticky() -> bool:
+    """True from the first abort on (flag on) -> every later author turn uses the recovery request profile."""
+    return bool(_L4["sticky"] and flag("PROSE_STICKY_NOTHINK"))
+
+
 # --------------------------------------------------------------------------- shared run state
 _VOE = {"edits": 0, "runs": 0, "last_secs": 0.0}
 _PH = {"cwd": None, "verify": None, "passing": False}
 _LAST_VERIFY_SECS = [0.0]
+_L4 = {"sticky": False}
 
 
 def note_verify_secs(secs):
@@ -366,6 +398,7 @@ def arm_run(cwd, task, task_kind, verify, log=None):
     try:
         _VOE.update(edits=0, runs=0, last_secs=0.0)
         _PH.update(cwd=None, verify=verify, passing=False)
+        _L4["sticky"] = False
         if flag("PROTECT_HARNESS"):
             if sealed_coding_harness(cwd, task, task_kind, verify):
                 _PH["cwd"] = _norm(cwd)
@@ -377,6 +410,9 @@ def arm_run(cwd, task, task_kind, verify, log=None):
         if flag("VERIFY_ON_EDIT") and log:
             log(f"[worker] VERIFY_ON_EDIT armed: verify every {VOE_EVERY}nd successful non-harness edit "
                 f"(max {VOE_MAX_RUNS} runs, skipped once a verify took > {int(VOE_SKIP_IF_SLOWER_S)}s).")
+        if flag("PROSE_STICKY_NOTHINK") and log:
+            log("[worker] PROSE_STICKY_NOTHINK armed: after the first prose-runaway abort, thinking stays OFF "
+                "for the rest of the run.")
         if flag("READ_MIN_WINDOW") and log:
             log(f"[worker] READ_MIN_WINDOW armed: read_file windows < {MIN_WINDOW_LINES} lines are widened.")
     except Exception:

@@ -109,6 +109,8 @@ non-harness edit, max 6 runs, skipped once a verify took >120 s; appends a <=150
 note that says to `task_complete`; rides `_quick_verify`, so the `EDIT_CHECKPOINT` snapshot hook still fires),
 `PROTECT_HARNESS=1` (sealed coding harness only: `refimpl.py` hidden/unreadable/unrunnable, harness files un-editable,
 harness / whole-tree / after-PASS `git checkout|restore|stash` refused), `READ_MIN_WINDOW=1` (read_file length <120
-is served >=120 lines, real range noted). Per-job passthrough with no queue change: a `Worker-flags: K=1 K=1` line in
+is served >=120 lines, real range noted), `PROSE_STICKY_NOTHINK=1` (L4: after the FIRST prose-runaway abort / output-cap cut
+the recovery request profile -- thinking OFF + recovery sampling -- stays for every later author turn; before it and non-author
+roles untouched; log `L4: prose runaway seen`). Per-job passthrough with no queue change: a `Worker-flags: K=1 K=1` line in
 the task text (allow-listed names, 0/1 only; an env var already set wins). A/B: arm `F` in
-`~/.ollama-dispatch/ab-sampling/v2/submit.py` = arm A + all three.
+`~/.ollama-dispatch/ab-sampling/v2/submit.py` = arm A + the first three; arm `G` = arm F + `PROSE_STICKY_NOTHINK=1`.
