@@ -65,6 +65,15 @@ LANDING (qagent land)
   pass.  Commits ONLY the patch's files (no add -A; title = problem's first line; no attribution), pushes
   fast-forward-only (one retry after a rejection), then fast-forwards the user's checkout only if that cannot
   clobber anything (never reset/stash/force/checkout over their changes).  Idempotent (`landed` in the fix JSON).
+  Guards: INVALID BASELINE (baseline exit 126/127 or "No such file/command not found/ENOENT..." output aborts the fix
+  before enqueue); --harness-from copies the COMPLETE harness (untracked files + files the verify script references)
+  as protected; a model that modifies/creates a protected harness file -> UNVERIFIED; a declared scope ("Only edit X, Y")
+  makes any out-of-scope or NEW file UNVERIFIED and `land` refuses it; with no scope `land` refuses new-files-only patches
+  (override --allow-new-files) and patches that only touch protected harness files.
+UNLAND (qagent unland <job> [--push|--no-push])
+  Undo a recorded landing: fresh worktree at the branch's current tip, `git revert --no-edit <sha>` (already reverted ->
+  notice; conflict -> abort listing files), message `Revert "<first line>"`, no attribution, fast-forward-only push (one
+  retry), user's checkout fast-forwarded only if untouched.  Records `unlanded`; idempotent; no fix worktree needed.
 Env: QAGENT_WT_ROOT (worktree root), QAGENT_VERIFY_TIMEOUT (s, default 600), QAGENT_QUEUE_PY (queue script), QAGENT_STATE (state json), QAGENT_HOME (scratch root),
      QAGENT_ABORT (queue-abort path), QAGENT_DRY_ID (dry-run fake id),
      QAGENT_WATCHER (script `run` spawns as `<script> watch <id>`; default this file).
@@ -552,9 +561,134 @@ def check_patch(files, protected, wt):
     return bad
 
 
-def fix_verdict(before, after, files, bad):
+# ---------------------------------------------------------------- baseline validity / harness / scope
+INVALID_RE = re.compile(r"No such file or directory|command not found|cannot open|ENOENT|can't open file", re.I)
+REF_EXT = r"(?:py|sh|bash|ts|tsx|mts|js|mjs|cjs|jsx|json|txt|rb|go|rs|ya?ml|sql|csv|toml|ini|cfg)"
+REF_RE = re.compile(r"(?<![\w/.-])(?:\./)?([\w@+-][\w@+./-]*\.%s)(?![\w-])" % REF_EXT)
+SCRIPT_EXT = (".sh", ".bash")
+
+
+def file_sha(p):
+    import hashlib
+    try:
+        return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def _ref_ok(n):
+    return bool(n) and not n.startswith("/") and ".." not in Path(n).parts and "://" not in n
+
+
+def referenced_names(cmd, roots, depth=4):
+    """File names mentioned in the verify command and (transitively) inside any shell script it names that is
+    found under `roots`.  Names only -- they need not exist."""
+    seen, queue, out = set(), [cmd], []
+    for _ in range(depth + 1):
+        nxt = []
+        for text in queue:
+            for n in REF_RE.findall(text or ""):
+                if n in seen or not _ref_ok(n):
+                    continue
+                seen.add(n); out.append(n)
+                if n.endswith(SCRIPT_EXT):
+                    for r in roots:
+                        try:
+                            if (Path(r) / n).is_file() and under(Path(r) / n, r):
+                                nxt.append((Path(r) / n).read_text(errors="replace")); break
+                        except Exception:
+                            pass
+        queue = nxt
+        if not queue:
+            break
+    return out
+
+
+def untracked_refs(cmd, roots, repo, base):
+    """referenced_names() that are NOT tracked at `base`: harness-only names (copied in, or creatable by the model)."""
+    return sorted(n for n in referenced_names(cmd, roots)
+                  if git(repo, "cat-file", "-e", f"{base}:{n}").returncode != 0)
+
+
+def invalid_baseline(code, out, verify, wt, srcs, repo):
+    """Message when the baseline 'failure' is a missing file/command rather than a real failing check; else None."""
+    if code == 0:
+        return None
+    if not (code in (126, 127) or INVALID_RE.search(out or "")):
+        return None
+    cand = []
+    for ln in (out or "").splitlines():
+        if INVALID_RE.search(ln):
+            cand += [n.lstrip("./") if n.startswith("./") else n for n in re.findall(r"([\w@+./-]+\.\w+)", ln)]
+    cand += referenced_names(verify, [wt])
+    miss = sorted({n for n in cand if _ref_ok(n) and not (Path(wt) / n).exists()})
+    where = [str(d) for d in [Path(repo), *map(Path, srcs)] if any((d / n).is_file() for n in miss)]
+    return ("INVALID BASELINE: the baseline verify failed (exit %s) because a file or command is missing, not because a "
+            "check detected the bug -- fixing against it would let the model write the missing check itself.\n"
+            "Missing: %s\nRe-run with --harness-from <dir> containing the complete harness%s.\n"
+            "verify output (tail):\n%s" % (
+                code, ", ".join(miss) if miss else "(could not name a file; see output)",
+                (" (found in: " + "; ".join(where) + ")") if where else "", (out or "").strip()[-600:]))
+
+
+def parse_scope(problem):
+    """Paths declared by 'Only edit X' / 'Only edit X, Y' in the problem text ([] = no scope declared)."""
+    out = []
+    for mt in re.finditer(r"(?i)\bonly\s+edit\s+([^\n]*)", problem or ""):
+        seg = re.split(r"(?<=[\w`'\"/)])\.(?:\s|$)", mt.group(1))[0]
+        items = re.findall(r"`([^`]+)`", seg) or re.split(r"\s*(?:,|\band\b)\s*", seg)
+        for it in items:
+            it = it.strip().strip("`'\".;: ")
+            if it.startswith("./"):
+                it = it[2:]
+            if it and not re.search(r"\s", it):
+                out.append(it)
+    return out
+
+
+def scope_violations(scope, files):
+    """files = [(status, path)].  Out-of-scope paths, and ANY new file when a scope is declared."""
+    out = []
+    for st, f in files:
+        ok = any(f == s or f.startswith(s.rstrip("/") + "/") for s in scope)
+        if not ok:
+            out.append(f"{f} is outside the declared scope ({', '.join(scope)})")
+        elif st.startswith("A"):
+            out.append(f"{f} is a NEW file (scope allows editing existing files only)")
+    return out
+
+
+def harness_names(m):
+    names = set(m.get("protected", [])) | set(m.get("harness", [])) | set(m.get("harness_refs", []))
+    wt = m.get("worktree")
+    if wt and Path(wt).is_dir() and m.get("repo") and m.get("base"):
+        names |= set(untracked_refs(m["verify"], [wt], m["repo"], m["base"]))
+    return names
+
+
+def land_guard(m, allow_new=False):
+    """Reason `land` must refuse this report, else None.  Independent of the recorded verdict (old reports)."""
+    files = [tuple(x.split("\t", 1)) for x in m["report"]["files"] if "\t" in x]
+    scope = parse_scope(m.get("problem"))
+    if scope:
+        v = scope_violations(scope, files)
+        if v:
+            return "patch violates the declared scope:\n  " + "\n  ".join(v)
+    names = harness_names(m)
+    if files and all(f in names for _, f in files):
+        return ("patch only adds/changes protected harness file(s) (" + ", ".join(f for _, f in files) +
+                ") -- that is the verify harness, not a fix")
+    if not scope and not allow_new and files and all(st.startswith("A") for st, _ in files):
+        return ("patch only adds NEW files and modifies no pre-existing file (" + ", ".join(f for _, f in files) +
+                "); pass --allow-new-files if that is intended")
+    return None
+
+
+def fix_verdict(before, after, files, bad, unv=()):
     if bad:
         return "REJECTED"
+    if unv:
+        return "UNVERIFIED"
     if not files:
         return "NO-CHANGE"
     if before != 0 and after == 0:
@@ -578,7 +712,8 @@ def fix_finalize(jid, force=False):
     if rs != m["repo_snapshot"]:
         reasons.append("R's own checkout changed while the job ran (HEAD/status differ) -- worker wrote outside the worktree")
     # capture the patch BEFORE running verify (verify litter must not land in the patch)
-    hx = [f":(exclude){h}" for h in m.get("harness", [])]
+    hset = set(m.get("harness", []))
+    hx = [f":(exclude){h}" for h in sorted(hset | set(m.get("harness_refs", [])))]
     git(wt, "add", "-A", "--", ".", *JUNK_EXCLUDES, *hx)
     ns = git(wt, "diff", "--cached", "--name-status", "--no-renames", m["base"]).stdout
     files = [tuple(l.split("\t", 1)) for l in ns.splitlines() if "\t" in l]
@@ -589,11 +724,25 @@ def fix_finalize(jid, force=False):
     stat = git(wt, "diff", "--cached", "--stat", "--no-renames", m["base"]).stdout
     protected = set(m.get("protected", []))
     bad = reasons + check_patch(files, protected, wt)
+    unv = []
+    # harness integrity: protected harness files must be byte-identical; protected names must not be created
+    for h, sha in (m.get("harness_sha") or {}).items():
+        if file_sha(Path(wt) / h) != sha:
+            unv.append(f"model modified/deleted protected harness file {h} (dropped from the patch)")
+    for n in m.get("harness_refs", []):
+        if n not in hset and (Path(wt) / n).exists():
+            unv.append(f"model created file {n}, a name the verify script depends on (protected; dropped from the patch)")
+    scope = parse_scope(m.get("problem"))
+    if scope:
+        for x in scope_violations(scope, files):
+            unv.append("scope: " + x)
     aft, aout = run_verify(m["verify"], wt)
     before = m["baseline"]["exit"]
-    v = fix_verdict(before, aft, files, bad)
+    v = fix_verdict(before, aft, files, bad, unv)
     if v == "UNVERIFIED":
-        bad.append(f"verify after fix exit={aft} (needs fail->pass; before exit={before})")
+        if not (before != 0 and aft == 0):
+            bad.append(f"verify after fix exit={aft} (needs fail->pass; before exit={before})")
+        bad.extend(unv)
     m["report"] = {"verdict": v, "reasons": bad, "files": [f"{a}\t{b}" for a, b in files], "stat": stat,
                    "patch": str(pp), "before": before, "after": aft, "after_tail": aout[-1500:],
                    "when": time.strftime("%F %T")}
@@ -744,6 +893,9 @@ def fix_start(a, repo, base, note="", group=None, attempt=1):
             print("qagent: verify already passes on the base -- nothing to fix (nothing enqueued, worktree removed).",
                   file=sys.stderr)
             return 3, None
+        inv = invalid_baseline(code, out, a.verify, wt, [hf] if hf else [], repo)
+        if inv:
+            cleanup(); die(inv, 1)
         if code in (124, 127):
             cleanup(); die(f"baseline verify did not run cleanly (exit {code}): {out.strip()}", 1)
     else:
@@ -761,7 +913,9 @@ def fix_start(a, repo, base, note="", group=None, attempt=1):
     if rc != 0 or not jid:
         cleanup(); return (rc or 1), None
     protected = sorted(verify_protected(a.verify, wt))
-    fix_save(jid, {"job": jid, "fixid": fixid, "repo": str(repo), "worktree": str(wt), "base": base,
+    refs = untracked_refs(a.verify, [wt], repo, base)
+    hsha = {h: file_sha(Path(wt) / h) for h in harness}
+    fix_save(jid, {"harness_refs": refs, "harness_sha": hsha,"job": jid, "fixid": fixid, "repo": str(repo), "worktree": str(wt), "base": base,
                    "verify": a.verify, "baseline": {"exit": code, "tail": out[-1500:]}, "land": bool(a.land),
                    "protected": sorted(set(protected) | set(harness)), "harness": harness, "repo_snapshot": repo_snapshot(repo), "problem": a.problem,
                    **({"group": group, "attempt": attempt} if group else {})})
@@ -841,18 +995,34 @@ def missing_harness(cmd, wt, repo, problem):
 
 
 def copy_harness(cmd, src, wt):
-    """Copy verify files (named in cmd, plus verify.sh / verify.test.ts) that are absent in wt from src."""
+    """Copy the COMPLETE harness from src into wt (never overwriting): every untracked file of src (all files if src
+    is not a git work tree), every file named in the verify command / referenced by name inside the verify
+    script(s) that exists in src, plus verify.sh / verify.test.ts.  Returns the relative paths copied."""
     src = Path(src).expanduser().resolve()
     if not src.is_dir():
         die(f"--harness-from {src} is not a directory", 1)
-    names = set(_verify_paths(cmd)) | {"verify.sh", "verify.test.ts"}
+    wt = Path(wt)
+    cands = []
+    top = git(src, "rev-parse", "--show-toplevel")
+    if top.returncode == 0 and Path(top.stdout.strip()).resolve() == src:
+        cands += [x for x in git(src, "ls-files", "-o", "--exclude-standard", "-z").stdout.split("\0") if x]
+    elif top.returncode != 0:
+        for dp, dn, fn in os.walk(src):
+            dn[:] = [d for d in dn if d not in (".git", "node_modules", "__pycache__", ".venv")]
+            cands += [str((Path(dp) / f).relative_to(src)) for f in fn]
+    cands += _verify_paths(cmd) + ["verify.sh", "verify.test.ts"]
     done = []
-    for n in sorted(names):
-        s, d = src / n, Path(wt) / n
-        if s.is_file() and under(s, src) and not d.exists():
-            d.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(s, d); done.append(n)
-    return done
+    for _ in range(5):    # fixpoint: a copied script may reference more helpers
+        before = len(done)
+        for n in list(dict.fromkeys(cands + referenced_names(cmd, [src, wt]))):
+            s, d = src / n, wt / n
+            if (_ref_ok(n) and s.is_file() and not s.is_symlink() and under(s, src) and not d.exists()
+                    and s.stat().st_size <= 5_000_000 and len(done) < 500 and ".git" not in Path(n).parts):
+                d.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(s, d); done.append(n)
+        if len(done) == before:
+            break
+    return sorted(done)
 
 
 # ---------------------------------------------------------------- LAND
@@ -1003,6 +1173,9 @@ def cmd_land(a):
         print(f"qagent land: {err}", file=sys.stderr); return 1
     if m.get("landed"):
         print(landed_line(m["landed"]) + "   (already landed)"); return 0
+    why = land_guard(m, getattr(a, "allow_new_files", False))
+    if why:
+        print(f"qagent land: REFUSED, nothing landed. job {m['job']}: {why}", file=sys.stderr); return 1
     repo = m["repo"]
     branch = a.branch or git(repo, "symbolic-ref", "-q", "--short", "HEAD").stdout.strip() or "main"
     remotes = git(repo, "remote").stdout.split()
@@ -1033,6 +1206,113 @@ def cmd_land(a):
     return 0
 
 
+# ---------------------------------------------------------------- UNLAND
+def _unland_once(m, sha, branch, push, remote):
+    """One revert attempt.  ('ok', newsha, tip, files) | ('already', by_sha) | ('rejected',) | ('fail', msg)."""
+    repo, jid = m["repo"], m["job"]
+    if remote:
+        git(repo, "fetch", "-q", remote)
+    tip = git(repo, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
+    if tip.returncode != 0:
+        return ("fail", f"branch {branch} does not exist in {repo}")
+    tip = tip.stdout.strip()
+    if remote and git(repo, "rev-parse", "--verify", "-q", f"refs/remotes/{remote}/{branch}").returncode == 0:
+        rt = git(repo, "rev-parse", f"refs/remotes/{remote}/{branch}").stdout.strip()
+        if rt != tip:
+            if git(repo, "merge-base", "--is-ancestor", tip, rt).returncode == 0:
+                tip = rt
+            elif push and git(repo, "merge-base", "--is-ancestor", rt, tip).returncode == 0:
+                return ("fail", f"local {branch} has commits not on {remote}/{branch}; push them (or use --no-push) first")
+            elif push:
+                return ("fail", f"local {branch} and {remote}/{branch} have diverged; reconcile first")
+    if git(repo, "cat-file", "-e", f"{sha}^{{commit}}").returncode != 0 or \
+            git(repo, "merge-base", "--is-ancestor", sha, tip).returncode != 0:
+        return ("fail", f"landed commit {sha[:12]} is not in the history of {branch} tip {tip[:12]} (rebased away?) -- nothing to revert")
+    rv = git(repo, "log", "--format=%H", "-F", f"--grep=This reverts commit {sha}", f"{sha}..{tip}").stdout.split()
+    if rv:
+        return ("already", rv[0])
+    files = git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha).stdout.split()
+    WT_ROOT.mkdir(parents=True, exist_ok=True)
+    lw = WT_ROOT / ("unland-" + jid[:12] + "-" + os.urandom(2).hex())
+    r = git(repo, "worktree", "add", "--detach", str(lw), tip)
+    if r.returncode != 0:
+        return ("fail", f"worktree add failed: {(r.stderr or r.stdout).strip()}")
+    try:
+        r = git(lw, "revert", "--no-edit", sha)
+        if r.returncode != 0:
+            conf = git(lw, "diff", "--name-only", "--diff-filter=U").stdout.split()
+            txt = (r.stderr + r.stdout)
+            git(lw, "revert", "--abort")
+            if not conf and "empty" in txt.lower():
+                return ("already", tip)
+            return ("fail", f"revert of {sha[:12]} conflicts at {branch} tip {tip[:12]}"
+                    + (f"; conflicting files: {', '.join(conf)}" if conf else f"\n{txt.strip()[-600:]}"))
+        new = git(lw, "rev-parse", "HEAD").stdout.strip()
+        if push:
+            p = git(lw, "push", remote, f"{new}:refs/heads/{branch}", timeout=300)
+            if p.returncode != 0:
+                txt = p.stderr + p.stdout
+                if "rejected" in txt or "non-fast-forward" in txt or "fetch first" in txt:
+                    return ("rejected",)
+                return ("fail", f"push failed: {txt.strip()[-800:]}")
+            git(repo, "fetch", "-q", remote)
+        git(repo, "update-ref", f"refs/qagent/unlanded/{jid}", new)
+        return ("ok", new, tip, files)
+    finally:
+        git(repo, "worktree", "remove", "--force", str(lw))
+        git(repo, "worktree", "prune")
+
+
+def cmd_unland(a):
+    m = fix_meta(a.id)
+    if not m and a.id.startswith("grp-") and group_load(a.id):
+        for at in group_load(a.id)["attempts"]:
+            mm = fix_meta(at["job"])
+            if mm and mm.get("landed"):
+                m = mm; break
+    if not m:
+        print(f"qagent unland: {a.id}: not a qagent fix job (no {fix_dir()}/{a.id}*.json)", file=sys.stderr); return 1
+    L = m.get("landed")
+    if not L:
+        print(f"qagent unland: job {m['job']} has no `landed` record -- nothing to undo", file=sys.stderr); return 1
+    if m.get("unlanded"):
+        print(f"UNLANDED job {m['job']}: {L['sha']} was reverted by {m['unlanded']['sha']} on {m['unlanded']['branch']}"
+              "   (already unlanded)"); return 0
+    repo, branch, sha = m["repo"], L["branch"], L["sha"]
+    remotes = git(repo, "remote").stdout.split()
+    remote = ("origin" if "origin" in remotes else (remotes[0] if remotes else None))
+    tracks = bool(remote) and git(repo, "config", f"branch.{branch}.remote").returncode == 0
+    push = a.push if a.push is not None else (tracks and L.get("mode") == "pushed")
+    if push and not remote:
+        print("qagent unland: --push but the repo has no remote", file=sys.stderr); return 1
+    res = None
+    for attempt in (1, 2):
+        res = _unland_once(m, sha, branch, push, remote)
+        if res[0] != "rejected":
+            break
+        print(f"qagent unland: push rejected (remote moved); re-reverting from the new tip (attempt {attempt}/2)", file=sys.stderr)
+    if res[0] == "rejected":
+        print(f"qagent unland: job {m['job']}: push rejected twice -- giving up cleanly (nothing pushed, nothing changed locally)",
+              file=sys.stderr); return 1
+    if res[0] == "fail":
+        print(f"qagent unland: ABORTED, nothing reverted. {res[1]}", file=sys.stderr); return 1
+    m = fix_meta(m["job"])
+    if res[0] == "already":
+        m["unlanded"] = {"sha": res[1], "branch": branch, "mode": "already-reverted", "when": time.strftime("%F %T")}
+        fix_save(m["job"], m)
+        print(f"qagent unland: notice: {sha[:12]} is already reverted by {res[1][:12]} -- nothing to do")
+        print(f"UNLANDED job {m['job']}: {sha} reverted by {res[1]} on {branch} (already reverted)"); return 0
+    _, new, tip, files = res
+    mode = "pushed" if push else "local"
+    note = _advance_checkout(dict(m, job=m["job"] + "-unland"), new, tip, branch, files, mode)
+    if note:
+        print(f"qagent unland: {note}")
+    m["unlanded"] = {"sha": new, "branch": branch, "mode": mode, "when": time.strftime("%F %T")}
+    fix_save(m["job"], m)
+    print(f"UNLANDED job {m['job']}: {sha} reverted by {new} on {branch} ({mode})")
+    return 0
+
+
 def land_after(a, jid, rc):
     """qagent fix --land: land automatically once the --wait result is VERIFIED."""
     if not getattr(a, "land", False):
@@ -1041,6 +1321,7 @@ def land_after(a, jid, rc):
     if not m or (m.get("report") or {}).get("verdict") != "VERIFIED":
         return rc
     x = type("X", (), {})(); x.id = jid; x.push = None; x.branch = None
+    x.allow_new_files = getattr(a, "allow_new_files", False)
     return cmd_land(x) or rc
 
 
@@ -1072,12 +1353,17 @@ def main(argv=None):
     fx.add_argument("--wait", action="store_true", help="block until done, then print the result report")
     fx.add_argument("--attempts", type=int, default=1, help="verify-gated retries in fresh worktrees (needs --wait)")
     fx.add_argument("--wait-timeout", type=int, default=2400)
+    fx.add_argument("--allow-new-files", action="store_true", help="let --land accept a patch that only adds new files")
     fx.add_argument("--harness-from", help="dir holding verify files absent at --base (copied in as protected, uncommitted)")
     fx.add_argument("problem"); fx.set_defaults(f=cmd_fix)
     ld = sp.add_parser("land"); ld.add_argument("id")
     ld.add_argument("--push", dest="push", action="store_true", default=None)
     ld.add_argument("--no-push", dest="push", action="store_false")
-    ld.add_argument("--branch"); ld.set_defaults(f=cmd_land)
+    ld.add_argument("--branch"); ld.add_argument("--allow-new-files", action="store_true"); ld.set_defaults(f=cmd_land)
+    ul = sp.add_parser("unland", help="revert a landed fix commit (see UNLAND in the module doc)"); ul.add_argument("id")
+    ul.add_argument("--push", dest="push", action="store_true", default=None)
+    ul.add_argument("--no-push", dest="push", action="store_false")
+    ul.set_defaults(f=cmd_unland)
     ab = sp.add_parser("abort"); ab.add_argument("id"); ab.set_defaults(f=cmd_abort)
     a = p.parse_args(argv)
     return a.f(a)

@@ -727,5 +727,296 @@ class LandAuto(Attempts):
         self.assertEqual(self.g("log", "-1", "--format=%s").stdout.strip(), "add is wrong")
 
 
+class IncidentGuards(LandMode):
+    """2026-10-11 incident (job 2378208dac52): verify.sh called a helper that --harness-from did not copy, the baseline
+    'failed' only because the file was missing, the model wrote the helper itself, and `land` shipped it.
+    Every guard added for that has a mutant proof here."""
+
+    def sh(self, name, text):
+        p = self.d / name; p.write_text(text); return p
+
+    def harness_dir(self, files, git_init=False, exclude=""):
+        h = self.d / "H"; shutil.rmtree(h, ignore_errors=True); h.mkdir()
+        for n, t in files.items():
+            (h / n).write_text(t)
+        if git_init:
+            subprocess.run(["git", "init", "-q", str(h)], check=True)
+            (h / ".git" / "info").mkdir(exist_ok=True); (h / ".git" / "info" / "exclude").write_text(exclude)
+        return h
+
+    VSH = "python3 check_literals.py && python3 test_calc.py\n"
+
+    def fixp(self, verify, problem="add is wrong", extra=(), bin=None):
+        return self.q("fix", "--repo", str(self.repo), "--verify", verify, *extra, problem, bin=bin)
+
+    def meta(self):
+        return json.loads((self.d / "home/fix/abc123def456.json").read_text())
+
+    def finish_with(self, files, problem="add is wrong", verify="bash verify.sh", hdir=None, extra=()):
+        h = hdir or self.harness_dir({"verify.sh": self.VSH, "check_literals.py": "print('lit ok')\n"})
+        r = self.fixp(verify, problem, ("--harness-from", str(h), *extra))
+        self.assertEqual(r.stdout.strip(), "abc123def456", r.stderr)
+        wt = self.wt()
+        for n, t in files.items():
+            if t is None:
+                (wt / n).unlink()
+            else:
+                (wt / n).write_text(t)
+        self.finish(wt)
+        return self.q("result", "abc123").stdout
+
+    def no_wts_left(self):
+        self.assertEqual(list(self.wts.iterdir()) if self.wts.exists() else [], [])
+
+    # ---- 1. baseline validity
+    def test_incident_missing_helper_is_invalid_baseline(self):
+        h = self.harness_dir({"verify.sh": self.VSH})            # helper NOT in the harness dir (the incident)
+        r = self.fixp("bash verify.sh", extra=("--harness-from", str(h)))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("INVALID BASELINE", r.stderr); self.assertIn("check_literals.py", r.stderr)
+        self.assertIn("--harness-from", r.stderr)
+        self.assertFalse(self.log.exists()); self.no_wts_left()
+
+    def test_invalid_baseline_command_not_found_and_enoent_text(self):
+        r = self.fixp("nonexistent_cmd_xyz_1")
+        self.assertIn("INVALID BASELINE", r.stderr); self.assertFalse(self.log.exists()); self.no_wts_left()
+        r = self.fixp("echo 'Error: ENOENT: no such file' >&2; exit 1")
+        self.assertIn("INVALID BASELINE", r.stderr); self.assertFalse(self.log.exists())
+        r = self.fixp("python3 -c \"import sys; sys.exit('real failing check')\"")   # a REAL failure still enqueues
+        self.assertEqual(r.stdout.strip(), "abc123def456", r.stderr)
+
+    def test_mutant_baseline_guard_bites(self):
+        h = self.harness_dir({"verify.sh": self.VSH})
+        mp = self._mutant("        inv = invalid_baseline(", "        inv = None and invalid_baseline(")
+        r = self.fixp("bash verify.sh", extra=("--harness-from", str(h)), bin=mp)
+        self.assertEqual(r.returncode, 0, r.stderr)               # mutant enqueues the broken-baseline fix
+        self.assertTrue(self.log.exists())
+
+    # ---- 2. complete harness
+    def test_harness_from_copies_complete_harness(self):
+        h = self.harness_dir({"verify.sh": self.VSH, "check_literals.py": "print('lit ok')\n", "fixture.json": "{}\n"},
+                             git_init=True, exclude="check_literals.py\n")     # helper is git-IGNORED: only ref-scan finds it
+        out = self.finish_with({"calc.py": self.FIXED}, hdir=h)
+        m = self.meta()
+        self.assertEqual(sorted(m["harness"]), ["check_literals.py", "fixture.json", "verify.sh"])
+        self.assertEqual(sorted(m["protected"]), ["check_literals.py", "fixture.json", "verify.sh"])
+        self.assertIn("verdict: VERIFIED", out)
+        patch = (self.d / "home/fix/abc123def456.patch").read_text()
+        for n in ("verify.sh", "check_literals.py", "fixture.json"):
+            self.assertNotIn(n, patch)
+        r = self.land()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.bare_git("show", "--name-only", "--format=", "main").split(), ["calc.py"])
+
+    def test_mutants_complete_harness_bites(self):
+        h = self.harness_dir({"verify.sh": self.VSH, "check_literals.py": "print('lit ok')\n", "fixture.json": "{}\n"},
+                             git_init=True, exclude="check_literals.py\n")
+        mp = self._mutant("cands + referenced_names(cmd, [src, wt])", "cands")
+        r = self.fixp("bash verify.sh", extra=("--harness-from", str(h)), bin=mp)
+        self.assertIn("INVALID BASELINE", r.stderr)                # ref-scan removed: helper not copied -> caught by guard 1
+        mp2 = self._mutant('cands += [x for x in git(src, "ls-files", "-o", "--exclude-standard", "-z").stdout.split("\\0") if x]', "pass")
+        r = self.fixp("bash verify.sh", extra=("--harness-from", str(h)), bin=mp2)
+        self.assertEqual(r.stdout.strip(), "abc123def456", r.stderr)
+        self.assertNotIn("fixture.json", self.meta()["harness"])   # untracked-walk removed: fixture.json missing (real: copied)
+
+    def test_model_created_protected_name_dropped_and_unverified(self):
+        vsh = "python3 test_calc.py && { [ ! -f extra_check.py ] || python3 extra_check.py; }\n"
+        h = self.harness_dir({"verify.sh": vsh})
+        out = self.finish_with({"calc.py": self.FIXED, "extra_check.py": "print('model wrote me')\n"}, hdir=h)
+        self.assertIn("verdict: UNVERIFIED", out); self.assertIn("extra_check.py", out)
+        self.assertIn("protected; dropped from the patch", out)
+        self.assertNotIn("extra_check.py", (self.d / "home/fix/abc123def456.patch").read_text())
+        r = self.land(); self.assertNotEqual(r.returncode, 0); self.assertIn("UNVERIFIED", r.stderr)
+
+    def test_model_modifying_or_deleting_harness_is_unverified(self):
+        out = self.finish_with({"calc.py": self.FIXED, "verify.sh": "true\n"})
+        self.assertIn("verdict: UNVERIFIED", out); self.assertIn("protected harness file verify.sh", out)
+        self.assertNotIn("verify.sh", (self.d / "home/fix/abc123def456.patch").read_text())
+        shutil.rmtree(self.d / "home"); shutil.rmtree(self.wts); self.g("worktree", "prune")
+        out = self.finish_with({"calc.py": self.FIXED, "check_literals.py": None})
+        self.assertIn("verdict: UNVERIFIED", out); self.assertIn("check_literals.py", out)
+
+    def test_mutants_model_created_and_tamper_bite(self):
+        vsh = "python3 test_calc.py && { [ ! -f extra_check.py ] || python3 extra_check.py; }\n"
+        h = self.harness_dir({"verify.sh": vsh})
+        self.finish_with({"calc.py": self.FIXED, "extra_check.py": "print('x')\n"}, hdir=h)
+        mp = self._mutant("        if n not in hset and (Path(wt) / n).exists():", "        if False:")
+        meta = self.d / "home/fix/abc123def456.json"
+        m = json.loads(meta.read_text()); m.pop("report"); meta.write_text(json.dumps(m))
+        self.assertIn("verdict: VERIFIED", self.q("result", "abc123", bin=mp).stdout)
+        # tamper mutant
+        shutil.rmtree(self.d / "home"); shutil.rmtree(self.wts); self.g("worktree", "prune")
+        self.finish_with({"calc.py": self.FIXED, "verify.sh": "true\n"})
+        meta = self.d / "home/fix/abc123def456.json"
+        m = json.loads(meta.read_text()); m.pop("report"); meta.write_text(json.dumps(m))
+        mp = self._mutant("        if file_sha(Path(wt) / h) != sha:", "        if False:")
+        self.assertIn("verdict: VERIFIED", self.q("result", "abc123", bin=mp).stdout)
+
+    # ---- 3. scope guard
+    def test_parse_scope(self):
+        import importlib.machinery, importlib.util
+        ld = importlib.machinery.SourceFileLoader("qagent_mod", str(QAGENT))
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("qagent_mod", ld)); ld.exec_module(mod)
+        self.assertEqual(mod.parse_scope("Fix it. Only edit `app/api/import/route.ts`. Do not touch tests."), ["app/api/import/route.ts"])
+        self.assertEqual(mod.parse_scope("only edit a.ts, b/c.ts"), ["a.ts", "b/c.ts"])
+        self.assertEqual(mod.parse_scope("Only edit a.py and b.py"), ["a.py", "b.py"])
+        self.assertEqual(mod.parse_scope("add is wrong"), [])
+        self.assertEqual(mod.parse_scope("Only edit the handler please"), [])
+
+    def test_scope_new_file_and_out_of_scope_unverified_and_land_refuses(self):
+        out = self.finish_with({"calc.py": self.FIXED, "notes.txt": "hi\n"}, problem="add is wrong\nOnly edit `calc.py`")
+        self.assertIn("verdict: UNVERIFIED", out); self.assertIn("notes.txt is outside the declared scope", out)
+        r = self.land(); self.assertNotEqual(r.returncode, 0); self.assertIn("UNVERIFIED", r.stderr)
+        shutil.rmtree(self.d / "home"); shutil.rmtree(self.wts); self.g("worktree", "prune")
+        out = self.finish_with({"calc.py": self.FIXED, "suite.py": "print('suite ok!')\n"}, problem="add is wrong\nOnly edit calc.py")
+        self.assertIn("verdict: UNVERIFIED", out); self.assertIn("suite.py is outside the declared scope", out)
+        self.assertNotIn("calc.py is outside", out)
+        shutil.rmtree(self.d / "home"); shutil.rmtree(self.wts); self.g("worktree", "prune")
+        out = self.finish_with({"calc.py": self.FIXED, "notes.txt": "hi\n"}, problem="add is wrong\nOnly edit calc.py, notes.txt")
+        self.assertIn("verdict: UNVERIFIED", out); self.assertIn("notes.txt is a NEW file", out)
+
+    def test_scope_ok_still_verified_and_lands(self):
+        out = self.finish_with({"calc.py": self.FIXED}, problem="add is wrong\nOnly edit calc.py, suite.py")
+        self.assertIn("verdict: VERIFIED", out)
+        self.assertEqual(self.land().returncode, 0)
+
+    def _tamper_report(self, **kw):
+        meta = self.d / "home/fix/abc123def456.json"; m = json.loads(meta.read_text())
+        m["report"].update(kw); meta.write_text(json.dumps(m))
+
+    def test_land_guard_scope_independent_of_recorded_verdict(self):
+        self.finish_with({"calc.py": self.FIXED}, problem="add is wrong\nOnly edit calc.py")
+        self._tamper_report(files=["M\tcalc.py", "A\tcheck_literals2.py"])     # old/forged VERIFIED report with an extra file
+        rem = self.bare_head(); r = self.land()
+        self.assertNotEqual(r.returncode, 0); self.assertIn("declared scope", r.stderr); self.assertIn("check_literals2.py", r.stderr)
+        self.assertEqual(self.bare_head(), rem)
+        mp = self._mutant("    if scope:\n        v = scope_violations(scope, files)", "    if False:\n        v = scope_violations(scope, files)")
+        self.assertNotIn("declared scope", self.land(bin=mp).stderr)
+
+    def test_mutant_finalize_scope_bites(self):
+        self.finish_with({"calc.py": self.FIXED, "notes.txt": "hi\n"}, problem="add is wrong\nOnly edit calc.py")
+        meta = self.d / "home/fix/abc123def456.json"
+        m = json.loads(meta.read_text()); m.pop("report"); meta.write_text(json.dumps(m))
+        mp = self._mutant("    if scope:\n        for x in scope_violations(scope, files):", "    if False:\n        for x in scope_violations(scope, files):")
+        self.assertIn("verdict: VERIFIED", self.q("result", "abc123", bin=mp).stdout)
+
+    def test_no_scope_new_files_only_refused_unless_allowed(self):
+        r = self.fixp("python3 -c 'import newmod'")
+        self.assertEqual(r.stdout.strip(), "abc123def456", r.stderr)
+        wt = self.wt(); (wt / "newmod.py").write_text("x = 1\n"); self.finish(wt)
+        self.assertIn("verdict: VERIFIED", self.q("result", "abc123").stdout)
+        rem = self.bare_head(); r = self.land()
+        self.assertNotEqual(r.returncode, 0); self.assertIn("only adds NEW files", r.stderr); self.assertIn("--allow-new-files", r.stderr)
+        self.assertEqual(self.bare_head(), rem)
+        mp = self._mutant("    if not scope and not allow_new and files and all(", "    if False and files and all(")
+        mut = self.q("land", "abc123", bin=mp)
+        self.assertNotIn("only adds NEW files", mut.stderr)
+        r = self.q("land", "abc123", "--allow-new-files")
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("newmod.py", self.bare_git("ls-tree", "-r", "--name-only", "main"))
+
+    # ---- 4. protected-name-only patches
+    def test_land_refuses_patch_touching_only_harness_names(self):
+        self.finish_with({"calc.py": self.FIXED})
+        self._tamper_report(files=["A\tcheck_literals.py"])           # the incident shape
+        r = self.q("land", "abc123", "--allow-new-files")
+        self.assertNotEqual(r.returncode, 0); self.assertIn("protected harness", r.stderr)
+        mp = self._mutant("    if files and all(f in names for _, f in files):", "    if False:")
+        self.assertNotIn("protected harness", self.q("land", "abc123", "--allow-new-files", bin=mp).stderr)
+
+    # ---- 5. unland
+    def unl(self, *a, bin=None):
+        return self.q("unland", "abc123", *a, bin=bin)
+
+    def landed(self):
+        self.mkfix(); r = self.land(); self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip().splitlines()[-1].split()[1]
+
+    def test_unland_clean_reverts_pushes_no_attribution(self):
+        sha = self.landed()
+        r = self.unl(); self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertRegex(r.stdout, r"UNLANDED job abc123def456: " + sha + r" reverted by [0-9a-f]{40} on main \(pushed\)")
+        head = self.bare_head(); self.assertEqual(self.g("rev-parse", "HEAD").stdout.strip(), head)
+        self.assertEqual(self.g("rev-parse", "HEAD~1").stdout.strip(), sha)         # fast-forward, nothing rewritten
+        self.assertIn("return a - b", (self.repo / "calc.py").read_text())
+        msg = self.g("log", "-1", "--format=%B").stdout
+        self.assertEqual(msg.splitlines()[0], 'Revert "add is wrong"')
+        for bad in ("Co-Authored-By", "Claude", "Generated with", "claude.ai"):
+            self.assertNotIn(bad, msg)
+        self.assertEqual(self.g("status", "--porcelain").stdout, "")
+        u = self.meta()["unlanded"]; self.assertEqual(u["sha"], head); self.assertEqual(u["branch"], "main")
+        left = [p for p in self.wts.iterdir() if p.name.startswith("unland-")]; self.assertEqual(left, [])
+
+    def test_unland_idempotent(self):
+        self.landed(); self.unl(); head = self.bare_head()
+        r = self.unl(); self.assertEqual(r.returncode, 0); self.assertIn("already unlanded", r.stdout)
+        self.assertEqual(self.bare_head(), head)
+
+    def test_unland_not_landed_refused(self):
+        self.mkfix(); r = self.unl(); self.assertNotEqual(r.returncode, 0); self.assertIn("nothing to undo", r.stderr)
+
+    def test_unland_after_drift_keeps_later_work(self):
+        self.landed(); self.drift("README.md", "later work\n")
+        r = self.unl(); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("return a - b", (self.repo / "calc.py").read_text()); self.assertEqual((self.repo / "README.md").read_text(), "later work\n")
+        self.assertEqual(self.bare_head(), self.g("rev-parse", "HEAD").stdout.strip())
+
+    def test_unland_conflict_aborts_cleanly(self):
+        self.landed(); self.drift("calc.py", "def add(a, b):\n    return a + b  # touched later\n\n\n# tail\n")
+        head = self.g("rev-parse", "HEAD").stdout.strip(); rem = self.bare_head()
+        r = self.unl(); self.assertNotEqual(r.returncode, 0)
+        self.assertIn("calc.py", r.stderr); self.assertIn("conflict", r.stderr)
+        self.assertEqual(self.bare_head(), rem); self.assertEqual(self.g("rev-parse", "HEAD").stdout.strip(), head)
+        self.assertEqual(self.g("status", "--porcelain").stdout, "")
+        self.assertNotIn("unlanded", self.meta())
+        self.assertEqual([p for p in self.wts.iterdir() if p.name.startswith("unland-")], [])
+
+    def test_unland_already_reverted_by_hand_noop(self):
+        sha = self.landed(); self.g("revert", "--no-edit", sha); self.g("push", "-q", "origin", "main")
+        head = self.bare_head(); r = self.unl()
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("already reverted", r.stdout)
+        self.assertEqual(self.bare_head(), head); self.assertIn("unlanded", self.meta())
+        # mutant: without the already-reverted check a second revert is attempted (conflicts/fails)
+        shutil.rmtree(self.d / "home" / "fix" / "x", ignore_errors=True)
+        m = self.meta(); m.pop("unlanded"); (self.d / "home/fix/abc123def456.json").write_text(json.dumps(m))
+        mp = self._mutant('    if rv:\n        return ("already", rv[0])', '    if False:\n        return ("already", rv[0])')
+        self.assertNotEqual(self.unl(bin=mp).returncode, 0)
+
+    def test_unland_needs_no_fix_worktree(self):
+        self.landed(); wt = Path(self.meta()["worktree"])
+        self.g("worktree", "remove", "--force", str(wt)); self.assertFalse(wt.exists())
+        r = self.unl(); self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_unland_dirty_checkout_not_clobbered(self):
+        sha = self.landed(); rem0 = self.bare_head()
+        (self.repo / "calc.py").write_text((self.repo / "calc.py").read_text() + "# MY UNCOMMITTED WORK\n")
+        head = self.g("rev-parse", "HEAD").stdout.strip()
+        r = self.unl(); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotEqual(self.bare_head(), rem0)                                   # remote reverted
+        self.assertIn("MY UNCOMMITTED WORK", (self.repo / "calc.py").read_text())
+        self.assertEqual(self.g("rev-parse", "HEAD").stdout.strip(), head)
+        self.assertIn("pull --ff-only", r.stdout); self.assertEqual(self.g("stash", "list").stdout, "")
+
+    def test_unland_no_push_local_only(self):
+        self.mkfix(); r = self.land("--no-push"); self.assertEqual(r.returncode, 0, r.stderr)
+        rem = self.bare_head(); r = self.unl("--no-push"); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.bare_head(), rem); self.assertIn("(local)", r.stdout)
+        self.assertIn("return a - b", (self.repo / "calc.py").read_text())
+
+    def test_unland_remote_moved_reverts_on_new_tip(self):
+        self.landed()
+        other = self.d / "other"; subprocess.run(["git", "clone", "-q", str(self.bare), str(other)], check=True, env=self.env)
+        (other / "x.txt").write_text("x\n"); subprocess.run(["git", "-C", str(other), "add", "-A"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(other), "commit", "-qm", "other"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(other), "push", "-q", "origin", "main"], check=True, env=self.env)
+        r = self.unl(); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("x.txt", self.bare_git("ls-tree", "-r", "--name-only", "main"))
+        self.assertIn("return a - b", self.bare_git("show", "main:calc.py"))
+
+
+for _n in dir(LandMode):                  # the inherited LandMode tests already ran in LandMode
+    if _n.startswith("test_") and _n not in IncidentGuards.__dict__:
+        setattr(IncidentGuards, _n, None)
+
+
 if __name__ == "__main__":
     unittest.main()
