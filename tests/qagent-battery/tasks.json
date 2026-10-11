@@ -1,0 +1,17 @@
+{
+  "note": "Read-only qagent tasks with mechanically gradable answers. $HOME is substituted by run-battery.sh. Graders recompute ground truth at grading time.",
+  "tasks": [
+    {"id": "g1", "name": "failed-by-class", "grader": "graders/g1-failed-by-class.py",
+     "prompt": "Read $HOME/bin/ollama-queue-state.json (JSON with a top-level 'jobs' list). Count the jobs whose status is 'failed', grouped by their 'failure_class' field. Use a python3 one-liner, do not eyeball it. Report counts for the classes model, context, operator and nonconvergence_progressing. End your answer with a final line in exactly this format: ANSWER: model=N; context=N; operator=N; nonconvergence_progressing=N"},
+    {"id": "g2", "name": "function-home", "grader": "graders/g2-function-home.py",
+     "prompt": "Which file(s) directly inside $HOME/bin (not subdirectories) define a Python function named clip_tool_stream (a line starting with 'def clip_tool_stream(')? Ignore backup copies: any file whose name contains '.bak' or '.pre-'. End your answer with a final line in exactly this format, file basenames comma-separated: ANSWER: file1,file2"},
+    {"id": "g3", "name": "small-file-facts", "grader": "graders/g3-small-file-facts.py",
+     "prompt": "Read $HOME/bin/queue-abort. Report three facts: (1) the default value in seconds of its --wait option; (2) the names of every QUEUE_ABORT_* environment variable it documents or reads; (3) the exit code that means 'refused'. End your answer with a final line in exactly this format: ANSWER: wait=N; env=NAME1,NAME2; refused_exit=N"},
+    {"id": "g4", "name": "cli-subcommands", "grader": "graders/g4-cli-subcommands.py",
+     "prompt": "List every argparse subcommand defined in $HOME/bin/ollama-queue.py (each is created with sub.add_parser(\"name\", ...)). The file is huge: search it with grep, do not try to read it whole, and make sure your list is complete. End your answer with a final line in exactly this format, names comma-separated: ANSWER: cmd1,cmd2,cmd3"},
+    {"id": "g5", "name": "largest-logs", "grader": "graders/g5-largest-logs.py",
+     "prompt": "Find the 5 largest files by size in bytes among the *.log files directly inside $HOME/bin/ollama-queue-logs (the directory has thousands of files; use ls -S or sort, not a full listing). End your answer with a final line in exactly this format, basenames comma-separated, largest first: ANSWER: a.log,b.log,c.log,d.log,e.log"},
+    {"id": "g6", "name": "test-asserts", "grader": "graders/g6-test-asserts.py",
+     "prompt": "In $HOME/bin/test-qagent.py, read the test method test_bounds_always_set_and_no_sampling. What DEFAULT values does it assert for --max-tokens, --max-iters and --chat-timeout (ignore the later override with a different --max-tokens), and which flags does it assert are ABSENT from the enqueue argv? End your answer with a final line in exactly this format: ANSWER: max_tokens=N; max_iters=N; chat_timeout=N; absent=--flag1,--flag2,--flag3"}
+  ]
+}
