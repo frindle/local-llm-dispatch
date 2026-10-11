@@ -2417,9 +2417,9 @@ function cpuQueueRows(d) {
     reason: '', id: c.id || ''});
   return rows;
 }
-function cpuQueueRowHtml(r) {
+function cpuQueueRowHtml(r, nested) {
   const secs = r.secs == null ? '?' : Math.round(r.secs) + 's';
-  const bundle = r.bundle ? ` <a href="#" class="cpu-bundle" data-bundle="${escapeHtml(r.bundle)}" title="Jump to the owning bundle in the queue">bundle ${escapeHtml(r.bundle)}</a>` : '';
+  const bundle = (r.bundle && !nested) ? ` <a href="#" class="cpu-bundle" data-bundle="${escapeHtml(r.bundle)}" title="Jump to the owning bundle in the queue">bundle ${escapeHtml(r.bundle)}</a>` : '';
   const why = r.reason ? ` <span class="cpu-reason">RUNNING LOCALLY - local: ${escapeHtml(r.reason)}</span>` : '';
   return `<td>CPU</td><td><b>${escapeHtml(r.stage)}</b> ${escapeHtml(r.label)}${bundle}`
     + ` <span class="cpu-where">on ${escapeHtml(r.where)}</span>${why}</td>`
@@ -2433,16 +2433,63 @@ function cpuQueueCounts(d) {
 }
 // Draw the rows and refresh everything that says whether the queue is "empty": the Queue panel count
 // and empty line. Called by the CPU-lane poll and by renderSummary (whichever runs last wins, both agree).
+// Where each CPU row goes (Penn 2026-10-10: CPU stages belong INSIDE their bundle group in #jobs, like GPU
+// jobs). hasHeader(key) says whether the queue table already has a bundle header for `key`. A row with a
+// bundle key that is not a bare job id nests (under the existing header, or under a CPU-only header made for
+// it); a row with no bundle, or whose "bundle" is only a standalone job id, falls back to the #cpuQueue table.
+function cpuPlaceRows(rows, hasHeader) {
+  const nested = {}, cpuOnly = [], standalone = [];
+  for (const r of rows) {
+    const k = r.bundle || '';
+    if (!k || (!hasHeader(k) && /^[0-9a-f]{12}$/.test(k))) { standalone.push(r); continue; }
+    if (!hasHeader(k) && !cpuOnly.includes(k)) cpuOnly.push(k);
+    (nested[k] = nested[k] || []).push(r);
+  }
+  return {nested, cpuOnly, standalone};
+}
 function renderCpuQueue(q) {
   if (q) window.lastQueueQ = q;
   q = window.lastQueueQ || {bundles: 0, jobs: 0};
   const d = window.cpuLaneData || {};
   const rows = cpuQueueRows(d);
+  // 1. idempotent: drop what an earlier call inserted into #jobs, then place again.
+  document.querySelectorAll('#jobs tbody tr.cpu-nested, #jobs tbody tr.cpu-only-hdr').forEach(t => t.remove());
+  const headers = {};
+  document.querySelectorAll('#jobs tbody tr.queue-parent').forEach(t => { if (t.dataset.bundle) headers[t.dataset.bundle] = t; });
+  const plan = cpuPlaceRows(rows, k => !!headers[k]);
+  for (const k of plan.cpuOnly) {
+    const run = plan.nested[k].filter(r => r.status === 'running').length;
+    const hd = document.createElement('tr');
+    hd.className = 'queue-parent cpu-only-hdr';
+    hd.dataset.bundle = k; hd.dataset.expanded = '1';
+    hd.innerHTML = `<td>&#9662;</td><td><span class="proj-name">${escapeHtml(k)}</span><span class="chip m-chip ${run ? 'running' : 'pending'}">${run ? 'running' : 'pending'}</span>`
+      + `<div class="sub proj-summary">CPU lane only: ${plan.nested[k].length} stage${plan.nested[k].length === 1 ? '' : 's'}</div></td>`
+      + `<td class="st"><span class="chip status-${run ? 'running' : 'pending'} ${run ? 'running' : 'pending'}">${run ? 'running' : 'pending'}</span></td><td class="when"></td><td class="acts"></td>`;
+    const body = document.querySelector('#jobs tbody');
+    if (body) { body.appendChild(hd); headers[k] = hd; }
+  }
+  for (const k of Object.keys(plan.nested)) {
+    const hd = headers[k];
+    if (!hd) { plan.standalone.push(...plan.nested[k]); continue; }   // header could not be made: never lose the row
+    if (hd.dataset.expanded === '0') continue;                         // collapsed bundle hides its children
+    let last = hd;
+    while (last.nextElementSibling && last.nextElementSibling.classList.contains('queue-child')
+           && !last.nextElementSibling.classList.contains('cpu-only-hdr')) last = last.nextElementSibling;
+    let ref = last.nextElementSibling;
+    for (const r of plan.nested[k]) {
+      const tr = document.createElement('tr');
+      tr.className = 'queue-child cpu-nested cpu-queue-row' + (r.kind === 'local_running' ? ' local' : '');
+      tr.dataset.kind = r.kind; tr.dataset.stage = r.stage; tr.dataset.bundle = r.bundle;
+      tr.innerHTML = cpuQueueRowHtml(r, true);
+      hd.parentNode.insertBefore(tr, ref);
+    }
+  }
+  // 2. the standalone table keeps only rows with no bundle group to live in.
   const tbl = document.getElementById('cpuQueue');
   if (tbl) {
     const tb = tbl.querySelector('tbody');
     tb.innerHTML = '';
-    rows.forEach(r => {
+    plan.standalone.forEach(r => {
       const tr = document.createElement('tr');
       tr.className = 'cpu-queue-row' + (r.kind === 'local_running' ? ' local' : '');
       tr.dataset.kind = r.kind; tr.dataset.stage = r.stage; tr.dataset.bundle = r.bundle;
@@ -3334,6 +3381,7 @@ async function refresh() {
     const headWait = (g.children.find(c => c.wait_reason && ['pending', 'planned', 'queued'].includes(c.status)) || {}).wait_reason;
     const ptr = document.createElement('tr');
     ptr.className = 'queue-parent' + alertSummary.rowClass + (attnKind ? ' needs-attn' : '');
+    ptr.dataset.bundle = g.key; ptr.dataset.expanded = expanded ? '1' : '0';   // CPU-lane stages nest under this header
     ptr.innerHTML = `
       <td>${mpos >= 0 ? `<span class="bundle-grip" draggable="true" title="Drag to reorder this bundle in the queue" style="cursor:grab;margin-right:4px;opacity:0.55">&#10303;</span>` : ''}${expanded ? '&#9662;' : '&#9656;'}</td>
       <td><span class="proj-name">${escapeHtml(g.key)}</span><span class="chip m-chip ${chipTxt}">${chipTxt}</span>

@@ -29,7 +29,7 @@ MUTANTS = [
     ("fallback reason is not shown",
      "const why = r.reason ? ", "const why = false ? "),
     ("owning bundle is not shown",
-     "const bundle = r.bundle ? ", "const bundle = false ? "),
+     "const bundle = (r.bundle && !nested) ? ", "const bundle = false ? "),
     ("summary never renders the cpu rows",
      "  renderCpuQueue(q);\n", ""),
     ("cpu poll never renders the cpu rows",
@@ -39,6 +39,12 @@ MUTANTS = [
     ("count line omits CPU stages", "(n.total ? ` · ${n.total} CPU stage", "(false ? ` · ${n.total} CPU stage"),
     ("queue tile ignores cpu pending", "pend + paused + planned + cpuN.pending", "pend + paused + planned"),
     ("idle wait text still says 'Queue empty' with CPU busy", "return cn.total ? 'GPU queue empty - CPU lane busy (", "return false ? 'GPU queue empty - CPU lane busy ("),
+    ("cpu rows never nested in the bundle group", "    if (!hd) { plan.standalone.push(...plan.nested[k]); continue; }", "    plan.standalone.push(...(plan.nested[k] || [])); continue;"),
+    ("cpu row lands before the bundle's GPU rows, not after", "let last = hd;\n    while (", "let last = hd;\n    while (false && "),
+    ("cpu-only bundle gets no header", "if (!hasHeader(k) && !cpuOnly.includes(k)) cpuOnly.push(k);", ""),
+    ("re-render does not clear earlier nested rows", "forEach(t => t.remove());", "forEach(t => 0);"),
+    ("collapsed bundle still shows cpu rows", "if (hd.dataset.expanded === '0') continue;", ""),
+    ("bundle-less rows are nested nowhere and dropped", "if (!k || (!hasHeader(k) && /^[0-9a-f]{12}$/.test(k))) { standalone.push(r); continue; }", "if (!k) continue;"),
     ("idle tile still says nothing", "cpuQueueCounts(window.cpuLaneData).running ? ' - CPU lane active (", "false ? ' - CPU lane active ("),
 ]
 
@@ -71,16 +77,73 @@ const mk = (id) => els[id] || (els[id] = {id, textContent: '', hidden: false, in
   className: '', classList: {add(){}, remove(){}},
   appendChild(c){ this.children.push(c); }, addEventListener(){}, querySelectorAll(){ return []; },
   querySelector(){ return mk(id + '>tbody'); }});
-global.window = {}; global.document = {getElementById: mk, createElement: () => mk('row' + Math.random()), querySelectorAll: () => []};
+// a tiny DOM for the #jobs table: rows with parent/sibling links, classList, insertBefore, remove
+class El {
+  constructor(){ this.children = []; this.parentNode = null; this.dataset = {}; this.innerHTML = ''; this.cls = new Set();
+    const c = this.cls; this.classList = {add: x => c.add(x), remove: x => c.delete(x), contains: x => c.has(x)}; }
+  set className(v){ this.cls.clear(); String(v).split(/\s+/).filter(Boolean).forEach(x => this.cls.add(x)); }
+  get className(){ return [...this.cls].join(' '); }
+  get nextElementSibling(){ const i = this.parentNode ? this.parentNode.children.indexOf(this) : -1; return i >= 0 ? (this.parentNode.children[i + 1] || null) : null; }
+  appendChild(c){ c.parentNode = this; this.children.push(c); return c; }
+  insertBefore(c, ref){ c.parentNode = this; const i = ref ? this.children.indexOf(ref) : -1;
+    if (i < 0) this.children.push(c); else this.children.splice(i, 0, c); return c; }
+  remove(){ if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(x => x !== this); this.parentNode = null; }
+  addEventListener(){}
+}
+const jobsBody = new El();
+const jobsSel = sel => sel.split(',').map(x => x.trim()).filter(x => x.startsWith('#jobs tbody tr')).flatMap(x => {
+  const cl = x.replace('#jobs tbody tr', '').split('.').filter(Boolean);
+  return jobsBody.children.filter(c => cl.every(k => c.cls.has(k))); });
+global.window = {};
+global.document = {getElementById: mk, createElement: () => new El(),
+  querySelector: s => s === '#jobs tbody' ? jobsBody : null, querySelectorAll: jobsSel};
+const mkHdr = (key, expanded) => { const h = new El(); h.className = 'queue-parent'; h.dataset.bundle = key;
+  h.dataset.expanded = expanded === false ? '0' : '1'; jobsBody.appendChild(h); return h; };
+const mkKid = (label) => { const k = new El(); k.className = 'queue-child'; k.dataset.label = label; jobsBody.appendChild(k); return k; };
+const jobsOrder = () => jobsBody.children.map(c => (c.cls.has('queue-parent') ? 'H:' + c.dataset.bundle : c.cls.has('cpu-nested') ? 'CPU:' + c.dataset.stage : c.dataset.label || '?'));
 const escapeHtml=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
 """
+
+
+def nest(code, d):
+    """CPU stages render INSIDE their bundle's group in #jobs (Penn 2026-10-10)."""
+    d = dict(d); d["local_running"] = [dict(d["local_running"][0], bundle="rt-amazon-cardlink-rs1")]
+    d["running"] = [dict(d["running"][0], bundle="rt-amazon-cardlink-rs1")]
+    d["pending"] = [dict(d["pending"][0], bundle="cpu-only-bundle")]
+    setup = ("window.lastQueueQ={bundles:2,jobs:3};"
+             "mkHdr('other-bundle'); mkKid('other-gpu'); mkHdr('rt-amazon-cardlink-rs1'); mkKid('gpu-slice-1'); mkKid('gpu-slice-2');"
+             "mkHdr('collapsed-b', false); mkKid('hidden-gpu'); const solo = new El(); solo.dataset.label = 'standalone'; jobsBody.appendChild(solo);"
+             "window.cpuLaneData=" + json.dumps(d) + ";")
+    r = node(code + setup + "renderCpuQueue(); const a = jobsOrder(); renderCpuQueue(); renderCpuQueue(); const b = jobsOrder();"
+             "console.log(JSON.stringify({a, b, tbl: els['cpuQueue>tbody'].children.length, tblHidden: els.cpuQueue.hidden,"
+             "emptyHidden: els.activeEmpty.hidden, count: els.activeCount.textContent}));")
+    want = ["H:other-bundle", "other-gpu", "H:rt-amazon-cardlink-rs1", "gpu-slice-1", "gpu-slice-2", "CPU:relevance", "CPU:audit-trivial",
+            "H:collapsed-b", "hidden-gpu", "standalone", "H:cpu-only-bundle", "CPU:baseline-verify"]
+    check("CPU stages sit at the end of their bundle's group; CPU-only bundle gets its own header", r.get("a"), want)
+    check("re-render is idempotent (no duplicates)", r.get("b"), want)
+    check("nothing nested falls back to the standalone table; table hidden", (r.get("tbl"), r.get("tblHidden")), (0, True))
+    check("count line still counts nested CPU stages", "3 CPU stages (2 running, 1 pending)" in str(r.get("count")), True)
+    # bundle-less and bare-job-id rows fall back; collapsed bundle hides its CPU children but does not leak to the table
+    d2 = {"running": [{"id": "a1", "label": "x", "stage": "relevance", "bundle": "", "runner": "r", "running_s": 1}],
+          "pending": [{"id": "b2", "label": "y", "stage": "audit", "bundle": "9800001065f0", "waiting_s": 1}],
+          "local_running": [{"stage": "audit-trivial", "bundle": "collapsed-b", "reason": "r", "running_s": 2}]}
+    r = node(code + "mkHdr('collapsed-b', false); mkKid('hidden-gpu'); window.cpuLaneData=" + json.dumps(d2) + ";renderCpuQueue({bundles:1,jobs:1});"
+             "console.log(JSON.stringify({o: jobsOrder(), tbl: els['cpuQueue>tbody'].children.length, tblHidden: els.cpuQueue.hidden}));")
+    check("collapsed bundle hides its CPU row; bundle-less + bare-id rows use the standalone table",
+          (r.get("o"), r.get("tbl"), r.get("tblHidden")), (["H:collapsed-b", "hidden-gpu"], 2, False))
+    # the CPU-only header disappears when the stage finishes
+    r = node(code + "window.cpuLaneData=" + json.dumps(d) + ";renderCpuQueue({bundles:0,jobs:0}); window.cpuLaneData={}; renderCpuQueue({bundles:0,jobs:0});"
+             "console.log(JSON.stringify({o: jobsOrder(), emptyHidden: els.activeEmpty.hidden}));")
+    check("finished CPU work leaves no header/rows behind; queue reads empty", (r.get("o"), r.get("emptyHidden")), ([], False))
 
 
 def run(src):
     html = html_of(src)
     m = re.search(r"function cpuQueueRows\(d\) \{.*?\nfunction renderSummary\(", html, re.S)
     check("cpu queue helpers present", bool(m), True)
-    for needle in ("renderCpuQueue(q);", "window.cpuLaneData = d;", "id=\"cpuQueue\"", "pend + paused + planned + cpuN.pending"):
+    for needle in ("renderCpuQueue(q);", "window.cpuLaneData = d;", "id=\"cpuQueue\"", "pend + paused + planned + cpuN.pending",
+                   "(j.duration_s == null ? '' : j.duration_s + 's') + (j.queue_wait_s == null ? '' : ' / wait ' + j.queue_wait_s + 's')));\n    renderCpuQueue();\n",
+                   "cpuQueueCounts(window.cpuLaneData).running ? ' - CPU lane active ("):
         check(f"page wires {needle}", needle in html, True)
     if not m:
         return
@@ -92,7 +155,7 @@ def run(src):
          "local_running": [{"stage": "audit-trivial", "bundle": "rt-amazon-cardlink-rs1",
                             "reason": "runs locally by design (audit rewrites the target in this worktree)", "running_s": 62.4}]}
     r = node(code + "console.log(JSON.stringify({rows: cpuQueueRows(" + json.dumps(d) + "),"
-             "html: cpuQueueRows(" + json.dumps(d) + ").map(cpuQueueRowHtml), counts: cpuQueueCounts(" + json.dumps(d) + ")}));")
+             "html: cpuQueueRows(" + json.dumps(d) + ").map(r => cpuQueueRowHtml(r)), counts: cpuQueueCounts(" + json.dumps(d) + ")}));")
     rows = r.get("rows") or []
     check("three rows: running, local_running, pending (in that order)", [x["kind"] for x in rows], ["running", "local_running", "pending"])
     check("row fields", [(x["stage"], x["bundle"], x["where"], x["status"]) for x in rows], [
@@ -111,8 +174,9 @@ def run(src):
               "console.log(JSON.stringify({emptyHidden:e.hidden, count:c.textContent, tblHidden:t.hidden, "
               "n: els['cpuQueue>tbody'].children.length}));")
     check("GPU-idle + CPU-running: empty line hidden", r2.get("emptyHidden"), True)
-    check("GPU-idle + CPU-running: CPU table visible with 3 rows", (r2.get("tblHidden"), r2.get("n")), (False, 3))
+    check("GPU-idle + CPU-running: only the bundle-less row stays in the standalone table", (r2.get("tblHidden"), r2.get("n")), (False, 1))
     check("count line names the CPU stages", "3 CPU stages (2 running, 1 pending)" in str(r2.get("count")), True)
+    nest(code, d)
     # nothing anywhere -> empty
     r3 = node(code + "window.lastQueueQ={bundles:0,jobs:0}; window.cpuLaneData={running:[],pending:[],local_running:[]};"
               "renderCpuQueue(); console.log(JSON.stringify({emptyHidden:els.activeEmpty.hidden, tblHidden:els.cpuQueue.hidden, "
