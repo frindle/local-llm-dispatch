@@ -1607,6 +1607,10 @@ FRONTEND_HTML = r"""<!doctype html>
   table.q td.slice-facts { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .slice-fact { display: inline-block; padding: 0 6px; margin-right: 4px; border: 1px solid var(--line); border-radius: 8px; white-space: nowrap; }
   .slice-cause { color: var(--muted); font-size: .79rem; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  tr.cpu-queue-row.local td { background: var(--warn-bg, transparent); }
+  tr.cpu-queue-row.flash, #jobs tr.flash { outline: 2px solid var(--info); }
+  .cpu-where, .cpu-reason { color: var(--muted); font-size: .79rem; }
+  .cpu-reason { font-weight: 600; }
   .chip.pending, .chip.planned, .chip.queued, .chip.ph-queued, .chip.ph-pending { background: var(--info-bg); color: var(--info); }
   .chip.held, .chip.paused, .chip.blocked, .chip.parked, .chip.warn, .chip.done_unconverged { background: var(--warn-bg); color: var(--warn); }
   .chip.failed, .chip.bad, .chip.ph-failed, .chip.ph-escalated { background: var(--bad-bg); color: var(--bad); }
