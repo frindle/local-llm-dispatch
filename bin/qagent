@@ -13,6 +13,8 @@ authoring.  Output is UNVERIFIED local-model text; the caller must check it.
   qagent result <id>                                    summary + diff + banner + log path
   qagent followup <id> "<msg>" [--dry-run]              new job seeded from the prior one
   qagent abort <id>                                     via ~/bin/queue-abort
+  qagent watch <id> [--poll S]                          foreground watchdog: enforce --max-wall until the job
+                                                        is terminal (`run` auto-spawns one, detached; --no-watch)
 
 How the worker's mandatory-verify requirement is handled
   The queue REFUSES a coding job with no --verify unless --allow-no-verify (an
@@ -28,7 +30,8 @@ Isolation
                            edits, (c) throwaway worktree/scratch cwd, and (d) `result`
                            reports any diff it finds as a READONLY VIOLATION.
 Bounds (always set; override with flags): --max-tokens 12000/turn, --max-iters 12,
-  --chat-timeout 900s, --max-wall 1800s active time (aborted by status/wait when exceeded).
+  --chat-timeout 900s, --max-wall 1800s active time (aborted by the detached watchdog `run` spawns,
+  and also by status/wait).
   Sampling is never set -- the model-card profile applies.  NOTE the queue may serve a
   different model than requested (profile alias qwen3.8 -> qwen3.6 on the Darkbloom lane);
   `result` prints the served model parsed from the worker log.
@@ -37,7 +40,8 @@ Followup
   queue exposes no enqueue flag for it, so followup enqueues a NEW job whose prompt
   carries the original prompt, the prior final answer and the new message.
 Env: QAGENT_QUEUE_PY (queue script), QAGENT_STATE (state json), QAGENT_HOME (scratch root),
-     QAGENT_ABORT (queue-abort path), QAGENT_DRY_ID (dry-run fake id).
+     QAGENT_ABORT (queue-abort path), QAGENT_DRY_ID (dry-run fake id),
+     QAGENT_WATCHER (script `run` spawns as `<script> watch <id>`; default this file).
 """
 import argparse, json, os, re, subprocess, sys, time
 from pathlib import Path
@@ -64,10 +68,14 @@ READONLY_PREAMBLE = (
     "python3 ... status/list/show style queries). You MUST NOT create, edit, delete or move "
     "any file, and must not run anything that mutates state. Put your whole answer in your "
     "final message as plain text. Keep the final answer concise (under ~60 lines); never repeat "
-    "yourself or pad.\n\n")
+    "yourself or pad.\n"
+    "Tool output may be truncated: narrow queries with grep/cut/head/sort|uniq -c, state it if any "
+    "result was cut, and never claim completeness you did not verify.\n\n")
 GENERAL_PREAMBLE = (
     "You are a general-purpose local agent. Complete the task below, then end with a short "
-    "plain-text summary of what you did/found. Do not ask clarifying questions.\n\n")
+    "plain-text summary of what you did/found. Do not ask clarifying questions. Tool output may be "
+    "truncated: narrow queries with grep/cut/head, say so if a result was cut, and never claim "
+    "completeness you did not verify.\n\n")
 
 
 def die(msg, code=2):
@@ -161,6 +169,8 @@ def enqueue(args, prompt):
     if not jid:
         die(f"enqueued but could not parse job id:\n{out.strip()}", 1)
     (tf.parent / "JOB").write_text(jid)
+    if getattr(args, "watch", True):
+        spawn_watchdog(jid)
     m = json.loads((tf.parent / "META.json").read_text()); m["job"] = jid
     (tf.parent / "META.json").write_text(json.dumps(m))
     print(jid)
@@ -186,6 +196,42 @@ def enforce_wall(j):
         subprocess.run([ABORT, j["id"], "--yes"])
         return True
     return False
+
+
+WATCH_MAX_S = 6 * 3600   # a watcher never outlives this, even if the job is stuck pending
+
+
+def spawn_watchdog(jid):
+    """Detached (nohup-style: new session, no stdio) watcher so --max-wall holds with nobody polling.
+    Best-effort: a spawn failure must never fail the enqueue."""
+    script = os.environ.get("QAGENT_WATCHER", os.path.abspath(__file__))
+    try:
+        logf = open(QHOME / "watchdog.log", "a")
+        subprocess.Popen([sys.executable, script, "watch", jid], stdin=subprocess.DEVNULL, stdout=logf,
+                         stderr=logf, start_new_session=True, close_fds=True)
+        return True
+    except Exception as e:
+        print(f"qagent: watchdog spawn failed ({e}); wall cap only enforced by status/wait", file=sys.stderr)
+        return False
+
+
+def cmd_watch(a):
+    """Poll until the job is terminal, aborting it when its active time exceeds the wall cap."""
+    t0 = time.time(); missing = 0
+    while time.time() - t0 < (a.max_watch or WATCH_MAX_S):
+        j = find_job(a.id) or done_sidecar(a.id)
+        if j is None:
+            missing += 1
+            if missing > 20:   # never appeared / pruned: nothing left to guard
+                return 1
+        else:
+            missing = 0
+            if j.get("status") in TERMINAL:
+                return 0
+            if enforce_wall(j):
+                return 0
+        time.sleep(a.poll)
+    return 2
 
 
 def cmd_status(a):
@@ -253,6 +299,33 @@ def _log_text(j):
     return Path(lp).read_text(errors="replace") if lp and Path(lp).exists() else ""
 
 
+TRUNC_RE = re.compile(r"\[OUTPUT TRUNCATED[^\]]*\]|\[TRUNCATED at \d+ chars\]|page truncated at \d+ chars|"
+                      r"\[truncated \d+ (?:lines|chars)\]")
+
+
+def truncation_notes(tp, log_text):
+    """Worker-reported tool-result truncations (marker text the worker injects into tool results).
+    Fail-open: any problem reading the transcript just yields what the log shows (or nothing)."""
+    hits = []
+    try:
+        if tp and Path(tp).exists():
+            d = json.loads(Path(tp).read_text())
+            msgs = d.get("messages", d) if isinstance(d, dict) else d
+            for m in msgs:
+                if isinstance(m, dict) and m.get("role") == "tool":
+                    c = m.get("content")
+                    c = c if isinstance(c, str) else json.dumps(c)
+                    hits += [h[:120] for h in TRUNC_RE.findall(c or "")]
+    except Exception:
+        pass
+    try:
+        if not hits:
+            hits = [h[:120] for h in TRUNC_RE.findall(log_text or "")]
+    except Exception:
+        pass
+    return hits
+
+
 def collect_diff(j):
     cwd = j.get("cwd")
     if not cwd or not (Path(cwd) / ".git").exists():
@@ -270,8 +343,14 @@ def cmd_result(a):
     print(f"job {j.get('id')}  status={j.get('status')}  exit={j.get('exit_code')}  model={j.get('model')}")
     if j.get("status") not in TERMINAL:
         print("(job not finished yet -- use `qagent wait`)"); return 2
-    ans, tp, _ = final_answer(j)
+    ans, tp, ltxt = final_answer(j)
     print("\n--- final answer ---\n" + ans + "\n")
+    tn = truncation_notes(tp, ltxt)
+    if tn:
+        print(f"--- WARNING: {len(tn)} tool result(s) were TRUNCATED by the worker; the answer may rest on "
+              f"incomplete data (verify counts/lists) ---")
+        for h in tn[:5]:
+            print("  " + h)
     diff = collect_diff(j)
     if diff:
         ro = (j.get("task_kind") == "research")
@@ -303,7 +382,7 @@ def cmd_followup(a):
     n = NS(); n.readonly = ro; n.model = a.model or j.get("model") or DEFAULT_MODEL
     n.label = f"followup-{a.id[:6]}"; n.max_iters = a.max_iters; n.dry_run = a.dry_run
     n.max_tokens = n.chat_timeout = n.max_wall = None
-    n.repo = None
+    n.repo = None; n.watch = True
     cwd = j.get("cwd")
     if cwd and not ro and (Path(cwd) / ".git").exists():
         n.repo = cwd  # continue from the prior job's tree state
@@ -323,6 +402,7 @@ def main(argv=None):
     r.add_argument("--max-iters", type=int); r.add_argument("--max-tokens", type=int)
     r.add_argument("--chat-timeout", type=int); r.add_argument("--max-wall", type=int)
     r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--no-watch", dest="watch", action="store_false", help="skip the detached wall-cap watchdog")
     r.add_argument("prompt"); r.set_defaults(f=cmd_run)
     s = sp.add_parser("status"); s.add_argument("id"); s.set_defaults(f=cmd_status)
     w = sp.add_parser("wait"); w.add_argument("id"); w.add_argument("--timeout", type=int, default=0)
@@ -331,6 +411,8 @@ def main(argv=None):
     f = sp.add_parser("followup"); f.add_argument("id"); f.add_argument("msg")
     f.add_argument("--model"); f.add_argument("--max-iters", type=int)
     f.add_argument("--dry-run", action="store_true"); f.set_defaults(f=cmd_followup)
+    wd = sp.add_parser("watch"); wd.add_argument("id"); wd.add_argument("--poll", type=float, default=20)
+    wd.add_argument("--max-watch", type=float, default=0); wd.set_defaults(f=cmd_watch)
     ab = sp.add_parser("abort"); ab.add_argument("id"); ab.set_defaults(f=cmd_abort)
     a = p.parse_args(argv)
     return a.f(a)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test-qagent.py -- qagent against a STUB queue (no real model, no real queue).
 Includes a revert-proof: mutating qagent's read-only guard makes the suite fail."""
-import json, os, subprocess, sys, tempfile, unittest
+import json, os, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -23,6 +23,8 @@ class T(unittest.TestCase):
         self.env = dict(os.environ, QAGENT_QUEUE_PY=str(self.d / "stubq.py"), STUB_LOG=str(self.log),
                         QAGENT_STATE=str(self.state), QAGENT_LOGDIR=str(self.logs),
                         QAGENT_HOME=str(self.d / "home"), QAGENT_ABORT=str(self.d / "abort.sh"))
+        (self.d / "watcher.py").write_text("import sys,os\nopen(os.environ['WATCH_LOG'],'a').write(' '.join(sys.argv[1:])+'\\n')\n")
+        self.env.update(QAGENT_WATCHER=str(self.d / "watcher.py"), WATCH_LOG=str(self.d / "watch.log"))
         (self.d / "abort.sh").write_text("#!/bin/sh\necho \"$@\" > %s/abort.out\n" % self.d)
         os.chmod(self.d / "abort.sh", 0o755)
 
@@ -127,6 +129,76 @@ class T(unittest.TestCase):
         self.q("run", "--readonly", "x", bin=mp)
         a = self.argv()
         self.assertNotEqual(a[a.index("--task-kind") + 1], "research")  # mutant is detectable by the real test
+
+    def _wait_for(self, path, secs=5):
+        t = time.time()
+        while time.time() - t < secs:
+            if path.exists():
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_preamble_has_truncation_guidance(self):
+        for flags in (["--readonly"], []):
+            self.q("run", *flags, "x")
+            body = Path(self.argv()[self.argv().index("--task-file") + 1]).read_text()
+            self.assertIn("may be truncated", body)
+            self.assertIn("never claim completeness", body)
+
+    def test_result_surfaces_worker_truncation(self):
+        tr = self.d / "tr.json"
+        tr.write_text(json.dumps({"messages": [
+            {"role": "tool", "content": "[OUTPUT TRUNCATED: the first 9000 chars (~80 lines) of 12000 were omitted; x]\nrows"},
+            {"role": "assistant", "content": "ANS"}]}))
+        lg = self.d / "j.log"; lg.write_text(f"[worker] full transcript written to {tr}\n")
+        self.state.write_text(json.dumps({"jobs": [{"id": "abc123def456", "status": "done", "exit_code": 0,
+                              "task_kind": "research", "log_path": str(lg)}]}))
+        self.assertIn("TRUNCATED by the worker", self.q("result", "abc123").stdout)
+        tr.write_text("not json{{")   # fail-open: unreadable transcript must not crash result
+        r = self.q("result", "abc123"); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("TRUNCATED by the worker", r.stdout)
+
+    def test_run_spawns_detached_watchdog_and_dry_run_does_not(self):
+        self.q("run", "--dry-run", "x")
+        time.sleep(0.5); self.assertFalse((self.d / "watch.log").exists())
+        self.q("run", "--no-watch", "x")
+        time.sleep(0.5); self.assertFalse((self.d / "watch.log").exists())
+        self.q("run", "--readonly", "x")
+        self.assertTrue(self._wait_for(self.d / "watch.log"))
+        self.assertEqual((self.d / "watch.log").read_text().strip(), "watch abc123def456")
+
+    def _watch_setup(self, active):
+        self.q("run", "--readonly", "--max-wall", "60", "--no-watch", "x")
+        self.tf = self.argv()[self.argv().index("--task-file") + 1]
+        self.state.write_text(json.dumps({"jobs": [{"id": "abc123def456", "status": "running",
+                              "active_s": active, "task_file": self.tf}]}))
+
+    def test_watch_aborts_over_cap_without_polling_status(self):
+        self._watch_setup(61)
+        r = subprocess.run([sys.executable, str(QAGENT), "watch", "abc123", "--poll", "0.1"],
+                           capture_output=True, text=True, env=self.env, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("abc123", (self.d / "abort.out").read_text())
+
+    def test_watch_leaves_under_cap_and_exits_when_terminal(self):
+        self._watch_setup(10)
+        p = subprocess.Popen([sys.executable, str(QAGENT), "watch", "abc123", "--poll", "0.1"], env=self.env)
+        time.sleep(0.8); self.assertIsNone(p.poll())   # still guarding
+        self.assertFalse((self.d / "abort.out").exists())
+        self.state.write_text(json.dumps({"jobs": [{"id": "abc123def456", "status": "done"}]}))
+        self.assertEqual(p.wait(timeout=10), 0)
+        self.assertFalse((self.d / "abort.out").exists())
+
+    def test_revert_proof_watchdog_bites(self):
+        """A watcher with enforcement removed must NOT abort an over-cap job (so the real test discriminates)."""
+        self._watch_setup(61)
+        src = QAGENT.read_text()
+        mut = src.replace("            if enforce_wall(j):\n                return 0", "            if False:\n                return 0")
+        self.assertNotEqual(src, mut)
+        mp = self.d / "qagent_mut"; mp.write_text(mut)
+        p = subprocess.Popen([sys.executable, str(mp), "watch", "abc123", "--poll", "0.1", "--max-watch", "1"], env=self.env)
+        self.assertEqual(p.wait(timeout=10), 2)
+        self.assertFalse((self.d / "abort.out").exists())
 
 
 if __name__ == "__main__":
