@@ -97,6 +97,9 @@ bin|~/bin/mount-ollama-models.sh
 bin|~/bin/vault_conf.py
 bin|~/bin/notify-[a-z]*.py
 bin|~/bin/pgrun.py
+bin|~/bin/qagent
+bin|~/bin/queue-abort
+tests|~/bin/test-qagent.py
 bin|~/bin/prep-tokens.py
 bin|~/bin/claude-token-cursor.py
 bin|~/bin/verify-claims

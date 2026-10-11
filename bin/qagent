@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""qagent -- lightweight "Agent tool" front door for the local-LLM queue.
+
+Sends a FREEFORM prompt to ollama-worker.py (via ollama-queue.py -- never a direct
+model call) WITHOUT the ollama-dispatch-auto harness/gate/TASK-scaffold/verify
+authoring.  Output is UNVERIFIED local-model text; the caller must check it.
+
+  qagent run [--repo PATH] [--readonly] [--model M] [--label L] [--max-iters N]
+             [--dry-run] "<prompt>"                     -> prints job id
+  qagent status <id>
+  qagent wait <id> [--timeout S]                        exit 0 done, 1 failed, 2 timeout
+  qagent result <id>                                    summary + diff + banner + log path
+  qagent followup <id> "<msg>" [--dry-run]              new job seeded from the prior one
+  qagent abort <id>                                     via ~/bin/queue-abort
+
+How the worker's mandatory-verify requirement is handled
+  The queue REFUSES a coding job with no --verify unless --allow-no-verify (an
+  explicit "scope-only/advisory" acknowledgement).  We pass exactly that; no fake
+  always-pass verify.  Read-only runs use --task-kind research (no verify needed,
+  no gate, no diff collection).
+Isolation
+  --repo PATH              queue creates a throwaway git worktree from PATH (--repo),
+                           discarded by the pipeline reaper; PATH itself is never edited.
+  no --repo                private scratch dir ~/.qagent/<stamp>/ (non-git).
+  --readonly               the worker has NO edit-disable flag, so read-only is enforced
+                           by (a) task-kind research, (b) a prompt preamble forbidding
+                           edits, (c) throwaway worktree/scratch cwd, and (d) `result`
+                           reports any diff it finds as a READONLY VIOLATION.
+Followup
+  The worker's --resume only works on a paused/failed job's own transcript and the
+  queue exposes no enqueue flag for it, so followup enqueues a NEW job whose prompt
+  carries the original prompt, the prior final answer and the new message.
+Env: QAGENT_QUEUE_PY (queue script), QAGENT_STATE (state json), QAGENT_HOME (scratch root),
+     QAGENT_ABORT (queue-abort path), QAGENT_DRY_ID (dry-run fake id).
+"""
+import argparse, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+HOME = Path.home()
+QUEUE_PY = os.environ.get("QAGENT_QUEUE_PY", str(HOME / "bin" / "ollama-queue.py"))
+STATE = Path(os.environ.get("QAGENT_STATE", str(HOME / "bin" / "ollama-queue-state.json")))
+LOG_DIR = Path(os.environ.get("QAGENT_LOGDIR", str(HOME / "bin" / "ollama-queue-logs")))
+QHOME = Path(os.environ.get("QAGENT_HOME", str(HOME / ".qagent")))
+ABORT = os.environ.get("QAGENT_ABORT", str(HOME / "bin" / "queue-abort"))
+DEFAULT_MODEL = "qwen3.8:27b-q4_K_M"
+TERMINAL = {"done", "failed", "blocked", "cancelled", "canceled"}
+BANNER = ("=" * 72 + "\n  UNVERIFIED local-model output -- produced by a local LLM with no gate,\n"
+          "  no verify, no review. Check every claim/id/number against the source.\n" + "=" * 72)
+
+READONLY_PREAMBLE = (
+    "READ-ONLY TASK. You may read files and run read-only shell commands (cat, ls, grep, "
+    "python3 ... status/list/show style queries). You MUST NOT create, edit, delete or move "
+    "any file, and must not run anything that mutates state. Put your whole answer in your "
+    "final message as plain text.\n\n")
+GENERAL_PREAMBLE = (
+    "You are a general-purpose local agent. Complete the task below, then end with a short "
+    "plain-text summary of what you did/found. Do not ask clarifying questions.\n\n")
+
+
+def die(msg, code=2):
+    print(f"qagent: {msg}", file=sys.stderr); sys.exit(code)
+
+
+def slug(s, n=28):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:n] or "task"
+
+
+def load_jobs():
+    for _ in range(5):
+        try:
+            return json.loads(STATE.read_text()).get("jobs", [])
+        except Exception:
+            time.sleep(0.3)
+    return []
+
+
+def find_job(jid):
+    hits = [j for j in load_jobs() if str(j.get("id", "")).startswith(jid)]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        die(f"ambiguous id prefix {jid}")
+    return None
+
+
+def done_sidecar(jid):
+    p = LOG_DIR / f"{jid}.done.json"
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def job_or_sidecar(jid):
+    j = find_job(jid)
+    if j:
+        return j
+    d = done_sidecar(jid)
+    if d:
+        d.setdefault("id", jid)
+        return d
+    die(f"no such job {jid}", 1)
+
+
+def build_enqueue(args, prompt, qid_hint):
+    """Return (argv, task_file, cwd_note). Pure except for creating scratch + task file."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    workdir = QHOME / f"{stamp}-{qid_hint}"
+    workdir.mkdir(parents=True, exist_ok=True)
+    pre = READONLY_PREAMBLE if args.readonly else GENERAL_PREAMBLE
+    tf = workdir / "TASK.txt"
+    tf.write_text(pre + prompt + "\n")
+    label = f"qagent-{slug(args.label or prompt)}-{stamp[-6:]}"
+    argv = [sys.executable, QUEUE_PY, "enqueue", "--model", args.model, "--host", "auto",
+            "--task-file", str(tf), "--label", label, "--bundle", label, "--no-preflight"]
+    if args.repo:
+        argv += ["--repo", str(Path(args.repo).expanduser().resolve())]
+    else:
+        scratch = workdir / "scratch"; scratch.mkdir(exist_ok=True)
+        argv += ["--cwd", str(scratch), "--allow-unisolated"]
+    if args.readonly:
+        argv += ["--task-kind", "research"]
+    else:
+        argv += ["--task-kind", "coding", "--allow-no-verify"]
+    if args.max_iters:
+        argv += ["--max-iters", str(args.max_iters)]
+    return argv, tf, label
+
+
+def enqueue(args, prompt):
+    argv, tf, label = build_enqueue(args, prompt, "q")
+    if args.dry_run:
+        print(json.dumps({"argv": argv, "task_file": str(tf), "label": label}, indent=1))
+        print(os.environ.get("QAGENT_DRY_ID", "dryrun000000"))
+        return 0
+    r = subprocess.run(argv, capture_output=True, text=True)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        die(f"enqueue failed (exit {r.returncode}):\n{out.strip()}", 1)
+    m = re.search(r"\b([0-9a-f]{12})\b", out)
+    if not m:
+        j = [x for x in load_jobs() if x.get("label") == label]
+        jid = j[0]["id"] if j else None
+    else:
+        jid = m.group(1)
+    if not jid:
+        die(f"enqueued but could not parse job id:\n{out.strip()}", 1)
+    (tf.parent / "JOB").write_text(jid)
+    print(jid)
+    return 0
+
+
+def cmd_run(a):
+    return enqueue(a, a.prompt)
+
+
+def cmd_status(a):
+    j = job_or_sidecar(a.id)
+    print(f"{j.get('id')} status={j.get('status')} host={j.get('host_pref')} lane={j.get('lane')} "
+          f"exit={j.get('exit_code')} model={j.get('model')} label={j.get('label')}")
+    for k in ("failure_reason", "reason", "pause_reason"):
+        if j.get(k):
+            print(f"  {k}: {j[k]}")
+    if j.get("log_path"):
+        print(f"  log: {j['log_path']}")
+    return 0
+
+
+def cmd_wait(a):
+    t0 = time.time()
+    while True:
+        j = job_or_sidecar(a.id)
+        st = j.get("status")
+        if st in TERMINAL:
+            print(f"{a.id} {st} after {int(time.time()-t0)}s")
+            return 0 if st == "done" else 1
+        if a.timeout and time.time() - t0 > a.timeout:
+            print(f"{a.id} still {st} after {a.timeout}s (timeout)")
+            return 2
+        time.sleep(a.poll)
+
+
+def transcript_path(log_text):
+    m = re.search(r"^\[worker\] full transcript written to (.+)$", log_text, re.M)
+    return m.group(1).strip() if m else None
+
+
+def final_answer(j):
+    """Last assistant text from the saved transcript; falls back to the log tail."""
+    lp = j.get("log_path")
+    log_text = ""
+    if lp and Path(lp).exists():
+        log_text = Path(lp).read_text(errors="replace")
+    tp = j.get("resume_transcript") or transcript_path(log_text)
+    if tp and Path(tp).exists():
+        try:
+            d = json.loads(Path(tp).read_text())
+            msgs = d.get("messages", d) if isinstance(d, dict) else d
+            for m in reversed(msgs):
+                if m.get("role") == "assistant" and (m.get("content") or "").strip():
+                    return m["content"].strip(), tp, log_text
+        except Exception:
+            pass
+    return ("(no transcript answer found; log tail follows)\n" + "\n".join(log_text.splitlines()[-40:]),
+            tp, log_text)
+
+
+def collect_diff(j):
+    cwd = j.get("cwd")
+    if not cwd or not (Path(cwd) / ".git").exists():
+        return None
+    r = subprocess.run(["git", "-C", cwd, "status", "--porcelain"], capture_output=True, text=True)
+    if not r.stdout.strip():
+        return ""
+    d = subprocess.run(["git", "-C", cwd, "diff", "HEAD"], capture_output=True, text=True).stdout
+    return r.stdout + "\n" + d
+
+
+def cmd_result(a):
+    j = job_or_sidecar(a.id)
+    print(BANNER)
+    print(f"job {j.get('id')}  status={j.get('status')}  exit={j.get('exit_code')}  model={j.get('model')}")
+    if j.get("status") not in TERMINAL:
+        print("(job not finished yet -- use `qagent wait`)"); return 2
+    ans, tp, _ = final_answer(j)
+    print("\n--- final answer ---\n" + ans + "\n")
+    diff = collect_diff(j)
+    if diff:
+        ro = (j.get("task_kind") == "research")
+        print("--- diff / changed files" + (" (READONLY VIOLATION: read-only job changed files!)" if ro else "") + " ---")
+        print(diff)
+    elif diff == "":
+        print("--- diff: none (working tree clean) ---")
+    print(f"worker log: {j.get('log_path')}")
+    if tp:
+        print(f"transcript: {tp}")
+    print(BANNER)
+    return 0 if j.get("status") == "done" else 1
+
+
+def cmd_followup(a):
+    j = job_or_sidecar(a.id)
+    tf = j.get("task_file")
+    orig = Path(tf).read_text() if tf and Path(tf).exists() else "(original prompt unavailable)"
+    orig = orig.replace(READONLY_PREAMBLE, "").replace(GENERAL_PREAMBLE, "")
+    ans, _, _ = final_answer(j)
+    ro = j.get("task_kind") == "research"
+    prompt = (f"FOLLOW-UP to an earlier task.\n\n[Original task]\n{orig}\n[Your previous final answer "
+              f"(unverified -- re-check against the source if the follow-up questions it)]\n{ans}\n\n"
+              f"[Follow-up request]\n{a.msg}\n")
+    class NS: pass
+    n = NS(); n.readonly = ro; n.model = a.model or j.get("model") or DEFAULT_MODEL
+    n.label = f"followup-{a.id[:6]}"; n.max_iters = a.max_iters; n.dry_run = a.dry_run
+    n.repo = None
+    cwd = j.get("cwd")
+    if cwd and not ro and (Path(cwd) / ".git").exists():
+        n.repo = cwd  # continue from the prior job's tree state
+    return enqueue(n, prompt)
+
+
+def cmd_abort(a):
+    r = subprocess.run([ABORT, a.id, "--yes"])
+    return r.returncode
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="qagent", description=__doc__.split("\n")[1])
+    sp = p.add_subparsers(dest="cmd", required=True)
+    r = sp.add_parser("run"); r.add_argument("--repo"); r.add_argument("--readonly", action="store_true")
+    r.add_argument("--model", default=DEFAULT_MODEL); r.add_argument("--label")
+    r.add_argument("--max-iters", type=int); r.add_argument("--dry-run", action="store_true")
+    r.add_argument("prompt"); r.set_defaults(f=cmd_run)
+    s = sp.add_parser("status"); s.add_argument("id"); s.set_defaults(f=cmd_status)
+    w = sp.add_parser("wait"); w.add_argument("id"); w.add_argument("--timeout", type=int, default=0)
+    w.add_argument("--poll", type=float, default=15); w.set_defaults(f=cmd_wait)
+    x = sp.add_parser("result"); x.add_argument("id"); x.set_defaults(f=cmd_result)
+    f = sp.add_parser("followup"); f.add_argument("id"); f.add_argument("msg")
+    f.add_argument("--model"); f.add_argument("--max-iters", type=int)
+    f.add_argument("--dry-run", action="store_true"); f.set_defaults(f=cmd_followup)
+    ab = sp.add_parser("abort"); ab.add_argument("id"); ab.set_defaults(f=cmd_abort)
+    a = p.parse_args(argv)
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

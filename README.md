@@ -42,6 +42,19 @@ Supporting: `harness_lint.py` (pre-run spec validator, docs/harness-lint.md), `p
 `diagnosis-*` (root-cause harness), `goose-queue-proxy.py` (Goose through the queue), bake-off tools, `unraid-*.sh`.
 `hooks/` enforce "troubleshoot/author through the queue (qwen), not by hand".
 
+### qagent -- freeform "Agent tool" front door (no harness/gate)
+`bin/qagent` sends a freeform prompt to the local worker through the queue, skipping `ollama-dispatch-auto`'s
+scaffold/draft/verify/gate. Output is **UNVERIFIED** local-model text (every `result` carries a banner).
+```
+qagent run [--repo PATH] [--readonly] [--model M] [--label L] [--max-iters N] [--dry-run] "<prompt>"   # prints job id
+qagent status <id> | wait <id> [--timeout S] | result <id> | followup <id> "<msg>" | abort <id>
+```
+- No verify: coding runs pass the queue's `--allow-no-verify` (advisory/scope-only); `--readonly` uses `--task-kind research`.
+- Isolation: `--repo` => queue's throwaway worktree; otherwise a scratch dir under `~/.qagent/`. The worker has no
+  edit-disable flag, so read-only = research kind + prompt preamble + throwaway cwd + `result` flags any diff as a violation.
+- `followup` enqueues a NEW job seeded with the prior prompt + answer (the queue has no enqueue-with-resume flag).
+- Tests: `tests/test-qagent.py` (stub queue, includes a revert-proof). Source of truth stays live `~/bin/qagent`; `SYNC.sh` mirrors it here.
+
 ## Where it runs from
 - Pipeline scripts: `~/bin/<name>` (real files), including `ollama-queue.py`, `ollama-worker.py`, `ollama-dispatch-*`, `gate-on-complete.py`, `handoff-emit.py`.
 - Dashboard: `~/bin/ollama-queue-api.py`, `bundle_view.py`, `dashboard_chat.py`, `runstatus_retention.py` and several `test-*.py` are **symlinks** into `~/Desktop/GitHub Projects/ollama-queue-dashboard/src|tests`; here they appear under `dashboard/`.
