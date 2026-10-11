@@ -1780,7 +1780,8 @@ FRONTEND_HTML = r"""<!doctype html>
   <div class="panel-head"><h2>Queue</h2><span class="count" id="activeCount"></span>
     <span class="tools"><details class="legend"><summary>Exit codes</summary><div class="legend-body exit-legend">
       0 - Converged<br>1 - Verify Failed<br>2 - Iteration Cap<br>3 - Paused, Resumable<br>4 - Refused to Start<br>5 - Done, Unconverged</div></details></span></div>
-  <div class="list"><table class="q" id="jobs"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
+  <div class="list"><table class="q" id="cpuQueue" hidden><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
+  <table class="q" id="jobs"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
   <div class="empty" id="activeEmpty" hidden>The queue is empty.</div></div>
 </section>
 
@@ -2327,7 +2328,10 @@ function renderWaitBanner(w, jobs) {
 // pending count). NEVER daemon-log text (the log's HELD/focus lines can be stale).
 function idleWaitText(w, jobs, activeKey) {
   const pend = (jobs || []).filter(j => j.status === 'pending' || j.status === 'held');
-  if (!pend.length) return 'Queue empty';
+  if (!pend.length) {
+    const cn = typeof cpuQueueCounts === 'function' ? cpuQueueCounts(window.cpuLaneData) : {total: 0};
+    return cn.total ? 'GPU queue empty - CPU lane busy (' + cn.running + ' running' + (cn.pending ? ', ' + cn.pending + ' pending' : '') + ')' : 'Queue empty';
+  }
   if (w && w.source === 'state') {
     const out = [];
     for (const ln of Object.values(w.lanes || {})) {
@@ -2390,6 +2394,74 @@ function laneNowHtml(rows) {
   }).join('') + '</div>';
 }
 
+// CPU-LANE STAGES AS FIRST-CLASS QUEUE ROWS (Penn 2026-10-10: "CPU stages should be in the queue ...
+// running like others"). DISPLAY ONLY, from the same /api/cpu-lane payload the CPU lane panel uses:
+// d.running (Unraid runner), d.pending (waiting for a runner), d.local_running (stage running LOCALLY
+// on the Mac with its fallback reason, e.g. audit-determinism / audit-trivial). A GPU-idle but
+// CPU-busy queue therefore lists rows and never reads "The queue is empty."
+function cpuQueueRows(d) {
+  d = d || {};
+  const rows = [];
+  for (const c of (d.running || [])) rows.push({kind: 'running', status: 'running', stage: c.stage || 'cpu',
+    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', where: c.runner || 'runner', secs: c.running_s,
+    reason: '', id: c.id || ''});
+  for (const c of (d.local_running || [])) rows.push({kind: 'local_running', status: 'running', stage: c.stage || 'cpu',
+    label: c.stage || 'cpu stage', bundle: c.bundle || '', where: 'local (Mac)', secs: c.running_s,
+    reason: c.reason || 'fallback', id: ''});
+  for (const c of (d.pending || [])) rows.push({kind: 'pending', status: 'pending', stage: c.stage || 'cpu',
+    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', where: 'waiting for a runner', secs: c.waiting_s,
+    reason: '', id: c.id || ''});
+  return rows;
+}
+function cpuQueueRowHtml(r) {
+  const secs = r.secs == null ? '?' : Math.round(r.secs) + 's';
+  const bundle = r.bundle ? ` <a href="#" class="cpu-bundle" data-bundle="${escapeHtml(r.bundle)}" title="Jump to the owning bundle in the queue">bundle ${escapeHtml(r.bundle)}</a>` : '';
+  const why = r.reason ? ` <span class="cpu-reason">RUNNING LOCALLY - local: ${escapeHtml(r.reason)}</span>` : '';
+  return `<td>CPU</td><td><b>${escapeHtml(r.stage)}</b> ${escapeHtml(r.label)}${bundle}`
+    + ` <span class="cpu-where">on ${escapeHtml(r.where)}</span>${why}</td>`
+    + `<td class="st"><span class="chip ${r.status}">${r.status}</span></td><td></td>`
+    + `<td>${r.kind === 'pending' ? 'waiting ' : 'running '}${secs}</td>`;
+}
+function cpuQueueCounts(d) {
+  const rows = cpuQueueRows(d);
+  return {running: rows.filter(r => r.status === 'running').length, pending: rows.filter(r => r.status === 'pending').length,
+          total: rows.length};
+}
+// Draw the rows and refresh everything that says whether the queue is "empty": the Queue panel count
+// and empty line. Called by the CPU-lane poll and by renderSummary (whichever runs last wins, both agree).
+function renderCpuQueue(q) {
+  if (q) window.lastQueueQ = q;
+  q = window.lastQueueQ || {bundles: 0, jobs: 0};
+  const d = window.cpuLaneData || {};
+  const rows = cpuQueueRows(d);
+  const tbl = document.getElementById('cpuQueue');
+  if (tbl) {
+    const tb = tbl.querySelector('tbody');
+    tb.innerHTML = '';
+    rows.forEach(r => {
+      const tr = document.createElement('tr');
+      tr.className = 'cpu-queue-row' + (r.kind === 'local_running' ? ' local' : '');
+      tr.dataset.kind = r.kind; tr.dataset.stage = r.stage; tr.dataset.bundle = r.bundle;
+      tr.innerHTML = cpuQueueRowHtml(r);
+      tb.appendChild(tr);
+    });
+    tb.querySelectorAll('a.cpu-bundle').forEach(a => a.addEventListener('click', e => {
+      e.preventDefault();
+      const k = a.dataset.bundle;
+      const hit = [...document.querySelectorAll('#jobs tbody tr')].find(t => t.textContent.includes(k));
+      if (hit) { hit.scrollIntoView({block: 'center'}); hit.classList.add('flash'); setTimeout(() => hit.classList.remove('flash'), 1500); }
+    }));
+    tbl.hidden = !rows.length;
+  }
+  const n = cpuQueueCounts(d);
+  const ac = document.getElementById('activeCount');
+  if (ac) ac.textContent = `${q.bundles} bundle${q.bundles === 1 ? '' : 's'} · ${q.jobs} job${q.jobs === 1 ? '' : 's'}`
+    + (n.total ? ` · ${n.total} CPU stage${n.total === 1 ? '' : 's'} (${n.running} running${n.pending ? ', ' + n.pending + ' pending' : ''})` : '');
+  const ae = document.getElementById('activeEmpty');
+  if (ae) ae.hidden = !!(q.bundles || q.jobs || n.total);
+  return n;
+}
+
 function renderSummary(jobs, acts, attnStats, q) {
   const gpu = (acts || []).filter(a => a.kind === 'gpu');
   const other = (acts || []).filter(a => a.kind !== 'gpu');
@@ -2421,7 +2493,7 @@ function renderSummary(jobs, acts, attnStats, q) {
     now.title = 'Open the live log';
   } else {
     now.innerHTML = `<div class="k"><span class="idle-dot"></span>Running now</div>
-      <div class="now-job" style="color:var(--muted);font-weight:500">Nothing on the GPU</div>
+      <div class="now-job" style="color:var(--muted);font-weight:500">Nothing on the GPU${cpuQueueCounts(window.cpuLaneData).running ? ' - CPU lane active (' + cpuQueueCounts(window.cpuLaneData).running + ' running)' : ''}</div>
       <div class="now-more" id="idleWait">${escapeHtml(idleWaitText(queueWait, jobs, bundleViews.active))}</div>
       ${other.length ? `<div class="now-more">Off-GPU, live now: ${other.map(fmtAct).join(' &middot; ')}</div>` : ''}
       ${laneNowHtml(laneNowRows(jobs, acts, window.cpuLaneRunning))}`;
@@ -2429,9 +2501,10 @@ function renderSummary(jobs, acts, attnStats, q) {
   }
   const cnt = st => jobs.filter(j => j.status === st).length;
   const pend = cnt('pending'), paused = cnt('paused'), planned = cnt('planned');
+  const cpuN = cpuQueueCounts(window.cpuLaneData);
   document.getElementById('sumQueue').innerHTML = `<div class="k">Queue</div>
-    <div class="v">${pend + paused + planned}</div>
-    <div class="s">${pend} pending${paused ? ' &middot; ' + paused + ' paused' : ''} &middot; ${planned} planned</div>`;
+    <div class="v">${pend + paused + planned + cpuN.pending}</div>
+    <div class="s">${pend} pending${paused ? ' &middot; ' + paused + ' paused' : ''} &middot; ${planned} planned${cpuN.total ? ' &middot; CPU lane: ' + cpuN.running + ' running' + (cpuN.pending ? ', ' + cpuN.pending + ' pending' : '') : ''}</div>`;
   const nA = attnStats.failed + attnStats.parked + attnStats.blocked + (attnStats.stalled || 0);
   const nList = nA - (attnStats.stalled || 0);
   const brk = ['failed', 'parked', 'blocked', 'stalled'].filter(k => attnStats[k]).map(k => attnStats[k] + ' ' + k).join(' &middot; ');
@@ -2445,9 +2518,7 @@ function renderSummary(jobs, acts, attnStats, q) {
   document.querySelector('#attnEmpty .empty').textContent = attnStats.stalled
     ? attnStats.stalled + ' stalled/failed bundle' + (attnStats.stalled === 1 ? '' : 's') + ' (nothing live, not finished): see "Stalled / failed bundles" below.'
     : 'Nothing is stuck. Failed, parked and blocked work shows up here.';
-  document.getElementById('activeCount').textContent =
-    `${q.bundles} bundle${q.bundles === 1 ? '' : 's'} · ${q.jobs} job${q.jobs === 1 ? '' : 's'}`;
-  document.getElementById('activeEmpty').hidden = !!(q.bundles || q.jobs);
+  renderCpuQueue(q);
   document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString() + ' · refreshes every 4s';
 }
 // Menus: one open at a time; a click elsewhere, Escape, or picking an item closes it.
@@ -4124,7 +4195,8 @@ async function refreshCpuLane() {
   try {
     const d = await (await fetch('/api/cpu-lane')).json();
     const panel = document.getElementById('cpuLanePanel');
-    if (!d.enabled) { panel.hidden = true; window.cpuLaneRunning = []; return; }
+    if (!d.enabled) { panel.hidden = true; window.cpuLaneRunning = []; window.cpuLaneData = {}; renderCpuQueue(); return; }
+    window.cpuLaneData = d;
     panel.hidden = false;
     const c = d.counts || {};
     const rn = (d.runners || []).filter(r => r.seen_s_ago < 120).length;
@@ -4144,6 +4216,7 @@ async function refreshCpuLane() {
     (d.pending || []).forEach(j => add('pending', j, 'waiting ' + Math.round(j.waiting_s) + 's'));
     (d.recent || []).forEach(j => add(j.status + (j.exit_code ? ' (exit ' + j.exit_code + ')' : ''), j,
       (j.duration_s == null ? '' : j.duration_s + 's') + (j.queue_wait_s == null ? '' : ' / wait ' + j.queue_wait_s + 's')));
+    renderCpuQueue();
   } catch (e) { /* lane is optional */ }
 }
 
