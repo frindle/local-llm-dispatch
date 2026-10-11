@@ -6939,8 +6939,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._text("cpu lane unavailable: %s" % type(e).__name__, 503)
         return cpu_lane.handle(self, method)
 
+    def _invalidate_for_write(self):
+        """Drop the response cache on a state-changing request -- EXCEPT the Unraid runner's
+        /api/cpu/* claim / heartbeat / result calls. Those arrive every few seconds around the
+        clock and change nothing the cached payloads contain (the lane panel reads the uncached
+        /api/cpu-lane); invalidating on each one kept every heavy endpoint permanently cold,
+        which is what turned the ~6s payload builds into the 2026-10-10 thread pile-up."""
+        if not self.path.startswith("/api/cpu/"):
+            _invalidate_response_cache()
+
     def do_PUT(self):
-        _invalidate_response_cache()
+        self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("PUT")
         self._text("not found", 404)
@@ -7103,7 +7112,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         # Any state change must be visible on the very next poll.
-        _invalidate_response_cache()
+        self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("POST")
         if self.path.startswith("/api/chat/"):
@@ -7141,7 +7150,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._text("not found", 404)
 
     def do_DELETE(self):
-        _invalidate_response_cache()
+        self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("DELETE")
         if self.path.startswith("/api/jobs/"):
@@ -7472,6 +7481,23 @@ class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     # socketserver's default listen backlog is 5: a burst of dashboard tabs/polls overflowed it and
     # clients saw ECONNRESET / SYN retries (1s+ stalls) before a request ever reached a handler.
     request_queue_size = 128
+
+
+_PRIME_PATHS = ("/api/bundle-views", "/api/jobs", "/api/runs", "/api/runs/tree", "/api/jobs/completed",
+                "/api/runs/retention", "/api/hosts", "/api/web-search-usage", "/api/triage")
+
+
+def _prime_caches(port, paths=_PRIME_PATHS):
+    """Warm the heavy endpoints ONE AT A TIME right after start. Left to the first dashboard
+    polls, ~8 cold multi-second builds run concurrently on one GIL (a restart under load took
+    40s+ to answer /api/jobs and every waiter held a request slot); serial priming finishes each
+    build at its single-thread speed and later polls are cache hits. Never raises."""
+    import urllib.request
+    for p in paths:
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}{p}", timeout=120).read()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[queue-api] cache prime {p} failed: {e!r}\n")
 
 
 def _self_test():
@@ -10021,6 +10047,7 @@ if __name__ == "__main__":
     except Exception as _e:  # noqa: BLE001
         print(f"[queue-api] cpu lane disabled: {_e!r}", flush=True)
     srv = ThreadingServer((BIND_ADDR, PORT), Handler)
+    threading.Thread(target=_prime_caches, args=(PORT,), name="prime-caches", daemon=True).start()
     # flush=True: under launchd stdout is a file, so it is block-buffered and
     # this one-line banner would otherwise sit in the buffer forever (the
     # per-request lines go via stderr, which is unbuffered).

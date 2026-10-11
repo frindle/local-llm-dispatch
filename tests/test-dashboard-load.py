@@ -8,7 +8,9 @@ Handler (ThreadingServer on an ephemeral port, slow stand-ins for the expensive 
   C. stale-while-revalidate: an expired entry is served at once while ONE background refresh runs;
   D. the concurrency cap exists: over the cap -> fast 503 + Retry-After (never a pile-up), slots are
      returned, and /api/cpu/* (the Unraid runner) keeps its OWN headroom while the dashboard pool is full;
-  E. _livelog_path never globs the ~14k-file log dirs per request (indexed; sees new/removed files).
+  E. _livelog_path never globs the ~14k-file log dirs per request (indexed; sees new/removed files);
+  F. the Unraid runner's constant /api/cpu/* POSTs do not wipe the response cache (they did: every heavy
+     endpoint stayed permanently cold); G. startup priming warms the heavy endpoints one at a time.
 Sandboxed: temp HOME with a copy of the pipeline bin; nothing live is read or written.
 Run: python3 test-dashboard-load.py [--src PATH/ollama-queue-api.py] [--bin PIPELINE_BIN]"""
 import argparse
@@ -209,6 +211,37 @@ if has_cap:
     ok("every slot is returned after the burst (%d/4 free)" % free, free == 4)
     api._API_SLOTS = threading.BoundedSemaphore(500)
     api.q._load_job_result = _real_gate
+
+print("F. the runner's /api/cpu/* writes do NOT wipe the response cache; any other write does")
+
+
+def post(path):
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=30)
+    c.request("POST", path, body=b"{}", headers={"Content-Type": "application/json"})
+    r = c.getresponse()
+    r.read()
+    c.close()
+    return r.status
+
+
+reset()
+get("/api/runs")
+ok("cache is warm before the writes", "runs" in api._RESP_CACHE)
+for _ in range(5):
+    post("/api/cpu/claim")
+ok("5 runner POST /api/cpu/claim leave the cache intact", "runs" in api._RESP_CACHE)
+post("/api/not-a-real-route")
+ok("any other POST drops the cache (an action is visible on the next poll)", "runs" not in api._RESP_CACHE)
+
+print("G. startup priming warms the heavy endpoints serially")
+reset()
+api._prime_caches(PORT, paths=[p for p, _ in HEAVY if p != "/api/bundle-history"])
+ok("after _prime_caches every heavy builder has run (once; /api/runs + /api/runs/tree share one)",
+   all(1 <= CALLS.get(a, 0) <= 2 for p, a in HEAVY if p != "/api/bundle-history"), str(CALLS))
+ok("the server entrypoint starts the priming thread", "target=_prime_caches" in src[src.index('if __name__ == "__main__":'):])
+t0 = time.monotonic()
+get("/api/jobs")
+ok("first dashboard poll after priming is a cache hit", time.monotonic() - t0 < 0.2)
 
 print("E. _livelog_path: no per-request directory glob over the log dirs")
 ld, ll = Path(HOME) / "logs", Path(HOME) / "live"
