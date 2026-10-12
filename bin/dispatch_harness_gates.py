@@ -590,6 +590,13 @@ def literal_near_miss(lit: str, body: str):
             if not all(ch in it for ch in lit):
                 if not (len(used) < len(lit)):
                     continue
+                # 2026-10-10 (aw-codec-floor s2): when the existing text is SHORTER than the
+                # literal and is an ordered subsequence of it (`candidates` within `candidate_names`),
+                # the literal merely EXTENDS a word that already exists -- that is exactly the
+                # shape of a legitimate new identifier, not a misspelling of an existing line.
+                it2 = iter(lit)
+                if all(ch in it2 for ch in used):
+                    continue
             cand = (ratio, i, line.strip(), used)
             if best is None or cand[0] > best[0]:
                 best = cand
@@ -623,6 +630,277 @@ def literal_near_miss_findings(wt, task_text: str, target, refimpl_text: str = "
             f"way) or drop it; no refimpl that edits the real code can add the "
             f"misspelled form. Line {ln}: {line[:140]}"))
     return out
+
+
+# UNNATURAL-LITERAL LINT (2026-10-11, rt-amazon / jobs 521e3b134333 b5fcdc7582dd): a Must-contain
+# literal `/extractTrackingPageInBrowser/` (regex-literal shape around a plain identifier) was only
+# satisfiable by a contrived log string in the refimpl; the model burned its whole output cap on it
+# (prose_loop, zero edits). Two PURE gates, both admission-blocking SPEC_DEFECTs:
+#   (a) literal_shape_findings   -- slash-wrapped plain code identifier (slashes mean nothing in code)
+#   (b) literal_context_findings -- a plain-identifier literal whose ONLY occurrences (refimpl-applied
+#       tree) sit inside a comment or a string on a log/throw line, never in real code.
+# Both are deliberately narrow: explicit strings (URLs, error messages, aria-labels, CSS selectors)
+# are not plain identifiers and are never inspected.
+UNNATURAL_LITERAL = "UNNATURAL_LITERAL"
+_SLASH_IDENT_RE = re.compile(r"^/([A-Za-z_$][A-Za-z0-9_$]{5,})/$")
+_PLAIN_IDENT_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$")
+_LOGISH_RE = re.compile(r"console\.|\blog\w*\s*\(|\blogger\b|\bprint\s*\(|\bthrow\s+new\b|\bnew\s+\w*Error\s*\(|"
+                        r"\.(?:warn|error|info|debug|trace)\s*\(|\bwarn\w*\s*\(", re.I)
+
+
+def _codeish_ident(s: str) -> bool:
+    """camelCase / PascalCase / snake_case identifier: reads as code, not as a URL path segment."""
+    return bool(re.search(r"[a-z][A-Z]", s) or re.search(r"[A-Za-z0-9]_[A-Za-z0-9]", s))
+
+
+def unnatural_literal_shape(lit: str):
+    """PURE. (a) message when `lit` is a slash-wrapped plain code identifier, else None.
+    `/api/`, `/orders/` (URL path segments, lowercase) and `/\\d+/` (real regexes) pass."""
+    m = _SLASH_IDENT_RE.match(lit or "")
+    if not m or not _codeish_ident(m.group(1)):
+        return None
+    ident = m.group(1)
+    return (f"`{lit}` has the shape of a regex literal around the plain identifier `{ident}`, but the "
+            f"slashes mean nothing in code: only a contrived string/comment can ever contain them, and "
+            f"the model will burn its output cap trying. Drop the slashes and require the identifier "
+            f"`{ident}` (or drop the literal)")
+
+
+def literal_shape_findings(task_text: str):
+    """[finding] -- (a) for every REAL `## Must contain` literal."""
+    out = []
+    for f, lit in must_contain_literals(task_text):
+        msg = unnatural_literal_shape(lit)
+        if msg:
+            out.append(_finding(UNNATURAL_LITERAL, "Must-contain literal is unnatural (slash-wrapped identifier)",
+                                f or "TASK.md", msg))
+    return out
+
+
+def _occurrence_kinds(line: str, lit: str):
+    """['code'|'string'|'comment', ...] one per occurrence of `lit` on a single line (per-line
+    scanner; a multi-line template body starts in 'code' state, the SAFE direction)."""
+    if _COMMENT_LINE_RE.match(line):
+        return ["comment"] * line.count(lit)
+    kinds, q, i, n = [], None, 0, len(line)
+    while i < n:
+        if line.startswith(lit, i):
+            kinds.append("string" if q else "code")
+            i += max(1, len(lit))
+            continue
+        c = line[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = None
+        else:
+            if c in "'\"`":
+                q = c
+            elif line.startswith("//", i) or (c == "#" and not lit.startswith("#")):
+                kinds += ["comment"] * line.count(lit, i)
+                break
+        i += 1
+    return kinds
+
+
+def unnatural_literal_context(lit: str, text: str):
+    """PURE. True when `lit` (optionally slash-wrapped) is a plain identifier whose every occurrence
+    in `text` is a comment, or a string on a log/throw line -- i.e. never real code."""
+    core = lit[1:-1] if len(lit) > 2 and lit[0] == lit[-1] == "/" else lit
+    if not _PLAIN_IDENT_RE.match(core) or len(core) < 6 or not text:
+        return False
+    seen = False
+    for line in text.splitlines():
+        if lit not in line:
+            continue
+        for k in _occurrence_kinds(line, lit):
+            seen = True
+            if k == "code":
+                return False
+            if k == "string" and not _LOGISH_RE.search(line):
+                return False
+    return seen
+
+
+def literal_context_findings(pairs, texts_by_file, default_text: str = ""):
+    """[finding] -- (b) literals present in the refimpl-applied tree ONLY as comment / log-message text."""
+    bad = []
+    for f, lit in pairs or []:
+        body = texts_by_file.get(f, "") if f else default_text
+        if unnatural_literal_context(lit, body or ""):
+            bad.append(lit)
+    if not bad:
+        return []
+    names = ", ".join(repr(l) for l in bad[:6])
+    return [_finding(
+        UNNATURAL_LITERAL, "Must-contain literal is satisfiable only by a comment/log string", "TASK.md",
+        f"{len(bad)} literal(s) occur in the refimpl-applied tree only inside a comment or a log/throw "
+        f"message, never in real code: {names}. A model must invent a contrived string to satisfy it. "
+        f"Drop the literal, or require the real identifier / syntax (not its slash-wrapped or quoted form)")]
+
+
+# SPEC/TEST PARITY LINT (2026-10-11, rt-amazon: three prose_loop runs, zero edits). The repaired test asserted EXACT
+# evaluation counts and virtual-clock values (`detailEvals(), 1 + POLL_ATTEMPTS`, `clock.now, POLL_ATTEMPTS * POLL_MS`)
+# that TASK.md never stated, so the model burned its output cap re-deriving them. A SPEC_DEFECT, admission-blocking:
+# TASK.md must carry an "Exact behaviour contract" section that mentions every distinct non-trivial quantity the
+# fixture asserts exactly. Deliberately conservative: only counter/time/length-shaped ACTUAL values compared to a
+# NUMBER or a NAMED NUMERIC CONSTANT expression, and only when at least one is a named constant or a clock/elapsed value (bare `.length, 2` data asserts never fire); 0/1/true/false, string/data asserts, <=/>= bounds and ad-hoc
+# expectations are ignored; fewer than SPEC_PARITY_MIN_QUANTITIES distinct quantities never fires.
+SPEC_TEST_PARITY = "SPEC_TEST_PARITY"
+SPEC_PARITY_MIN_QUANTITIES = 2
+_PARITY_HEADING_RE = re.compile(r"exact (?:behaviou?r )?contract|expected counts|precise behaviou?r", re.I)
+_PARITY_FIXTURES = ("verify.test.ts", "verify.test.mts", "verify.test.js", "verify.test.mjs", "verify.py", "test_fixture.py")
+_PARITY_FN_RE = re.compile(r"(?<![\w$])(?:assert\.|t\.)?(strictEqual|deepStrictEqual|equal|deepEqual|assertEqual|assertEquals)\s*\(")
+_PARITY_EXPECT_RE = re.compile(r"(?<![\w$])expect\s*\(")
+_PARITY_COUNTERISH_RE = re.compile(
+    r"length|count|calls?\b|evals?\b|evaluat|attempt|retr|elapsed|clock|\bnow\b|time|\bms\b|size|tries|hits|invocation|sleeps?\b|polls?\b|Evals", re.I)
+_PARITY_TIMEISH_RE = re.compile(r"clock|\bnow\b|elapsed|\bms\b|Ms\b", re.I)
+_PARITY_QEXPR_RE = re.compile(r"^[\s\d_.()+\-*/%A-Z]+$")
+_PARITY_CONST_RE = re.compile(r"^\s*(?:export\s+)?(?:const|let|var)?\s*([A-Z][A-Z0-9_]{2,})\s*(?::\s*[\w<>\[\]]+)?=\s*([^;\n]+?)\s*;?\s*(?://.*|#.*)?$", re.M)
+
+
+def _split_args(src, open_idx):
+    """PURE. Top-level comma-separated args of the call whose '(' is at open_idx, plus the index just past ')'."""
+    depth, args, cur, i, q = 0, [], [], open_idx, None
+    while i < len(src):
+        c = src[i]
+        if q:
+            cur.append(c)
+            if c == "\\":
+                cur.append(src[i + 1:i + 2]); i += 1
+            elif c == q:
+                q = None
+        elif c in "'\"`":
+            q = c; cur.append(c)
+        elif c in "([{":
+            depth += 1
+            if depth > 1:
+                cur.append(c)
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(cur).strip())
+                return args, i + 1
+            cur.append(c)
+        elif c == "," and depth == 1:
+            args.append("".join(cur).strip()); cur = []
+        else:
+            cur.append(c)
+        i += 1
+    return None, len(src)
+
+
+def _numeric_consts(text):
+    """PURE. {NAME: rhs} for UPPER_CASE constants whose right side is a numeric expression of numbers / other such names."""
+    raw = {m.group(1): m.group(2).strip() for m in _PARITY_CONST_RE.finditer(text)}
+    ok = {}
+    for _ in range(4):
+        for n, rhs in raw.items():
+            if n in ok or not _PARITY_QEXPR_RE.match(rhs) or not re.search(r"\d", rhs):
+                continue
+            if all(t in ok for t in re.findall(r"[A-Z][A-Z0-9_]+", rhs)):
+                ok[n] = rhs
+    return ok
+
+
+def _quantity_expr(expr, consts):
+    """PURE. set of quantity keys ('16', 'POLL_ATTEMPTS', ...) when `expr` is a pure numeric expression of
+    non-trivial numbers / known numeric constants; None when it is anything else; empty set when trivial (0/1)."""
+    e = (expr or "").strip()
+    if not e or not _PARITY_QEXPR_RE.match(e) or not re.search(r"[\dA-Z]", e):
+        return None
+    names = re.findall(r"[A-Z][A-Z0-9_]{2,}", e)
+    if any(n not in consts for n in names):
+        return None
+    if re.search(r"[A-Z]", re.sub(r"[A-Z][A-Z0-9_]{2,}", "", e)):
+        return None
+    keys = set(names)
+    for n in re.findall(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", re.sub(r"[A-Z][A-Z0-9_]{2,}", " ", e)):
+        if n not in ("0", "1"):
+            keys.add(n)
+    return keys
+
+
+def parity_quantities(fixture_text):
+    """PURE. {quantity: [example assertion text]} for the exact counter/time/length assertions of a fixture."""
+    consts = _numeric_consts(fixture_text)
+    found, strong = {}, set()
+    pairs = []
+    for m in _PARITY_FN_RE.finditer(fixture_text):
+        args, _end = _split_args(fixture_text, m.end() - 1)
+        if args and len(args) >= 2:
+            pairs.append((args[0], args[1]))
+    for m in _PARITY_EXPECT_RE.finditer(fixture_text):
+        args, end = _split_args(fixture_text, m.end() - 1)
+        mm = re.match(r"\s*\.\s*(?:not\s*\.\s*)?(toBe|toEqual|toStrictEqual|toHaveLength)\s*\(", fixture_text[end:])
+        if args and mm:
+            a2, _e2 = _split_args(fixture_text, end + mm.end() - 1)
+            if a2:
+                pairs.append((args[0] if mm.group(1) != "toHaveLength" else args[0] + ".length", a2[0]))
+    for m in re.finditer(r"^\s*assert\s+(.+?)\s*==\s*(.+?)\s*(?:,.*)?$", fixture_text, re.M):
+        pairs.append((m.group(1), m.group(2)))
+    for a, b in pairs:
+        for act, exp in ((a, b), (b, a)):
+            if _quantity_expr(act, consts) is not None or not _PARITY_COUNTERISH_RE.search(act):
+                continue
+            keys = _quantity_expr(exp, consts)
+            if keys:
+                if any(k in consts for k in keys) or _PARITY_TIMEISH_RE.search(act):
+                    strong.add(True)
+                for k in keys:
+                    found.setdefault(k, f"{act.strip()[:60]}, {exp.strip()[:60]}")
+                break
+    return (found if strong else {}), consts   # plain data-length asserts alone (`result.length, 2`) are example-spec'd: never enough
+
+
+def _contract_sections(task_text):
+    """PURE. Concatenated body text of every heading matching the contract regex (to the next heading of the same or higher level)."""
+    lines, out, i = (task_text or "").splitlines(), [], 0
+    heads = [(n, len(m.group(1)), m.group(2)) for n, l in enumerate(lines) if (m := re.match(r"^(#{1,6})\s+(.*)$", l))]
+    for k, (n, lvl, title) in enumerate(heads):
+        if not _PARITY_HEADING_RE.search(title):
+            continue
+        end = next((n2 for n2, l2, _t in heads[k + 1:] if l2 <= lvl), len(lines))
+        out.append("\n".join(lines[n:end]))
+    return "\n".join(out)
+
+
+def _quantity_mentioned(q, consts, section):
+    if re.search(rf"(?<![\w$]){re.escape(q)}(?![\w$])", section):
+        return True
+    if q.isdigit():
+        if re.search(rf"(?<![\d,.]){int(q):,}(?![\d,])", section):
+            return True
+        if int(q) >= 1000 and int(q) % 1000 == 0 and re.search(rf"(?<![\d.]){int(q) // 1000}\s*(?:s|sec|seconds)\b", section):
+            return True
+        return False
+    rhs = consts.get(q, "")
+    return bool(re.fullmatch(r"\d+", rhs.strip())) and _quantity_mentioned(rhs.strip(), consts, section)
+
+
+def spec_test_parity_findings(wt, task_text):
+    """[finding] -- SPEC_TEST_PARITY: the fixture asserts exact counts/clock values TASK.md never states in an
+    'Exact behaviour contract' section. Empty when below SPEC_PARITY_MIN_QUANTITIES or fully covered."""
+    wt = Path(wt)
+    for fx in _PARITY_FIXTURES:
+        text = _read(wt / fx)
+        if not text:
+            continue
+        found, consts = parity_quantities(text)
+        if len(found) < SPEC_PARITY_MIN_QUANTITIES:
+            continue
+        section = _contract_sections(task_text)
+        missing = [q for q in sorted(found) if not _quantity_mentioned(q, consts, section)]
+        if missing:
+            return [_finding(
+                SPEC_TEST_PARITY, "Test asserts exact quantities the spec never states", fx,
+                f"{fx} asserts exact values ({'; '.join(f'`{found[q]}`' for q in missing[:3])}) but TASK.md has "
+                + ("no 'Exact behaviour contract' section" if not section else "an 'Exact behaviour contract' section missing them")
+                + f". Add an 'Exact behaviour contract' table listing: {', '.join(missing)} "
+                  f"(what each equals and why), so the model need not re-derive them from the tests.")]
+    return []
 
 
 def refimpl_literal_gap_findings(pairs, texts_by_file, default_text: str = ""):
@@ -666,6 +944,331 @@ def format_repeat_missing(cur) -> str:
             f"another model round will not change it")
 
 
+# ---------------------------------------------------------------------------
+# HARNESS-AUTHORING DEFECT LINTS (2026-10-11). Four defects that each burned a model round this week:
+#   REFIMPL_SWALLOWS_EXCEPTION   refimpl.py wraps the code under test in a broad `except:` / `except Exception: pass`
+#                                (arr-webhook: `target.session` was a NameError, swallowed -> every case returned the
+#                                same empty value and the fixture looked "wrong").
+#   JS_FIXTURE_LOAD_TRAP         a JS/TS fixture that crashes at LOAD: require() of a .ts module beside mock.module,
+#                                `globalThis.mock.module`, or `mock.module`/`test(` with no import of node:test.
+#   EVALUATE_NOT_SELF_CONTAINED  a function handed to page.evaluate() (serialized, rebuilt without its closure) calls a
+#                                module-scope helper -> ReferenceError in real Chromium (cardlink s2 extractDetailInBrowser).
+#   REAL_TIME_POLLING_FIXTURE    verify.sh caps each test at 10s; a fixture that really sleeps (or drives polling code
+#                                with no virtual/compressed timers) blows it.
+# All are narrow static checks (comment-blanked); a near-miss never flags. Related existing checks and why they do not
+# conflict: _mock_module_lint (ollama-dispatch-auto self-check) lints mock.module OPTIONS / static target import /
+# re-mocking -- this one only the load-crash shapes it does not look at; the working recipe added to the authoring prompt
+# (HARNESS_RECIPES_RULE) says "use mock.module (MOCK_MODULE_RULE) for ESM, Module._load stub for CJS require()" so no rule
+# demands what another forbids.
+REFIMPL_SWALLOWS_EXCEPTION = "REFIMPL_SWALLOWS_EXCEPTION"
+JS_FIXTURE_LOAD_TRAP = "JS_FIXTURE_LOAD_TRAP"
+EVALUATE_NOT_SELF_CONTAINED = "EVALUATE_NOT_SELF_CONTAINED"
+REAL_TIME_POLLING_FIXTURE = "REAL_TIME_POLLING_FIXTURE"
+_JS_FIXTURES = ("verify.test.ts", "verify.test.mts", "verify.test.js", "verify.test.mjs")
+_BROAD_EXC = {"Exception", "BaseException", "NameError", "AttributeError"}
+
+
+def _blank_js_comments(src: str) -> str:
+    return re.sub(r"/\*.*?\*/|(?<![:'\"`\\])//[^\n]*", lambda m: re.sub(r"[^\n]", " ", m.group(0)), src, flags=re.S)
+
+
+def _handler_names(h) -> set:
+    t = h.type
+    if t is None:
+        return {"<bare>"}
+    nodes = t.elts if isinstance(t, ast.Tuple) else [t]
+    return {getattr(n, "id", getattr(n, "attr", "?")) for n in nodes}
+
+
+def _handler_swallows(h) -> bool:
+    """True when the handler body neither re-raises nor exits nor reports (pass / continue / break / return <const>)."""
+    for n in ast.walk(ast.Module(body=h.body, type_ignores=[])):
+        if isinstance(n, ast.Raise):
+            return False
+        if isinstance(n, ast.Call):
+            f = n.func
+            nm = getattr(f, "id", getattr(f, "attr", ""))
+            if nm in ("exit", "_exit", "print", "write", "warn", "error", "exception", "fail", "abort"):
+                return False
+        if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            return False                   # records the failure / sets state: a decision, not a swallow
+    for n in h.body:
+        if isinstance(n, (ast.Pass, ast.Continue, ast.Break)):
+            continue
+        if isinstance(n, ast.Return) and (n.value is None or isinstance(n.value, ast.Constant)
+                                          or isinstance(n.value, (ast.List, ast.Dict, ast.Tuple, ast.Set))):
+            continue
+        if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant):
+            continue
+        return False
+    return True
+
+
+def refimpl_swallow_findings(refimpl_text: str):
+    """[finding] -- a broad except (bare / Exception / BaseException / NameError / AttributeError) that swallows, around a
+    try body that does more than plain file/path I/O."""
+    try:
+        tree = ast.parse(refimpl_text or "")
+    except SyntaxError:
+        return []
+    io_names = {"Path", "open", "read_text", "write_text", "exists", "is_file", "is_dir", "unlink", "remove", "rmtree", "mkdir",
+                "makedirs", "chmod", "stat", "listdir", "glob", "rglob", "iterdir", "resolve", "copy", "copy2", "move",
+                "rename", "replace", "write", "read", "close", "loads", "load", "dumps", "dump", "relative_to", "kill",
+                "run", "check_output", "Popen", "getenv", "environ", "get", "decode", "encode", "int", "float", "str"}
+    out, seen = [], set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        for h in node.handlers:
+            names = _handler_names(h)
+            if not (names & ({"<bare>"} | _BROAD_EXC)) or not _handler_swallows(h):
+                continue
+            calls = {getattr(n.func, "id", getattr(n.func, "attr", "")) for b in node.body for n in ast.walk(b)
+                     if isinstance(n, ast.Call)}
+            def _root(a):
+                while isinstance(a, (ast.Attribute, ast.Call, ast.Subscript)):
+                    a = a.value if isinstance(a, (ast.Attribute, ast.Subscript)) else a.func
+                return getattr(a, "id", "")
+            attrs = [n for b in node.body for n in ast.walk(b) if isinstance(n, ast.Attribute)
+                     and _root(n) not in ("os", "sys", "Path", "re", "json", "shutil", "subprocess", "time", "tempfile")]
+            if not (calls - io_names) and not attrs:
+                continue                  # try body is only file/path/json I/O: not "the code under test"
+            if h.lineno in seen:
+                continue
+            seen.add(h.lineno)
+            what = "bare `except:`" if "<bare>" in names else "`except " + "/".join(sorted(names)) + "`"
+            out.append(_finding(
+                REFIMPL_SWALLOWS_EXCEPTION, "refimpl swallows exceptions around the code it writes", "refimpl.py",
+                f"line {h.lineno}: {what} with a pass/default body hides a NameError/AttributeError/typo in the refimpl "
+                f"itself, so every case then returns the same empty value and the fixture looks wrong (arr-webhook: "
+                f"`target.session` did not exist). Catch the one specific exception you expect, or let it raise"))
+    return out[:4]
+
+
+_TRAP_TEST_USE_RE = re.compile(r"(?<![\w$.])(?:test|describe|it)\s*(?:\.\w+)?\s*\(")
+_TRAP_MOCK_USE_RE = re.compile(r"(?<![\w$.])mock\s*\.\s*(?:module|fn|method|timers)\b")
+
+
+def _binds(src: str, name: str) -> bool:
+    return bool(re.search(r"\bimport\b[^;]*?\b" + name + r"\b[^;]*?\bfrom\b", src, re.S)
+                or re.search(r"\b(?:const|let|var)\s*\{[^}]*\b" + name + r"\b[^}]*\}\s*=", src)
+                or re.search(r"\b(?:const|let|var)\s+" + name + r"\s*=", src)
+                or re.search(r"\bfunction\s+" + name + r"\s*\(", src))
+
+
+def js_fixture_trap_findings(name: str, src: str):
+    """[finding] -- crash-at-load shapes in one JS/TS fixture's text."""
+    s = _blank_js_comments(src or "")
+    out, msgs = [], []
+    has_mm = bool(re.search(r"(?<![\w$.])mock\s*\.\s*module\s*\(", s)) or "globalThis.mock" in s
+    if re.search(r"\b(?:globalThis|global)\s*\.\s*mock\b", s):
+        msgs.append("`globalThis.mock` does not exist (mock is exported by node:test, not a global): "
+                    "`import { test, mock } from 'node:test'` and call `mock.module(...)`")
+    if has_mm and re.search(r"\brequire\s*\(\s*['\"`][^'\"`]+\.m?ts['\"`]\s*\)", s):
+        msgs.append("require() of a .ts module beside mock.module: a .ts ESM target cannot be require()d (ERR_REQUIRE_ESM / "
+                    "undefined exports) and mock.module does not intercept it. Use `await import()` after module-scope "
+                    "mocks, or for a CJS target stub the dependency with the Module._load recipe")
+    for ident, use_re in (("mock", _TRAP_MOCK_USE_RE), ("test", _TRAP_TEST_USE_RE)):
+        if use_re.search(s) and not _binds(s, ident) and not (ident == "test" and (_binds(s, "describe") and _binds(s, "it"))):
+            if ident == "test" and re.search(r"\bfrom\s+['\"](?:vitest|@jest/globals|bun:test)['\"]", s):
+                continue
+            msgs.append(f"`{ident}` is used but never imported/declared (`import {{ test, mock }} from 'node:test'`): the "
+                        f"fixture dies with ReferenceError before running a single case")
+    for m in msgs:
+        out.append(_finding(JS_FIXTURE_LOAD_TRAP, "JS/TS fixture crashes at load", name, m))
+    return out
+
+
+# --- page.evaluate self-containment ---------------------------------------------------------------------------
+_EVAL_CALL_RE = re.compile(r"\.\s*(?:evaluate|evaluateHandle|\$eval|\$\$eval|waitForFunction)\s*\(\s*")
+_TOP_FN_RE = re.compile(r"^(?:export\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(|"
+                        r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\b|\([^)\n]*\)\s*(?::[^=\n]+)?=>|[A-Za-z_$][\w$]*\s*=>)", re.M)
+_JS_SKIP = {"if", "for", "while", "switch", "catch", "return", "function", "typeof", "new", "await", "async", "super"}
+
+
+def _match_close(s: str, i: int) -> int:
+    """index of the bracket closing the one opening at s[i]; strings/templates skipped (regex literals not modelled)."""
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    depth, j, n, q = 0, i, len(s), None
+    while j < n:
+        c = s[j]
+        if q:
+            if c == "\\":
+                j += 2
+                continue
+            if c == q:
+                q = None
+        elif c in "'\"`":
+            q = c
+        elif c in pairs:
+            depth += 1
+        elif c in ")}]":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
+def _fn_span(s: str, name: str):
+    m = re.search(r"(?:function\s*\*?\s*" + re.escape(name) + r"\s*\(|(?:const|let|var)\s+" + re.escape(name) + r"\s*=\s*(?:async\s*)?(?:function\b[^(]*\(|\())", s)
+    if not m:
+        return None
+    p = m.end() - 1
+    e = _match_close(s, p)
+    if e < 0:
+        return None
+    b = re.compile(r"\s*(?::[^{=]+)?\s*(?:=>)?\s*").match(s, e + 1)
+    k = b.end() if b else e + 1
+    if k < len(s) and s[k] == "{":
+        c = _match_close(s, k)
+        return (p, c + 1) if c > 0 else None
+    return (p, min(len(s), s.find("\n", k) if s.find("\n", k) > 0 else len(s)))
+
+
+def _inline_span(s: str, i: int):
+    """span of an inline function/arrow argument starting at s[i], else None."""
+    m = re.compile(r"(?:async\s*)?(?:function\b[^(]*\(|\()").match(s, i)
+    if not m:
+        m2 = re.compile(r"(?:async\s*)?[A-Za-z_$][\w$]*\s*=>").match(s, i)
+        if not m2:
+            return None
+        k = m2.end()
+        while k < len(s) and s[k] in " \t\n":
+            k += 1
+        if k < len(s) and s[k] == "{":
+            c = _match_close(s, k)
+            return (i, c + 1) if c > 0 else None
+        return None
+    e = _match_close(s, m.end() - 1)
+    if e < 0:
+        return None
+    b = re.compile(r"\s*(?:=>)?\s*").match(s, e + 1)
+    k = b.end()
+    if k < len(s) and s[k] == "{":
+        c = _match_close(s, k)
+        return (i, c + 1) if c > 0 else None
+    d, j = 0, k
+    while j < len(s):                      # expression body: ends at the evaluate call's `)` or a depth-0 `,`
+        c = s[j]
+        if c in "([{":
+            d += 1
+        elif c in ")]}":
+            if d == 0:
+                break
+            d -= 1
+        elif c == "," and d == 0:
+            break
+        j += 1
+    return (i, j)
+
+
+def evaluate_closure_findings(path: str, src: str):
+    """[finding] -- a function serialized by page.evaluate()/$eval()/waitForFunction() that calls a module-scope helper
+    function of the same file (not declared inside it): ReferenceError in real Chromium."""
+    s = _blank_js_comments(src or "")
+    helpers = {m.group(1) or m.group(2) for m in _TOP_FN_RE.finditer(s)}
+    helpers.discard(None)
+    if not helpers:
+        return []
+    out, seen = [], set()
+    for m in _EVAL_CALL_RE.finditer(s):
+        i = m.end()
+        im = re.compile(r"([A-Za-z_$][\w$]*)\s*[,)]").match(s, i)
+        if im and im.group(1) in helpers:
+            span, label = _fn_span(s, im.group(1)), im.group(1)
+        else:
+            span, label = _inline_span(s, i), "(inline function)"
+            if label == "(inline function)" and span is None:
+                continue
+        if not span:
+            continue
+        body = s[span[0]:span[1]]
+        # names declared inside the serialized function shadow module helpers
+        local = set(re.findall(r"\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)", body[1:])) | \
+            set(re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)", body))
+        for d in re.findall(r"\b(?:const|let|var)\s*[\[{]([^\]}=]*)[\]}]", body):
+            local |= {x.strip().split(":")[-1].strip() for x in d.split(",")}
+        head = body[:body.find(")") + 1] if ")" in body else ""
+        local |= set(re.findall(r"[A-Za-z_$][\w$]*", head))
+        for h in sorted(helpers - local - _JS_SKIP - ({im.group(1)} if im else set())):
+            if re.search(r"(?<![\w$.])" + re.escape(h) + r"\s*\(", body) and (label, h) not in seen:
+                seen.add((label, h))
+                out.append(_finding(
+                    EVALUATE_NOT_SELF_CONTAINED, "function passed to page.evaluate is not self-contained", path,
+                    f"`{label if label != '(inline function)' else 'the inline evaluate callback'}` is serialized by "
+                    f"page.evaluate and re-created in the browser WITHOUT its closure, but it calls module-scope helper "
+                    f"`{h}(...)` -> ReferenceError in real Chromium (a fake page that calls it in-process hides this). "
+                    f"Inline the helper's logic inside the function, or pass the data in as an argument"))
+    return out[:4]
+
+
+# --- real-time polling in fixtures -------------------------------------------------------------------------------
+_RT_SLEEP_JS_RE = re.compile(r"setTimeout\s*\(\s*(?:[A-Za-z_$][\w$]*|\(\)\s*=>\s*[A-Za-z_$][\w$]*\(\)|[^,()]*)\s*,\s*(\d[\d_]*)\s*\)|"
+                             r"\b(?:sleep|delay|wait|waitForTimeout)\s*\(\s*(\d[\d_]*)\s*\)")
+_RT_VIRT_JS_RE = re.compile(r"mock\.timers|useFakeTimers|installFakeClock|fakeTimers|\b(?:globalThis|global)\s*\.\s*setTimeout\s*=|"
+                            r"\bsetTimeout\s*=\s*|clock\b|virtual|sleep\s*:|sleepFn|\.tick\s*\(|compress", re.I)
+_RT_VIRT_PY_RE = re.compile(r"monkeypatch|mock\.patch|patch\s*\(|freezegun|time\.sleep\s*=|\bsleep\s*=|fake_?sleep|virtual|clock|compress", re.I)
+_RT_POLL_JS_RE = re.compile(r"(?:for|while)\s*\([^)]*\)\s*\{[^{}]{0,600}?(?:setTimeout|waitForTimeout|\bsleep\s*\(|\bdelay\s*\()|"
+                            r"(?:setTimeout|waitForTimeout|\bsleep\s*\(|\bdelay\s*\()[^{}]{0,200}?\}\s*(?:while|for)\b", re.S)
+_RT_POLL_PY_RE = re.compile(r"(?:for|while)\b[^\n]*:\n(?:[^\n]*\n){0,12}?[ \t]+(?:await\s+asyncio\.sleep|time\.sleep)\s*\(", re.M)
+
+
+def real_time_polling_findings(fixture_name: str, fixture_src: str, target_text: str = ""):
+    """[finding] -- (a) the fixture itself sleeps >= 1s of real time; (b) the code under test polls (loop around a
+    sleep) and the fixture installs no virtual / compressed timers. verify.sh caps each test at 10s."""
+    py = fixture_name.endswith(".py")
+    fx = fixture_src or ""
+    if not py:
+        fx = _blank_js_comments(fx)
+    msg = None
+    if py:
+        for m in re.finditer(r"\btime\.sleep\s*\(\s*(\d+(?:\.\d+)?)\s*\)", fx):
+            if float(m.group(1)) >= 1 and not _RT_VIRT_PY_RE.search(fx):
+                msg = f"the fixture calls time.sleep({m.group(1)}) in real time"
+                break
+        poll = _RT_POLL_PY_RE.search(target_text or "")
+        virt = _RT_VIRT_PY_RE.search(fx)
+    else:
+        for m in _RT_SLEEP_JS_RE.finditer(fx):
+            ms = int((m.group(1) or m.group(2)).replace("_", ""))
+            if ms >= 1000 and not re.search(r"\btest\s*\(\s*['\"`][^\n]*timeout", fx):
+                msg = f"the fixture sleeps {ms} ms of real time in one step"
+                break
+        poll = _RT_POLL_JS_RE.search(target_text or "")
+        virt = _RT_VIRT_JS_RE.search(fx)
+    if msg is None and poll and not virt:
+        msg = ("the code under test polls (a loop around a sleep) and the fixture installs no virtual/compressed timers, "
+               "so each case sleeps in real time")
+    if not msg:
+        return []
+    return [_finding(REAL_TIME_POLLING_FIXTURE, "fixture uses real-time sleeps (verify.sh caps each test at 10s)", fixture_name,
+                     msg + ". Compress or virtualize every timer (override globalThis.setTimeout to ms/50, or inject a "
+                     "fake clock / patch time.sleep) keeping attempt COUNTS unchanged")]
+
+
+def harness_authoring_findings(wt, target_text: str = ""):
+    """[finding] -- the four lints above over one worktree's authored files. `target_text` is the target file text
+    (ideally refimpl-applied) for the evaluate check; the polling check reads refimpl.py (the polling code the task
+    INTRODUCES -- a whole-file scan would flag every daemon loop in a big target)."""
+    wt = Path(wt)
+    out = []
+    ri = _read(wt / "refimpl.py")
+    if ri and not _REFIMPL_PLACEHOLDER_RE.search(ri):
+        out += refimpl_swallow_findings(ri)
+    for fx in _JS_FIXTURES + ("test_fixture.py", "verify.py"):
+        p = wt / fx
+        if not p.is_file():
+            continue
+        src = _read(p)
+        if fx in _JS_FIXTURES:
+            out += js_fixture_trap_findings(fx, src)
+        out += real_time_polling_findings(fx, src, ri)
+    if target_text:
+        out += evaluate_closure_findings("target", target_text)
+    return out
+
+
 def spec_defects(wt, target=None, creation=None, intent_text="", task_text="", refimpl_text=None,
                  verify_green=None, ref: str = "HEAD"):
     """THE CONTRADICTION GATE. [finding] where each finding is
@@ -691,6 +1294,9 @@ def spec_defects(wt, target=None, creation=None, intent_text="", task_text="", r
         out += refimpl_base_anchor_findings(wt, target, refimpl_text, ref)
     out += already_satisfied_findings(wt, task, target, verify_green, ref)
     out += literal_near_miss_findings(wt, task, target, refimpl_text or "", ref)
+    out += literal_shape_findings(task)
+    out += harness_authoring_findings(wt)
+    out += spec_test_parity_findings(wt, task)
     return out
 
 

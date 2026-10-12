@@ -95,7 +95,7 @@ except Exception:  # pragma: no cover
 CONFIG_DIR = Path(os.environ.get("OLLAMA_DISPATCH_HOME",
                                  Path.home() / ".ollama-dispatch"))
 DEFAULTS_FILE = CONFIG_DIR / "defaults.json"
-FALLBACK_MODEL = "qwen3.6-35b-a3b-vl-mtp-mxfp8"   # Darkbloom default (2026-10-02, the owner approved)
+FALLBACK_MODEL = "qwen3.6-35b-a3b-vl-mtp-mxfp8"   # Darkbloom default (2026-10-02, Penn approved)
 FALLBACK_HOST = "studio"
 
 # num_ctx sizing (fix 2026-09-13): the old hard-coded 32768 default starved a
@@ -324,7 +324,7 @@ def _under_slicer(a=None):
                 or (a is not None and getattr(a, "slice_id", None)))
 
 
-# --- CHAIN RUN STATE for the queue's bundle-focus scheduler (the owner 2026-09-24) -------
+# --- CHAIN RUN STATE for the queue's bundle-focus scheduler (Penn 2026-09-24) -------
 # "Auto author should have been first slice in that bundle so bake off would continue."
 # ollama-queue.py keeps ONE bundle focused start-to-finish, but it can only hold a
 # bundle it knows is still being worked. A sliced plan advertises that through the
@@ -456,6 +456,9 @@ def chain_state_write(a, phase, step=None, job=None, outcome=None, runs_dir=None
                 "updated_at": ts,
                 "code": CODE_STAMP,   # stale-driver detection (maybe_restart_stale)
             }
+            # machine-readable stop reason (record_stop) survives later phase writes
+            if prev.get("stop") and same_run:
+                rec["stop"] = prev["stop"]
             if job and job not in rec["rounds"]:
                 rec["rounds"].append(job)
             doc["runs"][label] = rec
@@ -987,6 +990,33 @@ if _REQUIRED and len(_mc_lits) > len(_REQUIRED) + MAX_EXTRA_LITERALS:
          "more thing the coding job can fail on. Trim the list." % (
              len(_mc_lits), len(_REQUIRED), MAX_EXTRA_LITERALS))
 
+# NO INVENTED DEFECTS (2026-10-09, aw-codec-floor s2b): the author invented downstream consumers
+# (logging, activity records, pushover) for an additive change, which misled the model. ADVISORY only.
+try:
+    import importlib.util as _dd_iu
+    _dd_p = Path.home() / "bin" / "dispatch_authoring_aids.py"
+    _dd = None
+    if _dd_p.is_file():
+        _dd_sp = _dd_iu.spec_from_file_location("dispatch_authoring_aids", str(_dd_p))
+        _dd = _dd_iu.module_from_spec(_dd_sp)
+        _dd_sp.loader.exec_module(_dd)
+    if _dd is not None:
+        import json as _dd_j
+        _dd_t = (_dd_j.loads((WT / ".dispatch-harness.json").read_text()) or {}).get("target") or ""
+        _dd_tt = (WT / _dd_t).read_text(errors="replace") if _dd_t and (WT / _dd_t).is_file() else ""
+        _dd_in = ""
+        if (WT / "AUTO-TASK.md").is_file():
+            _dd_m = _re.search(r"^INTENT:\s*(.+)$", (WT / "AUTO-TASK.md").read_text(errors="replace"), _re.M)
+            _dd_in = _dd_m.group(1) if _dd_m else ""
+        _dd_x = ""
+        for _dd_g in ["refimpl.py"] + list(_FIXTURE_GLOBS):
+            for _dd_f in sorted(_glob.glob(str(WT / _dd_g)))[:3]:
+                _dd_x += Path(_dd_f).read_text(errors="replace") + "\n"
+        for _dd_w in _dd.defect_section_findings(task, target_text=_dd_tt, intent=_dd_in, extra_text=_dd_x):
+            print("  WARN (TASK.md `## Confirmed defect`): " + _dd_w)
+except Exception:
+    pass
+
 pre = {l[3:] for l in git("status", "--porcelain").stdout.splitlines()
        if l[:2] == "??"}
 # Snapshot the bytes of pre-existing UNTRACKED files. A creation-task target
@@ -1059,7 +1089,7 @@ for _f in (git("diff", "--name-only", "HEAD").stdout.splitlines()):
 # runs for minutes (refimpl + npm test) and revert() replayed the pre-check bytes of
 # EVERY untracked/dirty file it had snapshotted -- including TASK.md / check_literals.py /
 # refimpl.py / verify.sh, which the check never modifies. A hand-edit made in that window
-# (the owner removed the unsatisfiable literal `normalize(orderNumber)` and re-froze) was
+# (Penn removed the unsatisfiable literal `normalize(orderNumber)` and re-froze) was
 # silently reverted at the end of the check, two rounds running. The harness files are now
 # restored ONLY when their on-disk bytes are still what the check itself last left there
 # (_known, refreshed by _note() after each step that can clobber them); a file that changed
@@ -1253,6 +1283,7 @@ if r.returncode == 0 and "VERIFY_OK" in r.stdout:
 # launch-baseline cascade). fail() exits via SystemExit, which the finally
 # still catches, so every exit path from here reverts.
 _secf = []
+_reach = ""
 try:
     r = sh("python3 refimpl.py")
     _note()
@@ -1740,11 +1771,53 @@ if not ok:
     _case_rx = r"^\s*(?:FAIL - |not ok \d+ - |✖ )(.+?)\s*(?:\(got: .*\))?$"
     _now = set(_re.findall(_case_rx, _full, _re.M))
     _npass = len(_re.findall(r"^\s*(?:ok(?: \d+)? +- |PASS - |✔ )", _full, _re.M))
+    # PYTHON FIXTURE FORMAT (2026-10-10, aw-codec-floor s3: 6 stage-3 jobs, all `model`
+    # nonconvergence). The scaffold's test_fixture.py runner prints `  FAIL <desc> -- raised
+    # X: msg` / `-- got A, want B` and `  K/N case(s) passed`; none of the patterns above
+    # match it, so for EVERY python-fixture harness the FAILING CASES block was never
+    # emitted, unsat_cases() saw nothing, plan_suspect() could never fire, and a fixture whose
+    # stubs fail ALL 6 cases against its own refimpl was re-authored forever.
+    _now |= set(_re.findall(r"^\s*FAIL (.+?) -- (?:raised|got) ", _full, _re.M))
+    _pym = _re.search(r"^\s*(\d+)/(\d+) case\(s\) passed", _full, _re.M)
     _ncases = len(_now) + _npass
+    if _pym:
+        _ncases = max(_ncases, int(_pym.group(2)))
     if len(_now) >= 1 and not ok:
         _lst = sorted(_now)
         tail += ("\n=== FAILING CASES (%d of %d failed with refimpl.py applied) ===\n" % (len(_lst), _ncases)
                  + "\n".join("  FAILED CASE: " + c[:160] for c in _lst[:30]))
+    # REACH PROBE (2026-10-10, aw-codec-floor s3: a 2nd fixture authored with the SAME defect). When the
+    # refimpl fails EVERY case (K of K, K>=2) nothing says WHY the handler never reached the asserted
+    # behaviour (a dedupe guard, a stub returning set()...). Trace the fixture's calls into the target NOW,
+    # while refimpl.py is still applied (python only; fail-open) and append the block to the failure text.
+    if (not ok) and len(_now) >= 2 and len(_now) == _ncases and _FIXTURE_GLOBS[0].endswith(".py"):
+        try:
+            import importlib.util as _rp_iu
+            _rp_sp = _rp_iu.spec_from_file_location("reach_probe", str(Path.home() / "bin" / "reach_probe.py"))
+            _rp_m = _rp_iu.module_from_spec(_rp_sp)
+            _rp_sp.loader.exec_module(_rp_m)
+            _reach = _rp_m.probe_inplace(WT, _target_reset, _FIXTURE_GLOBS[0]) or ""
+        except Exception:
+            _reach = ""
+    # FIXTURE-ORIGIN (2026-10-10e, rt-costco-receipt-attach s3: `orders.map is not a function` thrown inside the
+    # FIXTURE's own mock, 4/6 cases, the author edited refimpl.py for every iteration). Language-neutral: when the
+    # top user frame of the exception is in the fixture file, say so. Stashed outside the tree for the slicer re-spec.
+    _fxo = ""
+    if not ok:
+        try:
+            import importlib.util as _fo_iu
+            _fo_sp = _fo_iu.spec_from_file_location("fixture_origin", str(Path.home() / "bin" / "fixture_origin.py"))
+            _fo_m = _fo_iu.module_from_spec(_fo_sp)
+            _fo_sp.loader.exec_module(_fo_m)
+            try:
+                import json as _fo_j
+                _fo_t = (_fo_j.loads((WT / ".dispatch-harness.json").read_text()) or {}).get("target") or ""
+            except Exception:
+                _fo_t = ""
+            _fxo = _fo_m.analyze(_full, str(WT), [Path(_g).name for _g in _FIXTURE_GLOBS], _fo_t) or ""
+            _fo_m.stash(WT, _fxo)
+        except Exception:
+            _fxo = ""
     import hashlib as _hl, json as _js, tempfile as _tf
     _mem = Path(_tf.gettempdir()) / ("auto-harness-failcases-"
                                      + _hl.sha1(str(WT).encode()).hexdigest()[:12] + ".json")
@@ -1801,9 +1874,30 @@ if not ok:
                "Pass the actual value as chk's 3rd argument (it is printed on FAIL), ") +
             "re-read that case's stub/env setup line by line, and fix the fixture "
             "before touching refimpl.py again.")
-    fail("the reference impl (refimpl.py) does not make verify.sh print "
+    # WHERE IT FAILED (2026-10-09, aw-codec-floor s2b): this used to say "refimpl.py does not make
+    # verify.sh print VERIFY_OK" even when a NameError in the FIXTURE was the real failure. Name the
+    # stage, the file:line and the first failing assertion (dispatch_authoring_aids.py, fail-open).
+    _where = ""
+    try:
+        import importlib.util as _aa_iu
+        _aa_p = Path.home() / "bin" / "dispatch_authoring_aids.py"
+        if _aa_p.is_file():
+            _aa_sp = _aa_iu.spec_from_file_location("dispatch_authoring_aids", str(_aa_p))
+            _aa_m = _aa_iu.module_from_spec(_aa_sp)
+            _aa_sp.loader.exec_module(_aa_m)
+            try:
+                import json as _aa_j
+                _aa_t = (_aa_j.loads((WT / ".dispatch-harness.json").read_text()) or {}).get("target") or ""
+            except Exception:
+                _aa_t = ""
+            _where = _aa_m.selfcheck_failure_report(
+                _full, fixture_names=[Path(_g).name for _g in _FIXTURE_GLOBS], target=_aa_t)["text"]
+    except Exception:
+        _where = ""
+    fail((_where + "\n" if _where else "") + "the reference impl (refimpl.py) does not make verify.sh print "
          "VERIFY_OK -- the task is unsatisfiable as written, or the verify "
-         "asserts more than the spec:\n" + tail + _hint)
+         "asserts more than the spec:\n" + tail + _hint + ("\n\n" + _reach if _reach else "")
+         + ("\n\n" + _fxo if _fxo else ""))
 print("VERIFY_OK: harness discriminates and is satisfiable")
 '''
 
@@ -1830,12 +1924,14 @@ _FIXTURE_GLOBS_BY_LANG["typescript"] = _FIXTURE_GLOBS_BY_LANG["ts"]
 # relevance review was silently skipped (2026-09-27 e2e). Bash
 # (verify_cases.sh) and swift (Sources/<M>Tests/main.swift) were wrong too.
 _SCAFFOLD_FIXTURE = None
+_BOUND_WT = None        # the authoring worktree (set by bind_scaffold_fixture) -- author_prompt reads the target from it
 
 
 def bind_scaffold_fixture(wt: Path):
     """Read the emitted fixture from the scaffold's manifest; fall back to the
     draft tool's fixture resolver for a manifest written before the field."""
-    global _SCAFFOLD_FIXTURE
+    global _SCAFFOLD_FIXTURE, _BOUND_WT
+    _BOUND_WT = wt
     fx = None
     try:
         fx = json.loads((wt / ".dispatch-harness.json").read_text()).get("fixture")
@@ -2406,7 +2502,10 @@ NO_READ_HARNESS_RULE = (
     "`refimpl.py`, `TASK.md` or the fixture, then RUN it.\n")
 
 
-def author_prompt(a, target: str) -> str:
+def author_prompt(a, target: str, fresh: bool = False) -> str:
+    """`fresh=True` (AUTO_FRESH_RESTART round): the task + harness rules only -- the prior-
+    failure ledger (prior_failure_section) is OMITTED so the model does not re-read the
+    history of the loop that just failed to converge."""
     interface = (a.interface or "").strip()
     fx = fixture_name_for(a.lang)
     jsish = _is_jsish(a.lang)
@@ -2483,7 +2582,7 @@ def author_prompt(a, target: str) -> str:
     ) if jsish else ""
     # node:test mock.module traps (2026-10-06): see MOCK_MODULE_RULE.
     if jsish:
-        import_rule += MOCK_MODULE_RULE
+        import_rule += MOCK_MODULE_RULE + JS_FIXTURE_RECIPES_RULE
     if is_test_file_target(target) and not jsish:
         fixture_section = test_target_prompt_section(target)
     else:
@@ -2549,7 +2648,7 @@ Do not delete, rewrite, or replace existing imports/functions/classes that
 INTENT does not mention. A refimpl that wipes out prior slices' landed work to
 write a fresh from-scratch module fails every sibling slice that depends on
 what it deleted, even though its own verify may go green.
-
+{REFIMPL_HYGIENE_RULE}
 {fixture_section}
 ## 3. `TASK.md` -- the spec the DISPATCHED model will read
 Replace every `TODO` with: the goal, the exact contract, a `## Must contain`
@@ -2562,9 +2661,10 @@ literal pinned `in <path>:`), ADD that file to the scope line (``Only edit
 `{target}`, `<path>`; ...``) -- the self-check refuses a pin outside the scope.
 Copy every identifier from INTENT byte-for-byte (the self-check refuses a plan
 literal that is missing or misspelled). Leave no TODO behind.
+{EXACT_CONTRACT_RULE}{NO_INVENTED_DEFECT_RULE}
 
 {ESCAPING_RULE}
-{env_fixture_section(a, target)}{fake_browser_section(a, target)}{prior_failure_section(load_attempts(a))}
+{env_fixture_section(a, target)}{heavy_target_section(a, target)}{fake_browser_section(a, target)}{"" if fresh else prior_failure_section(load_attempts(a))}
 ## Done when
 `bash verify.sh` FAILS at the stub baseline and PASSES only after
 `python3 refimpl.py`. The self-check enforces exactly this: run
@@ -2670,6 +2770,43 @@ MOCK_MODULE_RULE = (
     "Never add test-only parameters to production code (e.g. extra args on a route "
     "handler) to work around a mock that did not apply -- fix the mock.\n")
 
+EXACT_CONTRACT_RULE = (
+    "EXACT-QUANTITY PARITY: any exact numeric assertion in the fixture (a call/evaluation "
+    "count, an elapsed/virtual-clock value, an array length, a named constant expression "
+    "like `1 + POLL_ATTEMPTS`) MUST be stated in an `## Exact behaviour contract` section of "
+    "TASK.md (a table: quantity, value, why). When you STRENGTHEN a test to kill a mutant "
+    "(e.g. make a loop bound exact), add the matching contract line in the same round -- the "
+    "coding model reads TASK.md, not your test, and admission blocks a test/spec mismatch "
+    "(SPEC_TEST_PARITY).")
+
+# HARNESS-AUTHORING RECIPES (2026-10-11): defects that each burned a model round this week; every one is also a
+# static lint (dispatch_harness_gates.harness_authoring_findings). Complements MOCK_MODULE_RULE (mock.module for ESM
+# imports); the Module._load stub below is for a CJS target's require() of an uninstallable package -- they never
+# apply to the same dependency, so the two rules do not conflict.
+JS_FIXTURE_RECIPES_RULE = (
+    "\n## JS/TS fixture recipes that LOAD (each crash below happened)\n"
+    "- `import { test, mock } from 'node:test'` -- `test`/`mock` are NOT globals and there is no `globalThis.mock`.\n"
+    "- Write the fixture as plain ESM (`import`), never `require()` a `.ts` file (not loadable by require; "
+    "ERR_REQUIRE_ESM) and never mix that with `mock.module`.\n"
+    "- Target is CJS (`require('playwright-core')` etc.) and a package it requires is not installed at the repo root: do NOT "
+    "use mock.module (it does not intercept that require). Stub it BEFORE the first `await import('./<target>')`:\n"
+    "  `import Module from 'node:module'; const o = (Module as any)._load; (Module as any)._load = function (r: string, ...a: any[]) "
+    "{ if (r === 'playwright-core') return { chromium: {} }; return o.call(this, r, ...a); };`\n"
+    "- page.evaluate / $eval / waitForFunction: Playwright SERIALIZES the function and rebuilds it WITHOUT its closure. "
+    "A fake page must do the same (`new Function('return (' + fn.toString() + ')')()(arg)`), and the refimpl's function "
+    "must be SELF-CONTAINED: no call to a module-scope helper from inside it (ReferenceError in real Chromium) -- inline "
+    "the logic or pass data as an argument.\n"
+    "- verify.sh caps EACH test at 10 seconds. Code that polls/sleeps (`await sleep(500)` x 16) must run on virtual or "
+    "compressed time: `const real = globalThis.setTimeout; globalThis.setTimeout = (f, ms, ...a) => real(f, Math.ceil(ms / 50), ...a)` "
+    "(attempt COUNTS and bounds unchanged), or an injected fake clock. Python: patch `time.sleep` / `asyncio.sleep`. "
+    "Never really sleep >= 1s in a test.\n")
+
+REFIMPL_HYGIENE_RULE = (
+    "\nrefimpl.py HYGIENE: never wrap the code you generate or call in a bare `except:` / `except Exception:` that "
+    "passes or returns a default -- it swallows a NameError/AttributeError/typo in the refimpl itself, every case then "
+    "returns the same empty value, and the fixture looks wrong (arr-webhook). Catch only the one specific exception you "
+    "expect, or let it raise. Reference only attributes/names you have READ in the target (grep first).\n")
+
 SURVIVOR_KILL_RULE = (
     "Kill each survivor with an INPUT whose OUTPUT differs under that mutation "
     "(e.g. for `> 0` -> `>= 0`, a case with the value exactly 0; for a mutated "
@@ -2677,7 +2814,8 @@ SURVIVOR_KILL_RULE = (
     "reading the target's source and matching the mutated line's text or a regex "
     "of it -- the self-check rejects any fixture that asserts on the target's "
     "source text. If no executable case can tell the mutant apart, the line is "
-    "unobservable or the fake is too loose (see below), not a reason to regex it.")
+    "unobservable or the fake is too loose (see below), not a reason to regex it. "
+    + EXACT_CONTRACT_RULE)
 
 
 # The refimpl failing the model's OWN tests during authoring is the loudest sign
@@ -2770,6 +2908,23 @@ def wait_out_operational_blockers(wt, requires, a, rc, data, sleep=time.sleep,
 
 
 _HG_MOD = []
+
+
+_HA_MOD = []
+
+
+def _ha():
+    """harness_admission (the ONE harness admission gate), or None. FAIL-OPEN on import error only."""
+    if not _HA_MOD:
+        try:
+            import importlib.util as _ilu
+            _sp = _ilu.spec_from_file_location("harness_admission", BIN / "harness_admission.py")
+            _m = _ilu.module_from_spec(_sp)
+            _sp.loader.exec_module(_m)
+            _HA_MOD.append(_m)
+        except Exception:
+            _HA_MOD.append(None)
+    return _HA_MOD[0]
 
 
 def _hg():
@@ -2894,6 +3049,11 @@ def auto_continue_go(wt, target, a, requires, data, runner=None, rerun=None):
         log_decision("go-continue", a, "refine", f"re-check after --confirm: verdict={d2.get('verdict')} "
                      f"contract={cst2} blockers={[b.get('check') for b in d2.get('blockers') or []]}")
         return "refine", "re-check after confirm was not a GO", d2
+    if _ha() is not None:
+        _adm = _ha().admit(wt, a.label, target=target, lang=getattr(a, "lang", None), dynamic=False)
+        if not _adm["ok"]:
+            log_decision("go-continue", a, "pause", f"harness admission refused ({_adm['cause']}): {_adm['message'][:300]}")
+            return "pause", _adm["message"], d2
     cmd = [sys.executable, str(QUEUE), "enqueue", "--model", a.model, "--host", a.host,
            "--cwd", str(wt), "--task-file", str(Path(wt) / "TASK.md"), "--task-kind", "coding",
            "--verify", "bash verify.sh", "--label", a.label,
@@ -3469,6 +3629,28 @@ def job_row(job):
         return None
 
 
+HANDOFF_IN_FLIGHT = frozenset({"pending", "running", "queued", "paused", "held"})
+HANDOFF_DONE = frozenset({"done", "done_unconverged"})
+
+
+def handoff_status_outcome(status):
+    """PURE. Map a handoff record's `**status**` token to 'done' | 'failed' | None.
+
+    None = the record is an IN-FLIGHT placeholder (handoff-emit writes a `pending` /
+    `running` stub for every live job: "In flight -- no diff or gate record until it
+    finishes"). Treating that as 'failed' (the old `else "failed"`) made a transient
+    live-row miss on a RUNNING job read as "failed (confirmed via the handoff record)"
+    -- the 2026-10-09 rt-costco-receipt-attach-s2 refimpl job b90e77ace2b2 was recorded
+    as a failed attempt (class other, NO-WRITE re-prompt) while it was still running and
+    then finished done/exit 0. Only a TERMINAL status is evidence of an outcome."""
+    s = str(status or "").strip().lower()
+    if s in HANDOFF_DONE:
+        return "done"
+    if s in HANDOFF_IN_FLIGHT or not s:
+        return None
+    return "failed"
+
+
 def _terminal_after_prune(job):
     """Recover a completed job's outcome after its LIVE row was pruned.
 
@@ -3491,10 +3673,10 @@ def _terminal_after_prune(job):
             if not d.is_dir():
                 continue
             for f in d.glob(f"*{job}*.md"):
-                m = re.search(r"\*\*status\*\*:\s*`?([a-z]+)",
+                m = re.search(r"\*\*status\*\*:\s*`?([a-z_]+)",
                               f.read_text(errors="replace"))
                 if m:
-                    return "done" if m.group(1) == "done" else "failed"
+                    return handoff_status_outcome(m.group(1))
                 return "done"  # record exists but unparseable -> it completed
     except Exception:
         pass
@@ -3562,6 +3744,12 @@ def hand_abort_reason(a, wt):
     if taken:
         return (f"TAKEN ELSEWHERE (slice {a.slice_plan}/{a.slice_id} is {taken!r} on disk -- "
                 f"another driver, e.g. a --regate, owns this worktree)")
+    # An orphaned driver must not enqueue/write either (single-flight per worktree):
+    # the slicer's completion hook drives the chain now, a further round from here is
+    # a SECOND author on the same tree.
+    gone = driver_gone(a)
+    if gone:
+        return f"DRIVER GONE ({gone})"
     return None
 
 
@@ -3708,7 +3896,112 @@ def _stop_for_hand(a, wt, what):
         raise SystemExit(EXIT_ORPHANED)
 
 
+# TRACKED-TARGET DIRT AFTER HARNESS AUTHORING (2026-10-09, rt-costco-receipt-attach-s2,
+# job b90e77ace2b2). The stage-2 (fixture) model ran `python3 refimpl.py` BY HAND, which
+# applies the reference solution to the tracked target; nothing reverted it (the
+# self-check deliberately PRESERVES an already-dirty tracked file as "the model's own
+# uncommitted work", and _harness_check_output restores the pre-check bytes, i.e. the same
+# dirt). Stage 3 then launched with launch_baseline.dirty=1 -> the gate flagged the job
+# UNTRUSTED/'concerns' and escalated an authoritative regate that froze other bundles.
+# While the HARNESS is being authored the target is by definition at base: nothing in an
+# `auto-author-*` job may legitimately leave a tracked product file modified. Enforce it
+# at the one choke point every authoring round passes through (staged stage, legacy round,
+# continuation), before AND after the job, instead of trusting each model/check to clean up.
+_AUTHORING_KEEP_NAMES = frozenset({
+    "TASK.md", "AUTO-TASK.md", "verify.sh", "refimpl.py", "check_literals.py",
+    "auto-harness-check.py", ".dispatch-harness.json", "dispatch-env.ts", "dispatch_env.py",
+    ".preflight-state.json", ".refine-guard.json"})
+
+
+def restore_authoring_tree_to_base(wt, target=None, lang=None, quiet=False):
+    """Put every TRACKED product file the harness authoring left modified back to HEAD
+    (the target above all) and, for a creation task whose untracked target stub was
+    overwritten with the solution, rewrite the scaffold stub. Harness files (TASK.md,
+    refimpl.py, the fixture, ...) are NEVER touched. Returns the list of restored paths;
+    [] when nothing was dirty or the tree is not usable. Fail-open on every error."""
+    import fnmatch as _fn
+    wt = Path(wt)
+    done = []
+    try:
+        d = subprocess.run(["git", "-C", str(wt), "diff", "--name-only", "HEAD"],
+                           capture_output=True, text=True, timeout=60)
+        if d.returncode != 0:
+            return done
+        keep_globs = list(fixture_globs_for(lang or "python"))
+        dirty = []
+        for f in d.stdout.splitlines():
+            f = f.strip()
+            if not f or Path(f).name in _AUTHORING_KEEP_NAMES:
+                continue
+            if any(_fn.fnmatch(f, g) or _fn.fnmatch(Path(f).name, g) for g in keep_globs):
+                continue
+            dirty.append(f)
+        creation = None
+        if target:
+            try:
+                hj = json.loads((wt / ".dispatch-harness.json").read_text()) or {}
+            except Exception:
+                hj = {}
+            if hj.get("creation_task") and (wt / target).is_file():
+                tr = subprocess.run(["git", "-C", str(wt), "ls-files", "--error-unmatch", "--", target],
+                                    capture_output=True, text=True, timeout=30)
+                if tr.returncode != 0:      # untracked creation stub
+                    creation = target
+        if not dirty and not creation:
+            return done
+        with tree_lock(wt, timeout=GATE_TREE_WAIT_S):
+            for f in dirty:
+                r = subprocess.run(["git", "-C", str(wt), "checkout", "HEAD", "--", f],
+                                   capture_output=True, text=True, timeout=60)
+                if r.returncode == 0:
+                    done.append(f)
+            if creation:
+                try:
+                    from importlib.machinery import SourceFileLoader as _SFL
+                    import importlib.util as _ilu
+                    _sl = _SFL("_scaffold_stub_r", str(BIN / "ollama-dispatch-scaffold"))
+                    _sm = _ilu.module_from_spec(_ilu.spec_from_loader("_scaffold_stub_r", _sl))
+                    _sl.exec_module(_sm)
+                    stub = _sm.creation_stub(creation, Path(creation).suffix)
+                    if stub is not None and (wt / creation).read_text(errors="replace") != stub:
+                        (wt / creation).write_text(stub)
+                        done.append(creation)
+                except Exception:
+                    pass
+        if done and not quiet:
+            print(f"    [repair] harness authoring left product file(s) modified "
+                  f"({', '.join(done[:6])}) -- restored to base so the next job launches "
+                  f"from a clean, attributable baseline.")
+    except Exception:
+        pass
+    return done
+
+
 def dispatch_model(wt: Path, prompt: str, label: str, verify_cmd: str, a, max_iters=None):
+    """Author/refine via the local model on the queue, or via --drafter-cmd.
+
+    For `auto-author-*` jobs the tracked target is restored to base before the job is
+    enqueued and again once it returns (see restore_authoring_tree_to_base)."""
+    _is_author = str(label or "").startswith("auto-author-") and not getattr(a, "drafter_cmd", None)
+    _tgt = getattr(a, "target", None)
+    if _is_author:
+        restore_authoring_tree_to_base(wt, _tgt, getattr(a, "lang", None))
+    try:
+        return _dispatch_model_inner(wt, prompt, label, verify_cmd, a, max_iters=max_iters)
+    finally:
+        if _is_author:
+            restore_authoring_tree_to_base(wt, _tgt, getattr(a, "lang", None))
+            # FREEZE: an ADMITTED harness (zero defects) may not be modified by an author job.
+            try:
+                _fz = _ha().enforce_freeze(wt, label) if _ha() is not None else []
+                if _fz:
+                    log_decision("harness-frozen", a, "author job modified an admitted harness; restored",
+                                 f"frozen-harness-mutated: {_fz}")
+            except Exception:
+                pass
+
+
+def _dispatch_model_inner(wt: Path, prompt: str, label: str, verify_cmd: str, a, max_iters=None):
     """Author/refine via the local model on the queue, or via --drafter-cmd.
 
     Returns (ok, why). The worker edits files in the worktree in place."""
@@ -3754,7 +4047,39 @@ def dispatch_model(wt: Path, prompt: str, label: str, verify_cmd: str, a, max_it
                        "not be regenerated -- refusing to enqueue a job whose verify "
                        "command would ENOENT on every iteration")
 
+    # HARNESS ADMISSION GATE (2026-10-10, harness_admission.py): no author/refine/continuation job is
+    # enqueued against a defective harness. Fail-closed with a named cause on the SPEC_DEFECT route
+    # (no more rounds, never auto-sliced); a recurrence of the same defect set is a re-slice/re-spec.
+    a._admission_wt = wt
+    _ha_adv = ""
+    if label.startswith(("auto-author-", "auto-refine-")) and _ha() is not None:
+        _adm = _ha().admit(wt, label, target=getattr(a, "target", None), lang=getattr(a, "lang", None), text=prompt)
+        if not _adm["ok"]:
+            _m = _adm["message"]
+            salvage_round(a, wt, "admission-refused", _m)
+            _m += f" [stop_reason={STOP_ADMISSION_REFUSED}]{_salvage_note(a)}"
+            record_stop(a, STOP_ADMISSION_REFUSED, _m, kind="spec-defect",
+                        decision=f"harness admission refused: {_adm['cause']}")
+            print(f"\n[auto] HARNESS ADMISSION REFUSED ({_adm['cause']}): {_m}", file=sys.stderr)
+            return False, _m
+        _ha_adv = _ha().advisory_prompt(_adm)
+    # HARD CEILING (2026-10-10): at most AUTHOR_ROUNDS_HARD_MAX authoring jobs per driver run,
+    # whatever their classification (staged stages + re-prompts + ladder + escalation).
+    if label.startswith("auto-author-"):
+        _n = int(getattr(a, "_author_rounds_run", 0) or 0)
+        if _n >= AUTHOR_ROUNDS_HARD_MAX:
+            _m = (f"{SPEC_DEFECT_ROUTE_PREFIX}ROUND CEILING: {_n} authoring jobs already ran in this "
+                  f"driver run (AUTHOR_ROUNDS_HARD_MAX={AUTHOR_ROUNDS_HARD_MAX}) -- NOT enqueuing "
+                  f"{label}. More rounds are not the fix; re-spec the slice / fix the harness.")
+            salvage_round(a, wt, "round-ceiling", _m)
+            _m += f" [stop_reason={STOP_ROUND_CEILING}]{_salvage_note(a)}"
+            record_stop(a, STOP_ROUND_CEILING, _m, kind="spec-defect", decision="author round hard ceiling")
+            print(f"\n[auto] ROUND CEILING STOP: {_m}", file=sys.stderr)
+            return False, _m
+        a._author_rounds_run = _n + 1
     pf = wt / "AUTO-TASK.md"
+    if _ha_adv and "HARNESS ADMISSION DEFECTS" not in prompt:
+        prompt = prompt.rstrip("\n") + _ha_adv
     # Budget-policy passthrough (worker_budget.py): the worker reads a `Budget-policy:` line from the
     # task text, so an A/B arm needs no queue change. Absent flag = prompt byte-identical to before.
     _bpol = getattr(a, "budget_policy", None)
@@ -3770,7 +4095,7 @@ def dispatch_model(wt: Path, prompt: str, label: str, verify_cmd: str, a, max_it
         cmd += ["--bundle", str(a.bundle)]
     if a.max_tokens:
         cmd += ["--max-tokens", str(a.max_tokens)]
-    # CONTINUATION (the owner 2026-09-24, "it should have gone to 2nd, not 5th"): every
+    # CONTINUATION (Penn 2026-09-24, "it should have gone to 2nd, not 5th"): every
     # round after this run's first one continues a chain already in flight, so the
     # queue places it right behind whatever is running instead of at FIFO position.
     _prev_round = getattr(a, "_chain_last_job", None)
@@ -3852,9 +4177,16 @@ def dispatch_model(wt: Path, prompt: str, label: str, verify_cmd: str, a, max_it
         # result would be a second driver on the worktree.
         gone = driver_gone(a)
         if gone:
-            return False, (f"ORPHANED while polling {job}: {gone}. The job stays "
-                           f"live in the queue and the slicer's completion hook "
-                           f"owns it from here; this poller stops.")
+            # SINGLE-FLIGHT (2026-10-09, rt-costco-receipt-attach-s1): this used to
+            # `return False, "ORPHANED ..."`. The staged-authoring caller read that as a
+            # failed attempt (record_attempt) and RE-PROMPTED: _stop_for_hand did not
+            # know the driver was gone, so it enqueued -s1-r1, -s1-r2 and a -c1
+            # continuation back to back, all on one worktree, each counted as a model
+            # failure. An orphan is not an attempt outcome: stop the whole run now.
+            print(f"\n[auto] ORPHANED while polling {job}: {gone}. The job stays "
+                  f"live in the queue and the slicer's completion hook owns it from "
+                  f"here; this poller stops and enqueues NOTHING further.")
+            raise SystemExit(EXIT_ORPHANED)
         row = job_row(job)
         if not row:
             # The row can be gone for two very different reasons: (a) the job
@@ -4041,6 +4373,11 @@ CONTAMINATED_PREFIX = "CONTAMINATED: "
 # dies with the `SPEC_DEFECT: ` line the slicer re-specs on -- never auto-sliced, never a
 # further model round (same destination as the pre-dispatch contradiction gate).
 SPEC_DEFECT_ROUTE_PREFIX = "SPEC_DEFECT: "
+# harness_admission refusals have their OWN marker (== harness_admission.ADMISSION_ROUTE_PREFIX): they stop
+# the rounds exactly like a spec defect here, but the slicer must NOT read them as a SPEC_DEFECT (it would
+# spend the respec budget a second time) -- see ollama-dispatch-slice.is_admission_refusal.
+ADMISSION_ROUTE_PREFIX = "ADMISSION_REFUSED: "
+NO_MORE_ROUNDS_PREFIXES = (SPEC_DEFECT_ROUTE_PREFIX, ADMISSION_ROUTE_PREFIX)
 # WORKER EXIT REASONS from the sampling-escalation ladder (worker_robust, 2026-10-09). They are
 # queue-row `terminal_reason`s and must not read as bare "did not converge":
 #   spec_defect_repeat_abort -> two aborts on the SAME failing check: the SPEC is wrong, so it takes
@@ -4109,7 +4446,7 @@ def _failure_route(why: str) -> str:
     # pieces -- park visibly; the slicer reads the self-check's own FAIL line.
     return ("die" if (why or "").startswith((CONTAMINATED_PREFIX, HARNESS_ENV_PREFIX,
                                              BASELINE_GREEN_PREFIX, PLAN_SUSPECT_PREFIX,
-                                             SPEC_DEFECT_ROUTE_PREFIX))
+                                             SPEC_DEFECT_ROUTE_PREFIX, ADMISSION_ROUTE_PREFIX))
             else "autoslice")
 
 
@@ -4596,6 +4933,351 @@ def plan_suspect(prev_cases, cases, total):
     >= half) of `total` AND identical to the previous round's set."""
     return bool(cases and len(cases) >= 2 and total and 2 * len(cases) >= total
                 and prev_cases and cases == prev_cases)
+# ROUND RUNAWAY (2026-10-10, aw-codec-floor s2b-incoming-name-var: ff50902db43f + r1 + r2, each
+# 14/14). Rounds kept being queued while the HARNESS-LEVEL failure never improved: the verify
+# said STAGE_FAIL (contradictory static checks) and the model's own self-check said "the
+# reference impl does not make verify.sh print VERIFY_OK". The queue labelled that
+# `nonconvergence_progressing` (the model's self-check text merely CHANGED), and nothing in this
+# driver compared consecutive rounds. "Progress" here is MEASURABLE: a round is progressing only
+# when its failure signature is new (not equal to the previous round, not a flap back to an
+# earlier one) or, for refimpl-fails-own-tests, when strictly FEWER cases fail. Anything else
+# stops the loop with a SPEC_DEFECT line (the slicer's re-spec path, respec_class) instead of
+# another model round. A hard per-driver ceiling bounds every other shape.
+AUTHOR_ROUNDS_HARD_MAX = int(os.environ.get("AUTHOR_ROUNDS_HARD_MAX", "8") or 8)
+_VERIFY_FAIL_LINE_RE = re.compile(r"^\s*(?:STAGE_FAIL:|FAIL\b|FAILED CASE:)[^\n]*$", re.M)
+_SELFCHECK_ECHO_RE = re.compile(r"^\[worker\] tool run_bash\(.*auto-harness-check\.py.*$", re.M)
+_ECHO_CASE_RE = re.compile(r"FAIL(?:ED CASE:)?[: ] ?([^\\\"]{3,110})")
+
+
+# SIGNATURE NORMALISATION (2026-10-10). A signature that includes run-specific noise makes the
+# SAME failure look new every round (a nondeterministic traceback, a tmp dir, "in 0.12s") and
+# defeats the runaway detector. Strip exactly the noise classes below -- and NOTHING else: other
+# digits (expected/actual values, counts) are part of WHAT failed, so `expected 3` vs `expected 5`
+# stay different signatures. (Collapsing every digit, as this did before, merged those.)
+_NOISE_RES = (
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<ts>"),
+    (re.compile(r"\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?"), "<ts>"),
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<id>"),
+    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<addr>"),
+    (re.compile(r"(?i)\b(?:pid|tid|process|thread)[ =:#]*\d+"), "<pid>"),
+    (re.compile(r"(?i)\b(?:in|took|after|elapsed|duration|time)[: =]*\d+(?:\.\d+)?\s*(?:ms|us|s|secs?|seconds?|min)\b"),
+     "<dur>"),
+    (re.compile(r"(?i)\b\d+(?:\.\d+)?\s*(?:ms|us|secs?|seconds)\b"), "<dur>"),
+    # absolute paths: keep only the basename (the tmp/worktree dir is run-specific)
+    (re.compile(r"(?<![\w./-])/(?:[\w.@+~-]+/)+([\w.@+~-]+)"), r"<path>/\1"),
+    # file:line[:col] and "line N": line-number drift between edits is not a different failure
+    (re.compile(r"(\.\w{1,5}):\d+(?::\d+)?\b"), r"\1:<n>"),
+    (re.compile(r"(?i)\bline \d+\b"), "line <n>"),
+    (re.compile(r"\b[0-9a-f]{8,}\b"), "<id>"),
+)
+
+
+def normalise_noise(s):
+    """PURE. `s` with run-specific noise (timestamps, absolute paths/tmp dirs, durations, pids,
+    memory addresses, uuids/hashes, line numbers) replaced by placeholders."""
+    s = str(s)
+    for rx, rep in _NOISE_RES:
+        s = rx.sub(rep, s)
+    return s
+
+
+def _norm_fail(s):
+    return " ".join(normalise_noise(s).lower().split())[:110]
+
+
+def harness_round_signature(log_text):
+    """PURE. The harness-level outcome of one failed authoring round, from its worker log:
+    {"verify": frozenset(normalised FAIL lines of the final verify block, else its first line),
+     "unsat": the model's LAST in-run self-check said the refimpl does not make verify pass,
+     "cases": frozenset(failing case names parsed from that self-check echo)}."""
+    txt = log_text or ""
+    blk = last_verify_block(txt)
+    names = {_norm_fail(m.group(0)) for m in _VERIFY_FAIL_LINE_RE.finditer(blk)}
+    if not names:
+        first = next((ln for ln in blk.splitlines() if ln.strip()), "")
+        if first:
+            names = {_norm_fail(first)}
+    echoes = _SELFCHECK_ECHO_RE.findall(txt)
+    unsat, cases = False, frozenset()
+    if echoes and REFIMPL_OWN_TESTS_MARK in echoes[-1]:
+        unsat = True
+        cases = frozenset(_norm_fail(c) for c in _ECHO_CASE_RE.findall(echoes[-1])
+                          if "reference impl" not in c and "verify fails" not in c.lower())
+    return {"verify": frozenset(names), "unsat": unsat, "cases": cases}
+
+
+# DISTINCT, MACHINE-READABLE STOP REASONS (2026-10-10; mini-swe-agent style exit statuses).
+# Recorded by record_stop() as `stop_reason=` on the auto-decisions log line AND as
+# runs[<label>].stop in the chain record (auto-runs/<key>.json), so "why did this run stop"
+# is a field, not a prose grep.
+STOP_REPEATED_SIGNATURE = "repeated_signature"     # same harness-level failure two rounds running
+STOP_FLAP = "flap"                                 # fell back to a failure an earlier round ended on
+STOP_UNSAT_NO_PROGRESS = "unsat_no_progress"       # refimpl-unsat twice and no fewer failing cases
+STOP_ROUND_CEILING = "round_ceiling"               # AUTHOR_ROUNDS_HARD_MAX authoring jobs spent
+STOP_ITERATION_CAP = "iteration_cap"               # continuation rounds exhausted, still not green
+STOP_SELFCHECK_IDENTICAL = "selfcheck_identical"   # continuation left the self-check byte-identical
+STOP_HARNESS_UNCHANGED = "harness_unchanged"       # continuation left the harness byte-identical
+STOP_EXTERNAL_KILL = "external_kill"               # the DRIVER was signalled (129/137/143)
+STOP_FRESH_RESTART_FAILED = "fresh_restart_failed"  # the one AUTO_FRESH_RESTART round also failed
+STOP_ADMISSION_REFUSED = "admission_refused"       # harness_admission.admit() refused the enqueue (re-slice / re-spec)
+STOP_REASONS = frozenset({STOP_ADMISSION_REFUSED, STOP_REPEATED_SIGNATURE, STOP_FLAP, STOP_UNSAT_NO_PROGRESS,
+                          STOP_ROUND_CEILING, STOP_ITERATION_CAP, STOP_SELFCHECK_IDENTICAL,
+                          STOP_HARNESS_UNCHANGED, STOP_EXTERNAL_KILL, STOP_FRESH_RESTART_FAILED})
+# the driver was signalled: SIGHUP 129 / SIGKILL 137 / SIGTERM 143 (a session close, a task time
+# limit, a daemon restart, an orphan cleanup) -- an external kill, not an authoring failure
+EXTERNAL_KILL_CODES = frozenset({128 + 1, 128 + 9, 128 + 15})
+
+
+def round_runaway_kind(history, cur):
+    """PURE. (stop, why, kind). `history` = earlier rounds' signatures (oldest first), `cur` =
+    the round that just failed. Stop when it is NOT measurably progressing; `kind` is one of the
+    STOP_* reasons (repeated_signature / flap / unsat_no_progress)."""
+    if not history or not (cur.get("verify") or cur.get("unsat")):
+        return False, "", ""
+    prev = history[-1]
+    if cur == prev:
+        return True, "identical harness-level failure signature two rounds running", STOP_REPEATED_SIGNATURE
+    if cur["verify"] and any(cur["verify"] == h.get("verify") for h in history[:-1]):
+        return True, "the verify failure flapped back to one an earlier round already ended on", STOP_FLAP
+    if prev.get("unsat") and cur["unsat"]:
+        if not (cur["cases"] and prev.get("cases") and len(cur["cases"]) < len(prev["cases"])):
+            return True, ("the refimpl does not make verify.sh pass in consecutive rounds and no "
+                          "fewer cases fail (the task is unsatisfiable as written, or the verify "
+                          "asserts more than the spec)"), STOP_UNSAT_NO_PROGRESS
+    return False, "", ""
+
+
+def round_runaway_decision(history, cur):
+    """PURE. (stop, why) -- round_runaway_kind without the kind."""
+    stop, why, _k = round_runaway_kind(history, cur)
+    return stop, why
+
+
+# SALVAGE ARTIFACTS (2026-10-10; SWE-agent 'autosubmit' salvage). When a round ends NOT
+# converged -- and on a runaway / ceiling / kill stop -- the work is captured before the next
+# round (or the park) can overwrite it. STABLE LOCATION, next to the driver's chain record
+# (auto-runs/<key>.json):
+#     <AUTO_RUNS_DIR>/<key>.artifacts/<label>/round-NN-<tag>/
+#         worktree.diff    git diff HEAD of the worktree + every untracked file (capped)
+#         verify-tail.txt  the round's last verify block + the tail of its worker log
+#         meta.json        {at, tag, why, job, log_path, worktree, signature}
+# The newest path is on `a._last_salvage` and is printed in every stop / park line so a human
+# (or a fresh-context round) can open it. Pure observation: never raises, never touches the tree.
+SALVAGE_DIFF_CAP = 1_000_000
+SALVAGE_FILE_CAP = 200_000
+SALVAGE_TAIL_CAP = 12_000
+
+
+def salvage_dir(a, runs_dir=None):
+    key = chain_key(a) or getattr(a, "label", None) or "run"
+    return Path(runs_dir or AUTO_RUNS_DIR) / f"{key}.artifacts" / (getattr(a, "label", None) or key)
+
+
+def _git_out(wt, *args, timeout=60):
+    r = subprocess.run(["git", "-C", str(wt), *args], capture_output=True, text=True,
+                       errors="replace", timeout=timeout)
+    return r.returncode, r.stdout
+
+
+def salvage_round(a, wt, tag, why="", verify_text=None, runs_dir=None, timeout=60):
+    """Write diff + last verify tail for the round that just ended to the artifact dir (see
+    above). Returns the directory path (str), or None. Never raises."""
+    try:
+        paths = getattr(a, "_salvage_paths", None)
+        if paths is None:
+            paths = []
+            a._salvage_paths = paths
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(tag))[:40].strip("-") or "round"
+        d = salvage_dir(a, runs_dir) / f"round-{len(paths) + 1:02d}-{safe}"
+        d.mkdir(parents=True, exist_ok=True)
+        diff = ""
+        if wt and Path(wt).is_dir():
+            try:
+                rc, out = _git_out(wt, "diff", "HEAD", "--no-color", timeout=timeout)
+                diff = out if rc == 0 else f"(git diff HEAD failed rc={rc})\n"
+                rc2, un = _git_out(wt, "ls-files", "--others", "--exclude-standard", "-z", timeout=timeout)
+                for rel in (un.split("\0") if rc2 == 0 else []):
+                    if not rel or "node_modules/" in rel or "__pycache__/" in rel or len(diff) > SALVAGE_DIFF_CAP:
+                        continue
+                    fp = Path(wt) / rel
+                    try:
+                        if not fp.is_file() or fp.stat().st_size > SALVAGE_FILE_CAP:
+                            diff += f"\n### untracked {rel}: skipped (missing or > {SALVAGE_FILE_CAP} bytes)\n"
+                            continue
+                        body = fp.read_text(errors="replace")
+                    except OSError:
+                        continue
+                    diff += f"\n### untracked file: {rel}\n" + body + ("" if body.endswith("\n") else "\n")
+            except Exception as e:
+                diff += f"\n(salvage: git unavailable: {type(e).__name__}: {e})\n"
+        else:
+            diff = "(no worktree path)\n"
+        (d / "worktree.diff").write_text(diff[:SALVAGE_DIFF_CAP])
+        o = getattr(a, "_last_job_outcome", None) or {}
+        vt = verify_text
+        lp = o.get("log_path")
+        logtxt = ""
+        if lp and Path(lp).is_file():
+            try:
+                logtxt = Path(lp).read_text(errors="replace")[-400000:]
+            except OSError:
+                logtxt = ""
+        if vt is None:
+            vt = last_verify_block(logtxt)
+        (d / "verify-tail.txt").write_text(
+            str(vt or "(no verify block in the worker log)")[-SALVAGE_TAIL_CAP:]
+            + ("\n\n--- worker log tail ---\n" + logtxt[-SALVAGE_TAIL_CAP:] if logtxt else ""))
+        sig = harness_round_signature(logtxt) if logtxt else {}
+        (d / "meta.json").write_text(json.dumps({
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tag": str(tag),
+            "why": " ".join(str(why or "").split())[:600], "job": o.get("job") or getattr(a, "_chain_last_job", None),
+            "log_path": lp, "worktree": str(wt) if wt else None,
+            "signature": {"verify": sorted(sig.get("verify", ())), "unsat": bool(sig.get("unsat")),
+                          "cases": sorted(sig.get("cases", ()))}}, indent=1))
+        paths.append(str(d))
+        a._last_salvage = str(d)
+        return str(d)
+    except Exception:
+        return None
+
+
+def record_stop(a, stop_reason, detail="", kind="round-stop", decision=None, runs_dir=None, persist=True):
+    """Record WHY this run stopped, machine-readably: a log_decision line carrying
+    `stop_reason=` + `artifact=` (the newest salvage dir) and runs[<label>].stop in the chain
+    record. `stop_reason` is one of STOP_REASONS. Never raises."""
+    try:
+        art = getattr(a, "_last_salvage", None)
+        a._stop_reason = stop_reason
+        rec = {"reason": stop_reason, "detail": " ".join(str(detail or "").split())[:300],
+               "artifact": art, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        key = chain_key(a)
+        if key:
+            fp = Path(runs_dir or AUTO_RUNS_DIR) / f"{key}.json"
+            lbl = getattr(a, "label", None) or key
+
+            def _mut(d):
+                d["runs"].setdefault(lbl, {})["stop"] = rec
+            _chain_locked_update(fp, _mut)
+        log_decision(kind, a, decision or stop_reason, rec["detail"], persist=persist,
+                     stop_reason=stop_reason, artifact=art)
+        # a runaway / repeated-signature stop is a RE-SLICE signal for THIS harness: the admission gate
+        # (and the queue backstop) refuse any further identical author/refine round until it changes.
+        _awt = getattr(a, "_admission_wt", None)
+        if (kind == "spec-defect" and _awt is not None and _ha() is not None
+                and stop_reason in (STOP_REPEATED_SIGNATURE, STOP_FLAP, STOP_UNSAT_NO_PROGRESS,
+                                    STOP_ROUND_CEILING, STOP_SELFCHECK_IDENTICAL, STOP_HARNESS_UNCHANGED,
+                                    STOP_FRESH_RESTART_FAILED)):
+            _ha().note_stop(_awt, stop_reason, rec["detail"])
+    except Exception:
+        pass
+
+
+def _salvage_note(a):
+    p = getattr(a, "_last_salvage", None)
+    return f" Salvage (diff + last verify output): {p}" if p else ""
+
+
+# FRESH-CONTEXT RESTART (2026-10-10; Fail-Fast Restart-Smart, arXiv 2608.03222). Behind
+# AUTO_FRESH_RESTART=1 (DEFAULT OFF). When the runaway detector fires on a model-authoring
+# non-convergence, allow exactly ONE restart round whose prompt carries the TASK + harness
+# rules only: no prior-failure ledger, no self-check output, no "NOT yet passing" lines -- just
+# an optional short `git diff --stat` of what is on disk. A harness-level signature
+# (refimpl-unsat) skips the restart: the harness itself is wrong and a new context cannot fix it.
+def fresh_restart_enabled():
+    return os.environ.get("AUTO_FRESH_RESTART", "0").strip() == "1"
+
+
+def fresh_restart_eligible(a, kind, cur):
+    """PURE-ish. True when ONE fresh round may run for this runaway."""
+    return bool(fresh_restart_enabled()
+                and not int(getattr(a, "_fresh_restarts", 0) or 0)
+                and not getattr(a, "drafter_cmd", None)
+                and kind in (STOP_REPEATED_SIGNATURE, STOP_FLAP)
+                and not (cur or {}).get("unsat")        # harness-level => straight to SPEC_DEFECT
+                and (cur or {}).get("verify"))
+
+
+def fresh_overlay(wt):
+    """The optional short diff summary appended to a fresh-restart prompt ('' if unavailable)."""
+    try:
+        rc, out = _git_out(wt, "diff", "HEAD", "--stat", "--no-color", timeout=30)
+        rc2, un = _git_out(wt, "ls-files", "--others", "--exclude-standard", timeout=30)
+        stat = (out.strip() if rc == 0 else "")[:700]
+        files = ", ".join(x for x in un.split("\n") if x)[:300] if rc2 == 0 else ""
+        if not (stat or files):
+            return ""
+        return ("\n\n## Optional context: files already on disk (from an earlier attempt that did "
+                "not converge)\nTreat them as a starting point you may keep or rewrite; judge "
+                "them against the task above, not against any earlier attempt.\n"
+                + (f"```\n{stat}\n```\n" if stat else "") + (f"Untracked: {files}\n" if files else ""))
+    except Exception:
+        return ""
+
+
+def resolve_runaway(a, wt, stop_msg, build_prompt, label, verify_cmd, max_iters=None):
+    """Called when check_round_runaway returned `stop_msg`. Returns (ok, text):
+      * not pending a restart (flag off / ineligible / already used): the stop was already
+        recorded -> (False, stop_msg);
+      * pending: run exactly ONE fresh-context round. Converged -> (True, why); else the stop is
+        recorded (fresh_restart_failed) and (False, stop_msg + note)."""
+    info = getattr(a, "_runaway_pending", None)
+    if not info:
+        return False, stop_msg
+    a._runaway_pending = None
+    a._fresh_restarts = int(getattr(a, "_fresh_restarts", 0) or 0) + 1
+    log_decision("fresh-restart", a, "ONE fresh-context round granted after a runaway signature",
+                 f"{info['kind']}: {info['why']}", stop_reason=info["kind"], artifact=getattr(a, "_last_salvage", None))
+    print(f"\n[auto] FRESH RESTART (AUTO_FRESH_RESTART=1): {info['kind']} -- one round with a clean "
+          f"context (task + harness only, failed history omitted) before SPEC_DEFECT.")
+    ok, why = dispatch_model(wt, build_prompt() + fresh_overlay(wt), label, verify_cmd, a, max_iters=max_iters)
+    if ok:
+        a._stop_reason = None
+        log_decision("fresh-restart", a, "fresh-context round converged", str(why)[:200])
+        return True, why
+    salvage_round(a, wt, "fresh-failed", why)
+    record_stop(a, STOP_FRESH_RESTART_FAILED, f"{info['kind']}; fresh round: {str(why)[:160]}",
+                kind="spec-defect", decision="fresh restart also failed -> round runaway stop")
+    return False, (stop_msg + f" A fresh-context restart round was also tried and did not converge "
+                   f"({str(why).splitlines()[0][:160] if why else 'no reason'}).")
+
+
+def check_round_runaway(a, why=""):
+    """Record this failed round's signature on `a`; return the SPEC_DEFECT stop line when the
+    loop is not progressing, else None. LOUD: logged to auto-decisions (with a machine-readable
+    `stop_reason`) + printed. When AUTO_FRESH_RESTART=1 and the failure is a model-authoring
+    non-convergence, the stop is NOT recorded yet: `a._runaway_pending` is set and the caller
+    hands the line to resolve_runaway(), which runs ONE fresh-context round first. Never raises."""
+    try:
+        a._runaway_pending = None
+        o = getattr(a, "_last_job_outcome", None) or {}
+        if is_non_attempt(o.get("failure_class"), o.get("terminal_reason"), o.get("status")):
+            return None
+        lp = o.get("log_path")
+        text = Path(lp).read_text(errors="replace")[-400000:] if lp and Path(lp).is_file() else ""
+        cur = harness_round_signature(text)
+        hist = getattr(a, "_round_sigs", None)
+        if hist is None:
+            hist = []
+            a._round_sigs = hist
+        stop, w, kind = round_runaway_kind(hist, cur)
+        hist.append(cur)
+        if not stop:
+            return None
+        msg = (f"{SPEC_DEFECT_ROUTE_PREFIX}ROUND RUNAWAY: {w} (round {len(hist)}; failing signal: "
+               f"{'; '.join(sorted(cur['verify']))[:160] or 'refimpl-unsat'}) -- NOT queuing another "
+               f"model round; another job cannot change this. Re-spec the slice / fix the harness, "
+               f"then --retry-slice. [stop_reason={kind}]{_salvage_note(a)}")
+        if fresh_restart_eligible(a, kind, cur):
+            a._runaway_pending = {"kind": kind, "why": w}
+            return msg
+        record_stop(a, kind, f"{w} (round {len(hist)})", kind="spec-defect",
+                    decision="round runaway stop (no measurable progress)")
+        print(f"\n[auto] ROUND RUNAWAY STOP: {msg}", file=sys.stderr)
+        return msg
+    except Exception:
+        return None
+
+
 BASELINE_GREEN_MARK = "verify.sh PASSES at baseline"
 
 
@@ -4729,6 +5411,11 @@ def _author_with_continuations(a, wt: Path, target: str, verify_cmd: str,
     else:
         ok, why = dispatch_model(wt, author_prompt(a, target),
                                  f"auto-author-{a.label}", verify_cmd, a)
+        if not ok and (why or "").startswith(NO_MORE_ROUNDS_PREFIXES):
+            return ok, why
+        if not ok:
+            salvage_round(a, wt, "author-round0", why)
+            check_round_runaway(a, why)      # seed the history with round 0
     if ok:
         return ok, why
     sig = _harness_signature(wt, a.lang, target)
@@ -4788,7 +5475,9 @@ def _author_with_continuations(a, wt: Path, target: str, verify_cmd: str,
                 f"refimpl.py applied, on the IDENTICAL set at two consecutive self-checks, so "
                 f"the cause is shared by all of them -- the refimpl, or what the plan asks it "
                 f"to do (a must_contain literal that is a `Name: value` pair, an intent/fixture "
-                f"body-shape mismatch, a datum the plan never defined) -- not a single case. "
+                f"body-shape mismatch, a datum the plan never defined, or -- when ALL cases fail "
+                f"identically -- the FIXTURE's own stubs never letting the handler reach the "
+                f"asserted behaviour) -- not a single case. "
                 f"NOT burning continuation round {rnd}. Failing cases: "
                 + "; ".join(sorted(_uc)[:6]) + ". Fix the plan/refimpl, then --retry-slice.")
         prev_unsat = _uc
@@ -4799,9 +5488,12 @@ def _author_with_continuations(a, wt: Path, target: str, verify_cmd: str,
         # it a thrashing model would burn every continuation round, and the
         # worst case here is 24 + rounds*24 iterations of Studio GPU.
         if prev_check is not None and _normalise_check(last_check) == prev_check:
+            salvage_round(a, wt, f"c{rnd - 1}-selfcheck-identical", why, verify_text=last_check)
+            record_stop(a, STOP_SELFCHECK_IDENTICAL, f"continuation round {rnd - 1} left the self-check identical")
             return False, (f"{why} -- and continuation round {rnd - 1} left the "
                            f"self-check output byte-identical, so the harness is "
-                           f"not improving (genuinely stuck, not out of runway)")
+                           f"not improving (genuinely stuck, not out of runway) "
+                           f"[stop_reason={STOP_SELFCHECK_IDENTICAL}]{_salvage_note(a)}")
         prev_check = _normalise_check(last_check)
         ok, why = dispatch_model(
             wt, author_continue_prompt(a, target, last_check),
@@ -4810,13 +5502,24 @@ def _author_with_continuations(a, wt: Path, target: str, verify_cmd: str,
         if ok:
             print(f"    converged on continuation round {rnd}: {why}")
             return ok, why
+        if (why or "").startswith(NO_MORE_ROUNDS_PREFIXES):
+            return ok, why
+        salvage_round(a, wt, f"c{rnd}", why)
+        _rr = check_round_runaway(a, why)
+        if _rr:
+            return resolve_runaway(a, wt, _rr, lambda: author_prompt(a, target, fresh=True),
+                                   f"auto-author-{a.label}-fresh", verify_cmd, a.author_max_iters)
         new_sig = _harness_signature(wt, a.lang, target)
         if new_sig == sig:
+            record_stop(a, STOP_HARNESS_UNCHANGED, f"continuation round {rnd} left the harness byte-identical")
             return False, (f"{why} -- and continuation round {rnd} left the "
                            f"harness byte-identical, so more rounds cannot help "
-                           f"(genuinely stuck, not out of runway)")
+                           f"(genuinely stuck, not out of runway) "
+                           f"[stop_reason={STOP_HARNESS_UNCHANGED}]{_salvage_note(a)}")
         sig = new_sig
-    return False, (worker_exit_failure(a, why) or why)
+    record_stop(a, STOP_ITERATION_CAP, f"{a.author_continue_rounds} continuation round(s) exhausted without converging")
+    return False, ((worker_exit_failure(a, why) or why)
+                   + f" [stop_reason={STOP_ITERATION_CAP}]{_salvage_note(a)}")
 
 
 # --------------------------------------------------------------------------
@@ -4827,7 +5530,7 @@ def _author_with_continuations(a, wt: Path, target: str, verify_cmd: str,
 # with the SAME class twice (refimpl fails its own tests -- a badly hand-built
 # fake page env), the continuation guard said "genuinely stuck", the run died
 # through _autoslice_on_failure -> die("... Human needed.") into a log nobody
-# reads, and the queue/dashboard showed nothing parked. The owner: "why did it remove
+# reads, and the queue/dashboard showed nothing parked. Penn: "why did it remove
 # itself from the queue?". Three fixes, each behind a pure, tested function:
 #   * every failed authoring attempt is recorded (class + exact reason + self-
 #     check tail) in auto-runs/<key>.attempts.json and the NEXT attempt's prompt
@@ -4843,8 +5546,9 @@ def _author_with_continuations(a, wt: Path, target: str, verify_cmd: str,
 #     dashboard), and the chain record carries `parked` (park_visible).
 # --------------------------------------------------------------------------
 FAKE_BROWSER_TS = BIN / "dispatch-templates" / "fake-browser.ts"
-ATTEMPT_CLASSES = ("refimpl-fails-own-tests", "syntax-error", "baseline-passes",
-                   "no-progress", "iteration-cap", "verify-missing", "contaminated",
+STAGE_CHECK_DISAGREES = "but the stage check disagrees"
+ATTEMPT_CLASSES = ("refimpl-fails-own-tests", "syntax-error", "baseline-passes", "stage-check-failed",
+                   "no-progress", "iteration-cap", "exploration-exhausted", "verify-missing", "contaminated",
                    "other")
 
 
@@ -4867,8 +5571,12 @@ def classify_author_failure(why, check=None):
         return "verify-missing"
     if re.search(r"byte-identical|no tree change|not improving|genuinely stuck", w):
         return "no-progress"
+    if "exploration-exhausted" in w:
+        return "exploration-exhausted"   # paged a huge target, never wrote the harness: re-cut, do not retry
     if re.search(r"iteration cap|DID NOT CONVERGE|stopped at iteration", w, re.I):
         return "iteration-cap"
+    if STAGE_CHECK_DISAGREES in w:
+        return "stage-check-failed"     # the JOB was done; its stage CHECK is what failed
     return "other"
 
 
@@ -4917,7 +5625,7 @@ def last_job_non_attempt(a, job=None):
 
 
 def record_attempt(a, job, why, check=None, model=None, escalated=False,
-                   runs_dir=None, now=None):
+                   runs_dir=None, now=None, check_failed=False):
     """Append (or update, keyed by job id) one failed attempt. Never raises."""
     p = attempts_path(a, runs_dir)
     if not p:
@@ -4930,6 +5638,7 @@ def record_attempt(a, job, why, check=None, model=None, escalated=False,
                "at": now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "class": classify_author_failure(why, check),
                "reason": str(why or "")[:600],
+               "kind": "check" if check_failed else None,
                "check_tail": str(check or "")[-2500:] or None,
                "model": model or getattr(a, "model", None), "escalated": bool(escalated)}
         for i, h in enumerate(hist):
@@ -5037,6 +5746,50 @@ def env_fixture_section(a, target):
     return ""
 
 
+_AIDS = []
+
+
+def _aids_mod():
+    """~/bin/dispatch_authoring_aids.py (shared pure helpers), loaded once; None when unloadable."""
+    if not _AIDS:
+        try:
+            import importlib.util as _ilu
+            _sp = _ilu.spec_from_file_location("dispatch_authoring_aids", BIN / "dispatch_authoring_aids.py")
+            _m = _ilu.module_from_spec(_sp)
+            _sp.loader.exec_module(_m)
+            _AIDS.append(_m)
+        except Exception:
+            _AIDS.append(None)
+    return _AIDS[0]
+
+
+NO_INVENTED_DEFECT_RULE = (
+    "\nIn `## Confirmed defect`: write ONLY what a baseline run of your fixture/probe shows. If the "
+    "change ADDS or DEFINES something (a new local, a helper, a field), write `Behavior to add (no defect "
+    "observed at baseline): <what does not exist yet, file:line>` -- do NOT claim a bug, and do NOT name "
+    "callers, logging, activity records, notifications or other consumers unless you can cite the "
+    "file:line in the target that reads the value. An invented consumer sends the dispatched model "
+    "editing code that does not exist.\n")
+
+
+def heavy_target_section(a, target):
+    """The worked heavy-global fixture example (patch every I/O global AFTER exec_module and BEFORE the
+    call; frame-local probe for a local-only change) when the PYTHON target is big or has module-level I/O
+    imports (dispatch_authoring_aids.heavy_python_reasons), else "". Fail-open."""
+    try:
+        if (getattr(a, "lang", "") or "python").lower() not in ("python", "py") or not target:
+            return ""
+        am = _aids_mod()
+        if am is None or _BOUND_WT is None:
+            return ""
+        p = Path(_BOUND_WT) / target
+        if not p.is_file():
+            return ""
+        return am.heavy_prompt_section(target, p.read_text(errors="replace"), fixture_name_for(a.lang))
+    except Exception:
+        return ""
+
+
 def fake_browser_section(a, target, path=None):
     """The sealed fake-browser/environment fixture for browser-ish targets, or "".
     (Was a paste-this-block helper; models pasted it and then extended it badly. It is now a
@@ -5139,6 +5892,31 @@ def stage_plan(a, target):
     return [s for s in STAGE_ORDER if not (s == "fixture" and is_test_file_target(target))]
 
 
+def py_fixture_case_count(txt):
+    """PURE. Number of entries in the module-level `CASES = [...]` list of a scaffold-shaped
+    python fixture (0 when absent / unparseable). A module-level `chk(`-style fixture counts its
+    top-level `chk(` calls instead."""
+    import ast as _ast
+    try:
+        tree = _ast.parse(txt)
+    except (SyntaxError, ValueError):
+        return 0
+    best = 0
+    for node in tree.body:
+        tgt = None
+        if isinstance(node, _ast.Assign):
+            tgt, val = node.targets, node.value
+        elif isinstance(node, _ast.AnnAssign) and node.value is not None:
+            tgt, val = [node.target], node.value
+        if tgt and any(isinstance(t, _ast.Name) and t.id == "CASES" for t in tgt) \
+                and isinstance(val, (_ast.List, _ast.Tuple)):
+            best = max(best, len(val.elts))
+    if not best:
+        best = sum(1 for n in _ast.walk(tree) if isinstance(n, _ast.Call)
+                   and isinstance(n.func, _ast.Name) and n.func.id == "chk")
+    return best
+
+
 def stage_check(stage, wt, lang, target, requires=()):
     """The per-stage success check. Returns (ok, message). Static and fast (no model, no network):
     the heavy both-ways proof is the self-check that the LAST stage runs as its verify."""
@@ -5165,7 +5943,15 @@ def stage_check(stage, wt, lang, target, requires=()):
         if not p.is_file():
             return False, f"{fx} is missing"
         txt = p.read_text(errors="replace")
-        if "SCAFFOLD_INCOMPLETE" in txt or "SCAFFOLD: cases not yet authored" in txt:
+        # The scaffold's python fixture is a plain script (CASES list + main() whose
+        # `if len(CASES) < 3: print("SCAFFOLD_INCOMPLETE ...")` guard is LEGITIMATE once the
+        # cases are filled in). 2026-10-10 (aw-codec-floor s2b): the old text test rejected
+        # that guard ("still contains the SCAFFOLD guard") and, once the model removed it,
+        # rejected the file again ("defines no test_ function") -- an unsatisfiable pair that
+        # burned three 14-iteration fixture rounds. A python fixture counts as authored when
+        # its CASES list holds >= 3 entries, whatever guard text remains.
+        _py_cases = py_fixture_case_count(txt) if fx.endswith(".py") else 0
+        if _py_cases < 3 and ("SCAFFOLD_INCOMPLETE" in txt or "SCAFFOLD: cases not yet authored" in txt):
             return False, f"{fx} still contains the SCAFFOLD guard -- replace it with real cases"
         if len(txt.strip()) < 80:
             return False, f"{fx} is effectively empty"
@@ -5174,8 +5960,9 @@ def stage_check(stage, wt, lang, target, requires=()):
                 compile(txt, fx, "exec")
             except SyntaxError as e:
                 return False, f"{fx} does not parse: {e}"
-            if not re.search(r"^\s*(?:async\s+)?def test_|unittest|pytest", txt, re.M):
-                return False, f"{fx} defines no test_ function"
+            if _py_cases < 3 and not re.search(r"^\s*(?:async\s+)?def test_|unittest|pytest", txt, re.M):
+                return False, (f"{fx} defines no test_ function and its CASES list has "
+                               f"{_py_cases} entr{'y' if _py_cases == 1 else 'ies'} (need >= 3)")
         elif not re.search(r"\b(?:test|it)\s*\(", txt):
             return False, f"{fx} defines no test(...) case"
         return True, f"{fx} authored"
@@ -5208,7 +5995,7 @@ def stage_verify_cmd(stage, a, target):
             f"--target {shlex.quote(target or '')} {reqs}").strip()
 
 
-def stage_prompt(a, target, stage, cls, prior=None, reprompt_n=0, runaway=None):
+def stage_prompt(a, target, stage, cls, prior=None, reprompt_n=0, runaway=None, fresh=False):
     """The prompt for one stage job: the full authoring context (so the model sees the intent,
     interface and rules) behind a STAGED override that restricts this job to ONE file."""
     files = stage_files(stage, a.lang)
@@ -5231,7 +6018,7 @@ def stage_prompt(a, target, stage, cls, prior=None, reprompt_n=0, runaway=None):
         head += "\n## Earlier stage output (already on disk, do not redo)\n" + prior + "\n"
     if reprompt_n:
         head += _reprompt_text(stage, files[0], reprompt_n, runaway)
-    body = author_prompt(a, target)
+    body = author_prompt(a, target, fresh=fresh)
     tail = (f"\n\n## REMINDER (staged job)\nWrite ONLY `{files[0]}` in this job, using a single "
             f"`write_file` call, then run the success check and finish.\n")
     return head + "\n---\n" + _tc_variant(cls) + body + tail
@@ -5313,25 +6100,51 @@ def _author_staged(a, wt, target, cls):
                 + (f"-r{attempt}" if attempt else ""),
                 stage_verify_cmd(stage, a, target), a,
                 max_iters=int(budgets.get(stage, a.author_max_iters)))
+            if not ok and (why or "").startswith(NO_MORE_ROUNDS_PREFIXES):
+                return False, why       # round ceiling: not a stage failure, do not re-prompt
             if last_job_non_attempt(a):
                 return False, (f"{why} -- stopped by an operator/daemon during staged stage "
                                f"`{stage}`; NOT re-prompting and NOT counted as an attempt")
+            _chk_tail = None    # the stage CHECK's own output, when the job was done but the check failed
             if ok:
                 ok2, msg2 = (stage_check(stage, wt, a.lang, target, getattr(a, "require", ()))
                              if stage != "refimpl" else (True, "self-check green"))
                 if ok2:
                     prior = (prior or "") + f"- `{files[0]}`: {msg2}\n"
                     break
-                why = f"{why} -- but the stage check disagrees: {msg2}"
+                why = f"{why} -- {STAGE_CHECK_DISAGREES}: {msg2}"
+                _chk_tail = str(msg2 or "")
             after = _sha_files(wt, files)
             runaway = prose_runaway_in_log((getattr(a, "_last_job_outcome", None) or {}).get("log_path"))
-            record_attempt(a, getattr(a, "_chain_last_job", None), f"stage {stage}: {why}", None)
+            record_attempt(a, getattr(a, "_chain_last_job", None), f"stage {stage}: {why}", _chk_tail,
+                           check_failed=_chk_tail is not None)
+            salvage_round(a, wt, f"{stage}-try{attempt}", why)
             _rep, _cur = missing_literal_round(a, getattr(a, "_chain_last_job", None),
                                                str(why or "") + "\n" + _job_log_tail(a))
             if _rep:
                 _m = _hg().format_repeat_missing(_cur)
                 log_decision("spec-defect", a, f"stage `{stage}`: same missing literals two rounds running", _m[:300])
                 return False, _m
+            if not (wrote_nothing(before, after) or runaway):
+                # the file changed yet the stage is still red: only another round if the
+                # harness-level failure is measurably different (see ROUND RUNAWAY)
+                _rr = check_round_runaway(a, why)
+                if _rr:
+                    _clean = "".join(ln for ln in (prior or "").splitlines(True) if "NOT yet passing" not in ln) or None
+                    _fok, _ftxt = resolve_runaway(
+                        a, wt, _rr, lambda: stage_prompt(a, target, stage, cls, _clean, 0, None, fresh=True),
+                        f"auto-author-{a.label}-s{STAGE_ORDER.index(stage) + 1}-fresh",
+                        stage_verify_cmd(stage, a, target), int(budgets.get(stage, a.author_max_iters)))
+                    if not _fok:
+                        return False, _ftxt
+                    ok2, msg2 = (stage_check(stage, wt, a.lang, target, getattr(a, "require", ()))
+                                 if stage != "refimpl" else (True, "self-check green"))
+                    if not ok2:
+                        record_stop(a, STOP_FRESH_RESTART_FAILED, f"fresh round ok but stage check disagrees: {msg2}",
+                                    kind="spec-defect", decision="fresh restart did not satisfy the stage check")
+                        return False, _rr + f" Fresh-context restart ran but the stage check still disagrees: {msg2}"
+                    prior = (prior or "") + f"- `{files[0]}`: {msg2}\n"
+                    break
             if wrote_nothing(before, after) or runaway:
                 if attempt < reprompts:
                     print(f"[auto] staged: stage `{stage}` ended with "
@@ -5431,7 +6244,7 @@ def _author_entry(a, wt, target, verify_cmd):
         return ok, why
     if last_job_non_attempt(a):
         return False, why
-    if (why or "").startswith((SPEC_DEFECT_ROUTE_PREFIX, RESPEC_ROUTE_PREFIX)):
+    if (why or "").startswith((SPEC_DEFECT_ROUTE_PREFIX, ADMISSION_ROUTE_PREFIX, RESPEC_ROUTE_PREFIX)):
         return False, why           # the SPEC is wrong: the continuation ladder cannot fix it
     _wx = worker_exit_failure(a, why)
     if _wx:
@@ -5468,7 +6281,7 @@ def _author_escalate(a, wt, target, verify_cmd, why):
     Returns (ok, why)."""
     if (why or "").startswith((CONTAMINATED_PREFIX, HARNESS_ENV_PREFIX,
                                BASELINE_GREEN_PREFIX, PLAN_SUSPECT_PREFIX,
-                               SPEC_DEFECT_ROUTE_PREFIX, RESPEC_ROUTE_PREFIX)) or a.drafter_cmd:
+                               SPEC_DEFECT_ROUTE_PREFIX, ADMISSION_ROUTE_PREFIX, RESPEC_ROUTE_PREFIX)) or a.drafter_cmd:
         return False, why
     last_check, contaminated = _harness_check_output(wt, verify_cmd, target, chain_key(a))
     if contaminated:
@@ -5519,6 +6332,14 @@ def park_decision(a, code, last_job):
     a pre-job refusal (exit 2, no job) was printed to the caller synchronously."""
     if code in (0, None) or code == EXIT_ORPHANED:
         return False
+    if code in EXTERNAL_KILL_CODES:
+        # The DRIVER itself was signalled (SIGHUP 129 / SIGKILL 137 / SIGTERM 143: a session
+        # close, a task time limit, a daemon restart, an orphan cleanup). That is an external
+        # kill, not an authoring failure: parking it as "authoring stuck: needs harness help"
+        # mislabels it and burns an Opus escalation (rt-amazon-cardlink 2026-10-10: exit 143
+        # from a background-task time limit). The chain record still closes `ended` (and
+        # run_chain records stop_reason=external_kill); --resume-author continues the run.
+        return False
     if _under_slicer(a) or getattr(a, "drafter_cmd", None) or getattr(a, "no_park", False):
         return False
     if code == 2 and not last_job:
@@ -5545,8 +6366,11 @@ def park_visible(a, code, reason, runs_dir=None, _run=None, log=None):
         print(f"\n[auto] NOT parking: job {job} was stopped by an operator/daemon "
               f"(force_stopped/cancelled), not an authoring failure. Re-run to continue.")
         return rec
+    _sr = getattr(a, "_stop_reason", None)
     msg = (f"authoring stuck: {why}, needs harness help"
-           + (f" (log: {log})" if log else ""))
+           + (f" (log: {log})" if log else "")
+           + (f" [stop_reason={_sr}]" if _sr else "")
+           + _salvage_note(a))
     wt = None
     try:
         wt = str((Path(a.dest).resolve() if getattr(a, "dest", None)
@@ -5583,6 +6407,7 @@ def park_visible(a, code, reason, runs_dir=None, _run=None, log=None):
         except Exception as e:
             rc, out, err = 1, "", str(e)
     rec = {"code": code, "reason": msg, "job": job, "log": log, "worktree": wt,
+           "stop_reason": _sr, "salvage": getattr(a, "_last_salvage", None),
            "queue_escalate_rc": rc,
            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "attempts": len(counted_attempts(load_attempts(a, runs_dir)))}
@@ -5700,7 +6525,7 @@ SLICE_MAX_AUTHOR_JOBS = 8
 def escalation_point_note(slice_plan, slice_id):
     """PURE-ish (reads the slice-run state). A short string saying where THIS slice really
     escalates, so a counter like `round 2/2` is not read as "the last job" (2026-10-06,
-    The owner: the auto loop's N-of-N looked like the end; the cap is per SLICE: author JOBS
+    Penn: the auto loop's N-of-N looked like the end; the cap is per SLICE: author JOBS
     across all attempts and author ATTEMPTS). "" outside a slice run / unreadable state."""
     if not slice_plan or not slice_id:
         return ""
@@ -6038,7 +6863,7 @@ STALE_LEDGER_NAME = "stale-restarts.json"
 
 def _stale_notify(title, msg, key):
     try:
-        subprocess.run([sys.executable, str(BIN / "notify-owner.py"), title, msg,
+        subprocess.run([sys.executable, str(BIN / "notify-penn.py"), title, msg,
                         "--dedupe-key", key, "--dedupe-s", "3600"],
                        capture_output=True, timeout=30)
     except Exception:
@@ -7066,6 +7891,16 @@ def run_chain(a, do=None, park=None):
 
     def _park(code, reason):
         try:
+            if code in EXTERNAL_KILL_CODES:
+                # distinct stop reason: the driver was signalled, the authoring did not fail
+                _wt = None
+                try:
+                    _wt = (Path(a.dest).resolve() if getattr(a, "dest", None)
+                           else CONFIG_DIR / "worktrees" / f"wt-{a.label}")
+                except Exception:
+                    pass
+                salvage_round(a, _wt, "external-kill", f"driver exited {code}", timeout=20)
+                record_stop(a, STOP_EXTERNAL_KILL, f"driver exited {code} (signal {code - 128}); not an authoring failure")
             if park_decision(a, code, getattr(a, "_chain_last_job", None)):
                 (park or park_visible)(a, code, reason)
         except Exception as pe:  # pragma: no cover - parking must never mask the exit

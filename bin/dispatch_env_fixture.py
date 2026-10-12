@@ -146,6 +146,31 @@ def _imported_names(src) -> set:
     return names
 
 
+_GENERIC_PREFIX_RE = re.compile(r"^(?:make|create|build|new|test)", re.I)
+_DOUBLE_SIGN_RE = re.compile(r"\b(?:querySelector(?:All)?|getElementById|innerHTML|outerHTML|goto|locator|waitForSelector|"
+                             r"evaluate|content|document|window|\$eval)\b|\bnodeType\b|\bchildren\b|\bnodeName\b")
+
+
+def _factory_is_benign(src, m, ok) -> bool:
+    """A make/create/build-prefixed factory (e.g. the ubiquitous `makePage`) is only a hand-written double when its
+    body actually builds one. It is NOT when it (a) delegates to a vetted dispatch-env name, or (b) is a bare
+    `...Page` helper (page = pagination / a page of data) whose body never touches a DOM/page API. Explicit
+    fake/mock/stub/dummy-prefixed names always count."""
+    name = m.group(1)
+    if not _GENERIC_PREFIX_RE.match(name) or re.match(r"(?:make|create|build|new|test)(?:fake|mock|stub|dummy)", name, re.I):
+        return False
+    body = src[m.end():m.end() + 1500]
+    nxt = re.search(r"\n(?:export\s+)?(?:async\s+)?(?:function|class|const|let|var|test|describe|it)\b", body)
+    if nxt:
+        body = body[:nxt.start()]
+    if any(re.search(r"(?<![\w$.])" + re.escape(n) + r"\b", body) for n in ok):
+        return True
+    word = name[len(_GENERIC_PREFIX_RE.match(name).group(0)):]
+    if re.fullmatch(r"(?:Page|page)", word) and not _DOUBLE_SIGN_RE.search(body):
+        return True
+    return False
+
+
 def lint_fake_env(wt, fixture_files) -> list:
     """Messages (one per offence, <= 6) for hand-built DOM/page/window/browser doubles in the JS/TS
     fixture file(s). Static text checks on comment-blanked source; [] when clean or unreadable.
@@ -172,6 +197,8 @@ def lint_fake_env(wt, fixture_files) -> list:
                        % (name, line(m.start()), m.group(1)))
         for m in _FACTORY_RE.finditer(src):
             if m.group(1) in ok:
+                continue
+            if _factory_is_benign(src, m, ok):
                 continue
             out.append("%s:%d defines `%s` -- a hand-written fake page/window/document/browser factory."
                        % (name, line(m.start()), m.group(1)))

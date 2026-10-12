@@ -11,6 +11,8 @@ Checks (each a pure function returning findings; run_lint() composes them):
                 REFIMPL-APPLIED tree (refimpl run in a throwaway `git archive HEAD` copy); a literal
                 that is absent from both gets a difflib "did you mean" against the nearest base line
   consistency   TASK.md scope line / forbidden-edit list / pinned-literal files / target agree
+  authoring     refimpl swallowing broad exceptions, JS fixture load-crash traps, page.evaluate callbacks calling
+                module-scope helpers, real-time polling sleeps in a fixture (harness_authoring_findings)
   stage_dryrun  the stage's own static check (`ollama-dispatch-auto --stage-check STAGE`) executes
                 and prints STAGE_OK / STAGE_FAIL before any model is started
   stale_prompt  AUTO-TASK.md (the prompt a continuation/resume round would send) quotes no
@@ -106,10 +108,13 @@ def check_literals(wt, task, target, apply_refimpl=True):
     refimpl_text = _read(wt / "refimpl.py")
     files = sorted({f or target for f, _l in pairs if (f or target)})
     applied = refimpl_applied_texts(wt, files) if apply_refimpl else None
-    out = []
+    out = list(hg.literal_shape_findings(task))                 # (a) slash-wrapped identifier: static
     for f, lit in pairs:
         path = f or target or ""
         if not path:
+            continue
+        if applied is not None and hg.unnatural_literal_context(lit, applied.get(path, "")):
+            out += hg.literal_context_findings([(f, lit)], {path: applied.get(path, "")})   # (b)
             continue
         base = hg.blob_at(wt, path, "HEAD")
         if base is None:                       # creation target: nothing at HEAD to compare
@@ -133,6 +138,19 @@ def check_literals(wt, task, target, apply_refimpl=True):
             out.append(_f("REFIMPL_LITERAL_UNPROVEN", "Must-contain literal not at HEAD and not in refimpl.py text", path,
                           f"`{lit}` is absent at HEAD and refimpl.py never spells it (refimpl not runnable here)"))
     return out
+
+
+# ------------------------------------------------- authoring-defect lints (2026-10-11)
+def check_authoring(wt, target, apply_refimpl=True):
+    """REFIMPL_SWALLOWS_EXCEPTION / JS_FIXTURE_LOAD_TRAP / REAL_TIME_POLLING_FIXTURE (static) plus, when the refimpl
+    can be applied in a throwaway tree, EVALUATE_NOT_SELF_CONTAINED on the refimpl-APPLIED target (a helper called from
+    a page.evaluate-serialized function only exists after the refimpl wrote it)."""
+    hg = _hg()
+    tt = ""
+    if apply_refimpl and target:
+        ap = refimpl_applied_texts(wt, [target])
+        tt = (ap or {}).get(target, "") if ap else ""
+    return hg.harness_authoring_findings(wt, tt)
 
 
 # ------------------------------------------------------------- consistency
@@ -335,6 +353,8 @@ def run_lint(wt, stage=None, target=None, full=False, quick=False, attempts=None
     if _is_real_task(task):
         for fn in (lambda: check_literals(wt, task, target, apply_refimpl=not quick),
                    lambda: check_consistency(task, target),
+                   lambda: list(_hg().spec_test_parity_findings(wt, task)),
+                   lambda: check_authoring(wt, target, apply_refimpl=not quick),
                    lambda: check_stale_prompt(wt, task)):
             try:
                 out += fn()
