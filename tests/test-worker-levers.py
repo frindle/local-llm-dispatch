@@ -23,7 +23,7 @@ FAILS = []
 LAST_ENV = []
 SEQ, REQS = [], []
 FLAG_KEYS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK", "READONLY_JOB", "PROSE_ACT_NUDGE",
-             "PROSE_PRESENCE_PENALTY", "NOTHINK_RUN")
+             "PROSE_PRESENCE_PENALTY", "NOTHINK_RUN", "REASONING_PARSER")
 BYFLAG = {"mode": None, "tools": []}      # L4 stub: mode "think" = prose runaway iff thinking is ON; "always" = every turn
 LOOP_TEXT = "\n".join(["Let me analyze the function. Let me read the function again and plan the change carefully."] * 3000)
 
@@ -228,7 +228,7 @@ def main():
     env = {}
     got = wl.apply_task_flags("x\nWorker-flags: VERIFY_ON_EDIT=1 PROTECT_HARNESS=1 READ_MIN_WINDOW=1 PROSE_STICKY_NOTHINK=1\ny", env)
     check("Worker-flags line sets exactly the 4 allow-listed names", (sorted(env), got.__len__()),
-          (sorted(k for k in FLAG_KEYS if k not in ("READONLY_JOB", "PROSE_ACT_NUDGE", "PROSE_PRESENCE_PENALTY", "NOTHINK_RUN")), 4))
+          (sorted(k for k in FLAG_KEYS if k not in ("READONLY_JOB", "PROSE_ACT_NUDGE", "PROSE_PRESENCE_PENALTY", "NOTHINK_RUN", "REASONING_PARSER")), 4))
     env = {}
     wl.apply_task_flags("Worker-flags: READONLY_JOB=1", env)
     check("READONLY_JOB is an allow-listed task flag", env, {"READONLY_JOB": "1"})

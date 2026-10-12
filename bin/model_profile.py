@@ -10,7 +10,8 @@ Public API
         -> dict   exactly what to merge into the request body:
         api="openai": top-level temperature/top_p/top_k/min_p/presence_penalty/
                       repetition_penalty(+repeat_penalty alias)/max_tokens/stop and
-                      chat_template_kwargs{enable_thinking,preserve_thinking}
+                      chat_template_kwargs{enable_thinking,preserve_thinking}, and (ONLY when the caller passes
+                      reasoning_parser AND the profile declares it for a darkbloom backend) reasoning_parser
         api="ollama": {"options": {...num_ctx,num_predict,repeat_penalty...},
                        "think": bool}   (think only when the profile/override sets it)
   resolve_alias(model, lane=None) -> (model, aliased_from_or_None)   logged once
@@ -156,8 +157,27 @@ def get_profile(model, role="author", lane=None, data=None):
     return out
 
 
+def reasoning_parser_for(model, role="author", requested=None, lane=None, data=None):
+    """The `reasoning_parser` request value to send, or None. `requested` is the lever's value (worker_levers
+    REASONING_PARSER); it is honoured ONLY when the model's profile declares that same parser for a darkbloom backend
+    (`reasoning_parser:` in model_profiles.yaml, citing the card), so a model/profile the card+probe do not support
+    never gets the field, whatever the lever says."""
+    if not requested:
+        return None
+    data = data or load_profiles()
+    resolved, _ = resolve_alias(model, lane, data)
+    _k, entry = _find_entry(data, resolved)
+    rp = (entry or {}).get("reasoning_parser")
+    if not isinstance(rp, dict) or str(rp.get("name") or "") != str(requested):
+        return None
+    if "darkbloom" not in (rp.get("backends") or []) or (entry or {}).get("backend") != "darkbloom":
+        return None
+    return str(rp["name"])
+
+
 def build_request_fields(model, role, api, overrides=None, think=None, lane=None,
-                         turn_kind=None, arm=None, sampling_step=0, seed=None, sampling_arm=None):
+                         turn_kind=None, arm=None, sampling_step=0, seed=None, sampling_arm=None,
+                         reasoning_parser=None):
     """What to put in the request body for `api` ("openai" | "ollama").
     `overrides`: {temperature, top_p, top_k, min_p, presence_penalty,
     repetition_penalty, max_tokens, num_ctx, stop}; None values are ignored.
@@ -205,6 +225,9 @@ def build_request_fields(model, role, api, overrides=None, think=None, lane=None
             ctk["preserve_thinking"] = bool(p["preserve_thinking"])
         if ctk:
             f["chat_template_kwargs"] = ctk
+        _rp = reasoning_parser_for(model, role, reasoning_parser, lane)   # default None: field absent, body unchanged
+        if _rp and thinking is not False:    # a thinking-off turn has no reasoning to split: body stays byte-identical to arm A
+            f["reasoning_parser"] = _rp
         return f
     if api == "ollama":
         opts = {}
@@ -478,6 +501,13 @@ def check_profiles(path=None):
             problems.append(f"{name}.thinking_coding: max_tokens < 32768")
         if not e.get("tool_call_format"):
             problems.append(f"{name}: missing tool_call_format")
+        rp = e.get("reasoning_parser")
+        if rp is not None:
+            if not (isinstance(rp, dict) and rp.get("name") and rp.get("backends") and str(rp.get("source") or "").strip()):
+                problems.append(f"{name}: reasoning_parser needs name, backends and a source: citation")
+            elif card_text and str(rp.get("card_flag") or "") not in card_text:
+                problems.append(f"{name}: reasoning_parser {rp.get('name')!r} but the card does not state "
+                                f"{rp.get('card_flag')!r}")
     problems += check_policy(data)
     problems += check_sampling(data)
     for src, a in (data.get("aliases") or {}).items():

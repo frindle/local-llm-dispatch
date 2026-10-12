@@ -249,6 +249,69 @@ def run_matrix(w, dbc):
         check(f"darkbloom_chat think->author {model}", sampling_openai(b), expect_openai(model, "author", think=True))
 
 
+def run_reasoning_parser(w):
+    """REASONING_PARSER=qwen3 lever (default OFF): the wire body gains `reasoning_parser` ONLY for a model whose RAW profile
+    declares it for a darkbloom backend, only on the openai-style path to a Darkbloom-lane host, only on a thinking turn.
+    Expected values come from the raw YAML, not from model_profile. Unraid/Ollama paths and lever-off never carry it."""
+    msgs = [{"role": "user", "content": "x"}]
+    real_lane = w._is_darkbloom_lane
+    w._is_darkbloom_lane = lambda h: str(h).rstrip("/") == HOST          # the stub plays the Darkbloom endpoint
+    prev = os.environ.get("REASONING_PARSER")
+
+    def declared(model):
+        rp = RAW["models"][model].get("reasoning_parser")
+        return (rp["name"] if isinstance(rp, dict) and "darkbloom" in (rp.get("backends") or [])
+                and RAW["models"][model].get("backend") == "darkbloom" else None)
+    try:
+        for model in MODELS:
+            for role in ROLES:
+                for val, lever_on in ((None, False), ("0", False), ("1", False), ("deepseek_r1", False), ("qwen3", True)):
+                    if val is None:
+                        os.environ.pop("REASONING_PARSER", None)
+                    else:
+                        os.environ["REASONING_PARSER"] = val
+                    want = dict(expect_openai(model, role))
+                    thinking = want.get("chat_template_kwargs", {}).get("enable_thinking")
+                    if lever_on and declared(model) and thinking is not False:
+                        want["reasoning_parser"] = declared(model)
+                    tag = f"{model}/{role} REASONING_PARSER={val}"
+                    take()
+                    w.call_ollama(HOST, model, msgs, None, None, api_style="openai", tools=False, role=role)
+                    check(f"reasoning_parser openai      {tag}", sampling_openai(take()[-1]["body"]), want)
+                    w.call_openai_streaming(HOST, model, msgs, None, None, tools=False, role=role)
+                    check(f"reasoning_parser openai-sse  {tag}", sampling_openai(take()[-1]["body"]), want)
+                    # Unraid / native Ollama: NEVER, lever or not
+                    w.call_ollama(HOST, model, msgs, None, None, api_style="ollama", tools=False, role=role)
+                    check(f"reasoning_parser ollama none {tag}", "reasoning_parser" in take()[-1]["body"], False)
+                    w.call_ollama_streaming(HOST, model, msgs, None, None, tools=False, role=role)
+                    check(f"reasoning_parser ollama-sse none {tag}", "reasoning_parser" in take()[-1]["body"], False)
+        # a non-Darkbloom OpenAI host (llama-server, Strata, the Unraid box) never gets it even with the lever on
+        os.environ["REASONING_PARSER"] = "qwen3"
+        w._is_darkbloom_lane = real_lane
+        take()
+        w.call_ollama(HOST, "qwen3.6-35b-a3b-vl-mtp-mxfp8", msgs, None, None, api_style="openai", tools=False, role="author")
+        w.call_openai_streaming(HOST, "qwen3.6-35b-a3b-vl-mtp-mxfp8", msgs, None, None, tools=False, role="author")
+        check("reasoning_parser: non-Darkbloom openai host never gets the field (both paths)",
+              ["reasoning_parser" in x["body"] for x in take()], [False, False])
+        # thinking-off turn: no reasoning to split, body unchanged
+        w._is_darkbloom_lane = lambda h: str(h).rstrip("/") == HOST
+        w.call_ollama(HOST, "qwen3.6-35b-a3b-vl-mtp-mxfp8", msgs, None, None, api_style="openai", tools=False, role="author", think=False)
+        check("reasoning_parser: thinking-off turn carries no field", "reasoning_parser" in take()[-1]["body"], False)
+        # the builder itself: ollama api never emits it; undeclared parser name never emitted
+        check("builder: api=ollama never emits reasoning_parser",
+              "reasoning_parser" in mp.build_request_fields("qwen3.6-35b-a3b-vl-mtp-mxfp8", "author", "ollama", reasoning_parser="qwen3"), False)
+        check("builder: a parser the profile does not declare is never emitted",
+              "reasoning_parser" in mp.build_request_fields("qwen3.6-35b-a3b-vl-mtp-mxfp8", "author", "openai", reasoning_parser="deepseek_r1"), False)
+        check("builder: default (no request) never emits it",
+              "reasoning_parser" in mp.build_request_fields("qwen3.6-35b-a3b-vl-mtp-mxfp8", "author", "openai"), False)
+    finally:
+        w._is_darkbloom_lane = real_lane
+        if prev is None:
+            os.environ.pop("REASONING_PARSER", None)
+        else:
+            os.environ["REASONING_PARSER"] = prev
+
+
 def run_overrides(w):
     msgs = [{"role": "user", "content": "x"}]
     pair = "qwen3.6-35b-a3b-vl-mtp-mxfp8"
@@ -476,6 +539,7 @@ def main():
         run_cli_defaults(w)
         run_queue()
         run_matrix(w, dbc)
+        run_reasoning_parser(w)
         run_overrides(w)
         run_ladder(w)
         run_e2e_subprocess()

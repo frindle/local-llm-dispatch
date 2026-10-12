@@ -113,4 +113,4 @@ is served >=120 lines, real range noted), `PROSE_STICKY_NOTHINK=1` (L4: after th
 the recovery request profile -- thinking OFF + recovery sampling -- stays for every later author turn; before it and non-author
 roles untouched; log `L4: prose runaway seen`). Per-job passthrough with no queue change: a `Worker-flags: K=1 K=1` line in
 the task text (allow-listed names, 0/1 only; an env var already set wins). A/B: arm `F` in
-`~/.ollama-dispatch/ab-sampling/v2/submit.py` = arm A + the first three; arm `G` = arm F + `PROSE_STICKY_NOTHINK=1`.
+`~/.ollama-dispatch/ab-sampling/v2/submit.py` = arm A + the first three; arm `G` = arm F + `PROSE_STICKY_NOTHINK=1`. `REASONING_PARSER=qwen3` (2026-10-12, DEFAULT OFF, the one non-0/1 flag value: sends `reasoning_parser: qwen3` so Darkbloom's local endpoint puts Qwen3.6 thinking in `reasoning_content` instead of `content`; only when `model_profiles.yaml` declares it for the model, only to the Darkbloom lane on thinking turns, never to Ollama/Unraid; a non-streaming turn cut inside an unclosed think block is treated as a cutoff and never replayed; tests `test-worker-reasoning-parser.py`, canary seam `reasoningparser`).

@@ -176,6 +176,14 @@ models:
     tool_call_format: qwen3_coder   # card L611 (--tool-call-parser qwen3_coder), XML-style
     ctx_native: 262144              # card L555
     source: "card L663-665 (sampling), L555-557 (ctx >=128K advised), L611 (tool parser), L827/L857 (chat_template_kwargs), L1012 (output length)"
+    # reasoning_parser (2026-10-12, DEFAULT OFF): Darkbloom's LOCAL endpoint (mlx-server) runs with parser=none unless the
+    # REQUEST carries `reasoning_parser`, so Qwen thinking lands in message.content (reasoning_content empty) and the worker's
+    # reasoning guards are blind. The card serves this model with `--reasoning-parser qwen3` (L611, L617). Sent ONLY when
+    # the Worker-flags lever REASONING_PARSER=qwen3 is on (worker_levers.py), only to a backend listed here, only on the
+    # openai-style path. Probed 2026-10-12 vs Darkbloom 0.9.19: streaming/non-streaming/tool-calls/thinking-off all OK
+    # (tool_calls intact, no <tool_call> text in content); evidence ~/.ollama-dispatch/thinking-leak-research-2026-10-12.md
+    # and ~/.ollama-dispatch/reasoning-parser-ab-2026-10-12.md. NOT declared for Qwen3.5-9B (not probed).
+    reasoning_parser: {name: qwen3, backends: [darkbloom], lever: REASONING_PARSER, card_flag: "--reasoning-parser qwen3", source: "card L611/L617 (--reasoning-parser qwen3); live probe 2026-10-12 Darkbloom 0.9.19"}
     modes:
       thinking_coding:   # "Thinking mode for precise coding tasks", L664
         {temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, max_tokens: 32768, ctx: 131072, enable_thinking: true, preserve_thinking: true, preserve_reasoning: true, stop: []}

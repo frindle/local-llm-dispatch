@@ -130,7 +130,7 @@ for name, frag in (
         ("reasoning-runaway abort hook", '_lad = _ladder.on_abort("reasoning_runaway")'),
         ("good turn resets", "_ladder.on_ok()"),
         ("verify signature fed at both verify sites", None),
-        ("step reaches the request builder", "think=think, sampling_step=sampling_step, seed=seed)"),
+        ("step reaches the request builder", "think=think, sampling_step=sampling_step, seed=seed, reasoning_parser=_rparser)"),
         ("step reaches the streaming call", "sampling_step=_turn_sstep, seed=_turn_seed)")):
     if frag is None:
         ok4 = W.count("_ladder.note_check(_verify_failure_signature(v_out)") == 2
@@ -140,7 +140,7 @@ for name, frag in (
         ok4 = frag in W
     check("4 worker: " + name, ok4, True)
 check("4 worker: all four senders accept sampling_step/seed",
-      W.count("sampling_step: int = 0, seed: int = None") >= 3 and "sampling_step=0, seed=None):" in W, True)
+      W.count("sampling_step: int = 0, seed: int = None") >= 3 and "sampling_step=0, seed=None, host=None):" in W, True)
 print()
 print("%d/%d checks" % (sum(R), len(R)))
 if not all(R):

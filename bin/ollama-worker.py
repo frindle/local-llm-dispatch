@@ -3027,19 +3027,24 @@ _PROFILE_LOG_SEEN = set()
 
 def _profile_fields(model, role, api_style, temperature=None, num_ctx=None, top_p=None,
                     top_k=None, max_tokens=None, repeat_penalty=None, think=None,
-                    sampling_step=0, seed=None):
+                    sampling_step=0, seed=None, host=None):
     """The request fields for (model, role, api): the model card's profile
     (model_profiles.yaml) with explicit non-None caller values layered on top. The
     ONLY place a request body's sampling / max_tokens / thinking control is decided."""
     if _wl is not None and _wl.nothink_run(role):    # NOTHINK_RUN (A/B, default OFF): thinking off for the whole author run
         think = False
+    # REASONING_PARSER=qwen3 (Worker-flags lever, DEFAULT OFF): ask Darkbloom's local endpoint to split Qwen thinking into
+    # reasoning_content. Only for an openai-style request to the Darkbloom lane (`host` given); the Unraid/Ollama paths and
+    # every non-Darkbloom OpenAI host never get the field. model_profile also requires the profile to declare it.
+    _rparser = (_wl.reasoning_parser_request() if (_wl is not None and api_style == "openai" and host
+                                                   and _is_darkbloom_lane(host)) else None)
     _fields = _mp.build_request_fields(
         model, role or "author", "openai" if api_style == "openai" else "ollama",
         overrides={"temperature": temperature, "num_ctx": num_ctx, "top_p": top_p,
                    "top_k": top_k, "max_tokens": max_tokens,
                    "repetition_penalty": repeat_penalty,
                    "presence_penalty": (_wl.presence_penalty_override(role) if _wl is not None else None)},
-        think=think, sampling_step=sampling_step, seed=seed)
+        think=think, sampling_step=sampling_step, seed=seed, reasoning_parser=_rparser)
     # MODEL_PROFILE_LOG=1 (default OFF): one line per request naming the profile + the effective
     # params that go on the wire (so a transcript shows what each turn was actually sent).
     # 2026-10-10: also ON by default for openai-style (Darkbloom) requests, deduped per distinct
@@ -3209,7 +3214,7 @@ def call_ollama(host: str, model: str, messages: list, temperature: float, num_c
     # Profile-driven (model_profiles.yaml): None args => the model card's values for `role`.
     _f = _profile_fields(model, role, api_style, temperature, num_ctx, top_p, top_k,
                          max_tokens, repeat_penalty, think,
-                         sampling_step=sampling_step, seed=seed)
+                         sampling_step=sampling_step, seed=seed, host=host)
     preserve_reasoning = preserve_reasoning or _mp.role_wants_reasoning_kept(model, role)
 
     if api_style == "openai":
@@ -3281,14 +3286,23 @@ def call_ollama(host: str, model: str, messages: list, temperature: float, num_c
                     # no tool call, i.e. the turn would otherwise be empty. A turn
                     # that did call a tool keeps content empty, so raw chain-of-
                     # thought is never mistaken for a deliberate answer.
+                    _fin = raw["choices"][0].get("finish_reason")
+                    _rp_on = "reasoning_parser" in payload
                     if preserve_reasoning:
                         _rc = _msg.get("reasoning_content")
                         if _rc:
                             _msg.setdefault("thinking", _rc)
-                            if not (_msg.get("content") or "").strip() and not _msg.get("tool_calls"):
+                            # REASONING_PARSER on: reasoning cut at the cap is a cutoff, not an answer -- it is NOT
+                            # promoted into content (that would make it prose); run_task's think-cap recovery owns it.
+                            if (not (_msg.get("content") or "").strip() and not _msg.get("tool_calls")
+                                    and not (_rp_on and str(_fin or "").lower() == "length")):
                                 _msg["content"] = _rc
                     _strip_inline_think(_msg)
-                    return {"message": _msg, "usage": raw.get("usage") or {}}
+                    _ret = {"message": _msg, "usage": raw.get("usage") or {}}
+                    if _rp_on:     # extra keys ONLY with the lever on: lever off == the old return value, byte for byte
+                        _ret.update({"done_reason": _fin, "_reasoning_parser": True,
+                                     "_thinking_on": (payload.get("chat_template_kwargs") or {}).get("enable_thinking") is not False})
+                    return _ret
                 # Ollama's native /api/chat reports token counts under
                 # different keys (prompt_eval_count/eval_count, no
                 # total_tokens at all) -- normalize to the same
@@ -3987,7 +4001,7 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
     non-streaming branch does under --preserve-reasoning."""
     _f = _profile_fields(model, role, "openai", temperature, num_ctx, top_p, top_k,
                          max_tokens, repeat_penalty, think,
-                         sampling_step=sampling_step, seed=seed)
+                         sampling_step=sampling_step, seed=seed, host=host)
     preserve_reasoning = preserve_reasoning or _mp.role_wants_reasoning_kept(model, role)
     payload = {"model": model, "messages": messages, "stream": True}
     payload.update(_f)
@@ -4310,7 +4324,10 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
     # turn would otherwise be completely empty.
     if preserve_reasoning and think_buf:
         message["thinking"] = think_buf
-        if not full_content.strip() and not tool_calls_acc:
+        # REASONING_PARSER on: a turn whose reasoning was cut at the output cap stays a reasoning-only turn (run_task's
+        # think-cap recovery); promoting it into content would turn the chain of thought into "prose".
+        if (not full_content.strip() and not tool_calls_acc
+                and not ("reasoning_parser" in payload and str(done_reason or "").lower() == "length")):
             message["content"] = think_buf
 
     if not completion_tokens:
@@ -4330,6 +4347,9 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
         "streamed": True,
         "message": message,
         "done_reason": done_reason,
+        **({"_reasoning_parser": True,
+            "_thinking_on": (payload.get("chat_template_kwargs") or {}).get("enable_thinking") is not False}
+           if "reasoning_parser" in payload else {}),
         "usage": {"prompt_tokens": prompt_tokens,
                   "completion_tokens": completion_tokens,
                   "total_tokens": prompt_tokens + completion_tokens},
@@ -4967,7 +4987,7 @@ def turn_log_record(i, resp, msg, thinking, usage, elapsed, turn_think) -> dict:
     content = str((msg or {}).get("content") or "")
     inline = content.split("</think>", 1)[0] if "</think>" in content else ""
     usage = usage or {}
-    return {
+    _rec = {
         "i": i,
         "thinking_chars": len(thinking or "") + len(inline),
         "content_chars": len(content),
@@ -4979,6 +4999,12 @@ def turn_log_record(i, resp, msg, thinking, usage, elapsed, turn_think) -> dict:
         "elapsed_s": round(float(elapsed or 0), 1),
         "think_requested": turn_think,
     }
+    if (resp or {}).get("_reasoning_parser"):      # REASONING_PARSER lever on only: default rows keep their old shape
+        _rec["reasoning_parser"] = True
+        _rec["reasoning_content_chars"] = len(thinking or "")
+        if (resp or {}).get("_unclosed_think"):
+            _rec["unclosed_think"] = True
+    return _rec
 
 
 def apply_extra_iterations(total_iters: int, extra) -> tuple:
@@ -7475,12 +7501,32 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
         # dict in-place relying on `messages.append(msg)` having stored a
         # reference, not a copy -- a copy here would desync that rewrite from
         # what's actually replayed on future turns.
+        # REASONING_PARSER lever on: a thinking turn cut at the cap whose unclosed think block still sits in `content`
+        # (probed: non-streaming + parser, reasoning empty) is re-shaped into the reasoning-only cutoff that the
+        # parser's own streaming path delivers -- so it takes the think-cap recovery (thinking-off retry), is never
+        # counted as prose and never replayed as assistant content.
+        _unclosed = False
+        if (_wl is not None and resp.get("_reasoning_parser")
+                and _wl.unclosed_think_cutoff(msg, resp.get("done_reason"), usage, _turn_max_tokens,
+                                              True, resp.get("_thinking_on", True))):
+            _unclosed = True
+            resp["_unclosed_think"] = True
+            _dispatch_metrics["unclosed_think_cuts"] = _dispatch_metrics.get("unclosed_think_cuts", 0) + 1
+            log(f"[worker] UNCLOSED THINK at iteration {i}/{total_iters}: reasoning parser on, finish_reason="
+                f"{resp.get('done_reason')}, {len(msg.get('content') or '')} chars in content and none in "
+                f"reasoning_content -- treating as a cut-off thinking turn (not prose, not replayed).")
+            msg["thinking"], msg["content"] = msg.get("content") or "", ""
         _msg_thinking = msg.get("thinking") or msg.get("reasoning") or msg.get("reasoning_content") or ""
         _turn_rec = turn_log_record(i, resp, msg, _msg_thinking, usage, _call_elapsed, _turn_think)
         _dispatch_metrics.setdefault("turn_log", [])
         if len(_dispatch_metrics["turn_log"]) < TURN_LOG_MAX:
             _dispatch_metrics["turn_log"].append(_turn_rec)
-        if not preserve_reasoning:
+        # a thinking turn CUT at the cap (parser on) is never replayed, even under preserve_reasoning: a truncated think
+        # block is not a usable prior-turn thought (the recovery nudge below already carries its tail).
+        _drop_cut_reasoning = _unclosed or bool(
+            resp.get("_reasoning_parser")
+            and think_cap_truncated(msg, usage, resp.get("done_reason"), _turn_max_tokens))
+        if not preserve_reasoning or _drop_cut_reasoning:
             for _rk in ("thinking", "reasoning", "reasoning_content"):
                 msg.pop(_rk, None)
 

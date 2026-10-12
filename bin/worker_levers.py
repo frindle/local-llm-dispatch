@@ -54,6 +54,17 @@ never overrides an env var that is already set).
   NOTHINK_RUN=1      (2026-10-12, A/B arm C) enable_thinking=false for EVERY author turn of the run (unlike
                      PROSE_STICKY_NOTHINK, which waits for the first runaway). Default off = unchanged.
 
+  REASONING_PARSER=qwen3  (2026-10-12, A/B first, DEFAULT OFF; the only flag whose value is not 0/1) Darkbloom's LOCAL endpoint
+                     delivers Qwen3.6's thinking INSIDE message.content (reasoning_content empty) unless the request carries
+                     `reasoning_parser`; with it, reasoning arrives in reasoning_content and content is the clean answer, which
+                     makes reasoning_budget_chars / the reasoning-loop guard / --preserve-reasoning see it and removes the
+                     "prose runaway" class. model_profile.reasoning_parser_for sends the field only if the model's profile
+                     (model_profiles.yaml `reasoning_parser:`, card-cited) declares the same parser for a darkbloom backend,
+                     only on the openai-style path to the Darkbloom lane, only on turns with thinking not off. Residual leak
+                     (probed): a NON-streaming turn cut at max_tokens inside an unclosed think block keeps the thinking in
+                     content with reasoning empty -- unclosed_think_cutoff() detects it; the worker treats it as a cutoff and
+                     never replays it. Default off = request bodies byte-identical.
+
 PURE apart from the module-level state dicts (reset per run by arm_run) and the one `git log` in
 sealed_coding_harness. No import of the worker; the worker owns the (tiny, gated) call sites."""
 import fnmatch
@@ -65,7 +76,8 @@ import time
 from pathlib import Path
 
 FLAGS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK", "READONLY_JOB", "PROSE_ACT_NUDGE",
-         "PROSE_PRESENCE_PENALTY", "NOTHINK_RUN")
+         "PROSE_PRESENCE_PENALTY", "NOTHINK_RUN", "REASONING_PARSER")
+REASONING_PARSER_VALUES = ("qwen3",)      # the only non-0/1 flag value; the profile must declare the same parser
 MIN_WINDOW_LINES = 120
 VOE_EVERY = 2
 VOE_MAX_RUNS = 6
@@ -97,6 +109,10 @@ def apply_task_flags(task, environ=None, log=None):
                 continue
             k, v = tok.split("=", 1)
             k, v = k.strip().upper(), v.strip()
+            if k == "REASONING_PARSER" and v in REASONING_PARSER_VALUES and k not in environ:
+                environ[k] = v
+                applied.append(f"{k}={v}")
+                continue
             if k not in FLAGS or v not in ("0", "1") or k in environ:
                 continue
             environ[k] = v
@@ -128,6 +144,39 @@ def presence_penalty_override(role, environ=None):
 def nothink_run(role, environ=None) -> bool:
     """True when NOTHINK_RUN=1 and the role is the author: thinking is off for the whole run."""
     return flag("NOTHINK_RUN", environ) and (role or "author") == "author"
+
+
+def reasoning_parser_request(environ=None):
+    """The parser name the REASONING_PARSER lever asks for ('qwen3'), else None (lever off / unknown value)."""
+    v = (os.environ if environ is None else environ).get("REASONING_PARSER")
+    return v if v in REASONING_PARSER_VALUES else None
+
+
+_COT_MARKERS = re.compile(r"(?i)(thinking process|thinking sequence|let me (check|think|re-?read|look|analy[sz]e)|"
+                          r"\bwait,|\bokay,|the user (wants|is asking|asked)|\bi need to\b|\bdeconstruct\b|"
+                          r"\bhmm\b|let's (see|check|think|analy[sz]e))")
+UNCLOSED_THINK_HUGE_CHARS = 12000
+
+
+def unclosed_think_cutoff(msg, done_reason, usage, max_tokens, parser_on, thinking_on=True):
+    """PURE. True when the reasoning parser was requested for a thinking turn yet the turn's THINKING is sitting in
+    `content`: no reasoning came back, no tool call, no `</think>` (the closed form is already split by the
+    worker's _strip_inline_think), and either the turn was cut at the output cap (finish_reason length /
+    completion >= max_tokens -- probed: a non-streaming turn cut mid-think keeps the unclosed block in content) or
+    it is huge and reads as chain of thought. Such a turn is a cutoff / runaway, never an answer or history."""
+    if not parser_on or not thinking_on:
+        return False
+    if msg.get("tool_calls") or msg.get("thinking") or msg.get("reasoning") or msg.get("reasoning_content"):
+        return False
+    c = msg.get("content") or ""
+    if not c.strip() or "</think>" in c:
+        return False
+    if str(done_reason or "").lower() == "length":
+        return True
+    ct = (usage or {}).get("completion_tokens") or 0
+    if max_tokens and ct >= max_tokens:
+        return True
+    return len(c) >= UNCLOSED_THINK_HUGE_CHARS and bool(_COT_MARKERS.search(c[:4000]))
 
 
 # --------------------------------------------------------------------------- L3 READ_MIN_WINDOW
