@@ -22,7 +22,8 @@ LEVERS = Path(os.environ.get("LEVERS_SRC") or HERE / "worker_levers.py")
 FAILS = []
 LAST_ENV = []
 SEQ, REQS = [], []
-FLAG_KEYS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK", "READONLY_JOB")
+FLAG_KEYS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK", "READONLY_JOB", "PROSE_ACT_NUDGE",
+             "PROSE_PRESENCE_PENALTY", "NOTHINK_RUN")
 BYFLAG = {"mode": None, "tools": []}      # L4 stub: mode "think" = prose runaway iff thinking is ON; "always" = every turn
 LOOP_TEXT = "\n".join(["Let me analyze the function. Let me read the function again and plan the change carefully."] * 3000)
 
@@ -204,11 +205,30 @@ def main():
     setflags(READ_MIN_WINDOW="0")
     check("L3 '0' = off", wl.min_window_length(10), 10)
 
+    # ================= pure unit: PROSE_ACT_NUDGE (default OFF) =================
+    setflags()
+    check("ACT_NUDGE off: no suffix even with no edit", wl.act_nudge_suffix(True), "")
+    setflags(PROSE_ACT_NUDGE="0")
+    check("ACT_NUDGE '0' = off", wl.act_nudge_suffix(True), "")
+    setflags(PROSE_ACT_NUDGE="1")
+    sfx = wl.act_nudge_suffix(True)
+    check("ACT_NUDGE on + no edit yet: plain stop-analysing text", ("Stop analysing the tests." in sfx
+          and "first edit now" in sfx and "bash verify.sh" in sfx), True)
+    check("ACT_NUDGE on but an edit already happened: no suffix", wl.act_nudge_suffix(False), "")
+    setflags()
+    env = {}
+    wl.apply_task_flags("Worker-flags: PROSE_ACT_NUDGE=1", env)
+    check("PROSE_ACT_NUDGE is an allow-listed task flag", env, {"PROSE_ACT_NUDGE": "1"})
+    src = WORKER.read_text()
+    check("worker nudge site: suffix gated on the flag + no-edit snapshot, base nudge text unchanged",
+          ('_wl.flag("PROSE_ACT_NUDGE")' in src and "_wl.act_nudge_suffix(" in src
+           and "prose_runaway_nudge(\n                    _PROSE_BUDGET_TOKENS, _pr_reason, task_kind) + _pan" in src), True)
+
     # ================= pure unit: task-text passthrough =================
     env = {}
     got = wl.apply_task_flags("x\nWorker-flags: VERIFY_ON_EDIT=1 PROTECT_HARNESS=1 READ_MIN_WINDOW=1 PROSE_STICKY_NOTHINK=1\ny", env)
     check("Worker-flags line sets exactly the 4 allow-listed names", (sorted(env), got.__len__()),
-          (sorted(k for k in FLAG_KEYS if k != "READONLY_JOB"), 4))
+          (sorted(k for k in FLAG_KEYS if k not in ("READONLY_JOB", "PROSE_ACT_NUDGE", "PROSE_PRESENCE_PENALTY", "NOTHINK_RUN")), 4))
     env = {}
     wl.apply_task_flags("Worker-flags: READONLY_JOB=1", env)
     check("READONLY_JOB is an allow-listed task flag", env, {"READONLY_JOB": "1"})
@@ -532,12 +552,36 @@ def main():
     lt, rt, wt_ = l4run(task="Fix it.\n\nWorker-flags: PROSE_STICKY_NOTHINK=1\n")
     check("L4 e2e: task-text Worker-flags line engages it", (set(thinking(rt)[1:]), "L4: prose runaway seen" in lt), ({False}, True))
 
+
+    # ================= A/B levers (2026-10-12): PROSE_PRESENCE_PENALTY / NOTHINK_RUN =================
+    check("AB unit: presence override off by default / author only",
+          (wl.presence_penalty_override("author", {}), wl.presence_penalty_override("author", {"PROSE_PRESENCE_PENALTY": "1"}),
+           wl.presence_penalty_override("reviewer", {"PROSE_PRESENCE_PENALTY": "1"})), (None, 1.0, None))
+    check("AB unit: nothink_run off by default / author only",
+          (wl.nothink_run("author", {}), wl.nothink_run("author", {"NOTHINK_RUN": "1"}), wl.nothink_run("reviewer", {"NOTHINK_RUN": "1"})), (False, True, False))
+    check("AB unit: both are Worker-flags allow-listed",
+          wl.apply_task_flags("Worker-flags: PROSE_PRESENCE_PENALTY=1 NOTHINK_RUN=1", {}), ["PROSE_PRESENCE_PENALTY=1", "NOTHINK_RUN=1"])
+    lab0, rab0, wab0 = l4run(mode=None)
+    check("AB e2e OFF: thinking ON every turn, profile presence_penalty",
+          (set(thinking(rab0)), {r.get("presence_penalty") for r in rab0} == {0.0}), ({True}, True))
+    lab1, rab1, wab1 = l4run(mode=None, PROSE_PRESENCE_PENALTY="1")
+    check("AB e2e presence: every request presence_penalty=1.0, thinking untouched, rest identical",
+          ({r.get("presence_penalty") for r in rab1}, set(thinking(rab1)),
+           norm([dict(r, presence_penalty=0.0) for r in rab1], wab1) == norm(rab0, wab0)), ({1.0}, {True}, True))
+    lab2, rab2, wab2 = l4run(mode=None, NOTHINK_RUN="1")
+    check("AB e2e nothink: thinking OFF on every turn incl. turn 1, presence untouched",
+          (set(thinking(rab2)), {r.get("presence_penalty") for r in rab2}), ({False}, {0.0}))
+    lab3, rab3, wab3 = l4run(mode=None, task="Fix it.\n\nWorker-flags: NOTHINK_RUN=1 PROSE_PRESENCE_PENALTY=1\n")
+    check("AB e2e: task-text Worker-flags engages both", (set(thinking(rab3)), {r.get("presence_penalty") for r in rab3}), ({False}, {1.0}))
+
     print("\nALL PASS" if not FAILS else f"\n{len(FAILS)} FAILED: {FAILS}")
     return 0 if not FAILS else 1
 
 
 MUTATIONS = [
     # (name, file, old, new)
+    ("ACT_NUDGE: on even when flag off", "worker_levers.py", 'if (no_edit_yet and flag("PROSE_ACT_NUDGE", environ))', 'if (no_edit_yet)'),
+    ("ACT_NUDGE: ignores edit-already-made", "worker_levers.py", 'if (no_edit_yet and flag("PROSE_ACT_NUDGE", environ))', 'if (flag("PROSE_ACT_NUDGE", environ))'),
     ("L1: verify never run", "worker_levers.py", "        ok, out = runner(verify, cwd)\n", "        ok, out = False, 'x'\n        return ''\n"),
     ("L1: runs every edit", "worker_levers.py", "        if _VOE[\"edits\"] % VOE_EVERY:\n            return \"\"\n", ""),
     ("L1: no run cap", "worker_levers.py", "        if _VOE[\"runs\"] >= VOE_MAX_RUNS:\n            return \"\"\n", ""),
@@ -568,11 +612,16 @@ MUTATIONS = [
     ("L4: sticky ignores the flag", "worker_levers.py", "    return bool(_L4[\"sticky\"] and flag(\"PROSE_STICKY_NOTHINK\"))", "    return bool(_L4[\"sticky\"])"),
     ("L4: sticky from turn 1 (not after the first abort)", "worker_levers.py", "    return bool(_L4[\"sticky\"] and flag(\"PROSE_STICKY_NOTHINK\"))", "    return flag(\"PROSE_STICKY_NOTHINK\")"),
     ("L4: state not reset per run", "worker_levers.py", "        _L4[\"sticky\"] = False\n        if flag(\"PROTECT_HARNESS\"):", "        if flag(\"PROTECT_HARNESS\"):"),
-    ("L4: not in the Worker-flags allow-list", "worker_levers.py", ", \"READ_MIN_WINDOW\", \"PROSE_STICKY_NOTHINK\")", ", \"READ_MIN_WINDOW\")"),
+    ("L4: not in the Worker-flags allow-list", "worker_levers.py", "\"READ_MIN_WINDOW\", \"PROSE_STICKY_NOTHINK\", ", "\"READ_MIN_WINDOW\", "),
     ("L4: worker never reports the abort", "ollama-worker.py", "                _wl.l4_note_abort(role, _prof.get(\"enable_thinking\"), log=log)", "                pass"),
     ("L4: later turns think again", "ollama-worker.py", "        if _l4_sticky:\n            _turn_think = False\n", ""),
     ("L4: later turns lose the recovery sampling", "ollama-worker.py", "        if _cap_cut_recover or _l4_sticky:", "        if _cap_cut_recover:"),
     ("task line: any env name accepted", "worker_levers.py", "            if k not in FLAGS or v not in (\"0\", \"1\") or k in environ:", "            if v not in (\"0\", \"1\"):"),
+    ("AB: presence override ignores the flag", "worker_levers.py", 'return PRESENCE_PENALTY_VALUE if (flag("PROSE_PRESENCE_PENALTY", environ) and', 'return PRESENCE_PENALTY_VALUE if (True and'),
+    ("AB: nothink ignores the flag", "worker_levers.py", 'return flag("NOTHINK_RUN", environ) and (role', 'return True and (role'),
+    ("AB: worker drops the presence override", "ollama-worker.py", '"presence_penalty": (_wl.presence_penalty_override(role) if _wl is not None else None)}', '"presence_penalty": None}'),
+    ("AB: worker drops nothink", "ollama-worker.py", '    if _wl is not None and _wl.nothink_run(role):', '    if False:'),
+    ("AB: not in Worker-flags allow-list", "worker_levers.py", '"PROSE_PRESENCE_PENALTY", "NOTHINK_RUN")', '"PROSE_PRESENCE_PENALTY",)'),
     ("task line not parsed by worker", "ollama-worker.py", "        _wl.apply_task_flags(task, log=log)", "        pass"),
     ("run not armed by worker", "ollama-worker.py", "        _wl.arm_run(cwd, task, task_kind, verify, log=log)", "        pass"),
 ]

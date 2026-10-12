@@ -42,6 +42,18 @@ never overrides an env var that is already set).
                      edit"), which is meaningless when the job must never edit. Identical-call loops, prose runaway,
                      no_progress, the wall cap and max-iters are untouched. Default off = coding runs unchanged.
 
+  PROSE_ACT_NUDGE=1  (2026-10-11, A/B-measure before enabling) when the prose-runaway guard aborts a turn and the run has made NO
+                     edit yet (worktree still byte-identical to dispatch start), the injected correction additionally
+                     says: stop analysing the tests, make your best first edit now, then run bash verify.sh and fix from
+                     the failing assertion. Evidence: Amazon task, 3 runs looped re-deriving a test contradiction with
+                     zero edits. Default off = the existing nudge text unchanged.
+
+  PROSE_PRESENCE_PENALTY=1  (2026-10-12, A/B arm B, measure before enabling) author-role requests carry
+                     presence_penalty=1.0 (the Qwen cards allow 0-2 "to reduce endless repetitions"; profile value is 0.0)
+                     for the whole run. Default off = the profile value, request bodies byte-identical.
+  NOTHINK_RUN=1      (2026-10-12, A/B arm C) enable_thinking=false for EVERY author turn of the run (unlike
+                     PROSE_STICKY_NOTHINK, which waits for the first runaway). Default off = unchanged.
+
 PURE apart from the module-level state dicts (reset per run by arm_run) and the one `git log` in
 sealed_coding_harness. No import of the worker; the worker owns the (tiny, gated) call sites."""
 import fnmatch
@@ -52,7 +64,8 @@ import subprocess
 import time
 from pathlib import Path
 
-FLAGS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK", "READONLY_JOB")
+FLAGS = ("VERIFY_ON_EDIT", "PROTECT_HARNESS", "READ_MIN_WINDOW", "PROSE_STICKY_NOTHINK", "READONLY_JOB", "PROSE_ACT_NUDGE",
+         "PROSE_PRESENCE_PENALTY", "NOTHINK_RUN")
 MIN_WINDOW_LINES = 120
 VOE_EVERY = 2
 VOE_MAX_RUNS = 6
@@ -91,6 +104,30 @@ def apply_task_flags(task, environ=None, log=None):
     if applied and log:
         log(f"[worker] WORKER FLAGS {' '.join(applied)} (from the task's Worker-flags line).")
     return applied
+
+
+# --------------------------------------------------------------------------- PROSE_ACT_NUDGE
+ACT_NUDGE_TEXT = ("Stop analysing the tests. Make your best first edit now with the edit tool, then run "
+                  "bash verify.sh and read the failing assertion; fix from that output.")
+
+
+def act_nudge_suffix(no_edit_yet, environ=None) -> str:
+    """'' unless PROSE_ACT_NUDGE=1 AND the run has made no edit yet; else the text to append to the nudge."""
+    return (" " + ACT_NUDGE_TEXT) if (no_edit_yet and flag("PROSE_ACT_NUDGE", environ)) else ""
+
+
+# --------------------------------------------------------------------------- A/B levers (2026-10-12)
+PRESENCE_PENALTY_VALUE = 1.0
+
+
+def presence_penalty_override(role, environ=None):
+    """1.0 when PROSE_PRESENCE_PENALTY=1 and the role is the author; else None (= keep the profile value)."""
+    return PRESENCE_PENALTY_VALUE if (flag("PROSE_PRESENCE_PENALTY", environ) and (role or "author") == "author") else None
+
+
+def nothink_run(role, environ=None) -> bool:
+    """True when NOTHINK_RUN=1 and the role is the author: thinking is off for the whole run."""
+    return flag("NOTHINK_RUN", environ) and (role or "author") == "author"
 
 
 # --------------------------------------------------------------------------- L3 READ_MIN_WINDOW

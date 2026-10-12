@@ -3031,11 +3031,14 @@ def _profile_fields(model, role, api_style, temperature=None, num_ctx=None, top_
     """The request fields for (model, role, api): the model card's profile
     (model_profiles.yaml) with explicit non-None caller values layered on top. The
     ONLY place a request body's sampling / max_tokens / thinking control is decided."""
+    if _wl is not None and _wl.nothink_run(role):    # NOTHINK_RUN (A/B, default OFF): thinking off for the whole author run
+        think = False
     _fields = _mp.build_request_fields(
         model, role or "author", "openai" if api_style == "openai" else "ollama",
         overrides={"temperature": temperature, "num_ctx": num_ctx, "top_p": top_p,
                    "top_k": top_k, "max_tokens": max_tokens,
-                   "repetition_penalty": repeat_penalty},
+                   "repetition_penalty": repeat_penalty,
+                   "presence_penalty": (_wl.presence_penalty_override(role) if _wl is not None else None)},
         think=think, sampling_step=sampling_step, seed=seed)
     # MODEL_PROFILE_LOG=1 (default OFF): one line per request naming the profile + the effective
     # params that go on the wire (so a transcript shows what each turn was actually sent).
