@@ -3705,6 +3705,14 @@ class ChatAbortedForReasoningLoop(Exception):
     frees immediately and run_task drops into its resumable-pause path."""
 
 
+def _with_thinking(exc, thinking):
+    """Attach the aborted turn's streamed reasoning to the exception so run_task can persist it
+    (an aborted turn's reasoning was previously discarded, leaving no way to tell a true loop
+    from a false positive after the fact)."""
+    exc.thinking = thinking
+    return exc
+
+
 def call_ollama_streaming(host: str, model: str, messages: list, temperature: float, num_ctx: int,
                           timeout: int = CHAT_TIMEOUT_S, tools: bool = True,
                           top_p: float = None, top_k: int = None, live: "LiveLog" = None,
@@ -3869,9 +3877,9 @@ def call_ollama_streaming(host: str, model: str, messages: list, temperature: fl
                         resp.close()
                     except Exception:
                         pass
-                    raise ChatAbortedForReasoningLoop(
+                    raise _with_thinking(ChatAbortedForReasoningLoop(
                         f"intra-turn reasoning loop ({_loop_reason}): {len(think_buf)} chars of "
-                        f"thinking with no content/tool_calls -- aborted the in-flight chat request")
+                        f"thinking with no content/tool_calls -- aborted the in-flight chat request"), think_buf)
                 if (_REASONING_BUDGET[0] and think_chars >= _REASONING_BUDGET[0]
                         and not (content_parts or tool_calls_acc)):
                     emit(f'[{model}] REASONING RUNAWAY ({think_chars} chars of thinking, no content/'
@@ -3880,7 +3888,7 @@ def call_ollama_streaming(host: str, model: str, messages: list, temperature: fl
                         resp.close()
                     except Exception:
                         pass
-                    raise ChatAbortedForReasoningRunaway(think_chars)
+                    raise _with_thinking(ChatAbortedForReasoningRunaway(think_chars), think_buf)
 
             if content:
                 if phase != 'writing':
@@ -4211,9 +4219,9 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
                             resp.close()
                         except Exception:
                             pass
-                        raise ChatAbortedForReasoningLoop(
+                        raise _with_thinking(ChatAbortedForReasoningLoop(
                             f"intra-turn reasoning loop ({_loop_reason}): {len(think_buf)} chars of "
-                            f"thinking with no content/tool_calls -- aborted the in-flight chat request")
+                            f"thinking with no content/tool_calls -- aborted the in-flight chat request"), think_buf)
                     if (_REASONING_BUDGET[0] and think_chars >= _REASONING_BUDGET[0]
                             and not (content_parts or tc_slots)):
                         emit(f'[{model}] REASONING RUNAWAY ({think_chars} chars of thinking, no '
@@ -4222,7 +4230,7 @@ def call_openai_streaming(host: str, model: str, messages: list, temperature: fl
                             resp.close()
                         except Exception:
                             pass
-                        raise ChatAbortedForReasoningRunaway(think_chars)
+                        raise _with_thinking(ChatAbortedForReasoningRunaway(think_chars), think_buf)
 
                 if content:
                     if phase != 'writing':
@@ -5634,6 +5642,30 @@ def persist_cutoff_turn(path, *, iteration, content, thinking, finish_reason, us
     return rec
 
 
+_REASONING_ABORT_MAX_FILES = 12     # evidence files per run (bounded; a pathological run must not fill the disk)
+
+
+def _persist_reasoning_abort(log_path, iteration, kind, exc, log, metrics):
+    """Persist the streamed reasoning of a turn aborted by the reasoning loop / runaway guard,
+    BEFORE the retry discards it. Without it nobody can later tell a true loop from a false
+    positive (A/B 2026-10-12: ten fires, zero retained text). Never raises."""
+    try:
+        th = getattr(exc, "thinking", "") or ""
+        n = metrics.get("reasoning_abort_files", 0)
+        if not th or n >= _REASONING_ABORT_MAX_FILES:
+            return None
+        rec = persist_cutoff_turn(
+            Path(log_path).with_name(f"{Path(log_path).stem}.reasoning-abort-{iteration}-{n}.txt"),
+            iteration=iteration, content="", thinking=th, finish_reason="aborted", usage=None,
+            streamed=True, abort_reason=f"reasoning_{kind}: {exc}", max_tokens=None)
+        metrics["reasoning_abort_files"] = n + 1
+        if rec.get("file"):
+            log(f"[worker] aborted-turn reasoning ({len(th)} chars) saved to {rec['file']}")
+        return rec
+    except Exception:
+        return None
+
+
 def prose_runaway_nudge(budget_tokens, reason, task_kind="coding") -> str:
     if task_kind != "coding":
         return (f"Your last response was STOPPED after ~{budget_tokens} tokens with no final answer "
@@ -6114,7 +6146,17 @@ INTRA_TURN_CHECK_INTERVAL = 2000    # chars of new thinking between checks (chea
 INTRA_TURN_TAIL_WINDOW = 400        # chars of the tail compared against everything earlier
 INTRA_TURN_SIMILARITY = 0.92        # lower than the cross-turn 0.98: intra-turn phrasing drifts more within one fixed point
 INTRA_TURN_MAX_THINK_CHARS = 60000  # ~15-20K tokens of unbroken thinking with zero content/tool_calls is never legitimate forward progress
-REASONING_LOOP_MAX_RETRIES = 1      # retries of the SAME turn (with a temperature bump) before pausing as resumable
+# INTRA_TURN_REPEAT_MIN_EARLIER (2026-10-12, REASONING_PARSER A/B): the "repeat" trigger used to
+# fire when the 400-char tail occurred ONCE earlier. Measured offline over every saved assistant
+# thinking block >= 2000 chars in ~/bin/ollama-worker-logs (2454 blocks): that rule fires on 134;
+# in 17 of those the repeated segment never recurs after the fire point (the model left it on its
+# own and went on to write the file / call the tool -- e.g. 20260914T062918Z it20 drafted a whole
+# function twice, then write_file; 20260821T214050Z it4 restated the same find command twice, then
+# ran it). Requiring >=2 earlier occurrences (3 in total) removes 16 of the 17 and requiring >=3
+# removes all 17, while the 113 fires whose cycle continues to the end of the block stay. >=3 chosen
+# (0 measured false fires); the 24000-char reasoning budget still backstops a slower cycle.
+INTRA_TURN_REPEAT_MIN_EARLIER = 3
+REASONING_LOOP_MAX_RETRIES = 1      # retries of the SAME turn (with a temperature bump) before the thinking-off retry
 
 # --- Output cap spent entirely on thinking (2026-09-27) ---------------------------
 # Measured: 8 of 876 iterations across the last 60 queue logs (cb21d014c3cd it5,
@@ -6249,6 +6291,18 @@ def think_cap_nudge(thinking, max_tokens, tail_chars=THINK_CAP_TAIL_CHARS):
 REASONING_LOOP_RETRY_TEMPERATURE = 0.4  # a temp=0 retry of a frozen decode reproduces itself deterministically
 
 
+def _count_overlapping(hay, needle, stop_at):
+    """Occurrences of needle in hay, overlaps counted (a cycle shorter than the needle repeats
+    at spacings < len(needle), which str.count would skip); stops early at `stop_at`."""
+    c, i = 0, hay.find(needle)
+    while i != -1:
+        c += 1
+        if c >= stop_at:
+            break
+        i = hay.find(needle, i + 1)
+    return c
+
+
 def think_buf_loop_check(think_buf, last_checked_len, has_output):
     """Pure check run periodically as one turn's thinking streams in.
 
@@ -6275,10 +6329,12 @@ def think_buf_loop_check(think_buf, last_checked_len, has_output):
     if len(norm) >= INTRA_TURN_TAIL_WINDOW * 2:
         tail = norm[-INTRA_TURN_TAIL_WINDOW:]
         earlier = norm[:-INTRA_TURN_TAIL_WINDOW]
-        if tail in earlier:
-            return True, True, n, "repeat"
-        sm = difflib.SequenceMatcher(None, earlier, tail)
-        if sm.quick_ratio() >= INTRA_TURN_SIMILARITY and sm.ratio() >= INTRA_TURN_SIMILARITY:
+        # The tail must have already occurred INTRA_TURN_REPEAT_MIN_EARLIER times: one earlier
+        # occurrence is how a model legitimately drafts the same function/command twice in its
+        # reasoning before writing it out (measured: INTRA_TURN_REPEAT_MIN_EARLIER comment above).
+        # (The old SequenceMatcher branch compared a 400-char tail against the WHOLE earlier
+        # buffer, so ratio <= 2*400/(len(earlier)+400) -- unreachable past ~1.2K chars; removed.)
+        if _count_overlapping(earlier, tail, INTRA_TURN_REPEAT_MIN_EARLIER) >= INTRA_TURN_REPEAT_MIN_EARLIER:
             return True, True, n, "repeat"
     return True, False, n, None
 
@@ -7358,6 +7414,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 _runaway_streak += 1
                 _dispatch_metrics["reasoning_runaways"] = _dispatch_metrics.get("reasoning_runaways", 0) + 1
                 _rr_chars = rr_err.args[0] if rr_err.args else 0
+                _persist_reasoning_abort(log_path, i, "runaway", rr_err, log, _dispatch_metrics)
                 _lad = _ladder.on_abort("reasoning_runaway")
                 if _lad[0] == "exit":
                     log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: sampling ladder -- {_lad[1]} "
@@ -7405,15 +7462,31 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                 # promise the model will converge.
                 _reasoning_loop_retries += 1
                 _dispatch_metrics["reasoning_loop_aborts"] = _dispatch_metrics.get("reasoning_loop_aborts", 0) + 1
+                _persist_reasoning_abort(log_path, i, "loop", loop_err, log, _dispatch_metrics)
                 if _reasoning_loop_retries > REASONING_LOOP_MAX_RETRIES:
+                    # Retries exhausted. Do NOT park the job awaiting a human (A/B 2026-10-12:
+                    # 3 of 3 REASONING_PARSER=qwen3 runs ended paused/exit 3 here). Take the same
+                    # recovery rung a reasoning runaway takes: nudge + this turn with thinking OFF.
+                    _runaway_streak += 1
+                    _lc = len(getattr(loop_err, "thinking", "") or "") or 0
+                    if _turn_think is False or _runaway_streak > 2:
+                        log(f"[worker] REASONING LOOP at iteration {i}/{total_iters}: {loop_err}. "
+                            f"{_reasoning_loop_retries} attempt(s) exhausted and thinking-off recovery "
+                            f"already used ({_runaway_streak} in a row) -- pausing as resumable rather "
+                            f"than retrying forever.")
+                        paused_for_review = f"reasoning loop, retries exhausted: {loop_err}"
+                        pause_reason_code = "reasoning_loop"
+                        pause_meta = {"retries": _reasoning_loop_retries}
+                        _outer_break = True
+                        break
+                    _turn_think = False
+                    messages.append({"role": "user", "content": _wr.reasoning_runaway_message(_lc)})
+                    _dispatch_metrics["reasoning_loop_thinkoff"] = _dispatch_metrics.get("reasoning_loop_thinkoff", 0) + 1
                     log(f"[worker] REASONING LOOP at iteration {i}/{total_iters}: {loop_err}. "
-                        f"{_reasoning_loop_retries} attempt(s) exhausted (including a temperature "
-                        f"bump) -- pausing as resumable rather than retrying forever.")
-                    paused_for_review = f"reasoning loop, retries exhausted: {loop_err}"
-                    pause_reason_code = "reasoning_loop"
-                    pause_meta = {"retries": _reasoning_loop_retries}
-                    _outer_break = True
-                    break
+                        f"{_reasoning_loop_retries} attempt(s) exhausted -- retrying this turn with "
+                        f"thinking DISABLED (recovery {_runaway_streak}).")
+                    _call_started = time.monotonic()
+                    continue
                 _eff_temperature = max(_eff_temperature, REASONING_LOOP_RETRY_TEMPERATURE)
                 log(f"[worker] REASONING LOOP at iteration {i}/{total_iters}: {loop_err}. Retrying "
                     f"this turn at temperature={_eff_temperature} -- attempt "
