@@ -460,7 +460,11 @@ VERIFY_TIMEOUT = int(os.environ.get("QAGENT_VERIFY_TIMEOUT", "600"))
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec|specs)/|(^|/)test_[^/]*\.py$|_test\.[a-z]+$|"
                      r"\.(test|spec)\.[a-z]+$|(^|/)conftest\.py$", re.I)
 JUNK_EXCLUDES = [":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.pyc", ":(exclude,glob)**/.pytest_cache/**",
-                 ":(exclude,glob)**/node_modules/**", ":(exclude,glob)**/.DS_Store"]
+                 ":(exclude,glob)**/node_modules/**", ":(exclude,glob)**/.DS_Store",
+                 # ollama-queue.py persists every job's final answer as ANSWER.md in the job cwd; in a fix
+                 # worktree that is the queue's artifact, never the model's edit (it tripped the scope guard
+                 # and made every otherwise-green fix UNVERIFIED).
+                 ":(exclude,top)ANSWER.md"]
 FIX_PREAMBLE = (
     "FIX TASK. You are working in an isolated git worktree (your working directory); edit files ONLY there. "
     "Make the SMALLEST source change that fixes the problem. You MUST NOT modify, delete, rename or add "
@@ -734,6 +738,9 @@ def fix_finalize(jid, force=False):
     # capture the patch BEFORE running verify (verify litter must not land in the patch)
     hset = set(m.get("harness", []))
     hx = [f":(exclude){h}" for h in sorted(hset | set(m.get("harness_refs", [])))]
+    # a re-finalize finds the queue's ANSWER.md already staged by the first pass; unstage it (an exclude
+    # pathspec only stops NEW staging)
+    git(wt, "reset", "-q", "--", "ANSWER.md")
     git(wt, "add", "-A", "--", ".", *JUNK_EXCLUDES, *hx)
     ns = git(wt, "diff", "--cached", "--name-status", "--no-renames", m["base"]).stdout
     files = [tuple(l.split("\t", 1)) for l in ns.splitlines() if "\t" in l]
