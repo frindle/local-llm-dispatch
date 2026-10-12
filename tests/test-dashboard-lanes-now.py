@@ -15,8 +15,8 @@ FAILS = []
 
 MUTANTS = [
     ("an idle lane is silently omitted",
-     "return NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k]}));",
-     "return NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k]})).filter(r => !r.idle);"),
+     "  out.auto = autoRows;\n  return out;",
+     "  out.auto = autoRows;\n  return Object.assign(out.filter(r => !r.idle), {auto: autoRows});"),
     ("unraid jobs land in the studio lane",
      "if (l.includes('unraid')) return 'unraid';", "if (false) return 'unraid';"),
     ("the CPU lane is not shown",
