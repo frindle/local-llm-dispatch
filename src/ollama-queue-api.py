@@ -2464,11 +2464,14 @@ function bundleAttention(g, view, kind) {
 // Summary strip: running now / queue depth / needs attention, plus section counts.
 // "Waiting on" banner: one line per lane that is IDLE while work is pending, from the
 // daemon's queue-wait.json. RED when the same reason has held an idle lane > stuck_after_s.
-function renderWaitBanner(w, jobs) {
+function renderWaitBanner(w, jobs, fetchedAt) {
   const el = document.getElementById('waitBanner');
   if (!el) return;
+  if (!w) { el.hidden = true; el.classList.remove('stuck'); el.innerHTML = ''; return; }
   const dur = s => { s = Math.max(0, Math.round(s)); return s >= 3600 ? Math.floor(s / 3600) + 'h' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm' : s >= 60 ? Math.floor(s / 60) + 'm' : s + 's'; };
-  const now = w.now || Date.now() / 1000;
+  // Ages tick on the CLIENT clock from the moment this payload arrived (fetchedAt), so a payload that
+  // stops being refreshed visibly ages instead of reading "1m" forever.
+  const now = (w.now || Date.now() / 1000) + (fetchedAt ? (Date.now() - fetchedAt) / 1000 : 0);
   const lines = [];
   let stuck = false;
   if (w.source === 'state') {
@@ -2490,6 +2493,38 @@ function renderWaitBanner(w, jobs) {
   el.hidden = !lines.length;
   el.classList.toggle('stuck', stuck);
   el.innerHTML = lines.join('');
+}
+
+// The banner refreshes on its OWN timer + fetch (5s abort), independent of refresh()'s slowest fetch.
+// On failure / non-ok / timeout it never keeps presenting the last "Waiting on" line as current.
+let waitBannerJobs = [], waitBannerOkAt = 0, WAIT_BANNER_TIMEOUT_MS = 5000, waitBannerBusy = false;
+function renderWaitBannerUnavailable() {
+  const el = document.getElementById('waitBanner');
+  if (!el) return;
+  const ago = waitBannerOkAt ? ' (last seen ' + Math.max(0, Math.round((Date.now() - waitBannerOkAt) / 1000)) + 's ago)' : '';
+  el.hidden = false;
+  el.classList.remove('stuck');
+  el.innerHTML = '<span class="lane log">Queue wait status unavailable' + ago + '</span>';
+}
+async function refreshWaitBanner() {
+  if (waitBannerBusy) return;
+  waitBannerBusy = true;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), WAIT_BANNER_TIMEOUT_MS);
+  try {
+    const r = await fetch('/api/queue-wait', {cache: 'no-store', signal: ac.signal});
+    if (!r || !r.ok) throw new Error('queue-wait not ok');
+    const w = await r.json();
+    queueWait = w;
+    waitBannerOkAt = Date.now();
+    renderWaitBanner(w, waitBannerJobs, waitBannerOkAt);
+  } catch (e) {
+    queueWait = null;
+    renderWaitBannerUnavailable();
+  } finally {
+    clearTimeout(timer);
+    waitBannerBusy = false;
+  }
 }
 
 // Why ONE queue row is waiting: the daemon's own reason (queue_wait.short) beats the API's derived
@@ -2882,15 +2917,14 @@ async function refresh() {
   if (document.querySelector('details.menu[open]') && Date.now() - menuOpenedAt < 20000) return;
   // finished bundles change slowly: refetch at most every 15s (or right after a control)
   const wantFinished = Date.now() - finishedFetchedAt > 15000;
-  const [res, bvRes, fbRes, qwRes, trRes] = await Promise.all([fetch('/api/jobs'),
+  const [res, bvRes, fbRes, trRes] = await Promise.all([fetch('/api/jobs'),
     fetch('/api/bundle-views').catch(() => null),
     wantFinished ? fetch('/api/bundle-history?days=' + finishedDays + '&limit=' + finishedLimit)
       .catch(() => null) : null,
-    fetch('/api/queue-wait').catch(() => null),
     fetch('/api/triage').catch(() => null)]);
   checkFrontendVersion(res);   // an open tab notices a new build and reloads once
   const jobs = await res.json();
-  try { if (qwRes && qwRes.ok) { queueWait = await qwRes.json(); renderWaitBanner(queueWait, jobs); } } catch (e) { /* keep last */ }
+  waitBannerJobs = jobs;   // the banner's own timer (refreshWaitBanner) reads these for its no-state fallback
   try { if (trRes && trRes.ok) triageOpen = await trRes.json(); } catch (e) { /* keep last */ }
   // Dashboard B: live per-slice truth; an older API (404) just renders as before.
   try { if (bvRes && bvRes.ok) bundleViews = await bvRes.json(); } catch (e) { /* keep last */ }
@@ -4594,12 +4628,14 @@ async function refreshCpuLane() {
 }
 
 refresh();
+refreshWaitBanner();
 refreshHosts();
 refreshHostSettings();
 refreshRuns();
 refreshCpuLane();
 setInterval(refreshCpuLane, 5000);
 setInterval(refresh, 4000);
+setInterval(refreshWaitBanner, 4000);
 setInterval(refreshHosts, 4000);
 setInterval(refreshRuns, 5000);
 
