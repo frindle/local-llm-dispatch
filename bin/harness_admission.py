@@ -64,7 +64,7 @@ if str(HERE) not in sys.path:
 
 # --- causes (pipeline_cause_owners.referenced_causes reads this tuple) -------------------
 ADMISSION_CAUSES = ("fixture-untraceable", "baseline-not-red", "refimpl-unapplicable",
-                    "refimpl-syntax", "contract-broken", "flaky-fixture", "fixture-type-mismatch", "oversize-reslice", "reslice-required", "repeated-defect",
+                    "refimpl-syntax", "contract-broken", "flaky-fixture", "fixture-type-mismatch", "oversize-reslice", "reslice-required", "repeated-defect", "refine-no-change",
                     "frozen-harness-mutated",
                     "refusal-respec")        # slicer-side: a refusal's ONE bounded re-spec (owner: ollama-dispatch-slice.bound_stale_worktree_retry)
 # OWN marker (NOT "SPEC_DEFECT: "): the auto driver treats it as a no-more-rounds stop, but the slicer's
@@ -442,16 +442,89 @@ def classify_selfcheck_failure(out: str):
     return "contract-broken", f"fail-before/pass-after not proven by the self-check ({first})"
 
 
+REFINE_GUARD = ".refine-guard.json"        # == ollama-dispatch-auto.REFINE_GUARD
+REFINE_NOOP_LIMIT = 2                      # a refine round that changed nothing may be re-admitted ONCE; the 2nd is a retry storm
+
+
+def _guard_aside(wt):
+    """Move an armed refine guard out of the way for the contract measurement. Returns the aside path or None."""
+    g = Path(wt) / REFINE_GUARD
+    if not g.is_file():
+        return None
+    a = Path(wt) / (REFINE_GUARD + ".admission-aside")
+    try:
+        os.replace(g, a)
+        return a
+    except OSError:
+        return None
+
+
+def _guard_restore(wt, aside):
+    if aside is None:
+        return
+    g = Path(wt) / REFINE_GUARD
+    try:
+        if g.exists():                       # a fresh guard was written meanwhile: it wins
+            Path(aside).unlink(missing_ok=True)
+        else:
+            os.replace(aside, g)
+    except OSError:
+        pass
+
+
+def refine_state_hash(wt):
+    """sha1 of the CURRENT bytes of every file the armed refine guard watches (None: no guard). PURE read."""
+    g = Path(wt) / REFINE_GUARD
+    try:
+        files = sorted(json.loads(g.read_text()).get("files") or [])
+    except (OSError, ValueError, AttributeError):
+        return None
+    h = hashlib.sha1()
+    for f in files:
+        p = Path(wt) / f
+        h.update(f.encode() + b"\0" + (hashlib.sha256(p.read_bytes()).digest() if p.is_file() else b"-"))
+    return h.hexdigest()[:20]
+
+
+def note_refine_round(st, state_hash, label=None):
+    """Record the state a refine round STARTS from; returns how many consecutive refine rounds have started
+    from this identical state (0 = first sighting). A round that changed nothing leaves the state identical."""
+    if state_hash is None:
+        return 0
+    if st.get("refine_state") == state_hash and label is not None and st.get("refine_label") == label:
+        return int(st.get("refine_noop") or 0)      # the SAME round re-enqueued (infra retry): not a new no-change round
+    st["refine_label"] = label
+    if st.get("refine_state") == state_hash:
+        st["refine_noop"] = int(st.get("refine_noop") or 0) + 1
+    else:
+        st["refine_state"], st["refine_noop"] = state_hash, 0
+    return st["refine_noop"]
+
+
+def _is_stale_refine_guard_refusal(st) -> bool:
+    d = str(st.get("detail") or "")
+    return d.startswith("contract-broken:") and "REFINE NOT DONE" in d
+
+
 def contract_defects(wt, runner=None, preflight_runner=None, timeout=900) -> list[dict]:
     """[{cause, detail}] from the contract measurement. FAIL-CLOSED: cannot-measure is a defect."""
     wt = Path(wt)
     sc = wt / "auto-harness-check.py"
     if sc.is_file() and preflight_runner is None:
         run = runner or _sh
+        # A REFINE round is admitted with .refine-guard.json already armed (write_refine_guard runs just
+        # before the enqueue). The guard makes the self-check FAIL "REFINE NOT DONE" while the harness is
+        # byte-identical to the round start -- i.e. at EXACTLY this moment -- which classified as
+        # contract-broken and refused every refine round before it began (pa-supersede-policy x2, amazon,
+        # sidecar-novnc-tunnel-url). The gate measures the CONTRACT (fail-before/pass-after); the guard is
+        # a different question (did the model change anything), so it is set aside for the measurement.
+        guard_aside = _guard_aside(wt)
         try:
             rc, out = run("python3 auto-harness-check.py", wt, timeout)
         except Exception as e:
             return [{"cause": "contract-broken", "detail": f"contract could not be measured: {type(e).__name__}: {e}"}]
+        finally:
+            _guard_restore(wt, guard_aside)
         if rc == 0 and "VERIFY_OK" in (out or ""):
             return []
         if rc == 124 or "SELFCHECK_HANG" in (out or ""):
@@ -699,6 +772,12 @@ def admit(wt, label, target=None, lang=None, dynamic=True, runner=None, prefligh
         # status / frozen snapshot are bound to the harness bytes and reset with them; the defect-signature
         # HISTORY is keyed by signature and survives (a re-edited harness with the same defect is a recurrence).
         st = {"fp": fp, "history": st.get("history", []), "status": "new"}
+    if st.get("status") == "reslice" and _is_stale_refine_guard_refusal(st):
+        # Refusals recorded by the pre-fix gate: the armed refine guard's "REFINE NOT DONE" was measured as a
+        # broken contract. That was never a harness defect (see contract_defects); the record is void.
+        st = {"fp": fp, "history": [h for h in st.get("history", []) if h.get("tier") != "refine"], "status": "new"}
+        save_state(wt, st)
+        res["notes"].append("voided a stale refine-guard false-positive reslice record")
     if st.get("status") == "reslice" and tier != "repair":
         res.update(ok=False, cause="reslice-required",
                    message=f"{REFUSAL_PREFIX} [reslice-required]: {st.get('detail', 'a runaway/repeated-signature stop')} "
@@ -731,6 +810,18 @@ def admit(wt, label, target=None, lang=None, dynamic=True, runner=None, prefligh
     if tier == "repair":                  # the repair path never rewrites the refusal state it exists to clear
         res["advisory"] = [f"[{d['cause']}] {d['detail']}" for d in defects]
         return res
+    if tier == "refine":
+        # RETRY STORM: a refine round that ends with the harness byte-identical (nothing killed a survivor)
+        # re-queues the same state. One re-admission is tolerated; the next is the runaway.
+        noop = note_refine_round(st, refine_state_hash(wt), str(label))
+        if noop >= REFINE_NOOP_LIMIT:
+            st.update(status="reslice", detail=f"refine-no-change: {noop} refine rounds started from byte-identical state", fp=fp)
+            save_state(wt, st)
+            res.update(ok=False, cause="refine-no-change",
+                       message=f"{REFUSAL_PREFIX} [refine-no-change]: the previous {noop} refine rounds changed nothing "
+                               f"(fixture/refimpl/TASK/target byte-identical) -- NOT enqueuing another job; re-slice / "
+                               f"re-spec, or repair the harness through the repair path and it must re-pass this gate.")
+            return res
     sig = _sig(defects)
     prev_sigs = [h.get("sig") for h in st.get("history", [])]
     st.setdefault("history", []).append({"sig": sig, "tier": tier, "label": str(label), "at": time.time(),

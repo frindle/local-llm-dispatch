@@ -804,5 +804,88 @@ def anchored_size():
 
 guard("anchored_size", anchored_size)
 
+def refine_admission():
+    """P. REFINE round admission (2026-10-11, sidecar-novnc-tunnel-url): write_refine_guard arms .refine-guard.json
+    BEFORE the refine enqueue, and the armed guard makes the self-check FAIL 'REFINE NOT DONE' while the harness
+    is unchanged -- exactly at admission. That was measured as contract-broken and refused EVERY refine round
+    (pa-supersede-policy x2, amazon, sidecar). Converged refimpl + outstanding survivors => ADMITTED; a really
+    non-converged refimpl => still refused; a refine round that changes nothing, twice => refine-no-change."""
+    tgt, base = "lib/x.ts", "export function f(a){ return a + 1 }\n"
+    WRITE_REF = 'open("lib/x.ts", "w").write("export function f(a){ return 2 }\\n")\n'
+    no_tc = lambda w, fx: {"ok": True, "errors": [], "mocks": 0, "notes": []}
+    same = lambda w: (1.0, "ok 1 - a\n", "ok 1 - a\n")
+    red = lambda c, w, t: (1, "AssertionError x")
+    seen = []
+
+    def self_check(converged=True):
+        def run(cmd, cwd, t):
+            g = Path(cwd) / ".refine-guard.json"
+            seen.append(g.is_file())
+            if g.is_file():                       # the REAL auto-harness-check behaviour: armed + unchanged => FAIL
+                return 1, "  FAIL: REFINE NOT DONE: 7 surviving mutation(s) are still outstanding and nothing changed yet"
+            return (0, "VERIFY_OK: harness discriminates") if converged else (1, "  FAIL: fixture still red after refimpl")
+        return run
+
+    def arm(wt):
+        (wt / ".refine-guard.json").write_text(json.dumps({"files": [tgt, "refimpl.py", "TASK.md"], "hashes": {}, "survivors": 7}))
+        return (wt / ".refine-guard.json").read_text()
+
+    def adm(wt, label, converged=True):
+        return ha.admit(wt, label, target=tgt, flake_runner=same, typecheck_runner=no_tc,
+                        selfcheck_runner=self_check(converged), runner=red)
+
+    def fresh():
+        w = mk("ts", tgt, base, refimpl=WRITE_REF)
+        (w / "auto-harness-check.py").write_text("# stand-in; the runner is injected\n")
+        return w
+
+    wt = fresh(); g0 = arm(wt); seen.clear()
+    r = adm(wt, "auto-refine-p-r1")
+    chk("P converged refimpl + outstanding survivors (guard armed) => refine ADMITTED", (r["ok"], r["defects"]), (True, []))
+    chk("P ...the self-check ran WITHOUT the armed guard", seen, [False])
+    chk("P ...and the guard is back, byte-identical, for the model's round", (wt / ".refine-guard.json").is_file() and (wt / ".refine-guard.json").read_text() == g0, True)
+    chk("P ...no aside file left behind", (wt / ".refine-guard.json.admission-aside").exists(), False)
+
+    wt = fresh(); g0 = arm(wt)
+    r = adm(wt, "auto-refine-p-r1", converged=False)
+    chk("P NON-converged refimpl + armed guard => still refused (the real guard stays)", (r["ok"], r["cause"]), (False, "contract-broken"))
+    chk("P ...guard restored after a refused measurement too", (wt / ".refine-guard.json").read_text() == g0, True)
+
+    wt = fresh(); arm(wt)
+    outs = [adm(wt, f"auto-refine-p-r{i}") for i in (1, 2, 3)]
+    chk("P refine that changed nothing: 1st and 2nd admission ok, 3rd (2 no-change rounds) refused refine-no-change",
+        [(o["ok"], o["cause"]) for o in outs], [(True, None), (True, None), (False, "refine-no-change")])
+    chk("P ...recorded as reslice: the next identical round is reslice-required", adm(wt, "auto-refine-p-r4")["cause"], "reslice-required")
+    chk("P ...the repair path stays exempt", adm(wt, "auto-refine-p-s3-r101")["ok"], True)
+
+    wt = fresh(); arm(wt)
+    a1, a2 = adm(wt, "auto-refine-p-r1"), adm(wt, "auto-refine-p-r1")
+    a3 = adm(wt, "auto-refine-p-r1")
+    chk("P the SAME round re-enqueued (infra retry, same label) is not counted as a no-change round", (a1["ok"], a2["ok"], a3["ok"]), (True, True, True))
+
+    wt = fresh(); arm(wt)
+    adm(wt, "auto-refine-p-r1"); adm(wt, "auto-refine-p-r2")
+    (wt / tgt).write_text(base + "// refine killed a survivor\n")
+    r = adm(wt, "auto-refine-p-r3")
+    chk("P a round that DID change the harness/target resets the no-change count", (r["ok"], r["cause"]), (True, None))
+    r = adm(wt, "auto-refine-p-r4")
+    chk("P ...and one no-change round after that is tolerated again", r["ok"], True)
+
+    wt = fresh(); arm(wt)
+    st = ha.load_state(wt)
+    st.update(status="reslice", fp=ha.fingerprint(wt), history=[],
+              detail="contract-broken: [contract-broken] fail-before/pass-after not proven by the self-check (FAIL: REFINE NOT DONE: # surviving mutation(s) are still outstanding and nothing changed ")
+    ha.save_state(wt, st)
+    r = adm(wt, "auto-refine-p-r1")
+    chk("P a reslice record written by the pre-fix false positive (REFINE NOT DONE) is voided", (r["ok"], r["cause"]), (True, None))
+    wt = fresh(); arm(wt)
+    st = ha.load_state(wt)
+    st.update(status="reslice", fp=ha.fingerprint(wt), history=[], detail="contract-broken: [contract-broken] FAIL: fixture still red")
+    ha.save_state(wt, st)
+    chk("P ...but a genuine contract-broken record is NOT voided", adm(wt, "auto-refine-p-r1")["cause"], "reslice-required")
+
+
+guard("refine_admission", refine_admission)
+
 print("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)
