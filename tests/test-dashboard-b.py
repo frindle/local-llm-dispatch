@@ -184,7 +184,7 @@ def main():
         {"_bundle_commit": {"key": PLAN}}, now=NOW)
     wr = {r["id"]: r.get("wait_reason") for r in rows}
     ok("a row in the active bundle is held only on the running job, not a bundle",
-       wr["r1"], "held on running job r4 (None)")
+       wr["r1"], "waiting for job r4 (None; another bundle: other) to finish")
     ok("a waiting row outside it says which bundle it waits on",
        wr["r2"], f"held on bundle {PLAN} (between steps)")
     ok("a held row keeps its own hold reason", wr["r3"], "held on hold: pending gate x")
