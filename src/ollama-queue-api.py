@@ -1691,6 +1691,7 @@ FRONTEND_HTML = r"""<!doctype html>
   .lane-card.idle .lane-wait { color: var(--warn); }
   .lane-card.run { border-left: 3px solid var(--run); }
   .lane-card.run.local { border-left-color: #d9822b; }
+  .lane-card.auto-run { border-left: 3px dashed var(--muted); color: var(--muted); }
   #cpuWhyLocal { margin: 6px 10px 2px; font-size: 12px; color: var(--muted); }
   .lane-name { font-weight: 650; text-transform: uppercase; font-size: .72rem; letter-spacing: .05em; color: var(--muted); }
   .lane-meta, .lane-line { color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -2619,19 +2620,31 @@ function laneNowRows(jobs, acts, cpuRunning, cpuLocal, wv) {
       elapsed_s: c.running_s, bundle: c.bundle || null, line: 'RUNNING LOCALLY - local: ' + (c.reason || 'fallback'),
       id: 'local-' + (c.stage || '') + '-' + (c.bundle || ''), local: true});
   }
-  // live ollama-dispatch-auto drivers working outside the queue (no queue job of theirs running now):
-  // say what is happening instead of a bare "idle". A display row only, never a queue job.
+  // live ollama-dispatch-auto drivers: the thin orchestrator process (NOT a lane occupant; its real work
+  // runs as queue jobs). Shown as a separate AUTO RUN (driver) row, never under a lane label.
+  const autoRows = [];
   for (const a of (acts || [])) {
     if (a.kind !== 'auto' || (jobs || []).some(j => j.status === 'running' && j.id === a.job)) continue;
-    const st = a.step || a.phase || 'running';
-    by.cpu.push({label: (/^author/.test(st) ? 'authoring: ' : 'driver: ') + a.label, model: '-',
-      host: 'Mac driver (pid ' + a.pid + ', not in queue)', elapsed_s: a.elapsed_s, bundle: a.bundle || null,
-      line: st + ' (driver, not in queue)', id: 'auto-' + a.label});
+    const mine = (a.bundle || a.job) ? (cpuRunning || []).find(c => (a.job && c.id === a.job) || (a.bundle && c.bundle === a.bundle)) : null;
+    const gj = (!mine && a.bundle) ? (acts || []).find(g => g.kind === 'gpu' && g.group_key === a.bundle) : null;
+    const inflight = mine ? {label: mine.label || mine.stage || String(mine.id || '').slice(0, 8), host: mine.runner || 'cpu'}
+      : gj ? {label: gj.display || gj.label || gj.id, host: gj.host || '?'} : null;
+    autoRows.push({label: a.label, step: a.step || a.phase || 'running', pid: a.pid, elapsed_s: a.elapsed_s,
+      bundle: a.bundle || null, inflight});
   }
   if (wv === undefined) wv = (typeof queueWait !== 'undefined') ? queueWait : null;
   const cpuPend = (typeof cpuQueueCounts === 'function' && typeof window !== 'undefined') ? cpuQueueCounts(window.cpuLaneData).pending : 0;
-  return NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k],
+  const out = NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k],
     wait: (by[k].length || typeof laneWaitText !== 'function') ? '' : laneWaitText(k, wv, jobs, cpuPend)}));
+  out.auto = autoRows;
+  return out;
+}
+function autoRunHtml(a) {
+  return `<div class="lane-card auto-run" data-auto="${escapeHtml(a.label)}"><span class="lane-name">AUTO RUN (driver)</span>`
+    + ` <b>${escapeHtml(a.label)}</b> <span class="lane-meta">${escapeHtml(a.step)} &middot; ${formatElapsed(a.elapsed_s)}`
+    + ` &middot; pid ${escapeHtml(a.pid)}${a.bundle ? ' &middot; bundle ' + escapeHtml(a.bundle) : ''}</span>`
+    + ` <span class="lane-line">orchestrating; work runs as queue jobs`
+    + `${a.inflight ? ' (queue job in flight: ' + escapeHtml(a.inflight.label) + ' on host ' + escapeHtml(a.inflight.host) + ')' : ''}</span></div>`;
 }
 function laneNowHtml(rows) {
   return '<div class="lane-now">' + rows.map(r => {
@@ -2640,7 +2653,7 @@ function laneNowHtml(rows) {
       + ` <b>${escapeHtml(x.label)}</b> <span class="lane-meta">model ${escapeHtml(x.model)} &middot; host ${escapeHtml(x.host)}`
       + ` &middot; ${formatElapsed(x.elapsed_s)}${x.bundle ? ' &middot; bundle ' + escapeHtml(x.bundle) : ''}</span>`
       + ` <span class="lane-line">${escapeHtml(x.line)}</span></div>`).join('');
-  }).join('') + '</div>';
+  }).join('') + ((rows.auto || []).map(autoRunHtml).join('')) + '</div>';
 }
 
 // CPU-LANE STAGES AS FIRST-CLASS QUEUE ROWS (Penn 2026-10-10: "CPU stages should be in the queue ...

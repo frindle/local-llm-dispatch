@@ -66,7 +66,7 @@ def grab(html, name):
 def run(src):
     html = html_of(src)
     names = ["jobWaitText", "driverActiveSlices", "sliceWaitInfo", "sliceChipInfo", "driverNote", "laneWaitText", "laneOfJob", "idleWaitText",
-             "cpuQueueRows", "cpuQueueCounts", "laneNowRows", "laneNowHtml", "escapeHtml", "formatElapsed"]
+             "cpuQueueRows", "cpuQueueCounts", "laneNowRows", "autoRunHtml", "laneNowHtml", "escapeHtml", "formatElapsed"]
     parts = {n: grab(html, n) for n in names}
     for n, p in parts.items():
         check(f"{n} present", bool(p), True)
