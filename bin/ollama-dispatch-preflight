@@ -1450,6 +1450,41 @@ class Preflight:
             fix="re-spec (the slicer's re-spec path) or park: no authoring/coding job can "
                 "satisfy a spec that contradicts the base. Nothing is enqueued.")
 
+    def check_nversion(self):
+        """N-VERSION CHECK (2026-10-11), advisory. The refimpl is APPLIED and the verify is green: build an equivalent
+        variant of the applied target (Python: an extra idempotent read duplicated) and run the SAME verify on it. Red on
+        an equivalent implementation = the fixture pins refimpl internals the spec never states (cardlink s2 "exactly
+        16 reads"). WARN, never blocking: a count TASK.md states legitimately fails the variant. The applied text is
+        always restored. Skipped (SKIP, silently) for non-Python targets, no qualifying read, or DISPATCH_NO_NVERSION=1.
+        Static counterpart: SPEC_TEST_PARITY (dispatch_harness_gates.overspec_findings)."""
+        if os.environ.get("DISPATCH_NO_NVERSION"):
+            return
+        hg = _hg()
+        try:
+            tf = self.target_files()
+            tgt = self._rel_to_wt(tf[0]) if tf else None
+            if hg is None or not tgt or not str(tgt).endswith(".py"):
+                return
+            applied = (self.wt / tgt).read_text()
+            base = hg.blob_at(self.wt, tgt, "HEAD") or ""
+            if not hg.nversion_variants(base, applied):
+                return
+
+            def _run():
+                rc, out = self.local_visible("nversion-variant", lambda: self.sh(self.a.verify, timeout=VERIFY_TIMEOUT_S))
+                return (rc == 0 and "VERIFY_OK" in out), out
+
+            fs = hg.nversion_findings(self.wt, tgt, base, applied, _run)
+        except Exception:
+            return
+        if fs:
+            self.add("nversion-variant", WARN, fs[0]["reason"] + ": " + fs[0]["path"],
+                     detail=hg.format_spec_defects(fs)[:900].replace(hg.SPEC_DEFECT_PREFIX, ""),
+                     fix="advisory: loosen the exact call-count/order assertion on that read to >=/<= or state it in the "
+                         "Exact behaviour contract; a model taking another valid route would fail it")
+        else:
+            self.add("nversion-variant", PASS, "an equivalent variant (extra idempotent read) also passes the verify")
+
     def check_contract(self):
         """FAIL-BEFORE / PASS-AFTER (Agentless): the contract every dispatch rests on.
         The verify must FAIL on the untouched baseline and PASS with the refimpl applied.
@@ -2717,6 +2752,8 @@ class Preflight:
                          fix="either the task is unsatisfiable as written or the "
                              "verify asserts something the spec never asked for -- "
                              "the model would fail this too, indefinitely")
+            if green:
+                self.check_nversion()
             pairs = self.must_contain_pairs()
             lits = [lit for _f, lit in pairs]
             if not lits:

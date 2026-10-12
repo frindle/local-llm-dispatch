@@ -9219,6 +9219,30 @@ def stash_dead_attempt(job: dict) -> dict | None:
         return None
 
 
+def _record_orig_base(cwd) -> str:
+    """Record the ORIGINAL clean base SHA of a worktree at its FIRST round seal (2026-10-11, arr-webhook 8557454d853b /
+    950dffa5697f: auto-fix r1 sealed the model's partial target diff into HEAD and later rounds measured 'baseline'
+    against it). Written to `<git-dir>/dispatch-orig-base` -- outside the tree, so it never dirties it and the model cannot
+    edit it. IDEMPOTENT (an existing record is never overwritten) and FAIL-OPEN ('' on any error). Same file/format as
+    dispatch_harness_gates.record_orig_base, which the admission lint reads (kept inline: the daemon imports no gate module)."""
+    try:
+        g = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--absolute-git-dir"],
+                           capture_output=True, text=True, timeout=10)
+        h = subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=10)
+        if g.returncode != 0 or h.returncode != 0:
+            return ""
+        f = Path(g.stdout.strip()) / "dispatch-orig-base"
+        if f.is_file():
+            cur = f.read_text().split()
+            if cur and re.fullmatch(r"[0-9a-f]{7,64}", cur[0]):
+                return cur[0]
+        f.write_text(h.stdout.strip() + "\n")
+        return h.stdout.strip()
+    except Exception:
+        return ""
+
+
 def seal_prev_round_baseline(job: dict) -> dict | None:
     """Before a CONTINUATION round is LAUNCHED, COMMIT the previous round's own
     uncommitted deliverable in the worktree so this round starts from a CLEAN,
@@ -9279,6 +9303,14 @@ def seal_prev_round_baseline(job: dict) -> dict | None:
                 return {"head": head.stdout.strip() if head.returncode == 0 else None,
                         "sealed": [], "target_reset": target_reset}
             return None
+        # BASELINE HYGIENE (2026-10-11): remember the ORIGINAL clean base BEFORE this seal moves HEAD. At the first seal
+        # HEAD is still the clean base (harness sealed, target untouched); later seals never overwrite it. When this seal
+        # carries the model's own diff of the declared TARGET (a coding continuation) the seal itself is still required
+        # (Cause 1: a dirty launch tree makes the verdict UNTRUSTED) but HEAD is no longer a clean baseline for the
+        # target -- the caller logs it and consumers measure against dispatch_harness_gates.clean_target_ref().
+        orig_base = _record_orig_base(cwd)
+        _tgt_decl = _harness_target(cwd)
+        target_sealed = _tgt_decl if (_tgt_decl and _tgt_decl in paths) else None
         # Stage EXACTLY the real-dirty paths (-A so tracked edits, new files and
         # deletions all stage; scaffold artifacts are already excluded from `paths`).
         add = subprocess.run(["git", "-C", str(cwd), "add", "-A", "--"] + paths,
@@ -9303,7 +9335,8 @@ def seal_prev_round_baseline(job: dict) -> dict | None:
         head = subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"],
                               capture_output=True, text=True, timeout=10)
         return {"head": head.stdout.strip() if head.returncode == 0 else None,
-                "sealed": paths, "target_reset": target_reset}
+                "sealed": paths, "target_reset": target_reset,
+                "orig_base": orig_base or None, "target_sealed": target_sealed}
     except Exception:
         return None
 
@@ -14360,6 +14393,9 @@ def cmd_run(args):
                     print(f"[queue] {job['id']} ({job['label']}): sealed "
                           f"{len(_sealed['sealed'])} carried-forward path(s) from the "
                           f"previous round before launch (clean, attributable baseline)"
+                          + (f"; BASE NOW CARRIES the model's diff of `{_sealed['target_sealed']}` (original clean base "
+                             f"{str(_sealed.get('orig_base') or '?')[:12]}): measure baselines/failure counts against that original base, "
+                             f"not HEAD" if _sealed.get("target_sealed") else "")
                           + (f"; harness target `{_sealed['target_reset']}` reset to HEAD "
                              f"(an authoring round's target edit is an artifact, not the "
                              f"deliverable -- sealing it makes the harness self-certifying)"

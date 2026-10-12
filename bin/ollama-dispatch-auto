@@ -1193,6 +1193,18 @@ def revert():
 # unactionable: the model's fixture may discriminate perfectly. Put the declared
 # target back to HEAD for the measurement only; revert() restores the model's
 # version afterwards from pre_tracked.
+def _clean_ref(_target):
+    """BASELINE HYGIENE (2026-10-11): the commit whose TARGET is the original, un-poisoned baseline. HEAD normally; the
+    parent of the first 'auto: seal round baseline' commit that committed a previous round's partial diff of the target
+    otherwise (arr-webhook 950dffa5697f: failure counts were measured against base + the model's own work). Fail-open."""
+    try:
+        sys.path.insert(0, str(Path.home() / "bin"))
+        import dispatch_harness_gates as _hgc
+        return _hgc.clean_target_ref(WT, _target) or "HEAD"
+    except Exception:
+        return "HEAD"
+
+
 _target_reset = None
 # Fixture text, captured BEFORE the measurement (revert() runs before the hint is built and may
 # drop an untracked fixture); the failure hint below keys on what the fixture actually fakes.
@@ -1211,7 +1223,7 @@ try:
         _hjd = _json.loads(_hj.read_text()) or {}
         _t = _hjd.get("target")
         if _t and _t in pre_tracked:
-            git("checkout", "HEAD", "--", _t)
+            git("checkout", _clean_ref(_t), "--", _t)
             _target_reset = _t
         elif (_t and _hjd.get("creation_task") and _t in pre_snap):
             # CREATION task, target still UNTRACKED (2026-10-02, bfmr-replace-tracking
@@ -2777,7 +2789,10 @@ EXACT_CONTRACT_RULE = (
     "TASK.md (a table: quantity, value, why). When you STRENGTHEN a test to kill a mutant "
     "(e.g. make a loop bound exact), add the matching contract line in the same round -- the "
     "coding model reads TASK.md, not your test, and admission blocks a test/spec mismatch "
-    "(SPEC_TEST_PARITY).")
+    "(SPEC_TEST_PARITY). OVER-SPECIFICATION: the fixture may only pin what TASK.md states. Every "
+    "function/RPC method it STUBS must be NAMED in an `## Interface` section (say if alternatives are fine), the "
+    "entry function's return SHAPE (int vs tuple) must match the one TASK.md declares, call counts need a contract line "
+    "or must be `>=`/`<=`, and never count calls by matching the SOURCE TEXT of a callback (`String(fn).includes(..)`).")
 
 # HARNESS-AUTHORING RECIPES (2026-10-11): defects that each burned a model round this week; every one is also a
 # static lint (dispatch_harness_gates.harness_authoring_findings). Complements MOCK_MODULE_RULE (mock.module for ESM

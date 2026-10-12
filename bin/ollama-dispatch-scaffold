@@ -3576,6 +3576,21 @@ def freeze_literals(root: Path):
     return 0
 
 
+def _record_orig_base_at_seal(root: Path) -> None:
+    """Remember the ORIGINAL clean base (HEAD right after the first harness seal: harness committed, target untouched or a
+    creation stub) so a later queue round-seal that commits the model's partial target diff can still be told apart from
+    the real base (dispatch_harness_gates.record_orig_base; idempotent, fail-open, stored in the git dir)."""
+    try:
+        import importlib.util as _iu
+        _sp = _iu.spec_from_file_location(
+            "dispatch_harness_gates", Path(__file__).resolve().parent / "dispatch_harness_gates.py")
+        _m = _iu.module_from_spec(_sp)
+        _sp.loader.exec_module(_m)
+        _m.record_orig_base(root)
+    except Exception:
+        pass
+
+
 def seal_baseline(root: Path):
     """Commit the (now-authored) harness into the worktree baseline so the
     launch tree is CLEAN and the harness is TRACKED.
@@ -3775,11 +3790,13 @@ def seal_baseline(root: Path):
                          "--"] + present)
         if rc2 == 0 and not st.strip():
             print("harness already sealed (no changes to commit).")
+            _record_orig_base_at_seal(root)
             return 0
         print(f"could not seal baseline: {err.strip()}", file=sys.stderr)
         return 2
     print("sealed harness into baseline (clean launch tree): "
           + ", ".join(present))
+    _record_orig_base_at_seal(root)
     rc, st, _ = sh(["git", "-C", str(root), "status", "--porcelain"])
     stray = [l for l in st.splitlines()
              if l.strip() and "node_modules" not in l

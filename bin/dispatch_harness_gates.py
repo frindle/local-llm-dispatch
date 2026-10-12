@@ -880,7 +880,7 @@ def _quantity_mentioned(q, consts, section):
     return bool(re.fullmatch(r"\d+", rhs.strip())) and _quantity_mentioned(rhs.strip(), consts, section)
 
 
-def spec_test_parity_findings(wt, task_text):
+def _parity_quantity_findings(wt, task_text):
     """[finding] -- SPEC_TEST_PARITY: the fixture asserts exact counts/clock values TASK.md never states in an
     'Exact behaviour contract' section. Empty when below SPEC_PARITY_MIN_QUANTITIES or fully covered."""
     wt = Path(wt)
@@ -901,6 +901,451 @@ def spec_test_parity_findings(wt, task_text):
                 + f". Add an 'Exact behaviour contract' table listing: {', '.join(missing)} "
                   f"(what each equals and why), so the model need not re-derive them from the tests.")]
     return []
+
+
+# ---------------------------------------------------------------------------
+# OVER-SPECIFICATION LINT (2026-10-11), an extension of SPEC_TEST_PARITY. Two real rounds were burned by fixtures that
+# pinned things TASK.md never states:
+#   cardlink s2   a counter matched every page.evaluate whose SOURCE contained 'payment method', so a valid
+#                 extractDetailInBrowser change failed it; and 'exactly 16 reads' pinned refimpl internals.
+#   arr-webhook   the fixture stubbed `get_all_torrents` (TASK.md never named the fetch method; the model used
+#                 core.get_torrents, valid on live Deluge) and expected a (count, calls) tuple while TASK.md said int.
+# Four static checks, all under the SPEC_TEST_PARITY code (one admission path, one canary seam):
+#   (1) STUBBED SEAM    a function the fixture stubs (monkeypatch/setattr/patch.object/`target.f =`, mock.method /
+#                       spyOn / mock.module namedExports, JSON-RPC `method == 'a.b'` dispatch) that the BASE target
+#                       defines or imports must be NAMED in a spec section (Interface / Exact contract / Required
+#                       change / Must contain / Entry point...). A model cannot route through a seam it was never told.
+#   (2) RETURN SHAPE    the fixture unpacks the entry function's result into several names (a tuple) while TASK.md
+#                       declares a scalar (`-> int`, "NOT a tuple") or never mentions a tuple/pair at all.
+#   (3) EXACT COUNT     `== N` (N >= 2, a LITERAL number) on a call-log-shaped value (calls / posts / reads / evals /
+#                       fetches ...) must appear in the spec sections; `>=`/`<=` and bare data lengths never fire.
+#                       (Named-constant / clock quantities stay the older parity rule's job.)
+#   (4) SOURCE MATCH    a counter/branch keyed on the SOURCE TEXT of the callback (`String(fn).includes('x')`,
+#                       `fn.toString()`): any valid rewrite of the callback that drops the string breaks it.
+# Deliberately conservative: comments blanked, 0/1 counts exempt, stdlib objects exempt, seam names must be defined or
+# imported by the BASE target (a brand-new function the task adds is not a seam), near-misses never fire.
+# Why this does not undo earlier rules: it only ADDS findings; older SPEC_TEST_PARITY quantities (named constants,
+# clock values, >=2 quantity minimum) are untouched and not re-reported; JS fixtures' load-trap / polling / evaluate lints
+# look at different shapes.
+# ---------------------------------------------------------------------------
+_OVERSPEC_SECTION_RE = re.compile(
+    r"interface|exact (?:behaviou?r )?contract|expected counts|precise behaviou?r|required change|entry point|"
+    r"signature|\bapi\b|must contain|must hold|exact behaviou?r|contract|behaviou?r", re.I)
+_PY_STD_OBJS = {"os", "sys", "time", "random", "subprocess", "requests", "json", "re", "socket", "shutil", "builtins",
+                "datetime", "threading", "logging", "urllib", "asyncio", "importlib", "pathlib", "tempfile", "uuid",
+                "globalThis", "global", "process", "console", "Math", "Date", "JSON", "Object", "Promise", "fs"}
+_PY_PATCH_OBJ_RE = re.compile(
+    r"(?:monkeypatch\.setattr|(?<![\w.])setattr|(?:mock\.)?patch\.object)\s*\(\s*([\w.]+)\s*,\s*['\"](\w+)['\"]")
+_PY_PATCH_STR_RE = re.compile(r"(?<![\w.])(?:mock\.)?patch\s*\(\s*['\"]([\w.]+)['\"]")
+_PY_MODALIAS_RE = re.compile(r"^\s*(\w+)\s*=\s*(?:importlib\.util\.)?(?:module_from_spec|import_module|__import__)\b", re.M)
+_JS_METHOD_RE = re.compile(r"(?<![\w$])(?:mock\.method|sinon\.stub|(?:jest|vi)\.spyOn)\s*\(\s*([\w$.]+)\s*,\s*['\"`]([\w$]+)['\"`]")
+_JS_MOCKMOD_RE = re.compile(r"mock\.module\s*\(\s*['\"`](\.{1,2}/[^'\"`]+)['\"`]")
+_RPC_EQ_RE = re.compile(r"\b(?:method|rpc|action|op|endpoint|cmd|command)\w*\s*(?:===?|\.startsWith\()\s*\(?\s*['\"`]([A-Za-z_]+(?:\.[A-Za-z_]+)+)['\"`]")
+_CALLLOG_RE = re.compile(
+    r"calls?\b|call_?count|callCount|\bposts?\b|\breads?\b|\bevals?\b|evaluat\w*|\bfetch\w*|invocations?|\brequests?\b|"
+    r"\bhits\b|\bsends?\b|\bpolls?\b|\bsleeps?\b|\bwrites?\b|\bgets\b|\bqueries\b", re.I)
+# Counts of 1-3 are structural (first page + the short page that ends paging, one retry, "once"): the spec's behaviour
+# rules imply them. Magic counts (cardlink: 16 reads) are not derivable. Sweep 2026-10-11: min 2 flagged a healthy
+# paging slice (sidecar-bfmr s4: `page.calls.length, 2` = "stop after the first short page").
+OVERSPEC_MIN_COUNT = 4
+_NUMWORDS = {"two": 2, "twice": 2, "three": 3, "thrice": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+             "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
+_CB = r"(?:fn|func|f|cb|callback|script|code|expr|expression|pageFunction|handler|source|src|evalFn|pageFn)\b"
+_SRC_OF = r"(?:String\s*\(\s*" + _CB + r"\s*\)|" + _CB + r"\s*\.toString\s*\(\s*\)|Function\.prototype\.toString\.call\s*\(\s*" + _CB + r"\s*\))"
+_SRC_MATCH_RE = re.compile(
+    _SRC_OF + r"\s*\.\s*(?:includes|match|indexOf|search|startsWith)\s*\(\s*(['\"`/])([^'\"`/\n]{2,80})\1|"
+    r"/([^/\n]{2,80})/[a-z]*\s*\.test\s*\(\s*" + _SRC_OF)
+_SRC_ASSIGN_RE = re.compile(r"\b(?:const|let|var)\s+([\w$]+)\s*=\s*" + _SRC_OF)
+
+
+def _spec_name_sections(task_text):
+    """PURE. Concatenated text of every heading whose title is an Interface / contract / required-change style
+    section (to the next heading of the same or higher level). Empty when TASK.md has none."""
+    lines = (task_text or "").splitlines()
+    heads = [(n, len(m.group(1)), m.group(2)) for n, l in enumerate(lines) if (m := re.match(r"^(#{1,6})\s+(.*)$", l))]
+    out = []
+    for k, (n, lvl, title) in enumerate(heads):
+        if not _OVERSPEC_SECTION_RE.search(title):
+            continue
+        end = next((n2 for n2, l2, _t in heads[k + 1:] if l2 <= lvl), len(lines))
+        out.append("\n".join(lines[n:end]))
+    return "\n".join(out)
+
+
+def _name_in(name, text):
+    return bool(re.search(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])", text or ""))
+
+
+def _defined_in_base(name, base_text):
+    """True when the BASE target defines or imports `name` (so the task did not invent it)."""
+    return bool(re.search(
+        r"(?:\bdef\s+|\bclass\s+|\bfunction\s*\*?\s*|\b(?:const|let|var)\s+|\bimport\s+[^\n]*?|\bas\s+)" + re.escape(name) + r"\b|"
+        r"\bfrom\s+\S+\s+import\s+[^\n]*\b" + re.escape(name) + r"\b|"
+        r"\bimport\s*\{[^}]*\b" + re.escape(name) + r"\b[^}]*\}", base_text or ""))
+
+
+def stubbed_seams(fixture_name, fixture_src, base_text=""):
+    """PURE. {seam_name: example} the fixture stubs: functions the BASE target defines/imports, plus JSON-RPC style
+    dotted method literals the fake dispatches on."""
+    py = fixture_name.endswith(".py")
+    src = fixture_src or ""
+    if not py:
+        src = _blank_js_comments(src)
+    found = {}
+    if py:
+        aliases = {"target"} | set(_PY_MODALIAS_RE.findall(src))
+        for m in _PY_PATCH_OBJ_RE.finditer(src):
+            obj, nm = m.group(1), m.group(2)
+            if obj.split(".")[0] not in _PY_STD_OBJS and _defined_in_base(nm, base_text):
+                found.setdefault(nm, f"patches {obj}.{nm}")
+        for m in _PY_PATCH_STR_RE.finditer(src):
+            dotted = m.group(1)
+            root, nm = dotted.split(".")[0], dotted.split(".")[-1]
+            if "." in dotted and root not in _PY_STD_OBJS and _defined_in_base(nm, base_text):
+                found.setdefault(nm, f"patches {dotted}")
+        for a in aliases:
+            for m in re.finditer(r"(?<![\w.])" + re.escape(a) + r"\.(\w+)\s*=(?!=)", src):
+                if _defined_in_base(m.group(1), base_text):
+                    found.setdefault(m.group(1), f"assigns {a}.{m.group(1)}")
+    else:
+        for m in _JS_METHOD_RE.finditer(src):
+            obj, nm = m.group(1), m.group(2)
+            if obj.split(".")[0] not in _PY_STD_OBJS and _defined_in_base(nm, base_text):
+                found.setdefault(nm, f"stubs {obj}.{nm}")
+        for m in _JS_MOCKMOD_RE.finditer(src):
+            body = src[m.end():m.end() + 1500]
+            ne = re.search(r"namedExports\s*:\s*\{", body)
+            if not ne:
+                continue
+            j = body.find("{", ne.start())
+            close = _match_close(body, j)
+            blk = body[j + 1:close] if close > 0 else ""
+            for km in re.finditer(r"(?:^|[,{\s])([A-Za-z_$][\w$]*)\s*(?::|\()", blk):
+                if _defined_in_base(km.group(1), base_text):
+                    found.setdefault(km.group(1), f"mock.module({m.group(1)}) export")
+    for m in _RPC_EQ_RE.finditer(src):
+        found.setdefault(m.group(1), f"dispatches on {m.group(1)!r}")
+    return found
+
+
+_DATA_SEAM_RE = re.compile(
+    r"^_*(?:get|fetch|list|load|read|query|find|search|lookup|resolve|check|is|has|parse|build|compute|extract|select)(?:_|[A-Z0-9]|$)|"
+    r"(?:_|[a-z])(?:info|status|url|client|state|rows?|data|torrents|hash|keys?)$|^[A-Z]\w*(?:Client|Session|Store)$|^\w+\.\w+", re.I)
+
+
+def _seam_returns_data(name):
+    """PURE. A stub that FEEDS DATA to the code under test (fetch/lookup/parse/client, or a dotted RPC method) is a route the
+    model must know about; a side-effect-only stub (login, record_activity, send_*, ensure_*) is harmless when unused."""
+    return bool(_DATA_SEAM_RE.search(name))
+
+
+def _entry_calls(fixture_name, fixture_src):
+    """PURE. Names of target functions the fixture CALLS directly (`target.f(...)` / a bare call of an imported name)."""
+    src = fixture_src or ""
+    if fixture_name.endswith(".py"):
+        al = {"target"} | set(_PY_MODALIAS_RE.findall(src))
+        return {m.group(2) for m in re.finditer(r"(?<![\w.])(" + "|".join(map(re.escape, al)) + r")\.(\w+)\s*\(", src)}
+    s = _blank_js_comments(src)
+    return {m.group(1) for m in re.finditer(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(", s)} - _JS_SKIP
+
+
+def _base_entry_reaches(base_text, entries, seam, py):
+    """PURE. True when `seam` is referenced by the BASE body of a function the fixture calls, directly or through other
+    base functions it calls (<= 4 hops): the existing code already routes through it, so the model edits a call it can
+    see rather than choosing a route. A brand-new entry function (absent at base) never qualifies."""
+    if not base_text or not entries:
+        return False
+    tail = seam.split(".")[-1]
+    bodies = {}
+    if py:
+        try:
+            tree = ast.parse(base_text)
+        except SyntaxError:
+            return False
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                bodies.setdefault(n.name, ast.get_source_segment(base_text, n) or "")
+    else:
+        s = _blank_js_comments(base_text)
+        for m in _TOP_FN_RE.finditer(s):
+            nm = m.group(1) or m.group(2)
+            sp = _fn_span(s, nm) if nm else None
+            if sp:
+                bodies.setdefault(nm, s[sp[0]:sp[1]])
+    seen, frontier = set(), {e for e in entries if e in bodies}
+    for _ in range(4):
+        if any(_name_in(tail, bodies[f]) for f in frontier):
+            return True
+        seen |= frontier
+        frontier = {g for g in bodies if g not in seen and any(_name_in(g, bodies[f]) for f in frontier)}
+        if not frontier:
+            break
+    return False
+
+
+def _seam_named(seam, section):
+    if "." in seam and not seam.startswith("."):
+        return _name_in(seam, section) or _name_in(seam.split(".")[-1], section)
+    return _name_in(seam, section)
+
+
+def _entry_shapes(fixture_name, fixture_src):
+    """PURE. {fn_name: (shape, example)} -- result of a target call unpacked into >=2 names (a tuple/list)."""
+    out = {}
+    if fixture_name.endswith(".py"):
+        for m in re.finditer(r"^\s*\(?\s*(\w+(?:\s*,\s*\w+)+)\s*\)?\s*=\s*(?:await\s+)?(?:target|mod|module|m)\.(\w+)\s*\(",
+                             fixture_src or "", re.M):
+            out.setdefault(m.group(2), ("tuple", m.group(0).strip()[:70]))
+        for m in re.finditer(r"assert\s+(?:target|mod|module)\.(\w+)\s*\([^\n]*?\)\s*==\s*\(", fixture_src or ""):
+            out.setdefault(m.group(1), ("tuple", m.group(0).strip()[:70]))
+    else:
+        s = _blank_js_comments(fixture_src or "")
+        for m in re.finditer(r"\b(?:const|let|var)\s*\[\s*[\w$]+\s*,\s*[\w$]+[^\]]*\]\s*=\s*(?:await\s+)?[\w$.]*?([\w$]+)\s*\(", s):
+            out.setdefault(m.group(1), ("tuple", m.group(0).strip()[:70]))
+    return out
+
+
+def _base_returns_tuple(base_text, fn):
+    """PURE. The BASE definition of `fn` already returns a tuple (`return a, b`): the shape is visible in the code the
+    task edits, so a fixture unpacking it is not over-specifying."""
+    try:
+        tree = ast.parse(base_text or "")
+    except SyntaxError:
+        return False
+    return any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn
+               and any(isinstance(r, ast.Return) and isinstance(r.value, ast.Tuple) for r in ast.walk(n))
+               for n in ast.walk(tree))
+
+
+def _declared_return(fn, section):
+    """PURE. ('scalar'|'tuple'|None, text) from the spec lines that name `fn`."""
+    lines = [l for l in (section or "").splitlines() if _name_in(fn, l)]
+    joined = " ".join(lines)
+    if not joined:
+        return None, ""
+    if re.search(r"tuple|pair|\(\s*\w+\s*,\s*\w+|\[\s*\w+\s*,\s*\w+", re.sub(r"(?i)\bnot\s+a\s+tuple", "", joined), re.I):
+        return "tuple", joined
+    if re.search(r"->\s*(?:a\s+|plain\s+)?`?(?:int|bool|str|float|None|number|string|boolean)\b|"
+                 r"returns?\s+(?:a\s+)?(?:plain\s+)?`?(?:int|bool|str|float|number|string|boolean)\b|"
+                 r"plain\s+`?(?:int|str|bool)\b|not\s+a\s+tuple", joined, re.I):
+        return "scalar", joined
+    return None, joined
+
+
+def _is_count_expr(act):
+    """PURE. The asserted value is a COUNT of a call log (`len(x.calls)`, `x.calls.length`, `x.callCount`, `evals`,
+    `env.detailEvals()`), not a field of one entry (`updateCalls[0].data.buyerId`)."""
+    a = act.strip()
+    if re.search(r"\]\s*[.\[]", a) or re.fullmatch(r"[\d\s]+", a):
+        return False
+    return bool(re.match(r"len\s*\(", a) or re.search(r"\.length\s*$|\.(?:call_?count|callCount|count|size)\s*$|\(\s*\)\s*$", a)
+                or re.fullmatch(r"[\w$.]+", a))
+
+
+def _exact_call_counts(fixture_name, fixture_src):
+    """PURE. {N: example} for `<call-log value> == N` assertions with a LITERAL N >= 2."""
+    src = fixture_src or ""
+    if not fixture_name.endswith(".py"):
+        src = _blank_js_comments(src)
+    pairs = []
+    for m in _PARITY_FN_RE.finditer(src):
+        args, _e = _split_args(src, m.end() - 1)
+        if args and len(args) >= 2:
+            pairs.append((args[0], args[1]))
+    for m in _PARITY_EXPECT_RE.finditer(src):
+        args, end = _split_args(src, m.end() - 1)
+        mm = re.match(r"\s*\.\s*(toBe|toEqual|toStrictEqual|toHaveLength|toHaveBeenCalledTimes)\s*\(", src[end:])
+        if args and mm:
+            a2, _e2 = _split_args(src, end + mm.end() - 1)
+            if a2:
+                pairs.append((args[0] if mm.group(1) not in ("toHaveLength",) else "len(" + args[0] + ")", a2[0]))
+    for m in re.finditer(r"^\s*assert\s+(.+?)\s*==\s*(.+?)\s*(?:,.*)?$", src, re.M):
+        pairs.append((m.group(1), m.group(2)))
+    out = {}
+    for a, b in pairs:
+        for act, exp in ((a, b), (b, a)):
+            if re.fullmatch(r"\d+", exp.strip()) and int(exp.strip()) >= OVERSPEC_MIN_COUNT and _CALLLOG_RE.search(act) \
+                    and _is_count_expr(act):
+                out.setdefault(int(exp.strip()), f"{act.strip()[:60]}, {exp.strip()}")
+                break
+    return out
+
+
+def _number_justified(n, section):
+    if re.search(rf"(?<![\w$.]){n}(?![\w$])", section or "") or re.search(rf"(?<![\d,.]){n:,}(?![\d,])", section or ""):
+        return True
+    low = (section or "").lower()
+    return any(w for w, v in _NUMWORDS.items() if v == n and re.search(rf"\b{w}\b", low))
+
+
+def overspec_findings(wt, task_text, skip_quantities=()):
+    """[finding] -- SPEC_TEST_PARITY over-specification: stubbed seams / return shapes / exact call counts / source-text
+    matching in the fixture that TASK.md's Interface / contract sections do not state. See the block comment above."""
+    wt = Path(wt)
+    man = _manifest(wt)
+    target = man.get("target")
+    base_text = (blob_at(wt, target, "HEAD") or "") if target else ""
+    section = _spec_name_sections(task_text)
+    out = []
+    for fx in _PARITY_FIXTURES:
+        text = _read(wt / fx)
+        if not text:
+            continue
+        # (1) stubbed seams
+        miss = [(s, ex) for s, ex in sorted(stubbed_seams(fx, text, base_text).items())
+                if _seam_returns_data(s) and not _seam_named(s, section)
+                and not _base_entry_reaches(base_text, _entry_calls(fx, text), s, fx.endswith('.py'))]
+        if miss:
+            out.append(_finding(
+                SPEC_TEST_PARITY, "Test stubs a seam the spec never names", fx,
+                f"{fx} stubs {', '.join(f'`{s}` ({ex})' for s, ex in miss[:3])} but TASK.md's Interface / Required-change / "
+                f"contract sections never name " + ("it" if len(miss) == 1 else "them") + ". A model that reaches the same "
+                "result through another valid route (a different helper, a different RPC method) fails the fixture for "
+                "nothing. Name the seam in an 'Interface' section (and say whether alternatives are allowed), or stub at a "
+                "boundary the spec does name"))
+        # (2) return shape
+        for fn, (shape, ex) in sorted(_entry_shapes(fx, text).items()):
+            decl, _j = _declared_return(fn, section)
+            if decl == "tuple" or (fx.endswith(".py") and _base_returns_tuple(base_text, fn)) \
+                    or (not base_text and not man.get("creation_task")):   # no base to read (non-git hand harness): cannot judge
+                continue
+            why = ("TASK.md declares a plain scalar return" if decl == "scalar"
+                   else "TASK.md never states what it returns" if _name_in(fn, section) else "TASK.md never names it")
+            out.append(_finding(
+                SPEC_TEST_PARITY, "Test asserts a return shape the spec contradicts or omits", fx,
+                f"{fx} unpacks `{fn}`'s result as a {shape} (`{ex}`) but {why}. State the exact return shape "
+                f"(e.g. `{fn}(...) -> (count, calls)`) in the Interface section, or assert only what the spec says"))
+        # (3) exact literal call counts (named-constant / clock quantities belong to the older rule)
+        bad = [(n, ex) for n, ex in sorted(_exact_call_counts(fx, text).items())
+               if str(n) not in skip_quantities and not _number_justified(n, section)]
+        if bad:
+            out.append(_finding(
+                SPEC_TEST_PARITY, "Test pins an exact call count the spec never states", fx,
+                f"{fx} asserts exact call counts ({'; '.join(f'`{ex}`' for _n, ex in bad[:3])}) that TASK.md never states. "
+                f"A valid implementation with one more or one fewer harmless call fails. State the count ({', '.join(str(n) for n, _ in bad)}) "
+                f"in the Exact behaviour contract with its reason, or assert an inequality (>= / <=)"))
+        # (4) matching on the SOURCE TEXT of a callback
+        if not fx.endswith(".py"):
+            s = _blank_js_comments(text)
+            hits = [(m.group(2) or m.group(3) or "").strip() for m in _SRC_MATCH_RE.finditer(s)]
+            for am in _SRC_ASSIGN_RE.finditer(s):
+                v = re.escape(am.group(1))
+                hits += [m.group(2).strip() for m in re.finditer(
+                    r"(?<![\w$])" + v + r"\s*\.\s*(?:includes|match|indexOf|search|startsWith)\s*\(\s*(['\"`])([^'\"`\n]{2,80})\1", s)]
+            hits = [h for h in dict.fromkeys(hits) if h and not _name_in(h, section)]
+            if hits:
+                out.append(_finding(
+                    SPEC_TEST_PARITY, "Test identifies calls by matching the callback's source text", fx,
+                    f"{fx} keys a counter/branch on the SOURCE TEXT of a function ({', '.join(repr(h) for h in hits[:3])}): "
+                    f"it matches every evaluate whose code merely contains that string, and any valid rewrite that drops it "
+                    f"fails (cardlink s2). Identify calls by their arguments / results / call order instead"))
+    return out
+
+
+def spec_test_parity_findings(wt, task_text):
+    """[finding] -- SPEC_TEST_PARITY: (a) the older exact-quantity rule (counts / clock values the contract never states)
+    plus (b) the over-specification checks (stubbed seams, return shapes, literal call counts, source-text matching)."""
+    old = _parity_quantity_findings(wt, task_text)
+    skip = set(re.findall(r"\b\d+\b", " ".join(f["message"] for f in old)))
+    return old + overspec_findings(wt, task_text, skip_quantities=skip)
+
+
+# ---------------------------------------------------------------------------
+# N-VERSION CHECK (2026-10-11), the dynamic half of the over-specification check. With the refimpl APPLIED and the
+# fixture green, build a second, independently-shaped but equivalent implementation and run the SAME fixture on it. A
+# fixture that fails an equivalent implementation pins refimpl internals the spec never states (cardlink s2: "exactly
+# 16 reads"). IMPLEMENTED SUBSET: Python targets, one variant family -- "extra harmless read": a statement the refimpl
+# ADDED that only reads (`x = get_*/fetch_*/list_*/load_*/read_*/query_*/find_*/search_*/lookup_*(...)` or a bare call of
+# one) is duplicated in place. A correct implementation with one more idempotent read must still pass; an exact
+# call-count assertion on that seam does not. NOT implemented (documented gap): JS/TS targets, call reordering, and
+# alternate-helper substitution -- those need per-language equivalence knowledge and are covered only by the static lint.
+# Result is advisory (WARN): an exact count the TASK states legitimately fails the variant.
+# ---------------------------------------------------------------------------
+NVERSION_VARIANT_FAILS = "NVERSION_VARIANT_FAILS"
+# bare `load`/`read` (json.load(fh), fh.read()) CONSUME a stream: duplicating them is not an equivalent variant (sweep FPs)
+_NV_READ_RE = re.compile(r"^_*(?!(?:load|read)$)(?:get|fetch|list|load|read|query|find|search|lookup)(?:_|[A-Z0-9]|$)")
+NVERSION_MAX_VARIANTS = 2
+
+
+def _added_lines(base_text, applied_text):
+    """PURE. 1-based line numbers of `applied_text` that are not in `base_text` (difflib)."""
+    import difflib
+    sm = difflib.SequenceMatcher(None, (base_text or "").splitlines(), (applied_text or "").splitlines(), autojunk=False)
+    out = set()
+    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+        if tag in ("insert", "replace"):
+            out.update(range(j1 + 1, j2 + 1))
+    return out
+
+
+def _stmt_read_callee(node):
+    """PURE. callee name when `node` is `f(...)` / `x = f(...)` / `x = await f(...)` with a read-ish f, else None."""
+    val = node.value if isinstance(node, (ast.Expr, ast.Assign, ast.AnnAssign)) else None
+    if isinstance(val, ast.Await):
+        val = val.value
+    if not isinstance(val, ast.Call):
+        return None
+    f = val.func
+    nm = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ""
+    return nm if _NV_READ_RE.match(nm or "") else None
+
+
+def nversion_variants(base_text, applied_text):
+    """PURE. [(description, variant_text)] -- up to NVERSION_MAX_VARIANTS Python variants of the refimpl-applied target, each
+    duplicating one refimpl-ADDED read statement. [] when not Python / nothing qualifies."""
+    try:
+        tree = ast.parse(applied_text or "")
+    except SyntaxError:
+        return []
+    added = _added_lines(base_text, applied_text)
+    lines = (applied_text or "").splitlines(keepends=True)
+    out, seen = [], set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for st in ast.walk(fn):
+            if not isinstance(st, (ast.Expr, ast.Assign)) or st.lineno not in added or st.end_lineno is None:
+                continue
+            if any(l not in added for l in range(st.lineno, st.end_lineno + 1)):
+                continue
+            nm = _stmt_read_callee(st)
+            if not nm or nm in seen:
+                continue
+            seen.add(nm)
+            seg = lines[st.lineno - 1:st.end_lineno]
+            if not seg[-1].endswith("\n"):
+                seg[-1] += "\n"
+            variant = "".join(lines[:st.end_lineno]) + "".join(seg) + "".join(lines[st.end_lineno:])
+            try:
+                ast.parse(variant)
+            except SyntaxError:
+                continue
+            out.append((f"{nm}(...) called twice at line {st.lineno} of `{fn.name}` (extra idempotent read)", variant))
+            if len(out) >= NVERSION_MAX_VARIANTS:
+                return out
+    return out
+
+
+def nversion_findings(wt, target, base_text, applied_text, run_verify):
+    """[finding] -- run `run_verify()` -> (ok: bool, output: str) once per variant with the variant written over `target`;
+    the applied text is ALWAYS restored. A failing variant = the fixture is over-specified (see block comment)."""
+    wt = Path(wt)
+    p = wt / target
+    out = []
+    for desc, vtext in nversion_variants(base_text, applied_text):
+        try:
+            p.write_text(vtext)
+            ok, log = run_verify()
+        finally:
+            p.write_text(applied_text)
+        if not ok:
+            first = next((l.strip() for l in (log or "").splitlines() if re.search(r"FAIL|Error|assert", l, re.I)), "")[:160]
+            out.append(_finding(
+                NVERSION_VARIANT_FAILS, "An equivalent implementation fails the fixture (over-specified)", target,
+                f"variant: {desc}. The fixture is green on the refimpl but RED on this equivalent one ({first or 'see verify output'}): "
+                f"it pins refimpl internals (an exact call count / call order on a read). If TASK.md states that count, ignore; "
+                f"otherwise loosen the assertion to >=/<= or state the contract"))
+    return out
 
 
 def refimpl_literal_gap_findings(pairs, texts_by_file, default_text: str = ""):
@@ -1297,6 +1742,7 @@ def spec_defects(wt, target=None, creation=None, intent_text="", task_text="", r
     out += literal_shape_findings(task)
     out += harness_authoring_findings(wt)
     out += spec_test_parity_findings(wt, task)
+    out += base_poison_findings(wt, target)
     return out
 
 
@@ -1551,6 +1997,113 @@ def base_drift_findings(wt):
                      f"HEAD is {head[:12] or '?'}, which does not contain it: the tree was "
                      f"re-based/reset after the spec was checked, so every base-relative "
                      f"verdict is stale. Re-run from the resolved base.")]
+
+
+# ---------------------------------------------------------------------------
+# ORIGINAL-BASE RECORD + BASE POISON (2026-10-11). arr-webhook job 8557454d853b failed; auto-fix r1 (950dffa5697f)
+# then SEALED the model's partial 96-line diff into HEAD (queue seal_prev_round_baseline, "auto: seal round baseline"),
+# so every later round measured "baseline" against HEAD = base + the model's own partial work: failure counts were
+# understated (cardlink s2: queue said 2 failures, real 3). Sealing a continuation round's work is deliberate (Cause 1:
+# a dirty launch tree makes the verdict UNTRUSTED), so the seal stays -- but the ORIGINAL clean base is now
+#   * recorded at the FIRST seal (idempotent, never overwritten) in `<git-dir>/dispatch-orig-base` -- outside the
+#     worktree, so it can never dirty the tree or be edited by the model;
+#   * the reference for "baseline" measurements of the target (clean_target_ref: the parent of the first seal commit that
+#     touched the target) -- consumed by auto-harness-check's baseline reset;
+#   * checked by BASE_POISONED_BY_SEAL at admission: seal commits that changed the declared target sit between the
+#     recorded original base and HEAD.
+# Detection keys on the seal commits themselves (subject prefix + the target in their diff), not on `diff orig..HEAD`,
+# so a legitimate base refresh (refresh_stale_base / origin moved) never reads as poison.
+# ---------------------------------------------------------------------------
+BASE_POISONED_BY_SEAL = "BASE_POISONED_BY_SEAL"
+SEAL_SUBJECT_PREFIX = "auto: seal round baseline"
+
+
+def orig_base_path(wt):
+    """git-dir/dispatch-orig-base for the worktree (per-worktree git dir for linked worktrees), or None."""
+    r = _git_run(wt, "rev-parse", "--absolute-git-dir")
+    if r is None or r.returncode != 0:
+        return None
+    return Path(r.stdout.decode().strip()) / "dispatch-orig-base"
+
+
+def read_orig_base(wt):
+    """The recorded original clean base SHA, or ''."""
+    p = orig_base_path(wt)
+    try:
+        v = p.read_text().split()[0] if p and p.is_file() else ""
+    except (OSError, IndexError):
+        return ""
+    return v if re.fullmatch(r"[0-9a-f]{7,64}", v or "") else ""
+
+
+def record_orig_base(wt, sha=None):
+    """Record the original clean base ONCE (first seal). Idempotent: an existing record is never overwritten. Returns
+    the SHA now on record ('' when it could not be determined/written). Fail-open."""
+    cur = read_orig_base(wt)
+    if cur:
+        return cur
+    # no explicit sha: HEAD, unless seal commits already moved the target (legacy worktree) -> the pre-poison commit
+    sha = sha or _rev(wt, clean_target_ref(wt, _manifest(Path(wt)).get("target")))
+    p = orig_base_path(wt)
+    if not sha or p is None:
+        return ""
+    try:
+        p.write_text(sha + "\n")
+    except OSError:
+        return ""
+    return sha
+
+
+def seal_commits_touching(wt, target):
+    """[(sha, +added, -deleted)] oldest first: queue seal commits reachable from HEAD that changed `target`."""
+    if not target:
+        return []
+    r = _git_run(wt, "log", "--reverse", "--no-merges", "--format=%H%x00%s", "-n", "200", "--", str(target))
+    out = []
+    if r is None or r.returncode != 0:
+        return out
+    for line in r.stdout.decode("utf-8", "replace").splitlines():
+        sha, _, subj = line.partition("\x00")
+        if not subj.startswith(SEAL_SUBJECT_PREFIX):
+            continue
+        ns = _git_run(wt, "show", "--numstat", "--format=", sha, "--", str(target))
+        a = d = 0
+        for l in (ns.stdout.decode("utf-8", "replace").splitlines() if ns is not None else []):
+            m = re.match(r"^(\d+)\s+(\d+)\s+", l)
+            if m:
+                a += int(m.group(1)); d += int(m.group(2))
+        out.append((sha, a, d))
+    return out
+
+
+def clean_target_ref(wt, target):
+    """The commit whose `target` is the ORIGINAL (un-poisoned) baseline: the parent of the first seal commit that changed
+    the target; 'HEAD' when none did (the common case -- nothing to correct)."""
+    sc = seal_commits_touching(wt, target)
+    if not sc:
+        return "HEAD"
+    par = _rev(wt, sc[0][0] + "^")
+    return par or "HEAD"
+
+
+def base_poison_findings(wt, target=None):
+    """[finding] -- BASE_POISONED_BY_SEAL: the worktree's HEAD carries a prior round's sealed diff of the target, so a
+    baseline measured at HEAD is not the original. Silent for an untouched target and for legacy worktrees."""
+    wt = Path(wt)
+    target = target or _manifest(wt).get("target")
+    sc = seal_commits_touching(wt, target)
+    if not sc:
+        return []
+    orig = read_orig_base(wt) or _manifest(wt).get("base_sha") or ""
+    clean = clean_target_ref(wt, target)
+    a = sum(x[1] for x in sc)
+    d = sum(x[2] for x in sc)
+    return [_finding(
+        BASE_POISONED_BY_SEAL, "Worktree base carries a previous round's sealed diff of the target", str(target),
+        f"{len(sc)} 'auto: seal round baseline' commit(s) changed {target} (+{a}/-{d} lines, first {sc[0][0][:12]}) so HEAD "
+        f"{_rev(wt, 'HEAD')[:12]} is NOT the original base{(' ' + orig[:12]) if orig else ''}: a baseline / failure count measured "
+        f"at HEAD includes the model's own partial work and understates what is still broken. Measure against "
+        f"{clean[:12]} (clean_target_ref), or re-create the worktree from the original base before a fresh dispatch")]
 
 
 def baseline_probe(wt, timeout=300):

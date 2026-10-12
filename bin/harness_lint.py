@@ -355,6 +355,7 @@ def run_lint(wt, stage=None, target=None, full=False, quick=False, attempts=None
                    lambda: check_consistency(task, target),
                    lambda: list(_hg().spec_test_parity_findings(wt, task)),
                    lambda: check_authoring(wt, target, apply_refimpl=not quick),
+                   lambda: list(_hg().base_poison_findings(wt, target)),
                    lambda: check_stale_prompt(wt, task)):
             try:
                 out += fn()
