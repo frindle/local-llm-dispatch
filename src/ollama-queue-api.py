@@ -1785,6 +1785,10 @@ FRONTEND_HTML = r"""<!doctype html>
   .waitbanner .badge { display: inline-block; font-size: .68rem; font-weight: 700; letter-spacing: .06em;
     text-transform: uppercase; padding: 1px 6px; border-radius: 6px; border: 1px solid currentColor; margin-right: 6px; }
   .waitbanner .log { opacity: .85; font-weight: 400; font-size: .78rem; }
+  .lanechips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+  .lchip { border: 1px solid var(--warn); background: var(--warn-bg); color: var(--warn); border-radius: 999px;
+    padding: 2px 10px; font-size: .78rem; cursor: help; }
+  .lchip.stuck { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); font-weight: 650; }
   .wait-reason { color: var(--muted); font-size: .79rem; display: block; margin-top: 2px; }
   span.qpos { font-size: .72rem; color: var(--muted); margin-right: 6px; font-variant-numeric: tabular-nums;
               white-space: nowrap; cursor: help; }
@@ -1915,6 +1919,7 @@ FRONTEND_HTML = r"""<!doctype html>
   <div class="tile attn" id="sumAttn"><div class="k">Needs attention</div><div class="v">&ndash;</div></div>
 </div>
 
+<div id="laneChips" class="lanechips" hidden></div>
 <div id="waitBanner" class="waitbanner" hidden></div>
 
 <section class="panel" id="activePanel">
@@ -2513,47 +2518,84 @@ function bundleAttention(g, view, kind) {
 // daemon's queue-wait.json. RED when the same reason has held an idle lane > stuck_after_s.
 // WARNING lines for jobs NO host can serve (w.unsat from /api/queue-wait: pending longer than the
 // daemon-side threshold with a model that cannot load). Display only; never throws.
+function fmtDur(s) {
+  s = Math.max(0, Math.round(Number(s) || 0));
+  return s >= 3600 ? Math.floor(s / 3600) + 'h' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm' : s >= 60 ? Math.floor(s / 60) + 'm' : s + 's';
+}
+// Identical unsatisfiable warnings (same kind + model + reason once the drifting numbers -- GB figures,
+// "Ns ago" ages -- are blanked) collapse into ONE line: "N jobs waiting: <model> needs X GB, Y GB usable
+// (Z GB short), oldest 16m". Job ids/labels ride in the title tooltip. Display only; never throws.
 function unsatBannerLines(w) {
   try {
-    const out = [];
+    const groups = new Map();
     for (const u of ((w && Array.isArray(w.unsat)) ? w.unsat : [])) {
       if (!u || typeof u !== 'object' || !(u.id || u.label)) continue;
-      const age = Math.max(0, Math.round(Number(u.age_s) || 0));
-      const dur = age >= 3600 ? Math.floor(age / 3600) + 'h' + String(Math.floor(age % 3600 / 60)).padStart(2, '0') + 'm'
-        : age >= 60 ? Math.floor(age / 60) + 'm' : age + 's';
-      if (u.kind === 'capacity') {
-        // NO-SWITCH capacity wait (queue never switches Darkbloom models; the provider evicts/loads itself)
-        out.push(`<span class="lane"><span class="badge">WARNING</span>`
-          + `<b>${escapeHtml(String(u.label || u.id || 'job'))}</b> (${escapeHtml(String(u.model || 'model?'))}) waiting for Darkbloom capacity: `
-          + `${escapeHtml(String(u.reason || 'reason unknown'))} <span class="log">(waiting ${dur}; still queued, retrying, nothing was changed or switched)</span></span>`);
-        continue;
-      }
-      out.push(`<span class="lane"><span class="badge">WARNING</span>`
-        + `<b>${escapeHtml(String(u.label || u.id || 'job'))}</b> (${escapeHtml(String(u.model || 'model?'))}) cannot be served by any host: `
-        + `${escapeHtml(String(u.reason || 'reason unknown'))} <span class="log">(unsatisfiable ${dur}; still queued, nothing was changed)</span></span>`);
+      const reason = String(u.reason || 'reason unknown');
+      const key = (u.kind === 'capacity' ? 'capacity' : 'unsat') + '|' + String(u.model || '') + '|'
+        + reason.replace(/\d+(?:\.\d+)?\s*(?:GB|s|m|h)\b/g, '#');
+      let g = groups.get(key);
+      if (!g) { g = {kind: u.kind === 'capacity' ? 'capacity' : 'unsat', model: String(u.model || 'model?'), reason, ids: [], oldest: 0}; groups.set(key, g); }
+      g.ids.push(String(u.label || u.id));
+      const age = Math.max(0, Number(u.age_s) || 0);
+      if (age >= g.oldest) { g.oldest = age; g.reason = reason; }   // newest numbers come from the oldest job's reason
+    }
+    const out = [];
+    for (const g of groups.values()) {
+      const n = g.ids.length, jobs = n + (n === 1 ? ' job' : ' jobs');
+      const m = g.reason.match(/needs ([\d.]+ GB),? (?:have )?([\d.]+ GB) usable(?: \(([\d.]+ GB) short\))?/);
+      const nums = m ? `needs ${m[1]}, ${m[2]} usable` + (m[3] ? ` (${m[3]} short)` : '') : g.reason.slice(0, 90);
+      const tip = escapeHtml(g.ids.join(', ') + ' -- ' + g.reason);
+      const head = g.kind === 'capacity' ? `${jobs} waiting for Darkbloom capacity: ` : `${jobs} waiting, no host can serve: `;
+      out.push(`<span class="lane" title="${tip}"><span class="badge">WARNING</span>${head}<b>${escapeHtml(g.model)}</b> ${escapeHtml(nums)}, oldest ${fmtDur(g.oldest)} `
+        + `<span class="log">(still queued, nothing was changed; hover for job ids)</span></span>`);
     }
     return out;
   } catch (e) { return []; }
 }
+// One compact chip per lane in the summary strip: "studio-db: idle 16m, waiting on memory/model load (25 pending)";
+// the full daemon sentence is the hover title.
+function laneChipReason(sentence) {
+  const t = String(sentence || '');
+  if (/cannot load|load_usable|needs [\d.]+ GB|out of memory|\bOOM\b|memory/i.test(t)) return 'waiting on memory/model load';
+  if (!t) return 'reason unknown';
+  const c = t.split(/[:;(]/)[0].trim();
+  return 'waiting on ' + (c.length > 60 ? c.slice(0, 57) + '...' : c);
+}
+function renderLaneChips(w, now) {
+  const box = document.getElementById('laneChips');
+  if (!box) return;
+  const chips = [];
+  if (w && w.source === 'state') {
+    for (const [lane, ln] of Object.entries(w.lanes || {})) {
+      if (ln.state !== 'idle' || !ln.pending) continue;
+      const r = ln.reason || {};
+      const isStuck = (w.stuck || []).includes(lane);
+      const full = String(r.sentence || 'reason unknown') + ` (${ln.pending} pending, same reason ${fmtDur(now - (r.since || now))})`
+        + (isStuck ? ' -- POSSIBLE STUCK SEAM' : '');
+      chips.push(`<span class="lchip${isStuck ? ' stuck' : ''}" title="${escapeHtml(full)}">${escapeHtml(lane)}: idle ${fmtDur(now - (ln.idle_since || now))}, `
+        + `${escapeHtml(laneChipReason(r.sentence))} (${ln.pending} pending)</span>`);
+    }
+  }
+  box.hidden = !chips.length;
+  box.innerHTML = chips.join('');
+}
 function renderWaitBanner(w, jobs, fetchedAt) {
   const el = document.getElementById('waitBanner');
   if (!el) return;
-  if (!w) { el.hidden = true; el.classList.remove('stuck'); el.innerHTML = ''; return; }
-  const dur = s => { s = Math.max(0, Math.round(s)); return s >= 3600 ? Math.floor(s / 3600) + 'h' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm' : s >= 60 ? Math.floor(s / 60) + 'm' : s + 's'; };
+  if (!w) { el.hidden = true; el.classList.remove('stuck'); el.innerHTML = ''; renderLaneChips(null, 0); return; }
   // Ages tick on the CLIENT clock from the moment this payload arrived (fetchedAt), so a payload that
   // stops being refreshed visibly ages instead of reading "1m" forever.
   const now = (w.now || Date.now() / 1000) + (fetchedAt ? (Date.now() - fetchedAt) / 1000 : 0);
   const lines = [];
   let stuck = false;
   if (w.source === 'state') {
-    for (const [lane, ln] of Object.entries(w.lanes || {})) {
-      if (ln.state !== 'idle' || !ln.pending) continue;
-      const r = ln.reason || {};
-      const isStuck = (w.stuck || []).includes(lane);
-      stuck = stuck || isStuck;
-      lines.push(`<span class="lane"><span class="badge">${escapeHtml(lane)} idle ${dur(now - (ln.idle_since || now))}</span>`
-        + `${isStuck ? '<b>POSSIBLE STUCK SEAM (same reason &gt; ' + Math.round((w.stuck_after_s || 300) / 60) + ' min): </b>' : ''}`
-        + `Waiting on: ${escapeHtml(r.sentence || 'reason unknown')} <span class="log">(${ln.pending} pending, same reason ${dur(now - (r.since || now))})</span></span>`);
+    // Idle lanes live in the lane-summary chips; the banner only adds a short red line for a stuck lane.
+    for (const lane of (w.stuck || [])) {
+      const ln = (w.lanes || {})[lane];
+      if (!ln || ln.state !== 'idle' || !ln.pending) continue;
+      stuck = true;
+      lines.push(`<span class="lane"><span class="badge">${escapeHtml(lane)} idle ${fmtDur(now - (ln.idle_since || now))}</span>`
+        + `<b>POSSIBLE STUCK SEAM (same reason &gt; ${Math.round((w.stuck_after_s || 300) / 60)} min)</b> <span class="log">see lane chip above</span></span>`);
     }
   } else if ((jobs || []).some(j => j.status === 'pending' || j.status === 'held')) {
     lines.push(`<span class="lane">${escapeHtml(w.message || 'reason unavailable')}</span>`);
@@ -2562,6 +2604,7 @@ function renderWaitBanner(w, jobs, fetchedAt) {
     for (const l of (lg.held_lines || [])) lines.push(`<span class="lane log">from daemon log: ${escapeHtml(l)}</span>`);
   }
   for (const l of unsatBannerLines(w)) lines.push(l);
+  renderLaneChips(w, now);
   el.hidden = !lines.length;
   el.classList.toggle('stuck', stuck);
   el.innerHTML = lines.join('');
@@ -2576,6 +2619,7 @@ function renderWaitBannerUnavailable() {
   const ago = waitBannerOkAt ? ' (last seen ' + Math.max(0, Math.round((Date.now() - waitBannerOkAt) / 1000)) + 's ago)' : '';
   el.hidden = false;
   el.classList.remove('stuck');
+  renderLaneChips(null, 0);
   el.innerHTML = '<span class="lane log">Queue wait status unavailable' + ago + '</span>';
 }
 async function refreshWaitBanner() {
