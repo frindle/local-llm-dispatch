@@ -96,7 +96,7 @@ const busy = now => ({source: 'state', now, stuck: [], lanes: {'studio-db': {sta
 
 def run(src):
     html = html_of(src)
-    names = ["renderWaitBanner", "renderWaitBannerUnavailable", "refreshWaitBanner"]
+    names = ["renderWaitBanner", "renderWaitBannerUnavailable", "refreshWaitBanner", "unsatBannerLines"]
     parts = {n: grab(html, n) for n in names}
     for n, p in parts.items():
         check(f"{n} present", bool(p), True)

@@ -1588,6 +1588,12 @@ def _queue_wait_payload(now=None):
     for ln in (v.get("lanes") or {}).values():
         (ln.get("reason") or {}).pop("sig", None)
     v.pop("jobs", None)
+    # UNSATISFIABLE-JOB WARNINGS (2026-10-13): pending jobs no host can serve for > the threshold
+    # (queue.unsat_warnings_from_state: read-only, warning only). Never worth a 500 / lost banner.
+    try:
+        v["unsat"] = list(q.unsat_warnings_from_state(now=now))
+    except Exception:       # noqa: BLE001 -- includes an older queue module without the probe
+        v["unsat"] = []
     return v
 
 
@@ -2036,6 +2042,42 @@ FRONTEND_HTML = r"""<!doctype html>
       <span id="hostsMsg" style="font-size:.78rem;"></span>
     </div>
   </div>
+  <div>   <!-- Settings: Log retention -->
+    <details id="logRetention">
+      <summary><h2 style="display:inline">Log retention</h2> <span id="lrSummary" style="font-size:.78rem; opacity:.65"></span></summary>
+      <div style="font-size:.78rem; opacity:.65; margin:.4rem 0;">
+        Days to keep queue and dispatch logs. The rotation job runs <strong>daily at 04:17</strong> and re-reads
+        these values each run. Failures and Successful default to <em>inherit</em> (= All). A pinned job or
+        bundle is held until you unpin it. Anything a live queue row, pending handoff or open escalation
+        references is never deleted.
+      </div>
+      <table id="lrLevels" style="width:100%; border-collapse:collapse; font-size:.8rem;">
+        <thead><tr><th style="text-align:left">Level</th><th style="text-align:left">Keep (days, 1-365)</th>
+          <th style="text-align:left">Would delete now</th></tr></thead>
+        <tbody>
+          <tr><td>All</td><td><input id="lrAll" inputmode="numeric" style="width:5em; font-size:.8rem" placeholder="30"></td>
+            <td id="lrPrevAll">&mdash;</td></tr>
+          <tr><td>Failures</td><td><input id="lrFailures" inputmode="numeric" style="width:5em; font-size:.8rem" placeholder="inherit"></td>
+            <td id="lrPrevFailures">&mdash;</td></tr>
+          <tr><td>Successful</td><td><input id="lrSuccessful" inputmode="numeric" style="width:5em; font-size:.8rem" placeholder="inherit"></td>
+            <td id="lrPrevSuccessful">&mdash;</td></tr>
+        </tbody>
+      </table>
+      <div id="lrPrevTotal" style="font-size:.78rem; opacity:.8; margin-top:.3rem;"></div>
+      <div style="margin-top:.5rem; display:flex; gap:.4rem; align-items:center; flex-wrap:wrap;">
+        <button id="lrSave" type="button">save</button>
+        <span id="lrMsg" style="font-size:.78rem;"></span>
+      </div>
+      <h3 style="font-size:.85rem; margin:.8rem 0 .3rem">Pins (held until unpinned)</h3>
+      <div id="lrPins" style="font-size:.8rem;"></div>
+      <div style="margin-top:.4rem; display:flex; gap:.4rem; align-items:center; flex-wrap:wrap;">
+        <input id="lrPinId" style="width:12em; font-size:.8rem" placeholder="job id or bundle name">
+        <input id="lrPinWhy" style="flex:1; min-width:10em; font-size:.8rem" maxlength="200" placeholder="why">
+        <button id="lrPinAdd" type="button">pin</button>
+      </div>
+      <div id="lrLast" style="font-size:.78rem; margin-top:.6rem; opacity:.85;"></div>
+    </details>
+  </div>
 </div>
 </div><!-- .wrap -->
 
@@ -2469,6 +2511,30 @@ function bundleAttention(g, view, kind) {
 // Summary strip: running now / queue depth / needs attention, plus section counts.
 // "Waiting on" banner: one line per lane that is IDLE while work is pending, from the
 // daemon's queue-wait.json. RED when the same reason has held an idle lane > stuck_after_s.
+// WARNING lines for jobs NO host can serve (w.unsat from /api/queue-wait: pending longer than the
+// daemon-side threshold with a model that cannot load). Display only; never throws.
+function unsatBannerLines(w) {
+  try {
+    const out = [];
+    for (const u of ((w && Array.isArray(w.unsat)) ? w.unsat : [])) {
+      if (!u || typeof u !== 'object' || !(u.id || u.label)) continue;
+      const age = Math.max(0, Math.round(Number(u.age_s) || 0));
+      const dur = age >= 3600 ? Math.floor(age / 3600) + 'h' + String(Math.floor(age % 3600 / 60)).padStart(2, '0') + 'm'
+        : age >= 60 ? Math.floor(age / 60) + 'm' : age + 's';
+      if (u.kind === 'capacity') {
+        // NO-SWITCH capacity wait (queue never switches Darkbloom models; the provider evicts/loads itself)
+        out.push(`<span class="lane"><span class="badge">WARNING</span>`
+          + `<b>${escapeHtml(String(u.label || u.id || 'job'))}</b> (${escapeHtml(String(u.model || 'model?'))}) waiting for Darkbloom capacity: `
+          + `${escapeHtml(String(u.reason || 'reason unknown'))} <span class="log">(waiting ${dur}; still queued, retrying, nothing was changed or switched)</span></span>`);
+        continue;
+      }
+      out.push(`<span class="lane"><span class="badge">WARNING</span>`
+        + `<b>${escapeHtml(String(u.label || u.id || 'job'))}</b> (${escapeHtml(String(u.model || 'model?'))}) cannot be served by any host: `
+        + `${escapeHtml(String(u.reason || 'reason unknown'))} <span class="log">(unsatisfiable ${dur}; still queued, nothing was changed)</span></span>`);
+    }
+    return out;
+  } catch (e) { return []; }
+}
 function renderWaitBanner(w, jobs, fetchedAt) {
   const el = document.getElementById('waitBanner');
   if (!el) return;
@@ -2495,6 +2561,7 @@ function renderWaitBanner(w, jobs, fetchedAt) {
     if (lg.focus_line) lines.push(`<span class="lane log">from daemon log (last focus line, untimestamped): ${escapeHtml(lg.focus_line)}</span>`);
     for (const l of (lg.held_lines || [])) lines.push(`<span class="lane log">from daemon log: ${escapeHtml(l)}</span>`);
   }
+  for (const l of unsatBannerLines(w)) lines.push(l);
   el.hidden = !lines.length;
   el.classList.toggle('stuck', stuck);
   el.innerHTML = lines.join('');
@@ -4175,6 +4242,198 @@ document.getElementById('saveHosts').addEventListener('click', async () => {
     msg.textContent = 'save failed: ' + e;
   }
 });
+
+// ---- Settings: Log retention ------------------------------------------------
+// Everything shown comes from the server's last answer; nothing is optimistic. A failed or
+// hung fetch (aborted at LR_TIMEOUT_MS) replaces the panel state with 'unavailable', never
+// leaves the previous numbers standing as if they were current.
+let lrOkAt = 0, lrBusy = false, lrSaving = false, lrPrevSeq = 0, lrPrevTimer = null, lrPrevAbort = null;
+let LR_TIMEOUT_MS = 8000, LR_DEBOUNCE_MS = 400, lrLoaded = null;
+function lrEl(id) { return document.getElementById(id); }
+function lrMB(b) { return (Math.round((b || 0) / 1048576 * 10) / 10).toFixed(1) + ' MB'; }
+async function lrFetchJson(url, opts) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), LR_TIMEOUT_MS);
+  try {
+    const o = Object.assign({cache: 'no-store'}, opts || {}, {signal: ac.signal});
+    const r = await fetch(url, o);
+    let d = null;
+    try { d = await r.json(); } catch (e) { d = null; }
+    if (!r || !r.ok) throw new Error((d && d.error) || ('HTTP ' + (r && r.status)));
+    if (d === null || typeof d !== 'object') throw new Error('bad response');
+    return d;
+  } finally { clearTimeout(timer); }
+}
+function lrPost(url, obj, method) {
+  return lrFetchJson(url, {method: method || 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Requested-With': 'dashboard'},
+    body: obj === undefined ? undefined : JSON.stringify(obj)});
+}
+function lrSetMsg(text, color) {
+  const m = lrEl('lrMsg'); if (!m) return;
+  m.style.color = color || '';
+  m.textContent = text;
+}
+function lrRenderUnavailable() {
+  const ago = lrOkAt ? ' (last seen ' + Math.max(0, Math.round((Date.now() - lrOkAt) / 1000)) + 's ago)' : '';
+  lrLoaded = null;
+  ['All', 'Failures', 'Successful'].forEach(k => { lrEl('lrPrev' + k).textContent = '—'; });
+  lrEl('lrPrevTotal').textContent = '';
+  lrEl('lrPins').innerHTML = '<em>Log retention unavailable' + escapeHtml(ago) + '</em>';
+  lrEl('lrLast').textContent = '';
+  lrEl('lrSummary').textContent = 'unavailable' + ago;
+  lrEl('lrSave').disabled = true;
+  lrEl('lrPinAdd').disabled = true;
+  lrSetMsg('unavailable — nothing shown here is current', '#c00');
+}
+function lrRenderPins(pins) {
+  const box = lrEl('lrPins');
+  if (!pins || !pins.length) { box.innerHTML = '<em style="opacity:.6">no pins</em>'; return; }
+  box.innerHTML = '<table style="width:100%; border-collapse:collapse"><tbody>' + pins.map(p =>
+    '<tr><td style="padding:.1rem .3rem"><code>' + escapeHtml(p.id) + '</code> <span style="opacity:.6">' + escapeHtml(p.type) + '</span></td>'
+    + '<td style="padding:.1rem .3rem">' + escapeHtml(p.why) + '</td>'
+    + '<td style="padding:.1rem .3rem; opacity:.6">' + escapeHtml(p.who) + ' ' + escapeHtml(String(p.when || '').slice(0, 10)) + '</td>'
+    + '<td><button type="button" class="lr-unpin" data-id="' + escapeHtml(p.id) + '">unpin</button></td></tr>').join('') + '</tbody></table>';
+}
+function lrRenderLast(lr) {
+  const el = lrEl('lrLast');
+  const run = lr && lr.last_run, ap = lr && lr.last_apply;
+  let t = 'Rotation runs ' + escapeHtml((lr && lr.schedule) || 'daily at 04:17') + '. ';
+  if (!run) t += 'No rotation recorded yet.';
+  else {
+    t += 'Last run: ' + escapeHtml(run.ts) + ' (' + escapeHtml(run.mode) + ', ' + (run.mode === 'apply' ? 'freed ' : 'would free ') + lrMB(run.freed_bytes) + ', ' + (run.deleted == null ? '?' : run.deleted) + ' files).';
+    if (ap && ap.ts !== run.ts) t += ' Last delete run: ' + escapeHtml(ap.ts) + ', freed ' + lrMB(ap.freed_bytes) + '.';
+    if (!ap) t += ' No deleting run recorded yet.';
+  }
+  el.innerHTML = t;
+}
+function lrRenderPreview(pv) {
+  const L = (pv && pv.levels) || {};
+  const set = (id, lv) => { lrEl(id).textContent = lv ? lv.count + ' logs, ' + lrMB(lv.bytes) : '—'; };
+  set('lrPrevAll', L.all); set('lrPrevFailures', L.failures); set('lrPrevSuccessful', L.successful);
+  const tot = pv && pv.total;
+  lrEl('lrPrevTotal').textContent = tot
+    ? 'Total: ' + tot.count + ' logs, ' + lrMB(tot.bytes) + (L.ledger ? ' (sidecars ' + L.ledger.count + ', ' + lrMB(L.ledger.bytes) + ')' : '')
+      + (pv.pinned ? '; held by pins: ' + pv.pinned.count + ' (' + lrMB(pv.pinned.bytes) + ')' : '') : '';
+}
+function lrRenderState(d) {
+  const c = d.config || {};
+  lrLoaded = {all: c.all, failures: c.failures == null ? null : c.failures, successful: c.successful == null ? null : c.successful};
+  lrEl('lrAll').value = c.all == null ? '' : String(c.all);
+  lrEl('lrFailures').value = c.failures == null ? '' : String(c.failures);
+  lrEl('lrSuccessful').value = c.successful == null ? '' : String(c.successful);
+  lrEl('lrFailures').placeholder = 'inherit (' + c.all + ')';
+  lrEl('lrSuccessful').placeholder = 'inherit (' + c.all + ')';
+  lrEl('lrSave').disabled = false;
+  lrEl('lrPinAdd').disabled = false;
+  lrRenderPins(c.pins || []);
+  lrRenderLast(d.last_rotation);
+  if (d.preview && !(d.preview.errors && d.preview.errors.length)) lrRenderPreview(d.preview);
+  else {
+    lrRenderPreview(null);
+    if (d.preview && d.preview.errors && d.preview.errors.length) lrEl('lrPrevTotal').textContent = 'preview unavailable: ' + d.preview.errors.join('; ');
+  }
+  lrEl('lrSummary').textContent = 'keep ' + c.all + 'd' + (c.failures != null ? ', failures ' + c.failures + 'd' : '')
+    + (c.successful != null ? ', successful ' + c.successful + 'd' : '') + ', ' + (c.pins || []).length + ' pin(s)';
+  const warn = [].concat(d.errors || [], d.validation || []);
+  lrSetMsg(warn.length ? 'config file warning: ' + warn.join('; ') : '', warn.length ? '#c60' : '');
+}
+async function refreshLogRetention() {
+  if (lrBusy || lrSaving) return;
+  lrBusy = true;
+  try {
+    const d = await lrFetchJson('/api/log-retention');
+    lrOkAt = Date.now();
+    lrRenderState(d);
+  } catch (e) {
+    lrRenderUnavailable();
+  } finally { lrBusy = false; }
+}
+function lrReadInputs() {
+  const one = (id, name, req) => {
+    const s = lrEl(id).value.trim();
+    if (s === '') return req ? {err: name + ' is required (1-365)'} : {v: null};
+    if (!/^\d{1,3}$/.test(s)) return {err: name + ' must be a whole number 1-365'};
+    const n = parseInt(s, 10);
+    if (n < 1 || n > 365) return {err: name + ' must be 1-365'};
+    return {v: n};
+  };
+  const a = one('lrAll', 'All', true), f = one('lrFailures', 'Failures', false), s = one('lrSuccessful', 'Successful', false);
+  for (const r of [a, f, s]) if (r.err) return {err: r.err};
+  return {cfg: {all: a.v, failures: f.v, successful: s.v}};
+}
+function lrSchedulePreview() {
+  clearTimeout(lrPrevTimer);
+  lrPrevTimer = setTimeout(lrRunPreview, LR_DEBOUNCE_MS);
+}
+async function lrRunPreview() {
+  const inp = lrReadInputs();
+  if (inp.err) { lrRenderPreview(null); lrSetMsg(inp.err, '#c00'); return; }
+  const seq = ++lrPrevSeq;
+  try {
+    const d = await lrPost('/api/log-retention/preview', {config: inp.cfg});
+    if (seq !== lrPrevSeq) return;   // a newer edit superseded this answer
+    lrRenderPreview(d.preview);
+    lrSetMsg('', '');
+  } catch (e) {
+    if (seq !== lrPrevSeq) return;
+    lrRenderPreview(null);
+    lrSetMsg('preview unavailable: ' + (e && e.message || e), '#c00');
+  }
+}
+async function lrSave() {
+  if (lrSaving) return;
+  const inp = lrReadInputs();
+  if (inp.err) { lrSetMsg('NOT saved: ' + inp.err, '#c00'); return; }
+  lrSaving = true;
+  lrSetMsg('saving...', '');
+  try {
+    const d = await lrPost('/api/log-retention', {config: inp.cfg});
+    lrOkAt = Date.now();
+    lrLoaded = null;
+    lrRenderState(Object.assign({}, d, {preview: null}));   // show what the SERVER stored, not what was typed
+    lrSetMsg('saved', '#0a0');
+    setTimeout(() => { if (lrEl('lrMsg').textContent === 'saved') lrSetMsg('', ''); }, 3000);
+    lrSchedulePreview();
+  } catch (e) {
+    lrSetMsg('NOT saved: ' + (e && e.name === 'AbortError' ? 'timed out' : (e && e.message || e)), '#c00');
+  } finally { lrSaving = false; }
+}
+async function lrPinAction(fn, label) {
+  if (lrSaving) return;
+  lrSaving = true;
+  try {
+    const d = await fn();
+    lrOkAt = Date.now();
+    lrRenderPins((d.config || {}).pins || []);
+    lrRenderLast(d.last_rotation);
+    lrSetMsg(label + ' done', '#0a0');
+    lrSchedulePreview();
+  } catch (e) {
+    lrSetMsg(label + ' failed: ' + (e && e.name === 'AbortError' ? 'timed out' : (e && e.message || e)), '#c00');
+  } finally { lrSaving = false; }
+}
+function lrAddPin() {
+  const id = lrEl('lrPinId').value.trim(), why = lrEl('lrPinWhy').value.trim();
+  if (!id || !why) { lrSetMsg('pin needs a job id / bundle name and a reason', '#c00'); return; }
+  return lrPinAction(async () => {
+    const d = await lrPost('/api/log-retention/pin', {job_or_bundle: id, reason: why});
+    lrEl('lrPinId').value = ''; lrEl('lrPinWhy').value = '';
+    return d;
+  }, 'pin');
+}
+function lrUnpin(id) {
+  return lrPinAction(() => lrPost('/api/log-retention/pin?id=' + encodeURIComponent(id), undefined, 'DELETE'), 'unpin');
+}
+['lrAll', 'lrFailures', 'lrSuccessful'].forEach(id => lrEl(id).addEventListener('input', lrSchedulePreview));
+lrEl('lrSave').addEventListener('click', lrSave);
+lrEl('lrPinAdd').addEventListener('click', lrAddPin);
+lrEl('lrPins').addEventListener('click', ev => {
+  const b = ev.target && ev.target.closest ? ev.target.closest('.lr-unpin') : null;
+  if (b) lrUnpin(b.getAttribute('data-id'));
+});
+lrEl('logRetention').addEventListener('toggle', () => { if (lrEl('logRetention').open) refreshLogRetention(); });
+setInterval(() => { if (lrEl('logRetention').open) refreshLogRetention(); }, 60000);
 
 // Unified run-status table: backed by /api/runs (see ollama-queue-api.py's
 // _run_status_jobs), which reads the NEVER-PRUNED gate sidecars minus anything
@@ -7308,6 +7567,259 @@ _API_SLOTS = threading.BoundedSemaphore(MAX_INFLIGHT)
 _CPU_SLOTS = threading.BoundedSemaphore(MAX_INFLIGHT_CPU)
 
 
+# ---- Log retention panel (config contract: ~/bin/log_retention_config.py) ----------------
+# User-editable log retention. The client sends ONLY the three level values and job/bundle
+# ids; it never supplies a path, never the pin metadata (who/when) and never ledger_days.
+# Every body is shape-checked here regardless of the page (the chat route's body check was
+# once assumed, not enforced). Responses are pure data so the tests can drive _lr_handle()
+# without a socket.
+LR_MAX_BODY = 16 * 1024
+LR_MAX_PINS = 200
+LR_MAX_REASON = 200
+LR_SCHEDULE = "daily at 04:17"
+LR_LEVEL_KEYS = ("all", "failures", "successful")
+LR_PIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+LR_JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+_LR_LOCK = threading.Lock()          # serializes read-modify-write of the config
+_LR_PREVIEW_LOCK = threading.Lock()  # a preview walks ~20k files (~2s): one at a time
+
+
+def _lr_mod():
+    import log_retention_config
+    return log_retention_config
+
+
+def _lr_is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _lr_audit_summary(max_bytes=256 * 1024):
+    """Last rotation run + last config save, parsed from the audit log (read-only)."""
+    out = {"last_run": None, "last_apply": None, "last_config_saved": None, "schedule": LR_SCHEDULE}
+    try:
+        p = _lr_mod().audit_path()
+        with open(p, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return out
+    for ln in reversed(lines):
+        ts, _, rest = ln.partition(" ")
+        if rest.startswith("rotate "):
+            kv = dict(re.findall(r"(\w+)=(\d+|[\w-]+)", rest.split(" skipped[")[0]))
+            row = {"ts": ts, "mode": kv.get("mode"),
+                   "deleted": int(kv["deleted"]) if kv.get("deleted", "").isdigit() else None,
+                   "freed_bytes": int(kv["freed_bytes"]) if kv.get("freed_bytes", "").isdigit() else None}
+            if out["last_run"] is None:
+                out["last_run"] = row
+            if out["last_apply"] is None and row["mode"] == "apply":
+                out["last_apply"] = row
+        elif rest.startswith("config-saved") and out["last_config_saved"] is None:
+            out["last_config_saved"] = {"ts": ts, "detail": rest[:300]}
+        if out["last_run"] and out["last_apply"] and out["last_config_saved"]:
+            break
+    return out
+
+
+def _lr_preview_cached(cfg):
+    """Dry run for cfg, serialized and cached 10s by config content (never raises)."""
+    key = json.dumps(cfg, sort_keys=True)
+    hit = _lr_preview_cache.get(key)
+    if hit and time.time() - hit[0] < 10:
+        return hit[1]
+    if not _LR_PREVIEW_LOCK.acquire(timeout=15):
+        return {"errors": ["preview busy, try again"]}
+    try:
+        try:
+            res = _lr_mod().preview(cfg)
+        except Exception as e:  # noqa: BLE001
+            return {"errors": [f"preview failed: {type(e).__name__}: {e}"[:300]]}
+        if not res.get("errors"):
+            if len(_lr_preview_cache) > 16:
+                _lr_preview_cache.clear()
+            _lr_preview_cache[key] = (time.time(), res)
+        return res
+    finally:
+        _LR_PREVIEW_LOCK.release()
+
+
+_lr_preview_cache = {}
+
+
+def _lr_levels_from(obj, what="config"):
+    """Strict shape check for a client-supplied levels object -> (levels, error).
+    Exactly the keys all/failures/successful; all required int; the others int or null.
+    Numeric strings, floats, bools and unknown keys are rejected (range is validate()'s job)."""
+    if not isinstance(obj, dict):
+        return None, f"{what} must be a JSON object"
+    extra = sorted(str(k) for k in obj if k not in LR_LEVEL_KEYS)
+    if extra:
+        return None, f"{what} has unknown field(s): {', '.join(extra)[:80]}"
+    if "all" not in obj:
+        return None, f"{what}.all is required"
+    out = {}
+    for k in LR_LEVEL_KEYS:
+        v = obj.get(k)
+        if k == "all" and not _lr_is_int(v):
+            return None, "all must be a whole number of days"
+        if k != "all" and v is not None and not _lr_is_int(v):
+            return None, f"{k} must be a whole number of days or null (inherit)"
+        out[k] = v
+    return out, None
+
+
+def _lr_merge(levels):
+    """Server-owned fields (pins, ledger_days) come from the current file, never the client."""
+    cfg, _ = _lr_mod().load_checked()
+    cfg = dict(cfg)
+    cfg.update(levels)
+    return cfg
+
+
+def _lr_state():
+    C = _lr_mod()
+    cfg, errs = C.load_checked()
+    return {"config": cfg, "errors": errs, "validation": C.validate(cfg),
+            "preview": _lr_preview_cached(cfg), "last_rotation": _lr_audit_summary(),
+            "schedule": LR_SCHEDULE}
+
+
+def _lr_pin_state(cfg):
+    return {"ok": True, "config": cfg, "last_rotation": _lr_audit_summary(), "schedule": LR_SCHEDULE}
+
+
+def _lr_clean_text(s):
+    return "".join(ch for ch in s if ch.isprintable()).strip()
+
+
+def _lr_handle(method, path, headers, body):
+    """-> (status, json-able). method GET/POST/DELETE; path may carry ?query; headers is a
+    case-insensitive Mapping; body is bytes (already length-capped by the caller)."""
+    u = urllib.parse.urlsplit(path)
+    route = u.path.rstrip("/")
+    if method in ("POST", "DELETE"):
+        # CSRF: a cross-site form/fetch cannot send JSON or a custom header without a CORS
+        # preflight, and this server answers none. The page always sends both.
+        ctype = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if method == "POST" and ctype != "application/json":
+            return 415, {"ok": False, "error": "Content-Type must be application/json"}
+        if headers.get("X-Requested-With") != "dashboard":
+            return 403, {"ok": False, "error": "missing X-Requested-With header"}
+
+    def parse():
+        if len(body) > LR_MAX_BODY:
+            return None, (413, {"ok": False, "error": f"body too large (max {LR_MAX_BODY} bytes)"})
+        try:
+            data = json.loads(body.decode("utf-8") if body else "")
+        except (ValueError, UnicodeDecodeError):
+            return None, (400, {"ok": False, "error": "body must be valid JSON"})
+        if not isinstance(data, dict):
+            return None, (400, {"ok": False, "error": "body must be a JSON object"})
+        return data, None
+
+    C = _lr_mod()
+    if route == "/api/log-retention" and method == "GET":
+        return 200, _lr_state()
+    if route == "/api/log-retention/preview" and method == "POST":
+        data, err = parse()
+        if err:
+            return err
+        if set(data) - {"config"}:
+            return 400, {"ok": False, "error": "body must be {config: {...}} only"}
+        levels, e = _lr_levels_from(data.get("config"))
+        if e:
+            return 400, {"ok": False, "error": e}
+        cfg = _lr_merge(levels)
+        errs = C.validate(cfg)
+        if errs:
+            return 400, {"ok": False, "error": "; ".join(errs)[:400], "errors": errs}
+        res = _lr_preview_cached(cfg)
+        if res.get("errors"):
+            return 503, {"ok": False, "error": "; ".join(res["errors"])[:400]}
+        return 200, {"ok": True, "preview": res}
+    if route == "/api/log-retention" and method == "POST":
+        data, err = parse()
+        if err:
+            return err
+        if set(data) - {"config"}:
+            return 400, {"ok": False, "error": "body must be {config: {...}} only"}
+        levels, e = _lr_levels_from(data.get("config"))
+        if e:
+            return 400, {"ok": False, "error": e}
+        with _LR_LOCK:
+            cfg = _lr_merge(levels)
+            errs = C.validate(cfg)
+            if errs:
+                return 400, {"ok": False, "error": "; ".join(errs)[:400], "errors": errs}
+            try:
+                saved = C.save(cfg, who="dashboard")
+            except ValueError as ve:
+                return 400, {"ok": False, "error": str(ve)[:400]}
+            except OSError as oe:
+                return 500, {"ok": False, "error": f"could not write config: {oe}"[:300]}
+        _lr_preview_cache.clear()
+        return 200, _lr_pin_state(saved)
+    if route == "/api/log-retention/pin" and method == "POST":
+        data, err = parse()
+        if err:
+            return err
+        if set(data) - {"job_or_bundle", "reason"}:
+            return 400, {"ok": False, "error": "body must be {job_or_bundle, reason} only"}
+        pid, reason = data.get("job_or_bundle"), data.get("reason")
+        if not isinstance(pid, str) or not isinstance(reason, str):
+            return 400, {"ok": False, "error": "job_or_bundle and reason must be strings"}
+        pid, reason = pid.strip(), _lr_clean_text(reason)
+        if not LR_PIN_ID_RE.match(pid):
+            return 400, {"ok": False, "error": "job_or_bundle must be a 12-hex job id or a bundle name (letters, digits, . _ -; max 80)"}
+        if not reason or len(reason) > LR_MAX_REASON:
+            return 400, {"ok": False, "error": f"reason required (1..{LR_MAX_REASON} chars)"}
+        ptype = "job" if LR_JOB_ID_RE.match(pid) else "bundle"
+        with _LR_LOCK:
+            cfg, _ = C.load_checked()
+            cfg = dict(cfg)
+            pins = list(cfg.get("pins") or [])
+            if any(p.get("id") == pid for p in pins):
+                return 409, {"ok": False, "error": f"{pid} is already pinned"}
+            if len(pins) >= LR_MAX_PINS:
+                return 400, {"ok": False, "error": f"too many pins (max {LR_MAX_PINS})"}
+            pins.append({"type": ptype, "id": pid, "who": "dashboard",
+                         "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "why": reason})
+            cfg["pins"] = pins
+            try:
+                saved = C.save(cfg, who="dashboard")
+            except ValueError as ve:
+                return 400, {"ok": False, "error": str(ve)[:400]}
+            except OSError as oe:
+                return 500, {"ok": False, "error": f"could not write config: {oe}"[:300]}
+        _lr_preview_cache.clear()
+        return 200, _lr_pin_state(saved)
+    if route == "/api/log-retention/pin" and method == "DELETE":
+        q = urllib.parse.parse_qs(u.query)
+        ids = q.get("id") or []
+        if len(ids) != 1 or not LR_PIN_ID_RE.match(ids[0]):
+            return 400, {"ok": False, "error": "exactly one valid ?id= required"}
+        pid = ids[0]
+        with _LR_LOCK:
+            cfg, _ = C.load_checked()
+            cfg = dict(cfg)
+            pins = list(cfg.get("pins") or [])
+            keep = [p for p in pins if p.get("id") != pid]
+            if len(keep) == len(pins):
+                return 404, {"ok": False, "error": f"{pid} is not pinned"}
+            cfg["pins"] = keep
+            try:
+                saved = C.save(cfg, who="dashboard")
+            except ValueError as ve:
+                return 400, {"ok": False, "error": str(ve)[:400]}
+            except OSError as oe:
+                return 500, {"ok": False, "error": f"could not write config: {oe}"[:300]}
+        _lr_preview_cache.clear()
+        return 200, _lr_pin_state(saved)
+    return 404, {"ok": False, "error": "not found"}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     _slot = None
 
@@ -7403,6 +7915,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.send_header("Content-Length", str(len(out)))
         self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(out)
+
+    def _log_retention(self, method):
+        """/api/log-retention*: thin socket wrapper over _lr_handle (all rules live there).
+        The body is read only after its declared length passes the cap."""
+        try:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > LR_MAX_BODY:
+                return self._json({"ok": False, "error": "bad or oversized Content-Length"},
+                                  413 if length > LR_MAX_BODY else 400)
+            body = self.rfile.read(length) if length else b""
+            status, obj = _lr_handle(method, self.path, self.headers, body)
+        except Exception as e:  # noqa: BLE001
+            status, obj = 500, {"ok": False, "error": f"log retention error: {type(e).__name__}"}
+        self.send_response(status)
+        out = json.dumps(obj).encode()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frontend-Version", FRONTEND_VERSION)
         self.end_headers()
         self.wfile.write(out)
 
@@ -7528,6 +8064,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # ollama-worker.py's live config loader, so it never disagrees with
             # what the dispatcher/fit-router is actually using.
             self._json(_cached_response("settings/hosts", _hosts_settings, ttl=5))
+        elif self.path.split("?")[0].rstrip("/") == "/api/log-retention":
+            return self._log_retention("GET")
         elif self.path == "/api/web-search-usage":
             self._json(_cached_response("web-search-usage", _web_search_usage, ttl=15, stale=120))
         elif self.path == "/api/handoff":
@@ -7607,6 +8145,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._chat("POST")
         if self.path == "/api/jobs":
             self._enqueue()
+        elif self.path.split("?")[0].rstrip("/").startswith("/api/log-retention"):
+            return self._log_retention("POST")
         elif self.path == "/api/settings/hosts":
             return self._save_hosts()
         elif self.path == "/api/jobs/move":
@@ -7641,6 +8181,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("DELETE")
+        if self.path.startswith("/api/log-retention"):
+            return self._log_retention("DELETE")
         if self.path.startswith("/api/jobs/"):
             _p, _, _qs = self.path[len("/api/jobs/"):].partition("?")
             self._cancel(_p, force="force=1" in _qs.split("&"))
