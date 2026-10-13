@@ -52,6 +52,9 @@ REASON_REVIEW_CAP = "output_cap_review"     # a turn hit the (explicit, small) o
 # SAMPLING ESCALATION LADDER (A/B arm, default OFF; model_profiles.yaml `sampling_escalation`).
 REASON_SPEC_DEFECT_REPEAT = "spec_defect_repeat_abort"   # 2 aborts on the SAME failing check: spec path first
 REASON_LADDER_EXHAUSTED = "sampling_ladder_exhausted"    # step 3: still looping -> scheduler re-specs
+# Reasoning-loop recovery exhausted (plain retry looped, thinking-off rung looped): with the profile flag
+# robust.loop_exhaust_exit (default OFF) the run ENDS under this named reason instead of parking paused.
+REASON_LOOP_EXHAUSTED = "reasoning_loop_exhausted"
 # PER-TURN FAN-OUT (job c8f4f6ed95c1, 2026-10-09: ONE turn emitted 582 read_file calls, offset +100 past
 # EOF, 328s of decode; the run then ended as a generic nav_loop). Applies to EVERY task kind.
 REASON_TOOL_FANOUT = "tool_fanout_loop"       # a turn emitted more than the per-turn cap of tool calls, repeatedly
@@ -59,7 +62,7 @@ REASON_READ_PAST_EOF = "read_past_eof_loop"   # consecutive read_file calls whos
 NEW_EXIT_REASONS = (REASON_FORMAT, REASON_LOOP, REASON_STOPGATE, REASON_REASONING,
                     REASON_ERROR_LOOP, REASON_MONOLOGUE, REASON_ALTERNATION, REASON_NAV_LOOP,
                     REASON_REPEAT_CALL, REASON_REVIEW_CAP, REASON_TOOL_FANOUT, REASON_READ_PAST_EOF,
-                    REASON_SPEC_DEFECT_REPEAT, REASON_LADDER_EXHAUSTED)
+                    REASON_SPEC_DEFECT_REPEAT, REASON_LADDER_EXHAUSTED, REASON_LOOP_EXHAUSTED)
 REVIEW_REPEAT_CONSECUTIVE = 2   # the identical read-only call twice in a row ends the run
 REVIEW_REPEAT_TOTAL = 3         # ... or the third time overall (A,B,A,B,A re-reading evades "in a row")
 LIST_FILES_MAX_ENTRIES = 400    # list_files refuses a directory bigger than this (lists a sample)
@@ -1551,3 +1554,14 @@ class SamplingLadder:
         step, self.pending = self.pending, 0
         self.takes += 1
         return (step, (self.seed_base * 1009 + self.takes * 7919 + 17) % (2 ** 31 - 1))
+
+
+def loop_exhaust_exit_enabled(profile_robust=None, env=None):
+    """robust.loop_exhaust_exit (default OFF) / env WORKER_LOOP_EXHAUST_EXIT=1: when the reasoning-loop
+    recovery ladder is spent, end the run with the named reason REASON_LOOP_EXHAUSTED (scheduler
+    re-specs) instead of parking it paused for a resume that re-enters the same loop."""
+    env = os.environ if env is None else env
+    v = env.get("WORKER_LOOP_EXHAUST_EXIT")
+    if v is not None and v != "":
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool((profile_robust or {}).get("loop_exhaust_exit"))

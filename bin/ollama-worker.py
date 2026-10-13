@@ -7098,6 +7098,7 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
     _stop_gate_exhausted = False
     _reasoning_budget_chars = int(_rb.get("reasoning_budget_chars", 24000) or 0)
     _runaway_streak = 0
+    _loop_exhaust_exit = _wr.loop_exhaust_exit_enabled(_rb)   # default OFF: exhausted loop recovery pauses (legacy)
     _bash_only = _bash_only_mode
     _tool_extractor = bool(_rb.get("tool_extractor"))
     _sg_files, _sg_lits_raw = _wr.parse_task_criteria(task)
@@ -7470,10 +7471,17 @@ def run_task(model, host, cwd, task, verify, max_iters, temperature, num_ctx, se
                     _runaway_streak += 1
                     _lc = len(getattr(loop_err, "thinking", "") or "") or 0
                     if _turn_think is False or _runaway_streak > 2:
-                        log(f"[worker] REASONING LOOP at iteration {i}/{total_iters}: {loop_err}. "
-                            f"{_reasoning_loop_retries} attempt(s) exhausted and thinking-off recovery "
-                            f"already used ({_runaway_streak} in a row) -- pausing as resumable rather "
-                            f"than retrying forever.")
+                        if not _loop_exhaust_exit:
+                            log(f"[worker] REASONING LOOP at iteration {i}/{total_iters}: {loop_err}. "
+                                f"{_reasoning_loop_retries} attempt(s) exhausted and thinking-off recovery "
+                                f"already used ({_runaway_streak} in a row) -- pausing as resumable rather "
+                                f"than retrying forever.")
+                        if _loop_exhaust_exit:
+                            log(f"[worker] EARLY ABORT at iteration {i}/{total_iters}: reasoning-loop recovery "
+                                f"exhausted -- {_wr.REASON_LOOP_EXHAUSTED} (scheduler should re-spec, not resume).")
+                            _dispatch_metrics["early_abort"] = _wr.REASON_LOOP_EXHAUSTED
+                            _outer_break = True
+                            break
                         paused_for_review = f"reasoning loop, retries exhausted: {loop_err}"
                         pause_reason_code = "reasoning_loop"
                         pause_meta = {"retries": _reasoning_loop_retries}

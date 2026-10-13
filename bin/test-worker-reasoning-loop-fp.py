@@ -247,17 +247,34 @@ def main():
     # thinking-off recovery cannot be used forever: a persistent loop still ends, with the named pause
     calls, log, files = drive(m, ["LOOP"] * 12, max_iters=12)
     check("a persistent loop still terminates (bounded)", len(calls) <= 12, True)
+    check("flag OFF (default): spent recovery still pauses as resumable (legacy, byte-identical path)",
+          "pausing as resumable" in log and "reasoning_loop_exhausted" not in log, True)
+    for fp in files:
+        fp.unlink()
+    os.environ["WORKER_LOOP_EXHAUST_EXIT"] = "1"
+    try:
+        calls, log, files = drive(m, ["LOOP"] * 12, max_iters=12)
+    finally:
+        del os.environ["WORKER_LOOP_EXHAUST_EXIT"]
+    check("flag ON: spent recovery ends with the named reason reasoning_loop_exhausted",
+          "EARLY ABORT" in log and "reasoning_loop_exhausted" in log, True)
+    check("flag ON: the run is NOT parked paused", "pausing as resumable" in log or "PAUSED FOR REVIEW" in log, False)
+    check("flag ON: the thinking-off rung still runs first", any(c["think"] is False for c in calls), True)
+    for fp in files:
+        fp.unlink()
     print("\nALL PASS" if not FAILS else f"\n{len(FAILS)} FAILED: {FAILS}")
     return 0 if not FAILS else 1
 
 
 MUTATIONS = [
+    ("exhaust-exit flag ignored (still pauses)", "                        if _loop_exhaust_exit:\n", "                        if False:\n"),
+    ("exhaust-exit flag always on", "_loop_exhaust_exit = _wr.loop_exhaust_exit_enabled(_rb)", "_loop_exhaust_exit = True"),
     ("single earlier occurrence fires again", "if _count_overlapping(earlier, tail, INTRA_TURN_REPEAT_MIN_EARLIER) >= INTRA_TURN_REPEAT_MIN_EARLIER:",
      "if tail in earlier:"),
     ("min-earlier constant lowered to 1", "INTRA_TURN_REPEAT_MIN_EARLIER = 3", "INTRA_TURN_REPEAT_MIN_EARLIER = 1"),
     ("exhausted retries park the job (old behaviour)",
-     "                    if _turn_think is False or _runaway_streak > 2:\n                        log(f\"[worker] REASONING LOOP",
-     "                    if True:\n                        log(f\"[worker] REASONING LOOP"),
+     "                    if _turn_think is False or _runaway_streak > 2:\n                        if not _loop_exhaust_exit:",
+     "                    if True:\n                        if not _loop_exhaust_exit:"),
     ("thinking-off rung does not disable thinking",
      "                    _turn_think = False\n                    messages.append({\"role\": \"user\", \"content\": _wr.reasoning_runaway_message(_lc)})",
      "                    messages.append({\"role\": \"user\", \"content\": _wr.reasoning_runaway_message(_lc)})"),
