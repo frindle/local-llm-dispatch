@@ -51,6 +51,11 @@ PORT = 7684
 _ITER_RE = re.compile(r"--- iteration (\d+)/(\d+) ---")
 _TOKS_RE = re.compile(r"\(([\d.]+) tok/s\)")
 _LOG_TAIL_BYTES = 16_384  # comfortably more than one iteration's log output
+# The worker's end-of-run line: "[worker] USAGE SUMMARY: prompt_tokens=N completion_tokens=M tok_s=X decode_tok_s=Y calls=K"
+# (n/a = the backend reported nothing). Shown on finished job rows only; absent line = no usage shown.
+_USAGE_RE = re.compile(r"USAGE SUMMARY: prompt_tokens=(\S+) completion_tokens=(\S+) tok_s=(\S+) decode_tok_s=(\S+) calls=(\S+)")
+_USAGE_TAIL_BYTES = 65_536
+_USAGE_CACHE = {}
 
 # Sort TIERS for the queue panel's display order. ONE definition, injected into the
 # front-end below (see FRONTEND_HTML's `const STATUS_ORDER = __QUEUE_STATUS_ORDER__`)
@@ -2633,6 +2638,7 @@ function laneStatusLine(j) {
   if (j.tok_s != null) bits.push(j.tok_s.toFixed(1) + ' tok/s');
   return bits.length ? bits.join(' - ') : 'running';
 }
+function fmtTok(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n); }
 function laneNowRows(jobs, acts, cpuRunning, cpuLocal, wv) {
   // cpuLocal: stages running LOCALLY on the Mac (display-only records from cpu_stage; /api/cpu-lane.local_running)
   if (cpuLocal === undefined) cpuLocal = (typeof window !== 'undefined' && window.cpuLaneLocal) || [];
@@ -3154,6 +3160,7 @@ async function refresh() {
       isGpuJob && j.gpu_wait ? 'waiting: ' + escapeHtml(j.gpu_wait) : '',
       (j.model && !isGpuJob) ? escapeHtml(j.model) : '', escapeHtml(j.lane || j.host_pref || ''),
       progress ? 'iter ' + progress : '', toks ? toks + ' tok/s' : '',
+      (j.usage && j.usage.completion_tokens != null) ? ((j.usage.prompt_tokens != null ? fmtTok(j.usage.prompt_tokens) + ' in / ' : '') + fmtTok(j.usage.completion_tokens) + ' out' + (j.usage.tok_s != null ? ' @ ' + j.usage.tok_s + ' tok/s avg' : '')) : '',
       j.pid != null ? 'pid ' + j.pid : '', j.exit_code != null ? 'exit ' + j.exit_code : '']
       .filter(Boolean).map(x => `<span>${x}</span>`).join('');
     const why = j.status === 'failed' ? failReason(j) : '';
@@ -4765,6 +4772,38 @@ def _tail_progress(log_path):
     return iteration, max_iters, tok_s, warming
 
 
+def _usage_summary(log_path):
+    """{prompt_tokens, completion_tokens, tok_s, decode_tok_s, calls} (each a number or None) parsed from
+    the worker's USAGE SUMMARY log line, or None when the log has none. Best-effort: any failure -> None,
+    never an exception. Cached on (path, mtime, size) so polling finished jobs does not re-read logs."""
+    if not log_path:
+        return None
+    try:
+        st = os.stat(log_path)
+        key = (str(log_path), st.st_mtime_ns, st.st_size)
+        if key in _USAGE_CACHE:
+            return _USAGE_CACHE[key]
+        with open(log_path, "rb") as f:
+            f.seek(max(0, st.st_size - _USAGE_TAIL_BYTES))
+            tail = f.read().decode("utf-8", errors="replace")
+        m = _USAGE_RE.findall(tail)
+        out = None
+        if m:
+            def _n(x):
+                try:
+                    return float(x) if "." in x else int(x)
+                except ValueError:
+                    return None
+            pt, ct, ts, dts, calls = (_n(x) for x in m[-1])
+            out = {"prompt_tokens": pt, "completion_tokens": ct, "tok_s": ts, "decode_tok_s": dts, "calls": calls}
+        if len(_USAGE_CACHE) > 2000:
+            _USAGE_CACHE.clear()
+        _USAGE_CACHE[key] = out
+        return out
+    except Exception:
+        return None
+
+
 def _ollama_resident_models(url):
     """Models currently resident on an Ollama host, via /api/ps. Empty list
     on any failure (host down, timeout) -- this is a status display, not a
@@ -5069,6 +5108,7 @@ def _job_summary(j, jobs=None):
     d["iteration"] = iteration
     d["max_iters"] = max_iters
     d["tok_s"] = tok_s
+    d["usage"] = _usage_summary(j.get("log_path")) if j.get("status") not in ("pending", "running") else None
     # Only meaningful overlaid on a "running" job -- iteration is still None
     # at that point precisely because it hasn't started iterating yet.
     d["phase"] = "warming" if (j.get("status") == "running" and warming and iteration is None) else None
