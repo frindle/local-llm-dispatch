@@ -52,6 +52,7 @@ const escapeHtml=x=>String(x); const stageLabel=(k,l)=>String(k||l||'');
 const formatElapsed=s=>String(s); const sliceSuffix=()=>''; const saveExpandState=()=>{};
 const refresh=()=>{}; const openLivelog=()=>{}; const buildQueueRow=()=>new El('tr');
 const sliceOpenByDefault=()=>true;
+const bundleVerdicts={rows:{},bundles:{},unattached:[]}; const verdictRowsForSlice=()=>[]; const sliceExtraVerdictRows=()=>[]; const verdictRowEl=()=>new El('tr'); const verdictInline=()=>new El('div'); const worstOf=()=>null; const verdictClass=()=>'';
 const sliceChipInfo=sl=>({phase:sl.phase,cls:sl.phase,detail:sl.detail||''});
 const sliceSuffixParts=()=>({facts:[], cause:''});
 const sliceHeader=sl=>({num:'Slice '+sl.sid, entry:'', tip:''});

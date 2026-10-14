@@ -95,7 +95,7 @@ api._build_run_tree = lambda rows: slow("tree", {"tree": []})()         # /api/r
 api._finished_bundle_views = lambda **a: slow("bhist", {"bundles": []})()
 HEAVY += [("/api/jobs", "jobs"), ("/api/runs/tree", "tree"), ("/api/bundle-history", "bhist")]
 # cheap/other routes: timed warm but not single-flight-asserted
-CHEAP = ["/", "/api/queue-wait", "/api/cpu-lane", "/api/jobs/abcdef123456/gate", "/api/jobs/abcdef123456/livelog"]
+CHEAP = ["/", "/api/queue-wait", "/api/bundle-verdicts", "/api/cpu-lane", "/api/jobs/abcdef123456/gate", "/api/jobs/abcdef123456/livelog"]
 # routes that shell out to a child / external system: timed by their own tests, deliberately not here
 EXEMPT = {"/api/handoff"}
 

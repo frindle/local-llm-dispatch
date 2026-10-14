@@ -1863,6 +1863,12 @@ FRONTEND_HTML = r"""<!doctype html>
   tr.run-subplan td { font-size: .8rem; }
   tr.run-project { cursor: pointer; background: var(--surface-2); }
   tr.run-project .proj-name { font-weight: 700; }
+  .vinline { font-size: .78rem; margin-top: .1rem; }
+  .vinline .vchip { font-weight: 600; } .vinline .vwhy { color: var(--muted); }
+  .vinline.vgrp-handled { opacity: .65; } .vinline .vbtns { margin-left: .4rem; }
+  .vbadge { font-size: .72rem; font-weight: 600; border: 1px solid currentColor; border-radius: 3px; padding: 0 .3rem; white-space: nowrap; }
+  .vbadge.vbadge-eyes { background: color-mix(in srgb, currentColor 12%, transparent); }
+  tr.slice-verdict td { font-size: .85em; }
   .eyes-badge { font-weight: 600; }
   .eyes-badge.eyes-ok { color: var(--run); } .eyes-badge.eyes-warn { color: var(--warn); }
   .eyes-badge.eyes-bad { color: var(--bad); }
@@ -1957,6 +1963,14 @@ FRONTEND_HTML = r"""<!doctype html>
   </details></div>
 </section>
 
+<section class="panel" id="unattachedPanel" hidden>
+  <div class="list"><details class="fin" id="unattachedDetails" open>
+    <summary id="unattachedSummary"><b>Unattached</b> verdicts</summary>
+    <div class="empty" style="padding:.4rem .8rem;color:var(--muted)">Finished jobs with a gate verdict that could not be tied to any bundle or parent job (e.g. an old escalation review). Same fields and same clear path as Run Status.</div>
+    <table class="q" id="unattachedTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
+  </details></div>
+</section>
+
 <!-- UNIFIED run-status list (2026-09-17, the user: "complete jobs and handoff should
      essentially be the same one list when qwen is done that shows the run status
      that we can clear once it's handled"). ONE surface replacing the old split
@@ -1969,12 +1983,15 @@ FRONTEND_HTML = r"""<!doctype html>
      Backed by /api/runs; /api/jobs/completed and /api/handoff still exist for other
      consumers but the dashboard no longer renders their two separate tables. -->
 <section class="panel" id="runPanel">
-<div class="panel-head"><h2>Run Status</h2><span class="count">qwen finished: verdict + run status; clear once handled</span></div>
+<details class="fin" id="runStatusDetails">
+<summary id="runStatusSummary"><b>Run Status</b> <span class="count">flat list of every verdict -- verdicts now live with their bundles above (inline on each job, roll-up on the bundle header); open this for the full cross-bundle list</span></summary>
+<div class="panel-head"><span class="count">qwen finished: verdict + run status; clear once handled</span></div>
 <div class="list tablewrap">
 <table id="runStatus"><thead><tr>
   <th>verdict</th><th>label</th><th>model</th><th>host</th><th>files</th><th>when</th><th>flags</th><th></th>
 </tr></thead><tbody></tbody></table>
 </div>
+</details>
 </section>
 
 <section class="panel" id="cpuLanePanel">
@@ -2112,6 +2129,84 @@ let planExpanded = {};
 // planExpanded. Absent key = the default (open only for failed/escalated slices).
 let sliceExpanded = {};
 let bundleViews = {views: {}, activity: [], active: null};
+// Gate verdicts JOINED to their bundle (/api/bundle-verdicts, a read-only view over the
+// same annotated rows Run Status shows -- see _bundle_verdict_index). Verdicts live with
+// their bundle: inline on each job row, a roll-up on the bundle header.
+let bundleVerdicts = {rows: {}, bundles: {}, unattached: []};
+let _bvBySlice = {};
+function indexBundleVerdicts() {
+  _bvBySlice = {};
+  for (const i of Object.values((bundleVerdicts && bundleVerdicts.rows) || {})) {
+    if (!i.bundle) continue;
+    const k = i.bundle + '\u0000' + (i.slice || '');
+    (_bvBySlice[k] = _bvBySlice[k] || []).push(i);
+  }
+}
+function verdictRowsForSlice(key, sid) { return _bvBySlice[key + '\u0000' + (sid || '')] || []; }
+const VGROUP_LABEL = {needs_eyes: 'needs eyes', good_to_go: 'good to go', handled: 'handled'};
+function worstOf(infos) {
+  let w = null;
+  for (const i of infos) { const r = verdictRankJS(i.raw_verdict); if (!w || r > w.r) w = {r, v: i.raw_verdict || '?'}; }
+  return w ? w.v : null;
+}
+function verdictRankJS(raw) {
+  const t = String(raw || '?').toUpperCase();
+  for (const [p, r] of [['FAIL', 5], ['BLOCKED', 4], ['CONCERNS', 3], ['PENDING', 2], ['IN PROGRESS', 2], ['NO-GATE', 2], ['?', 2], ['SKIP', 1], ['PASS', 0]]) if (t.startsWith(p)) return r;
+  return 2;
+}
+// One job's verdict, inline: verdict chip, its group (needs eyes / good to go / handled),
+// the reason, an 'issues' button (same gate-detail view Run Status opens) and a 'clear'
+// button that is the SAME shared-ledger path as Run Status (POST /api/runs/<id>/clear).
+// A row still owing sign-off (or owned by a live auto run) gets NO clear button here:
+// that stays an explicit override in the Run Status panel.
+function verdictInline(info) {
+  const el = document.createElement('div');
+  el.className = 'vinline vgrp-' + info.group;
+  const sev = info.group === 'needs_eyes' ? (info.eyes_severity || 'warn') : (info.group === 'good_to_go' ? 'ok' : '');
+  const why = info.group === 'handled' ? (info.handled_reason || 'auto-handled')
+    : [info.eyes_label, info.blocked_reason].filter(Boolean).join(' -- ');
+  el.innerHTML = `<span class="vchip ${verdictClass(info.raw_verdict)}">${escapeHtml(info.verdict)}</span> `
+    + `<span class="eyes-badge${sev ? ' eyes-' + sev : ''} vgrp">${escapeHtml(VGROUP_LABEL[info.group] || info.group || '')}</span>`
+    + (why ? ` <span class="vwhy">${escapeHtml(why)}</span>` : '');
+  const btnBox = document.createElement('span');
+  btnBox.className = 'vbtns';
+  if (info.has_gate) {
+    const b = document.createElement('button');
+    b.textContent = 'issues'; b.className = 'iconbtn';
+    b.onclick = ev => { ev.stopPropagation(); openGateDetail(info.id, info.label); };
+    btnBox.appendChild(b);
+  }
+  if (info.clearable) {
+    const b = document.createElement('button');
+    b.textContent = 'clear'; b.className = 'iconbtn';
+    b.title = 'Handled -- archive this row (same shared ledger as Run Status)';
+    b.onclick = async ev => { ev.stopPropagation(); await clearRun(info.id, info.label, false); finishedFetchedAt = 0; refresh(); };
+    btnBox.appendChild(b);
+  }
+  if (btnBox.children.length) el.appendChild(btnBox);
+  return el;
+}
+// Roll-up for a bundle header: worst verdict across its jobs + how many need eyes.
+function bundleVerdictBadge(key) {
+  const b = ((bundleVerdicts && bundleVerdicts.bundles) || {})[key];
+  if (!b || !b.total) return '';
+  const eyes = b.needs_eyes ? ` &middot; ${b.needs_eyes} need${b.needs_eyes === 1 ? 's' : ''} eyes` : '';
+  return `<span class="vbadge ${verdictClass(b.worst)}${b.needs_eyes ? ' vbadge-eyes' : ''}" data-vbadge="${escapeHtml(key)}" title="Worst gate verdict across this bundle's ${b.total} finished job(s); ${b.needs_eyes} need eyes, ${b.good_to_go} good to go, ${b.handled} handled. Open the bundle for each job's verdict.">gate: ${escapeHtml(b.worst)}${eyes}</span> `;
+}
+// Extra verdict rows under a slice: finished jobs attached to it that are not one of its
+// history entries (esc-review / auto-fix children, label/plan-matched rows).
+function sliceExtraVerdictRows(key, sl) {
+  const have = new Set((sl.history || []).map(h => h.id).filter(Boolean));
+  return verdictRowsForSlice(key, sl.sid).filter(i => !have.has(i.id));
+}
+function verdictRowEl(info, cls, pad) {
+  const tr = document.createElement('tr');
+  tr.className = 'queue-child slice-verdict ' + cls;
+  tr.dataset.verdictId = info.id;
+  tr.innerHTML = `<td></td><td colspan="4" style="padding-left:${pad}"><span class="vlabel" title="${escapeHtml(info.label || '')}">${escapeHtml(info.display_label || info.label || info.id)}</span> <span style="opacity:.5">${escapeHtml(info.id)}</span></td>`;
+  tr.children[1].appendChild(verdictInline(info));
+  return tr;
+}
 let queueWait = null;   // last /api/queue-wait payload, read by the idle tile
 // FINISHED bundles (the user 2026-10-05): bundles with no queue row left, each with its
 // full per-slice history, newest activity first. Paged + age-bounded server-side
@@ -3034,17 +3129,19 @@ async function refresh() {
   if (document.querySelector('details.menu[open]') && Date.now() - menuOpenedAt < 20000) return;
   // finished bundles change slowly: refetch at most every 15s (or right after a control)
   const wantFinished = Date.now() - finishedFetchedAt > 15000;
-  const [res, bvRes, fbRes, trRes] = await Promise.all([fetch('/api/jobs'),
+  const [res, bvRes, fbRes, trRes, vdRes] = await Promise.all([fetch('/api/jobs'),
     fetch('/api/bundle-views').catch(() => null),
     wantFinished ? fetch('/api/bundle-history?days=' + finishedDays + '&limit=' + finishedLimit)
       .catch(() => null) : null,
-    fetch('/api/triage').catch(() => null)]);
+    fetch('/api/triage').catch(() => null),
+    fetch('/api/bundle-verdicts?days=' + finishedDays + '&limit=' + finishedLimit).catch(() => null)]);
   checkFrontendVersion(res);   // an open tab notices a new build and reloads once
   const jobs = await res.json();
   waitBannerJobs = jobs;   // the banner's own timer (refreshWaitBanner) reads these for its no-state fallback
   try { if (trRes && trRes.ok) triageOpen = await trRes.json(); } catch (e) { /* keep last */ }
   // Dashboard B: live per-slice truth; an older API (404) just renders as before.
   try { if (bvRes && bvRes.ok) bundleViews = await bvRes.json(); } catch (e) { /* keep last */ }
+  try { if (vdRes && vdRes.ok) { bundleVerdicts = await vdRes.json(); indexBundleVerdicts(); } } catch (e) { /* keep last */ }
   try { if (fbRes && fbRes.ok) { finishedBundles = await fbRes.json(); finishedFetchedAt = Date.now(); } }
   catch (e) { /* keep last */ }
   // pendingIds MUST reflect true FIFO enqueue order (the daemon's actual launch
@@ -3468,7 +3565,7 @@ async function refresh() {
       const sPhase = sc.phase, sCls = sc.cls, sDetail = sc.detail;
       str.innerHTML = `
         <td class="slice-caret">${sl.history && sl.history.length ? (open ? '&#9662;' : '&#9656;') : ''}</td>
-        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sCls}">${sPhase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}${(sp.cause || sl.summary) ? '<div class="slice-cause" title="' + escapeHtml(sp.cause || sl.summary) + '">' + escapeHtml(sp.cause || sl.summary) + '</div>' : ''}</td>
+        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sCls}">${sPhase}</span>${(() => { const vr = verdictRowsForSlice(g.key, sl.sid); if (!vr.length) return ''; const ne = vr.filter(i => i.group === 'needs_eyes').length; return ' <span class="vbadge ' + verdictClass(worstOf(vr)) + (ne ? ' vbadge-eyes' : '') + '" title="gate verdict(s) for this slice">' + escapeHtml(worstOf(vr)) + (ne ? ' &middot; ' + ne + ' eyes' : '') + '</span>'; })()}${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}${(sp.cause || sl.summary) ? '<div class="slice-cause" title="' + escapeHtml(sp.cause || sl.summary) + '">' + escapeHtml(sp.cause || sl.summary) + '</div>' : ''}</td>
         <td class="st"><span class="chip ph ph-${sCls}">${sPhase}</span></td>
         <td class="when slice-facts" colspan="2" title="${escapeHtml(sliceSuffix(sl))}">${sp.facts.map(f => '<span class="slice-fact">' + escapeHtml(f.replace(/^author jobs /, 'jobs ')) + '</span>').join('')}</td>`;
       str.addEventListener('click', () => {
@@ -3479,6 +3576,7 @@ async function refresh() {
         for (const h of sl.history || []) if (h.live && h.id) claimed.add(h.id);
         continue;
       }
+      for (const xi of sliceExtraVerdictRows(g.key, sl)) tbody.appendChild(verdictRowEl(xi, '', SLICE_KID));
       // One history entry as a row: a live queue row (all actions kept) or a read-only line.
       const histRow = (h, indent) => {
         const live = h.live && g.children.find(c => c.id === h.id);
@@ -3493,6 +3591,8 @@ async function refresh() {
             const rr = lc.querySelector('.rerun');
             if (rr) rr.remove();      // the "#N" rerun counter is noise under a slice
           }
+          const vi = (bundleVerdicts.rows || {})[live.id];
+          if (vi && r.children[1]) r.children[1].appendChild(verdictInline(vi));
           return r;
         }
         const htr = document.createElement('tr');
@@ -3507,6 +3607,8 @@ async function refresh() {
           <td class="st"><span class="chip status-${escapeHtml(h.status || '')} ${escapeHtml(h.status || '')}">${escapeHtml(h.status || '')}</span></td>
           <td class="when" title="${escapeHtml(when)}">${h.duration_s != null ? formatElapsed(h.duration_s) : ''}</td>
           <td></td>`;
+        const vi = h.id && (bundleVerdicts.rows || {})[h.id];
+        if (vi && htr.children[1]) htr.children[1].appendChild(verdictInline(vi));
         return htr;
       };
       // A collapsible summary line (an earlier attempt, or earlier refine rounds).
@@ -3625,6 +3727,10 @@ async function refresh() {
     }
     // live rows no slice claimed (an unmapped gate, a hand-enqueued row) still render
     for (const c of g.children) if (!claimed.has(c.id)) tbody.appendChild(buildQueueRow(c, true));
+    // finished jobs joined to this bundle but to no rendered slice (plan-key match only)
+    const _sids = new Set(view.slices.map(x => x.sid));
+    for (const i of Object.values(bundleVerdicts.rows || {}))
+      if (i.bundle === g.key && !_sids.has(i.slice)) tbody.appendChild(verdictRowEl(i, 'slice-verdict-orphan', SLICE_KID));
   };
   for (const g of planEntries) {
     // Render as a BUNDLE whenever the group is keyed. A key is set only when the row's
@@ -3834,7 +3940,7 @@ async function refresh() {
     ptr.innerHTML = `
       <td>${mpos >= 0 ? `<span class="bundle-grip" draggable="true" title="Drag to reorder this bundle in the queue" style="cursor:grab;margin-right:4px;opacity:0.55">&#10303;</span>` : ''}${expanded ? '&#9662;' : '&#9656;'}</td>
       <td><span class="proj-name">${escapeHtml(g.key)}</span><span class="chip m-chip ${chipTxt}">${chipTxt}</span>
-          <div class="sub">${total ? progHtml(through, total, unitName, fracTitle) : ''}${lead}${alertSummary.badge}${sliceBadge}</div>
+          <div class="sub">${total ? progHtml(through, total, unitName, fracTitle) : ''}${lead}${alertSummary.badge}${sliceBadge}${bundleVerdictBadge(g.key)}</div>
           ${summary ? `<div class="sub proj-summary">${summary}</div>` : ''}
           ${attnInfo && attnInfo.reason ? `<div class="reason${attnKind === 'failed' ? ' bad' : ''}">${escapeHtml(attnInfo.reason)}</div>`
             : (headWait && !counts.running ? `<span class="wait-reason">${escapeHtml(headWait)}</span>` : '')}</td>
@@ -4055,6 +4161,7 @@ async function refresh() {
   tbody = finBody;
   renderFinishedBundles(renderSliceLines);
   tbody = activeBody;
+  renderUnattachedVerdicts();
   renderSummary(jobs, acts, attnStats, {bundles: activeBundles, jobs: activeJobs});
   if (_openMenu) {
     const m = document.querySelector(`details.menu[data-menu="${CSS.escape(_openMenu)}"]`);
@@ -4098,7 +4205,7 @@ async function refresh() {
         <td>${open ? '&#9662;' : '&#9656;'}</td>
         <td><span class="proj-name">${escapeHtml(view.key)}</span><span class="chip m-chip failed">${label}</span>
           <div class="sub">${progHtml(view.through, view.total, view.unit || 'slices', '')}
-          <span class="plan-alert">&#9888; ${bad ? bad + ' failed' : 'slices still owed, nothing running'}</span>
+          <span class="plan-alert">&#9888; ${bad ? bad + ' failed' : 'slices still owed, nothing running'}</span>${bundleVerdictBadge(view.key)}
           <span class="proj-summary">${view.runs || 0} runs &middot; ${escapeHtml(dayLabel(view.last_activity))}</span></div></td>
         <td class="st"><span class="chip status-failed failed">${label}</span></td>
         <td class="when" title="${when ? escapeHtml(when.toLocaleString()) : ''}">${when ? when.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : ''}</td><td></td>`;
@@ -4152,7 +4259,7 @@ async function refresh() {
         <td>${open ? '&#9662;' : '&#9656;'}</td>
         <td><span class="proj-name">${escapeHtml(view.key)}</span><span class="chip m-chip ${bad ? 'failed' : 'done'}">${bad ? 'failed' : 'done'}</span>
           <div class="sub">${progHtml(view.through, view.total, view.unit || 'slices', '')}
-          ${bad ? `<span class="plan-alert">&#9888; ${bad} failed</span>` : ''}
+          ${bad ? `<span class="plan-alert">&#9888; ${bad} failed</span>` : ''}${bundleVerdictBadge(view.key)}
           <span class="proj-summary">${view.runs || 0} runs</span></div></td>
         <td class="st"><span class="chip status-${bad ? 'failed' : 'done'} ${bad ? 'failed' : 'done'}">${bad ? 'failed' : 'done'}</span></td>
         <td class="when" title="${when ? escapeHtml(when.toLocaleString()) : ''}">${when ? when.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : ''}</td><td></td>`;
@@ -4161,6 +4268,22 @@ async function refresh() {
       if (open && view.slices && view.slices.length) renderSlices({key: view.key, children: []}, view);
     }
   }
+}
+
+// Finished jobs whose verdict could not be tied to ANY bundle (esc-review of an old job,
+// stand-alone one-offs): listed here, never dropped.
+function renderUnattachedVerdicts() {
+  const un = (bundleVerdicts.unattached || []).map(id => (bundleVerdicts.rows || {})[id]).filter(Boolean);
+  const panel = document.getElementById('unattachedPanel');
+  if (!panel) return;
+  panel.hidden = !un.length;
+  const ne = un.filter(i => i.group === 'needs_eyes').length;
+  document.getElementById('unattachedSummary').innerHTML = `<b>Unattached</b> verdicts
+    <span class="count" style="color:var(--muted)">${un.length} finished job(s) not under any bundle</span>
+    ${ne ? `<span class="chip bad">${ne} need eyes</span>` : ''}`;
+  const body = document.querySelector('#unattachedTable tbody');
+  body.innerHTML = '';
+  for (const i of un) body.appendChild(verdictRowEl(i, 'unattached-verdict', '.6rem'));
 }
 
 document.getElementById('clearFinished').addEventListener('click', async () => {
@@ -4565,6 +4688,13 @@ function loadExpandState() {
   } catch (e) { /* unreadable/corrupt -- defaults are correct, never block the render */ }
 }
 loadExpandState();
+// Run Status starts COLLAPSED (verdicts live with their bundles); a hand toggle is remembered.
+(() => {
+  const rd = document.getElementById('runStatusDetails');
+  if (!rd) return;
+  rd.open = !!planExpanded['__runStatusOpen'];
+  rd.addEventListener('toggle', () => { planExpanded['__runStatusOpen'] = rd.open; saveExpandState(); });
+})();
 // Finished bundles start collapsed; an open/close by hand is remembered.
 (() => {
   const fd = document.getElementById('finishedDetails');
@@ -5885,6 +6015,126 @@ def _run_status_jobs(limit=100):
     _annotate_run_projects(rows)
     _annotate_eyes_labels(rows)
     return rows
+
+
+# --- BUNDLE VERDICTS (2026-10-14, Penn: "gate verdicts should stay with their bundle").
+# The verdict / needs_eyes|good_to_go|handled group / reason that Run Status shows is
+# ALSO surfaced inline on each job row under its bundle and as a roll-up on the bundle
+# header. Single source: the /api/runs rows (_run_status_jobs -> _annotate_run_groups);
+# this only JOINS those annotated rows to the bundle views by job id / parent / label
+# and copies the fields -- it never recomputes a group or a verdict. /api/runs and
+# /api/runs/tree are untouched (five tools read them).
+_BV_VERDICT_RANK = (("FAIL", 5), ("BLOCKED", 4), ("CONCERNS", 3), ("PENDING", 2),
+                    ("IN PROGRESS", 2), ("NO-GATE", 2), ("?", 2), ("SKIP", 1), ("PASS", 0))
+_BV_ROW_FIELDS = ("id", "label", "display_label", "verdict", "raw_verdict", "group",
+                  "handled_reason", "eyes_label", "eyes_severity", "blocked_reason",
+                  "has_gate", "awaiting_signoff", "auto_run_live", "regate",
+                  "terminal_reason", "parent", "slice_id", "timestamp")
+_BV_SUFFIX_RE = re.compile(r"(?: \[auto-fix r\d+\])?(?:-lc\d+|-rr)?$")
+
+
+def _bv_verdict_rank(raw):
+    t = str(raw or "?").strip().upper()
+    for pre, rank in _BV_VERDICT_RANK:
+        if t.startswith(pre):
+            return rank
+    return 2
+
+
+def _bundle_verdict_index(rows, view_list):
+    """PURE. Join annotated run-status `rows` to bundle `view_list` (live + finished +
+    stalled views, each {key, slices:[{sid, history:[{id,label}]}]}).
+
+    Attach order per row: (1) its own job id appears in a slice history; (2) it is a
+    gate/regate/esc-review child naming a parent job id that is in a slice history or
+    is itself an attached row; (3) its label (minus ' [auto-fix rN]' / '-lcN' / '-rr')
+    equals a history label; (4) its slicer `parent` plan key is a bundle key. Anything
+    else is UNATTACHED -- listed, never dropped. Returns
+    {rows: {id: info}, bundles: {key: roll-up}, unattached: [ids]} where info copies the
+    row's annotation fields plus bundle/slice/via/clearable, and roll-up carries the
+    WORST raw verdict over ALL attached rows and the needs_eyes count."""
+    ids, labs, keys = {}, {}, set()
+    for v in view_list or []:
+        k = v.get("key")
+        if not k:
+            continue
+        keys.add(k)
+        for sl in v.get("slices") or []:
+            for h in sl.get("history") or []:
+                if h.get("id") and h["id"] not in ids:
+                    ids[h["id"]] = (k, sl.get("sid"))
+                if h.get("label") and h["label"] not in labs:
+                    labs[h["label"]] = (k, sl.get("sid"))
+    try:
+        child_pid = _bundle_view_lib()[0].child_parent_id
+    except Exception:
+        child_pid = lambda _j: None
+    by_id = {r.get("id"): r for r in rows}
+    attach = {}
+
+    def _find(r, depth=0):
+        rid = r.get("id")
+        if rid in attach:
+            return attach[rid]
+        hit = None
+        if rid in ids:
+            hit = ids[rid] + ("job",)
+        if hit is None:
+            pid = child_pid({"label": r.get("label")})
+            if pid and pid in ids:
+                hit = ids[pid] + ("parent job",)
+            elif pid and pid in by_id and depth < 4 and by_id[pid] is not r:
+                ph = _find(by_id[pid], depth + 1)
+                hit = (ph[0], ph[1], "parent job") if ph else None
+        if hit is None:
+            lab = str(r.get("label") or "")
+            base = _BV_SUFFIX_RE.sub("", lab)
+            for cand in (lab, base):
+                if cand in labs:
+                    hit = labs[cand] + ("label",)
+                    break
+        if hit is None and r.get("parent") in keys:
+            hit = (r["parent"], r.get("slice_id"), "plan")
+        attach[rid] = hit
+        return hit
+
+    out_rows, bundles, unattached = {}, {}, []
+    for r in rows:
+        info = {k: r.get(k) for k in _BV_ROW_FIELDS}
+        # sign-off-protected (or live-auto-run-owned) rows are NEVER clearable from the
+        # inline UI; the Run Status panel keeps its explicit override prompt.
+        info["clearable"] = not (r.get("awaiting_signoff") or r.get("auto_run_live"))
+        hit = _find(r)
+        info["bundle"], info["slice"], info["via"] = (hit if hit else (None, None, None))
+        out_rows[r.get("id")] = info
+        if not hit:
+            unattached.append(r.get("id"))
+            continue
+        b = bundles.setdefault(hit[0], {"worst": None, "worst_rank": -1, "needs_eyes": 0,
+                                        "good_to_go": 0, "handled": 0, "total": 0, "ids": []})
+        b["total"] += 1
+        b["ids"].append(r.get("id"))
+        g = r.get("group")
+        if g in ("needs_eyes", "good_to_go", "handled"):
+            b[g] += 1
+        rk = _bv_verdict_rank(r.get("raw_verdict"))
+        if rk > b["worst_rank"]:
+            b["worst_rank"], b["worst"] = rk, r.get("raw_verdict") or "?"
+    return {"rows": out_rows, "bundles": bundles, "unattached": unattached}
+
+
+def _bundle_verdicts_payload(days=None, limit=None):
+    """I/O wrapper: the cached /api/runs rows joined to the same cached bundle views
+    the queue panel renders (live + finished page + stalled)."""
+    days = FINISHED_BUNDLE_DAYS if days is None else days
+    limit = FINISHED_BUNDLE_PAGE if limit is None else limit
+    rows = _cached_response("runs", _run_status_jobs, ttl=10, stale=120)
+    live = (_cached_response("bundle-views", _bundle_views, ttl=3, stale=60) or {}).get("views") or {}
+    a = {"days": float(days), "limit": int(limit), "offset": 0}
+    fin = _cached_response("bundle-history:" + json.dumps(a, sort_keys=True),
+                           lambda: _finished_bundle_views(**a), ttl=15, stale=120) or {}
+    views = list(live.values()) + list(fin.get("views") or []) + list(fin.get("stalled") or [])
+    return _bundle_verdict_index(rows, views)
 
 
 # --- run-status RETENTION (2026-10-02, the user via coordinator): harness rows
@@ -8215,6 +8465,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # between /api/jobs/completed and /api/handoff; those endpoints remain
             # for any other consumer, but the dashboard front-end now reads this one.
             self._json(_cached_response("runs", _run_status_jobs, ttl=10, stale=120))
+        elif self.path == "/api/bundle-verdicts" or self.path.startswith("/api/bundle-verdicts?"):
+            # Per-job verdicts joined to their bundle (see _bundle_verdict_index). Read-only
+            # view over /api/runs; ?days=&limit= mirror /api/bundle-history so the join
+            # sees the same finished bundles the panel renders.
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                _d = float(qs.get("days", [FINISHED_BUNDLE_DAYS])[0])
+                _l = int(qs.get("limit", [FINISHED_BUNDLE_PAGE])[0])
+            except ValueError:
+                return self._text("days/limit must be numbers", 400)
+            self._json(_bundle_verdicts_payload(_d, _l))
         elif self.path == "/api/runs/retention":
             # Retention preview: every row the auto-retention predicate would archive,
             # with the reason (never clears). See runstatus_retention.py.
