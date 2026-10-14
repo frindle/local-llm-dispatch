@@ -5748,6 +5748,115 @@ def _completed_jobs(limit=50):
 # Archived rows STAY archived (recoverable by hand from LOG_DIR/archive/); they do
 # not come back into the list.
 
+# --- SHARED HANDLED LEDGER (2026-10-14, Penn: "clearing a job in one doesn't clear it in
+# the other, I have to clear things twice"). Verified from the code before this change:
+#   * handoff `--acted` wrote ONLY acted.json; this list never read it, so an acted
+#     deliverable stayed in needs_eyes/good_to_go (54 of the 100 live rows were acted).
+#   * this list's clear ARCHIVED sidecars, but handoff-emit's load_jobs() also lists
+#     every job still in queue-state.json (336 terminal rows live), so a cleared slice
+#     member kept showing on the handoff panel -- the "drops off BOTH" note above is
+#     only true for reaped jobs.
+#   * the 100-row cap hid an awaiting-sign-off row (arr-webhook 8557454d853b) that the
+#     handoff panel shows.
+# Fix: handoff's acted.json is the ONE handled ledger. A clear here also writes an acted
+# mark there; an acted mark there folds the row here into 'handled' with the acted
+# reason (nothing archived, verdict untouched, row still listed). A required, unapproved
+# sign-off is NEVER folded by an acted mark unless that mark recorded an explicit
+# sign-off override. Only applies when this list reads the SAME log dir handoff-emit
+# does (so fixture LOG_DIRs never touch the real ledger). Kill switch:
+# RUNSTATUS_SHARED_LEDGER=off (both directions + the beyond-cap sign-off rows).
+SHARED_LEDGER_MODE = os.environ.get("RUNSTATUS_SHARED_LEDGER", "on").lower()
+
+
+def _shared_ledger_on():
+    if SHARED_LEDGER_MODE in ("off", "0", "false", "no"):
+        return False
+    try:
+        return Path(q.LOG_DIR).resolve() == Path(ho.LOGS).resolve()
+    except Exception:
+        return False
+
+
+def _shared_acted_view():
+    """Read-only acted.json, with the same last-good overlay `handoff-emit --json`
+    applies (so a mark it honours is a mark this list honours). {} when off/unreadable."""
+    if not _shared_ledger_on():
+        return {}
+    try:
+        acted = ho._load(ho.ACTED, {})
+        view = dict(acted) if isinstance(acted, dict) else {}
+        ho._restore_missing(view, log=False)
+        return view
+    except Exception:
+        return {}
+
+
+def _acted_fold_reason(meta):
+    """PURE. The handled_reason for a row folded by a handoff acted mark."""
+    meta = meta if isinstance(meta, dict) else {}
+    why = meta.get("reason") or meta.get("how") or "marked acted"
+    ts = meta.get("ts") or meta.get("archived_at") or ""
+    return f"acted on in handoff{(' ' + ts) if ts else ''}: {why}"
+
+
+def _signoff_path():
+    """The signoff.json handoff-emit's signoff_blocks_acting reads (next to it)."""
+    return Path(ho.__file__).parent / "signoff.json"
+
+
+def _signoff_rows_beyond_cap(rows, acted):
+    """Rows still owing a REQUIRED unapproved sign-off that the newest-`limit` cap
+    dropped (the handoff panel shows them; this list must too). Skips acted ids (the
+    handoff panel hides those as well) and anything without a durable result."""
+    if not _shared_ledger_on():
+        return []
+    have = {r.get("id") for r in rows}
+    try:
+        so = ho._load(_signoff_path(), {}) or {}
+    except Exception:
+        return []
+    out = []
+    for jid, rec in so.items():
+        if jid in have or jid in acted or not isinstance(rec, dict):
+            continue
+        if not rec.get("required") or rec.get("verdict") == "approve":
+            continue
+        try:
+            res = q._load_job_result(jid, q.LOG_DIR)
+            if res is None:
+                continue
+            s = _completed_summary(res)
+        except Exception:
+            continue
+        if s.get("status") in _LIVE_QUEUE_STATUSES or str(s.get("label") or "").startswith(("gate-", "regate-")):
+            continue
+        s["beyond_cap"] = True
+        out.append(s)
+    return out
+
+
+def _mark_shared_acted(job_id, label, how, override=None):
+    """Write the shared-ledger mark for a run-status clear. Never overwrites an
+    existing mark (the first decision stays authoritative). Returns 'marked',
+    'already', 'off', or 'error: ...' -- best effort, the archive already happened."""
+    if not _shared_ledger_on():
+        return "off"
+    try:
+        with ho._locked_acted() as acted:
+            if job_id in acted:
+                return "already"
+            entry = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "how": f"cleared in run-status ({how})", "label": label,
+                     "reason": how}
+            if override:
+                entry["how"] += " (SIGN-OFF OVERRIDDEN)"
+                entry["signoff_override_reason"] = override
+            acted[job_id] = entry
+        return "marked"
+    except Exception as e:
+        return f"error: {type(e).__name__}: {e}"
+
+
 def _run_status_jobs(limit=100):
     """The unified run-status list: every durable completed result that is NOT a
     live queue row and has NOT been cleared/archived, newest first, each annotated
@@ -5759,6 +5868,8 @@ def _run_status_jobs(limit=100):
     handoff INDEX can never disagree about which jobs a human still owes a decision.
     """
     rows = _completed_jobs(limit=limit)
+    acted = _shared_acted_view()
+    rows += _signoff_rows_beyond_cap(rows, acted)
     for r in rows:
         r["awaiting_signoff"] = ho.signoff_blocks_acting(r["id"], r.get("label")) is not None
     # Live queue labels count as "newer stages" for supersede detection: a finished
@@ -5769,7 +5880,7 @@ def _run_status_jobs(limit=100):
             live_labels = _live_queue_labels(lock.load().get("jobs", []))
     except Exception:
         live_labels = []
-    _annotate_run_groups(rows, live_labels, auto_runs=_auto_run_states())
+    _annotate_run_groups(rows, live_labels, auto_runs=_auto_run_states(), acted=acted)
     _annotate_run_parents(rows)
     _annotate_run_projects(rows)
     _annotate_eyes_labels(rows)
@@ -6249,7 +6360,7 @@ def _auto_run_for_row(row, runs):
     return None
 
 
-def _annotate_run_groups(rows, live_labels=None, auto_runs=None):
+def _annotate_run_groups(rows, live_labels=None, auto_runs=None, acted=None):
     """Tag every run-status row with a `group` ('needs_eyes' | 'handled') and, when
     handled, a `handled_reason`. NOTHING is hidden or archived here -- this only
     SORTS the one list so the surface can show a small trustworthy 'needs your eyes'
@@ -6294,6 +6405,15 @@ def _annotate_run_groups(rows, live_labels=None, auto_runs=None):
 
     for r in rows:
         lab = str(r.get("label") or "")
+        # SHARED HANDLED LEDGER: a handoff acted mark IS a clear (see
+        # _shared_acted_view). Fold, never archive; a sign-off still owed only folds
+        # when the mark itself recorded an explicit sign-off override.
+        _am = (acted or {}).get(r.get("id")) if acted else None
+        if _am is not None and (not r.get("awaiting_signoff")
+                                or (isinstance(_am, dict) and _am.get("signoff_override_reason"))):
+            r["group"], r["handled_reason"] = "handled", _acted_fold_reason(_am)
+            r["handoff_acted"] = True
+            continue
         if r.get("awaiting_signoff"):
             r["group"], r["handled_reason"] = "needs_eyes", ""
             continue
@@ -6905,8 +7025,12 @@ def _archive_run(job_id, override=None, how=None):
         entry["how"] = "cleared from dashboard (SIGN-OFF OVERRIDDEN)"
         entry["signoff_override_reason"] = override
     _clear_manifest_append(archive, entry)
+    # SHARED HANDLED LEDGER: the same clear also marks the job acted on the handoff
+    # panel, so it never has to be cleared twice (see _mark_shared_acted).
+    ledger = _mark_shared_acted(job_id, label, how or "cleared from dashboard",
+                                override=override if block else None)
     return {"ok": True, "id": job_id, "moved": moved,
-            "signoff_overridden": bool(block and override)}
+            "signoff_overridden": bool(block and override), "handoff_acted": ledger}
 
 
 def _web_search_usage():

@@ -54,6 +54,7 @@ for t in tests/test-bundle-history.py tests/test-dashboard-b.py tests/test-dashb
          tests/test-dashboard-slice-child-indent.py tests/test-runstatus-retention-api.py; do
   python3 "$t" || echo "FAIL $t"; done
 python3 tests/test-runstatus-retention-api.py --revert-check
+python3 tests/test-runstatus-shared-ledger.py --revert-check
 ```
 
 **Page layout** (top to bottom): a summary strip (running now with model/host/elapsed/tok/s,
@@ -67,6 +68,15 @@ in the Queue even when an earlier run failed (amber note); it moves to Needs att
 only when nothing of it is running or waiting. System fonts only, light/dark via
 `prefers-color-scheme`, no horizontal scroll at phone width. `tests/test-dashboard-layout.py`
 renders the page in headless Chrome against fixtures (`--shots DIR` saves screenshots).
+
+**Run Status and the handoff panel share ONE "handled" ledger** (handoff's `acted.json`,
+2026-10-14). `handoff-emit.py --acted <id>` folds the Run Status row into the collapsed
+*auto-handled* group with the acted reason (verdict kept, sidecars not archived); a Run
+Status `clear` (button, `qctl`, gate janitor, retention) also writes an acted mark, so a job
+is never cleared twice. A required, unapproved sign-off is never folded by a plain acted
+mark. Sign-off rows older than the newest-100 cap are still listed (`beyond_cap`). Kill
+switch: `RUNSTATUS_SHARED_LEDGER=off`. Test: `tests/test-runstatus-shared-ledger.py`
+(`--revert-check` proves each piece).
 
 **GPU-EXCLUSIVE rows** come from `ollama-queue.py enqueue-gpu`: a non-LLM shell job (for
 example a native model-server trial on the Unraid 3080) that has one lane's GPU to itself.
