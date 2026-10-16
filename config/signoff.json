@@ -58,7 +58,9 @@
   "verdict": null
  },
  "01fdda651fba": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "File 'schema.prisma' requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -71,7 +73,7 @@
   ],
   "shadow_ts": "2026-10-05T23:46:28Z",
   "ts": "2026-10-05T23:44:46Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "02b8b165b2ba": {
   "conditions": [],
@@ -103,6 +105,25 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-23T07:48:40Z",
+  "verdict": null
+ },
+ "0370d3fef520": {
+  "conditions": [],
+  "reason": "File 'schema.prisma' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "1 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "scope-check flagged 2 finding(s): files the task never named",
+   "the job's own verify exit was -9, not 0",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': verify-relevance exited 3: the reference impl produced no tracked diff; nothing to mutate; no preflight ledger entry for /Users/user/dispatch-worktrees/absamp-10101743-aC-s1-056efe735811-4949193f. ABSENT IS UNMEASURED, not relevant.",
+   "change class is not auto-approvable: 4 files changed; a single-site change touches at most 1; creates new file(s): prisma/migrations/20991231235959_add_egiftlink_table_7b0efa113f/migration.sql -- new code is not a bounded edit; 8 hunks; a single-site change has at most 3; 87 changed lines; cap for the safe class is 80; security-adjacent: line \"-import { encryptSetting } from '@/lib/secrets.ts';\" ~ /crypt/; line \"-import { encryptSetting } from '@/lib/secrets.ts';\" ~ /secret/; path 'prisma/migrations/20991231235959_add_egiftlink_table_7b0efa113f/migration.sql' ~ /migrat/; path 'prisma/migrations/20991231235959_add_egiftlink_table_7b0efa113f/migration.sql' ~ /prisma/"
+  ],
+  "shadow_ts": "2026-10-11T01:45:50Z",
+  "ts": "2026-10-11T01:44:44Z",
   "verdict": null
  },
  "03cca583f6c1": {
@@ -238,7 +259,7 @@
  },
  "06e50bcbd76d": {
   "conditions": [
-   "superseded: contained an unresolved bug (batch left as 'pass' -> undefined name in sonarr_bulk_search's log.info/for-loop, would NameError at runtime); never merged. r2 (9c04cfeaee49) was a separate false-PASS with zero real work; actual landing came from applying the reviewed refimpl.py directly and committing as e0d57dc"
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
   ],
   "reason": "File 'arr-webhook.py' requires sign-off",
   "required": true,
@@ -420,6 +441,14 @@
   "ts": "2026-09-02T05:54:12Z",
   "verdict": null
  },
+ "097e8984a7c5": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T16:50:47Z",
+  "verdict": null
+ },
  "09842bb3aada": {
   "conditions": [],
   "reason": "",
@@ -494,6 +523,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-21T15:05:45Z",
+  "verdict": null
+ },
+ "0b683cf0c2f9": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T06:19:51Z",
   "verdict": null
  },
  "0b72b7158139": {
@@ -637,7 +674,9 @@
   "verdict": null
  },
  "0ea47b5f09f8": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "File 'schema.prisma' requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -652,7 +691,7 @@
   ],
   "shadow_ts": "2026-10-05T23:35:32Z",
   "ts": "2026-10-05T23:34:38Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "0eb122a99cb9": {
   "conditions": [],
@@ -710,6 +749,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-18T15:52:10Z",
+  "verdict": null
+ },
+ "1016bd07c489": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-11T03:22:31Z",
   "verdict": null
  },
  "10293117a1d0": {
@@ -900,6 +947,14 @@
   "reviewer": "",
   "ts": "2026-10-03T19:57:52Z",
   "verdict": "approve"
+ },
+ "14bb4cb33ed3": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-11T00:11:37Z",
+  "verdict": null
  },
  "14c39421bff2": {
   "conditions": [],
@@ -1099,6 +1154,14 @@
   "ts": "2026-10-02T05:06:11Z",
   "verdict": null
  },
+ "1a7a00972c53": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T05:39:31Z",
+  "verdict": null
+ },
  "1a971e58aec6": {
   "conditions": [],
   "reason": "",
@@ -1146,6 +1209,14 @@
   "ts": "2026-09-20T17:05:22Z",
   "verdict": null
  },
+ "1c9003cf8be6": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T18:57:27Z",
+  "verdict": null
+ },
  "1c94b432dcaa": {
   "conditions": [],
   "reason": "",
@@ -1173,6 +1244,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-03T21:09:44Z",
+  "verdict": null
+ },
+ "1cf79fb02ceb": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T20:54:04Z",
   "verdict": null
  },
  "1d06edef6964": {
@@ -1259,6 +1338,25 @@
   "ts": "2026-09-17T22:07:55Z",
   "verdict": "approve"
  },
+ "1e5b0603ab15": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "1 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "scope-check flagged 1 finding(s): files the task never named",
+   "the job's own verify exit was 1, not 0",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 1); nothing to mutate against; no preflight ledger entry for /Users/user/.ollama-dispatch/worktrees/wt-slice-aw-codec-floor-s2-resolve-incoming-name. ABSENT IS UNMEASURED, not relevant.",
+   "change class is not auto-approvable: 2 files changed; a single-site change touches at most 1; creates new file(s): dispatch_env.py -- new code is not a bounded edit; 165 changed lines; cap for the safe class is 80; security-adjacent: line '+  memory_db(*sql, migrations_dir=None)   in-memory sqlite3 ' ~ /migrat/"
+  ],
+  "shadow_ts": "2026-10-09T22:50:41Z",
+  "ts": "2026-10-09T22:50:09Z",
+  "verdict": null
+ },
  "1e6b2de0c863": {
   "conditions": [],
   "reason": "",
@@ -1289,6 +1387,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-23T22:43:24Z",
+  "verdict": null
+ },
+ "1f9ef6805037": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T20:18:55Z",
   "verdict": null
  },
  "1faa897763ca": {
@@ -1501,6 +1607,14 @@
   "ts": "2026-10-06T09:29:59Z",
   "verdict": null
  },
+ "243871419807": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T23:44:58Z",
+  "verdict": null
+ },
  "246af20d5f11": {
   "conditions": [],
   "reason": "",
@@ -1565,7 +1679,9 @@
   "verdict": null
  },
  "2632c0a95b6d": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "File 'arr-webhook.py' requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -1577,7 +1693,7 @@
   ],
   "shadow_ts": "2026-09-24T01:53:01Z",
   "ts": "2026-09-24T01:52:15Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "2697efa46d6d": {
   "conditions": [
@@ -1798,6 +1914,14 @@
   "ts": "2026-09-22T17:12:20Z",
   "verdict": "approve"
  },
+ "2cab2a25a684": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T18:19:50Z",
+  "verdict": null
+ },
  "2d166280a8b6": {
   "conditions": [],
   "reason": "",
@@ -1836,6 +1960,31 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-03T20:01:02Z",
+  "verdict": null
+ },
+ "2ef1b8293304": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T18:26:35Z",
+  "verdict": null
+ },
+ "2f381f04c4f6": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "1 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "the job's own verify exit was 1, not 0",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 1); nothing to mutate against; no preflight ledger entry for /Users/user/.ollama-dispatch/worktrees/wt-slice-aw-codec-floor-s3-codec-floor-uses-incoming-name. ABSENT IS UNMEASURED, not relevant."
+  ],
+  "shadow_ts": "2026-10-10T11:11:39Z",
+  "ts": "2026-10-10T11:09:08Z",
   "verdict": null
  },
  "2f62c5cff687": {
@@ -1906,6 +2055,14 @@
   "ts": "2026-09-19T04:03:57Z",
   "verdict": null
  },
+ "30e665701777": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-11T00:02:19Z",
+  "verdict": null
+ },
  "313ad888ee38": {
   "conditions": [],
   "reason": "",
@@ -1946,6 +2103,30 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-23T19:12:46Z",
+  "verdict": null
+ },
+ "33b3e10ca7e5": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T23:47:41Z",
+  "verdict": null
+ },
+ "33dab7b757d6": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T06:44:56Z",
+  "verdict": null
+ },
+ "33db624e0ca2": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T03:18:01Z",
   "verdict": null
  },
  "340b20477cd9": {
@@ -2055,6 +2236,14 @@
    "why": "VOIDED 2026-10-06: dispatch-ack-reconcile vacuous merge -- worktree HEAD was still the job's launch baseline 0c858aa (the job made no commit), so 'HEAD is an ancestor of main' was trivially true. Nothing of this job was merged."
   }
  },
+ "35b3610fabd8": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T21:13:38Z",
+  "verdict": null
+ },
  "35cec551a27d": {
   "conditions": [],
   "reason": "",
@@ -2128,6 +2317,14 @@
   "reviewer": "",
   "ts": "2026-10-02T20:02:10Z",
   "verdict": "approve"
+ },
+ "374600717412": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T20:52:21Z",
+  "verdict": null
  },
  "378dd5939f18": {
   "conditions": [
@@ -2256,6 +2453,23 @@
   "reviewer": "",
   "ts": "2026-10-02T02:11:26Z",
   "verdict": "approve"
+ },
+ "3abd53100f5f": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "1 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "the job's own verify exit was 1, not 0",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 1); nothing to mutate against; preflight is 'unproven': only 1 evidence mutant(s) were tried; 3 needed before a verdict means anything. ABSENT IS UNMEASURED, not relevant."
+  ],
+  "shadow_ts": "2026-10-10T13:57:10Z",
+  "ts": "2026-10-10T13:56:21Z",
+  "verdict": null
  },
  "3b5e89fbf9d2": {
   "conditions": [
@@ -2413,6 +2627,19 @@
   "ts": "2026-09-03T13:48:21Z",
   "verdict": null
  },
+ "3ef4a1a8b8f0": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': only 1 evidence mutant(s) were tried; 3 needed before a verdict means anything; preflight is 'unproven': only 1 evidence mutant(s) were tried; 3 needed before a verdict means anything. ABSENT IS UNMEASURED, not relevant."
+  ],
+  "shadow_ts": "2026-10-10T13:59:26Z",
+  "ts": "2026-10-10T13:58:41Z",
+  "verdict": null
+ },
  "3f20040dcee9": {
   "conditions": [
    "merged 218ccdc (reconcile-on-push)"
@@ -2444,6 +2671,22 @@
    "verdict": "approve",
    "why": "VOIDED 2026-10-06: dispatch-ack-reconcile vacuous merge -- worktree HEAD was still the job's launch baseline 0c858aa (the job made no commit), so 'HEAD is an ancestor of main' was trivially true. Nothing of this job was merged."
   }
+ },
+ "3fbf674944d6": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T03:57:14Z",
+  "verdict": null
+ },
+ "3fe0e0b7d03c": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T02:40:08Z",
+  "verdict": null
  },
  "402437d11cf1": {
   "conditions": [],
@@ -2563,6 +2806,14 @@
   "ts": "2026-09-02T16:35:41Z",
   "verdict": null
  },
+ "42ca6ef5d859": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T22:44:28Z",
+  "verdict": null
+ },
  "4357baa05628": {
   "conditions": [],
   "reason": "",
@@ -2601,6 +2852,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-21T17:23:00Z",
+  "verdict": null
+ },
+ "442178b19399": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T09:46:59Z",
   "verdict": null
  },
  "4493c0aa3441": {
@@ -2656,6 +2915,14 @@
   "ts": "2026-09-21T19:27:14Z",
   "verdict": null
  },
+ "4744b05f208e": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T05:22:16Z",
+  "verdict": null
+ },
  "47579926ec04": {
   "conditions": [
    "merged 0b8946d (reconcile-on-push)"
@@ -2708,6 +2975,25 @@
   "ts": "2026-09-18T19:24:02Z",
   "verdict": "approve"
  },
+ "489d30ee57da": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "1 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "scope-check flagged 1 finding(s): files the task never named",
+   "the job's own verify exit was 1, not 0",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 1); nothing to mutate against; no preflight ledger entry for /Users/user/.ollama-dispatch/worktrees/wt-slice-aw-codec-floor-s2-resolve-incoming-name. ABSENT IS UNMEASURED, not relevant.",
+   "change class is not auto-approvable: 2 files changed; a single-site change touches at most 1; creates new file(s): dispatch_env.py -- new code is not a bounded edit; 175 changed lines; cap for the safe class is 80; security-adjacent: line '+  memory_db(*sql, migrations_dir=None)   in-memory sqlite3 ' ~ /migrat/"
+  ],
+  "shadow_ts": "2026-10-09T21:38:54Z",
+  "ts": "2026-10-09T21:38:04Z",
+  "verdict": null
+ },
  "48aef92dd500": {
   "conditions": [
    "merged a3e935e (reconcile-on-push)"
@@ -2717,6 +3003,14 @@
   "reviewer": "",
   "ts": "2026-09-14T05:47:07Z",
   "verdict": "approve"
+ },
+ "48c096d8d690": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T20:28:03Z",
+  "verdict": null
  },
  "48dcf6c501dc": {
   "conditions": [],
@@ -2780,6 +3074,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-25T21:55:57Z",
+  "verdict": null
+ },
+ "4a9528e8ab5c": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T02:20:04Z",
   "verdict": null
  },
  "4b0469f842a5": {
@@ -3084,6 +3386,14 @@
   "ts": "2026-09-18T08:27:18Z",
   "verdict": "approve"
  },
+ "52f0e5a5260d": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T18:44:48Z",
+  "verdict": null
+ },
  "530909f2eecb": {
   "conditions": [],
   "reason": "",
@@ -3165,6 +3475,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-20T14:35:16Z",
+  "verdict": null
+ },
+ "54e2df3449df": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T03:35:27Z",
   "verdict": null
  },
  "55086ac529cc": {
@@ -3251,6 +3569,14 @@
   "ts": "2026-10-02T14:27:33Z",
   "verdict": null
  },
+ "56c1e258014b": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T18:48:15Z",
+  "verdict": null
+ },
  "570f9265aac9": {
   "conditions": [],
   "reason": "",
@@ -3302,6 +3628,14 @@
   "reviewer": "fable",
   "ts": "2026-09-02T00:19:22Z",
   "verdict": "changes"
+ },
+ "57df36dc6647": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T19:31:56Z",
+  "verdict": null
  },
  "57e37096650c": {
   "conditions": [],
@@ -3494,6 +3828,14 @@
   "ts": "2026-10-04T21:18:04Z",
   "verdict": null
  },
+ "5c100027fef0": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T20:52:40Z",
+  "verdict": null
+ },
  "5c3da4998e57": {
   "conditions": [],
   "reason": "",
@@ -3508,6 +3850,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-14T22:16:45Z",
+  "verdict": null
+ },
+ "5d0f38a3613c": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T03:51:01Z",
   "verdict": null
  },
  "5d52fd8a8d5f": {
@@ -3556,6 +3906,22 @@
   "reviewer": "",
   "ts": "2026-09-08T19:07:28Z",
   "verdict": "approve"
+ },
+ "5dbf757f7fe8": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'concerns', not 'pass'",
+   "gate recorded code-category issue(s)",
+   "scope-check flagged 1 finding(s): files the task never named",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 0); nothing to mutate against; no preflight ledger entry for /Users/user/.ollama-dispatch/worktrees/wt-slice-aw-codec-floor-s3-codec-floor-uses-incoming-name. ABSENT IS UNMEASURED, not relevant."
+  ],
+  "shadow_ts": "2026-10-10T08:10:32Z",
+  "ts": "2026-10-10T08:06:02Z",
+  "verdict": null
  },
  "5e3f1b680c2e": {
   "conditions": [
@@ -3631,6 +3997,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-04T06:28:33Z",
+  "verdict": null
+ },
+ "61170d049bb2": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T23:12:52Z",
   "verdict": null
  },
  "6178c77b7c63": {
@@ -3858,7 +4232,9 @@
   "verdict": null
  },
  "6510de9a43f6": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "File 'arr-webhook.py' requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -3871,7 +4247,7 @@
   ],
   "shadow_ts": "2026-09-24T02:43:16Z",
   "ts": "2026-09-24T02:43:00Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "653ce1901edf": {
   "conditions": [],
@@ -3945,6 +4321,22 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-18T20:26:41Z",
+  "verdict": null
+ },
+ "6826dbf541cc": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T21:17:43Z",
+  "verdict": null
+ },
+ "68c735d7678a": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-11T03:37:27Z",
   "verdict": null
  },
  "68e3109a4616": {
@@ -4047,6 +4439,14 @@
   "ts": "2026-09-14T20:50:19Z",
   "verdict": "approve"
  },
+ "6aa322df74d9": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T03:47:34Z",
+  "verdict": null
+ },
  "6b0ff24758ed": {
   "conditions": [
    "merged 0ed76b3 (reconcile-on-push)"
@@ -4058,7 +4458,9 @@
   "verdict": "approve"
  },
  "6b86ecf5e352": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "File 'schema.prisma' requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -4074,7 +4476,7 @@
   ],
   "shadow_ts": "2026-10-09T12:20:02Z",
   "ts": "2026-10-09T12:18:10Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "6b8d1a102488": {
   "conditions": [],
@@ -4082,6 +4484,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-21T17:40:31Z",
+  "verdict": null
+ },
+ "6bc802109f42": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T17:28:51Z",
   "verdict": null
  },
  "6c57a0d19360": {
@@ -4188,6 +4598,14 @@
   "ts": "2026-09-20T12:54:19Z",
   "verdict": null
  },
+ "6ee9202d78c5": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T13:43:06Z",
+  "verdict": null
+ },
  "6faf4a297bbb": {
   "conditions": [
    "merged a3e935e (reconcile-on-push)"
@@ -4220,6 +4638,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-09T14:13:03Z",
+  "verdict": null
+ },
+ "6ff948c948cd": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T02:21:41Z",
   "verdict": null
  },
  "7012f219ac37": {
@@ -4373,6 +4799,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-03T13:43:18Z",
+  "verdict": null
+ },
+ "748751d8f01a": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-11T00:31:40Z",
   "verdict": null
  },
  "74d4220b4965": {
@@ -4610,6 +5044,14 @@
   "ts": "2026-09-13T06:28:17Z",
   "verdict": "approve"
  },
+ "7a804cba80de": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T02:50:13Z",
+  "verdict": null
+ },
  "7af6dd8f43bf": {
   "conditions": [],
   "reason": "",
@@ -4651,7 +5093,9 @@
   "verdict": "approve"
  },
  "7bba28d8d465": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "File 'arr-webhook.py' requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -4661,7 +5105,7 @@
   ],
   "shadow_ts": "2026-09-24T03:46:11Z",
   "ts": "2026-09-24T03:45:37Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "7c203d43d44c": {
   "conditions": [],
@@ -4755,6 +5199,14 @@
   "ts": "2026-10-01T19:28:22Z",
   "verdict": "approve"
  },
+ "7e93e24ae4bd": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T19:18:15Z",
+  "verdict": null
+ },
  "7ed88ee015e5": {
   "reason": "File 'schema.prisma' requires sign-off",
   "required": true,
@@ -4811,6 +5263,22 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-25T11:05:16Z",
+  "verdict": null
+ },
+ "7f4d90a21984": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T23:21:12Z",
+  "verdict": null
+ },
+ "7fecfcc4b805": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T23:51:11Z",
   "verdict": null
  },
  "80afb1dfc4ef": {
@@ -4908,6 +5376,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-02T08:02:54Z",
+  "verdict": null
+ },
+ "824ec6733a3c": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T09:50:53Z",
   "verdict": null
  },
  "825bde4aae26": {
@@ -5067,7 +5543,9 @@
   "verdict": null
  },
  "85f3e9c91e91": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "Path 'lib/payoutMismatch.test.ts' matches sign-off path glob '*payout*' and requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -5082,7 +5560,7 @@
   ],
   "shadow_ts": "2026-10-07T01:06:37Z",
   "ts": "2026-10-07T01:03:03Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "868c98019731": {
   "conditions": [],
@@ -5101,6 +5579,14 @@
   "reviewer": "",
   "ts": "2026-10-04T16:46:56Z",
   "verdict": "approve"
+ },
+ "878397c7933d": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T21:23:22Z",
+  "verdict": null
  },
  "878f437b61a1": {
   "conditions": [
@@ -5221,6 +5707,14 @@
   "ts": "2026-09-21T02:42:50Z",
   "verdict": "approve"
  },
+ "8ad7817dd6f4": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T21:34:57Z",
+  "verdict": null
+ },
  "8aecada681b4": {
   "conditions": [],
   "reason": "",
@@ -5293,6 +5787,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-07T02:00:31Z",
+  "verdict": null
+ },
+ "8e763360732c": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T03:48:43Z",
   "verdict": null
  },
  "8e88b23f0449": {
@@ -5441,6 +5943,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-06T07:47:53Z",
+  "verdict": null
+ },
+ "92f210b2c505": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T21:19:09Z",
   "verdict": null
  },
  "9359815c2067": {
@@ -5906,7 +6416,9 @@
   "verdict": "approve"
  },
  "9eda01a00375": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "File 'arr-webhook.py' requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -5917,7 +6429,7 @@
   ],
   "shadow_ts": "2026-09-24T01:54:32Z",
   "ts": "2026-09-24T01:54:02Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "9ee416afee61": {
   "conditions": [
@@ -5930,7 +6442,9 @@
   "verdict": "approve"
  },
  "9efebe48de57": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "Path 'lib/payoutMismatch.ts' matches sign-off path glob '*payout*' and requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -5940,7 +6454,7 @@
   ],
   "shadow_ts": "2026-10-07T00:32:39Z",
   "ts": "2026-10-07T00:31:31Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "9f0a86460dd0": {
   "conditions": [],
@@ -6206,6 +6720,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-22T20:53:29Z",
+  "verdict": null
+ },
+ "a465e147cf00": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T23:17:21Z",
   "verdict": null
  },
  "a477cab49aa9": {
@@ -6574,6 +7096,24 @@
   "ts": "2026-09-14T02:00:25Z",
   "verdict": "approve"
  },
+ "b033ca976da3": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "2 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "scope-check flagged 1 finding(s): files the task never named",
+   "review did not run cleanly (review_verdict='FAIL')",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 0); nothing to mutate against; no preflight ledger entry for /Users/user/.ollama-dispatch/worktrees/wt-slice-aw-codec-floor-s3-codec-floor-uses-incoming-name. ABSENT IS UNMEASURED, not relevant."
+  ],
+  "shadow_ts": "2026-10-10T13:20:36Z",
+  "ts": "2026-10-10T13:02:34Z",
+  "verdict": null
+ },
  "b08f56f19fa6": {
   "conditions": [],
   "reason": "",
@@ -6620,6 +7160,19 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-18T16:20:33Z",
+  "verdict": null
+ },
+ "b196a0ba7d85": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate-applied: verify relevance is 'low' (score 0.847): 3 changed site(s) are UNEXERCISED -- every mutant on arr-webhook.py:2953, arr-webhook.py:2959, arr-webhook.py:2964 survived, so the verify never runs that path (killed 35/40 elsewhere) [arr-webhook.py:2953 delete `movie_file = None`; arr-webhook.py:2959 delete `seen.add(sn)`; arr-webhook.py:2964 delete `seen.add(st)`]"
+  ],
+  "shadow_ts": "2026-10-09T21:27:20Z",
+  "ts": "2026-10-09T21:26:52Z",
   "verdict": null
  },
  "b1ae752065dd": {
@@ -6686,6 +7239,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-09T07:09:19Z",
+  "verdict": null
+ },
+ "b29a4bcede69": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T17:15:11Z",
   "verdict": null
  },
  "b2d99d680ac0": {
@@ -6775,6 +7336,30 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-02T02:25:36Z",
+  "verdict": null
+ },
+ "b4c9a09ff6ef": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T03:05:10Z",
+  "verdict": null
+ },
+ "b4e7641ef9a1": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T21:23:33Z",
+  "verdict": null
+ },
+ "b5207c85e938": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-11T01:10:22Z",
   "verdict": null
  },
  "b5ba5edf2b3c": {
@@ -6968,6 +7553,22 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-27T03:53:19Z",
+  "verdict": null
+ },
+ "b8f78dd76e07": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T18:33:20Z",
+  "verdict": null
+ },
+ "b90e77ace2b2": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T04:24:41Z",
   "verdict": null
  },
  "b922af58eb99": {
@@ -7189,6 +7790,14 @@
   "ts": "2026-09-17T16:20:21Z",
   "verdict": "approve"
  },
+ "bf03d55c1147": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T03:21:26Z",
+  "verdict": null
+ },
  "bf0e460ad21a": {
   "conditions": [],
   "reason": "",
@@ -7275,6 +7884,14 @@
   "ts": "2026-10-02T05:04:09Z",
   "verdict": null
  },
+ "c098dc76a90e": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T16:03:20Z",
+  "verdict": null
+ },
  "c15d8e8e9588": {
   "conditions": [
    "merged 0d6b4d0 (reconcile-on-push)"
@@ -7286,7 +7903,9 @@
   "verdict": "approve"
  },
  "c16c82ce9131": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "File 'arr-webhook.py' requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -7296,7 +7915,7 @@
   ],
   "shadow_ts": "2026-09-27T23:11:11Z",
   "ts": "2026-09-27T23:10:54Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "c16e8042d9d0": {
   "conditions": [],
@@ -7467,6 +8086,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-05T23:00:31Z",
+  "verdict": null
+ },
+ "c568eeb20293": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T17:45:41Z",
   "verdict": null
  },
  "c599501db961": {
@@ -7749,6 +8376,14 @@
   "ts": "2026-10-02T02:56:25Z",
   "verdict": null
  },
+ "ccbe0abbf714": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T23:14:07Z",
+  "verdict": null
+ },
  "ccd9c24e4943": {
   "conditions": [],
   "reason": "",
@@ -7942,6 +8577,23 @@
   "ts": "2026-09-09T01:11:28Z",
   "verdict": null
  },
+ "d3494c5ba76f": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "1 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "the job's own verify exit was 1, not 0",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 1); nothing to mutate against; no preflight ledger entry for /Users/user/.ollama-dispatch/worktrees/wt-slice-aw-codec-floor-s3-codec-floor-uses-incoming-name. ABSENT IS UNMEASURED, not relevant."
+  ],
+  "shadow_ts": "2026-10-10T08:15:04Z",
+  "ts": "2026-10-10T08:14:13Z",
+  "verdict": null
+ },
  "d3b2ac87a410": {
   "conditions": [],
   "reason": "",
@@ -8021,6 +8673,14 @@
   "ts": "2026-10-06T23:10:30Z",
   "verdict": null
  },
+ "d51768156340": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T17:03:26Z",
+  "verdict": null
+ },
  "d53c7400b2b5": {
   "conditions": [
    "merged c6ad8c7 (reconcile-on-push)"
@@ -8031,6 +8691,14 @@
   "ts": "2026-10-04T06:09:09Z",
   "verdict": "approve"
  },
+ "d56ac4009d1a": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T19:46:00Z",
+  "verdict": null
+ },
  "d629e18e0ae1": {
   "conditions": [
    "merged 252218e (reconcile-on-push)"
@@ -8040,6 +8708,14 @@
   "reviewer": "",
   "ts": "2026-09-08T22:57:17Z",
   "verdict": "approve"
+ },
+ "d64fd3636fbe": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T19:06:54Z",
+  "verdict": null
  },
  "d67127ec4db8": {
   "conditions": [],
@@ -8221,6 +8897,14 @@
    "why": "VOIDED 2026-10-06: dispatch-ack-reconcile vacuous merge -- worktree HEAD was still the job's launch baseline 0c858aa (the job made no commit), so 'HEAD is an ancestor of main' was trivially true. Nothing of this job was merged."
   }
  },
+ "d9848bbe8eea": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-11T00:13:35Z",
+  "verdict": null
+ },
  "d99795512d2a": {
   "conditions": [],
   "reason": "",
@@ -8243,6 +8927,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-03T16:46:18Z",
+  "verdict": null
+ },
+ "da38fece433c": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T18:12:57Z",
   "verdict": null
  },
  "da4b8db1de92": {
@@ -8285,6 +8977,14 @@
   "ts": "2026-10-06T08:47:13Z",
   "verdict": null
  },
+ "dc95585eefe4": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T23:18:33Z",
+  "verdict": null
+ },
  "dcb72c8472b1": {
   "conditions": [],
   "reason": "",
@@ -8294,7 +8994,9 @@
   "verdict": null
  },
  "dcc45d4fbfd8": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "Path 'lib/payoutMismatch.test.ts' matches sign-off path glob '*payout*' and requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -8310,6 +9012,14 @@
   ],
   "shadow_ts": "2026-10-07T00:21:42Z",
   "ts": "2026-10-07T00:20:20Z",
+  "verdict": "reject"
+ },
+ "dd0505b7aa28": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T21:32:07Z",
   "verdict": null
  },
  "dda4b3be60b9": {
@@ -8351,6 +9061,25 @@
   "reviewer": "",
   "ts": "2026-09-13T00:29:50Z",
   "verdict": "approve"
+ },
+ "dded003a8fd9": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "human",
+  "shadow_reasons": [
+   "gate verdict is 'fail', not 'pass'",
+   "1 code-high finding(s)",
+   "gate recorded code-category issue(s)",
+   "scope-check flagged 1 finding(s): files the task never named",
+   "the job's own verify exit was 1, not 0",
+   "verify relevance was never measured for this job, so it is unproven -- gate-applied is 'unproven': the reference impl does not turn the verify green (exit 1); nothing to mutate against; no preflight ledger entry for /Users/user/.ollama-dispatch/worktrees/wt-slice-aw-codec-floor-s2-resolve-incoming-name. ABSENT IS UNMEASURED, not relevant.",
+   "change class is not auto-approvable: 2 files changed; a single-site change touches at most 1; creates new file(s): dispatch_env.py -- new code is not a bounded edit; 168 changed lines; cap for the safe class is 80; security-adjacent: line '+  memory_db(*sql, migrations_dir=None)   in-memory sqlite3 ' ~ /migrat/"
+  ],
+  "shadow_ts": "2026-10-09T21:45:06Z",
+  "ts": "2026-10-09T21:44:34Z",
+  "verdict": null
  },
  "de00afb0c6bc": {
   "reason": "",
@@ -8609,6 +9338,26 @@
   "ts": "2026-10-04T08:28:38Z",
   "verdict": null
  },
+ "e381c7a1693f": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "auto-approve",
+  "shadow_reasons": [
+   "gate pass, no code findings",
+   "verify exited 0 and was PROVEN failing at baseline",
+   "verify judged non-gameable",
+   "review ran cleanly (PASS)",
+   "launch baseline recorded and clean, scope clean",
+   "1 file(s), 1 diff line(s) -- within caps",
+   "verify relevance proven: gate-applied score 1.0, 0 survivor(s) on the model's diff; preflight score 1.0, 0 survivor(s), scaffold digests match the gated tree",
+   "change class bounded_single_site: 1 file, 1 hunk(s), 1 changed line(s), no new/deleted files, no security-adjacent path or line"
+  ],
+  "shadow_ts": "2026-10-10T03:37:43Z",
+  "ts": "2026-10-10T03:36:24Z",
+  "verdict": null
+ },
  "e38ccb4d09df": {
   "conditions": [],
   "reason": "",
@@ -8649,6 +9398,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-09-14T07:24:52Z",
+  "verdict": null
+ },
+ "e43a411307c3": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T04:41:46Z",
   "verdict": null
  },
  "e49ba154136d": {
@@ -8878,6 +9635,22 @@
   "ts": "2026-09-14T16:04:27Z",
   "verdict": null
  },
+ "ec511b547958": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-11T01:36:38Z",
+  "verdict": null
+ },
+ "ecb6572c40e9": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T08:59:37Z",
+  "verdict": null
+ },
  "ed0a5e3c19bb": {
   "conditions": [],
   "reason": "",
@@ -8954,6 +9727,14 @@
   "ts": "2026-10-04T08:12:49Z",
   "verdict": null
  },
+ "ee4a8d0705bb": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T21:29:17Z",
+  "verdict": null
+ },
  "ee664f806312": {
   "conditions": [],
   "reason": "File 'ollama-queue-api.py' requires sign-off",
@@ -9013,6 +9794,14 @@
   "ts": "2026-09-14T11:51:01Z",
   "verdict": null
  },
+ "f0421b8da34c": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T02:53:37Z",
+  "verdict": null
+ },
  "f0516dde2f03": {
   "conditions": [],
   "reason": "",
@@ -9069,6 +9858,22 @@
   "ts": "2026-10-05T18:37:20Z",
   "verdict": null
  },
+ "f1d29efe964a": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-11T00:12:40Z",
+  "verdict": null
+ },
+ "f1eb7d7be2ca": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T18:18:50Z",
+  "verdict": null
+ },
  "f21621ab528f": {
   "conditions": [],
   "reason": "",
@@ -9102,7 +9907,9 @@
   "verdict": null
  },
  "f30d8fa11a0e": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "File 'arr-webhook.py' requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -9114,7 +9921,7 @@
   ],
   "shadow_ts": "2026-09-24T02:44:17Z",
   "ts": "2026-09-24T02:40:59Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "f34c6dcafc02": {
   "conditions": [],
@@ -9156,6 +9963,14 @@
   "required": false,
   "reviewer": "",
   "ts": "2026-10-06T20:30:35Z",
+  "verdict": null
+ },
+ "f425b7505f26": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-09T22:28:02Z",
   "verdict": null
  },
  "f430b8bc9517": {
@@ -9268,6 +10083,34 @@
   "ts": "2026-10-06T22:39:54Z",
   "verdict": null
  },
+ "f749d9957378": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T04:10:31Z",
+  "verdict": null
+ },
+ "f783362c004e": {
+  "conditions": [],
+  "reason": "File 'arr-webhook.py' requires sign-off",
+  "required": true,
+  "reviewer": "owner",
+  "shadow_decision": "auto-approve",
+  "shadow_reasons": [
+   "gate pass, no code findings",
+   "verify exited 0 and was PROVEN failing at baseline",
+   "verify judged non-gameable",
+   "review ran cleanly (PASS)",
+   "launch baseline recorded and clean, scope clean",
+   "1 file(s), 6 diff line(s) -- within caps",
+   "verify relevance proven: gate-applied score 1.0, 0 survivor(s) on the model's diff; preflight score 1.0, 0 survivor(s), scaffold digests match the gated tree",
+   "change class bounded_single_site: 1 file, 1 hunk(s), 6 changed line(s), no new/deleted files, no security-adjacent path or line"
+  ],
+  "shadow_ts": "2026-10-10T03:03:45Z",
+  "ts": "2026-10-10T03:03:17Z",
+  "verdict": null
+ },
  "f7f269df12a2": {
   "conditions": [],
   "reason": "",
@@ -9363,6 +10206,14 @@
   "ts": "2026-09-21T05:18:38Z",
   "verdict": null
  },
+ "fa59c7b6856e": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T02:26:12Z",
+  "verdict": null
+ },
  "faff8839d36c": {
   "conditions": [],
   "reason": "",
@@ -9380,6 +10231,14 @@
   "reviewer": "",
   "ts": "2026-09-13T22:14:09Z",
   "verdict": "approve"
+ },
+ "fb308ab4f1d1": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T05:48:14Z",
+  "verdict": null
  },
  "fbe89eb7d38d": {
   "conditions": [],
@@ -9422,7 +10281,9 @@
   "verdict": null
  },
  "fca00fce882b": {
-  "conditions": [],
+  "conditions": [
+   "superseded: work already on target repo main or replaced by hand-written commits (queue session 2026-10-09 triage)"
+  ],
   "reason": "File 'schema.prisma' requires sign-off",
   "required": true,
   "reviewer": "owner",
@@ -9438,7 +10299,7 @@
   ],
   "shadow_ts": "2026-10-09T03:00:14Z",
   "ts": "2026-10-09T02:59:30Z",
-  "verdict": null
+  "verdict": "reject"
  },
  "fcf3cd7c10a1": {
   "conditions": [
@@ -9449,6 +10310,14 @@
   "reviewer": "",
   "ts": "2026-09-13T22:25:30Z",
   "verdict": "approve"
+ },
+ "fd5b4297d984": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T03:35:45Z",
+  "verdict": null
  },
  "fd68c000d152": {
   "conditions": [],
@@ -9546,6 +10415,14 @@
   "ts": "2026-09-20T17:08:39Z",
   "verdict": null
  },
+ "ff50902db43f": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T03:08:51Z",
+  "verdict": null
+ },
  "ff746bf293bc": {
   "conditions": [
    "merged 7695fd0 (reconcile-on-push)"
@@ -9555,6 +10432,14 @@
   "reviewer": "",
   "ts": "2026-10-05T18:27:29Z",
   "verdict": "approve"
+ },
+ "ff7728b68566": {
+  "conditions": [],
+  "reason": "",
+  "required": false,
+  "reviewer": "",
+  "ts": "2026-10-10T05:10:10Z",
+  "verdict": null
  },
  "ffec7a13dbd8": {
   "conditions": [
