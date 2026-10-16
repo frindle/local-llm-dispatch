@@ -1182,6 +1182,64 @@ def _annotate_plan_rollup(rows, runs_dir=None, log_dir=None):
     return rows
 
 
+# BUNDLE ROLLUP PRECEDENCE (the owner 2026-10-09, rt-costco-receipt-attach read `pending` while its
+# slice 1 said `authoring 2:45`, beside a yellow "1 failed" for a round that was being
+# retried). _annotate_plan_rollup sees QUEUE ROWS only, so "2 pending, none running"
+# rolled up to `pending` even though a slicer/chain driver was authoring a slice
+# between queue rows. The slice view (bundle_view) knows the truth, so this post-pass
+# applies it. Precedence, highest first:
+#   unresolved failure (slice view phase failed/escalated, nothing active)  -> unchanged
+#   active slice (authoring/refining/coding/gate/... per the view)          -> that phase
+#   running row (already `running`)                                          -> running
+#   pending > queued > paused/held > planned                                 -> unchanged
+#   done                                                                     -> unchanged
+# A `failed` row whose slice is ACTIVE in the view is a superseded/in-flight retry: its
+# needs_attention is cleared (the row and its history still render; it just may not
+# colour the bundle or reach Needs attention). A slice that is failed/escalated in the
+# view keeps its alarm.
+def _apply_view_activity(rows, views, active_phases=None, heat=None):
+    """PURE. Stamp plan_active_phase and fold live slice-view activity into plan_status /
+    needs_attention (see BUNDLE ROLLUP PRECEDENCE). Only mutates the passed rows."""
+    if active_phases is None or heat is None:
+        try:
+            bv = _bundle_view_lib()[0]
+            active_phases = bv.ACTIVE_PHASES if active_phases is None else active_phases
+            heat = bv._HEAT if heat is None else heat
+        except Exception:
+            return rows
+    ignore = {"queued"}      # a plain queue wait is already visible as a pending row
+    for r in rows:
+        r.setdefault("plan_active_phase", None)
+    by_key = {}
+    for r in rows:
+        if r.get("group_key"):
+            by_key.setdefault(r["group_key"], []).append(r)
+    for key, grp in by_key.items():
+        view = (views or {}).get(key)
+        if not isinstance(view, dict):
+            continue
+        slices = [x for x in view.get("slices") or [] if isinstance(x, dict)]
+        act = [x for x in slices if x.get("phase") in active_phases
+               and x.get("phase") not in ignore and not x.get("attention")]
+        if not act:
+            continue
+        hot = max(act, key=lambda x: heat.get(x.get("phase"), 0))["phase"]
+        act_sids = [x.get("sid") for x in act if x.get("sid")]
+        for r in grp:
+            if r.get("plan_status") in ("pending", "queued", "scheduled", "planned",
+                                        "paused", "held", "done", "failed", None):
+                r["plan_status"] = hot
+            r["plan_active_phase"] = hot
+            if r.get("needs_attention") and r.get("status") in PLAN_ALERT_STATUSES:
+                base = _slice_base_label(r.get("label")) or ""
+                for sid in act_sids:
+                    pre = f"{key}-{sid}"
+                    if base == pre or base.startswith(pre + "-"):
+                        r["needs_attention"] = False
+                        break
+    return rows
+
+
 # BUNDLE ORDER (the user 2026-09-27: bundle rows "keep changing position as runs start
 # and finish"). The queue panel placed each bundle at plan_seq = MIN display_seq of
 # its rows, and display_seq puts RUNNING on top and gives terminal rows 10_000+tier.
@@ -1519,7 +1577,10 @@ FRONTEND_HTML = r"""<!doctype html>
   .lane-card { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; padding: 5px 8px; border: 1px solid var(--line);
                border-radius: 6px; font-size: .83rem; min-width: 0; overflow-wrap: anywhere; }
   .lane-card.idle { color: var(--muted); }
+  .lane-card.idle .lane-wait { color: var(--warn); }
   .lane-card.run { border-left: 3px solid var(--run); }
+  .lane-card.run.local { border-left-color: #d9822b; }
+  #cpuWhyLocal { margin: 6px 10px 2px; font-size: 12px; color: var(--muted); }
   .lane-name { font-weight: 650; text-transform: uppercase; font-size: .72rem; letter-spacing: .05em; color: var(--muted); }
   .lane-meta, .lane-line { color: var(--muted); font-variant-numeric: tabular-nums; }
   .now-more { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); font-size: .82rem; color: var(--muted); }
@@ -1544,6 +1605,9 @@ FRONTEND_HTML = r"""<!doctype html>
   table.q td:first-child { color: var(--muted); text-align: center; padding-inline: 4px; white-space: nowrap; }
   table.q td.when { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .8rem; }
   table.q td.acts { text-align: right; white-space: nowrap; overflow: visible; }
+  table.q td.slice-facts { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .slice-fact { display: inline-block; padding: 0 6px; margin-right: 4px; border: 1px solid var(--line); border-radius: 8px; white-space: nowrap; }
+  .slice-cause { color: var(--muted); font-size: .79rem; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sub { color: var(--muted); font-size: .79rem; margin-top: 2px; display: flex; flex-wrap: wrap;
          gap: 1px 10px; align-items: center; }
   .reason { font-size: .84rem; margin-top: 3px; }
@@ -1560,7 +1624,13 @@ FRONTEND_HTML = r"""<!doctype html>
           white-space: nowrap; background: var(--surface-2); color: var(--muted); line-height: 1.5; }
   .chip.running, .chip.ph-coding, .chip.ph-gate, .chip.ph-regate, .chip.ph-authoring, .chip.ph-refining,
   .chip.ph-preflight, .chip.ph-self-heal, .chip.ph-escalation-review, .chip.ph-second-opinion { background: var(--run-bg); color: var(--run); }
+  .chip.authoring, .chip.refining, .chip.preflight, .chip.coding, .chip.gate, .chip.regate, .chip.self-heal,
+  .chip.escalation-review, .chip.second-opinion { background: var(--run-bg); color: var(--run); }
   .chip.warming { background: var(--warn-bg); color: var(--warn); }
+  tr.cpu-queue-row.local td { background: var(--warn-bg, transparent); }
+  tr.cpu-queue-row.flash, #jobs tr.flash { outline: 2px solid var(--info); }
+  .cpu-where, .cpu-reason { color: var(--muted); font-size: .79rem; }
+  .cpu-reason { font-weight: 600; }
   .chip.pending, .chip.planned, .chip.queued, .chip.ph-queued, .chip.ph-pending { background: var(--info-bg); color: var(--info); }
   .chip.held, .chip.paused, .chip.blocked, .chip.parked, .chip.warn, .chip.done_unconverged { background: var(--warn-bg); color: var(--warn); }
   .chip.failed, .chip.bad, .chip.ph-failed, .chip.ph-escalated { background: var(--bad-bg); color: var(--bad); }
@@ -1724,18 +1794,19 @@ FRONTEND_HTML = r"""<!doctype html>
 
 <div id="waitBanner" class="waitbanner" hidden></div>
 
-<section class="panel" id="attnPanel">
-  <div class="panel-head"><h2>Needs attention</h2><span class="count" id="attnCount"></span></div>
-  <div class="list attn" id="attnList"><table class="q" id="attnTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table></div>
-  <div class="list" id="attnEmpty" hidden><div class="empty">Nothing is stuck. Failed, parked and blocked work shows up here.</div></div>
-</section>
-
 <section class="panel" id="activePanel">
   <div class="panel-head"><h2>Queue</h2><span class="count" id="activeCount"></span>
     <span class="tools"><details class="legend"><summary>Exit codes</summary><div class="legend-body exit-legend">
       0 - Converged<br>1 - Verify Failed<br>2 - Iteration Cap<br>3 - Paused, Resumable<br>4 - Refused to Start<br>5 - Done, Unconverged</div></details></span></div>
-  <div class="list"><table class="q" id="jobs"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
+  <div class="list"><table class="q" id="cpuQueue" hidden><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
+  <table class="q" id="jobs"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
   <div class="empty" id="activeEmpty" hidden>The queue is empty.</div></div>
+</section>
+
+<section class="panel" id="attnPanel">
+  <div class="panel-head"><h2>Needs attention</h2><span class="count" id="attnCount"></span></div>
+  <div class="list attn" id="attnList"><table class="q" id="attnTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table></div>
+  <div class="list" id="attnEmpty" hidden><div class="empty">Nothing is stuck. Failed, parked and blocked work shows up here.</div></div>
 </section>
 
 <section class="panel" id="stalledPanel" hidden>
@@ -1781,6 +1852,7 @@ FRONTEND_HTML = r"""<!doctype html>
   <th>state</th><th>stage</th><th>label</th><th>bundle</th><th>runner</th><th>time</th>
 </tr></thead><tbody></tbody></table>
 </div>
+<div id="cpuWhyLocal"></div>
 </section>
 
 <div id="livelogBackdrop" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.4); z-index:999;"></div>
@@ -1896,23 +1968,31 @@ function formatElapsed(s) {
   const pad = n => String(n).padStart(2, '0');
   return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
 }
-function sliceSuffix(sl) {
+function sliceSuffixParts(sl) {
   const hist = (sl && sl.history) || [];
   const att = hist.reduce((m, h) => Math.max(m, h.attempt || 1), 1);
-  const parts = [];
+  // {facts: [...always-visible short chips], cause: 'one failure-cause line' | ''}
+  const facts = [];
+  let cause = '';
   // ONE attempt counter (failure_ledger.slice_counter, same numbers as `ollama-dispatch-slice
   // --status` and the budget refusal): author jobs window/budget + lifetime/cap, last cause,
   // "same cause as <job>". Falls back to the old history-derived count if absent.
   const ctr = sl && sl.counter;
   if (ctr) {
-    parts.push('author jobs ' + ctr.jobs_window + '/' + ctr.job_budget + ' (life ' + ctr.jobs_lifetime + '/' + ctr.lifetime_cap + ')' + (ctr.at_cap ? ' AT CAP' : ''));
-    if (ctr.last_signature) parts.push(ctr.last_signature + (ctr.same_as ? ' = same cause as ' + String(ctr.same_as).slice(0, 8) : ''));
-  } else if (att > 1) parts.push('attempt ' + att);
+    facts.push('author jobs ' + ctr.jobs_window + '/' + ctr.job_budget + ' (life ' + ctr.jobs_lifetime + '/' + ctr.lifetime_cap + ')' + (ctr.at_cap ? ' AT CAP' : ''));
+    if (ctr.last_signature) cause = ctr.last_signature + (ctr.same_as ? ' = same cause as ' + String(ctr.same_as).slice(0, 8) : '');
+  } else if (att > 1) facts.push('attempt ' + att);
   let rnd = null;
   for (const h of hist) { if ((h.attempt || 1) !== att) continue; const m = /^refining \(round (\d+)\)/.exec(h.kind || ''); if (m) rnd = +m[1]; }
-  if (rnd) parts.push('refine r' + rnd);
-  if (sl && sl.active) { const run = hist.find(h => h.live && h.status === 'running' && h.duration_s != null); const el = run ? run.duration_s : sl.elapsed_s; if (el != null) parts.push(formatElapsed(el)); }
-  return parts.join(' · ');
+  if (rnd) facts.push('refine r' + rnd);
+  if (sl && sl.active) { const run = hist.find(h => h.live && h.status === 'running' && h.duration_s != null); const el = run ? run.duration_s : sl.elapsed_s; if (el != null) facts.push(formatElapsed(el)); }
+  return {facts, cause};
+}
+function sliceSuffix(sl) {
+  const p = sliceSuffixParts(sl);
+  const out = p.facts.slice();
+  if (p.cause) out.splice(Math.min(1, out.length), 0, p.cause);
+  return out.join(' \u00b7 ');
 }
 const sliceOpenByDefault = sl => !!(sl && sl.attention);
 // Short stage name for a child row under a slice (the bundle + slice are already on the
@@ -1970,11 +2050,15 @@ function attemptSummary(n, entries) {
 }
 // Within one attempt, fold every EARLIER refine round (all but the latest) into one
 // collapsible item once there are two or more of them: [{h} | {fold: [h...], label}].
+function isLiveRow(h) { return !!h.live || ['running', 'pending', 'queued', 'held', 'paused'].includes(h.status); }
 function foldRounds(entries) {
   const rnd = h => { const m = /^refining \(round (\d+)\)/.exec(h.kind || ''); return m ? +m[1] : null; };
   const rounds = entries.filter(h => rnd(h) !== null);
   const max = rounds.reduce((m, h) => Math.max(m, rnd(h)), 0);
-  const early = rounds.filter(h => rnd(h) < max);
+  // A LIVE (running/pending/...) row is never folded away: a chain relaunch restarts the
+  // round counter, so a running r1 can sit below an older done r2 and would otherwise be
+  // swallowed into the collapsed "refine r1-r1" group (the owner 2026-10-09).
+  const early = rounds.filter(h => rnd(h) < max && !isLiveRow(h));
   if (early.length < 2) return entries.map(h => ({h}));
   const out = []; let placed = false;
   for (const h of entries) {
@@ -2201,11 +2285,14 @@ function failReason(j) {
   if (j.failure_class && t !== j.failure_class && !t.includes(j.failure_class)) t = j.failure_class + ': ' + t;
   return t.length > 180 ? t.slice(0, 177) + '...' : t;
 }
+// A row the QUEUE held behind a pending gate/regate releases by itself when the verdict
+// lands: it is waiting, not stuck, so it never needs a person (no Resume, no Needs attention).
+function isGateHeld(j) { return j.status === 'held' && /pending gate/.test(j.hold_reason || ''); }
 // A standalone (bundle-less) row that needs a person: failed, held, or blocked.
 // paused stays in the queue: it keeps its queue position and has its own Resume button.
 function jobAttentionKind(j) {
   if (j.status === 'failed') return 'failed';
-  if (j.status === 'held') return 'parked';
+  if (j.status === 'held') return isGateHeld(j) ? null : 'parked';
   if (j.status === 'blocked') return 'blocked';
   return null;
 }
@@ -2264,12 +2351,71 @@ function renderWaitBanner(w, jobs) {
   el.innerHTML = lines.join('');
 }
 
+// Why ONE queue row is waiting: the daemon's own reason (queue_wait.short) beats the API's derived
+// wait_reason. '' when the row carries neither (or is not a waiting row).
+function jobWaitText(j) {
+  if (!j || (j.status !== 'pending' && j.status !== 'held')) return '';
+  return (j.queue_wait && j.queue_wait.short) || j.wait_reason || '';
+}
+// Slices a bundle DRIVER is actively working (authoring/refining/preflight/...) that have NO live
+// queue row yet, so no queue count can see them. [{key, sid, phase}]
+function driverActiveSlices(views, jobs) {
+  const out = [];
+  for (const [key, v] of Object.entries((views && views.views) || {})) {
+    for (const sl of (v && v.slices) || []) {
+      if (!sl.active || sl.attention) continue;
+      if ((sl.history || []).some(h => h.live)) continue;
+      out.push({key, sid: sl.sid, phase: sl.phase});
+    }
+  }
+  return out;
+}
+// A slice whose only live queue row(s) are PENDING is waiting, not "authoring": {reason} or null.
+function sliceWaitInfo(sl, children) {
+  let pend = null;
+  for (const h of (sl.history || [])) {
+    if (!h.live) continue;
+    const c = (children || []).find(x => x.id === h.id);
+    if (!c) continue;
+    if (c.status === 'running') return null;
+    if (c.status === 'pending' && !pend) pend = c;
+  }
+  return pend ? {reason: jobWaitText(pend) || 'queued', id: pend.id} : null;
+}
+// Chip + sub-line of one slice row: 'waiting' + the reason when its only live queue row is pending,
+// else the slice's own phase/detail.
+function sliceChipInfo(sl, children) {
+  const wi = sliceWaitInfo(sl, children);
+  if (wi) return {phase: 'waiting', cls: 'queued', detail: 'waiting: ' + wi.reason};
+  return {phase: sl.phase, cls: sl.phase, detail: (sl.detail || '').replace(/^refining \(round \d+\)( -- )?/, '')};
+}
+// Queue tile suffix for slices a driver is working that have no queue row yet.
+function driverNote(n) { return n ? ' &middot; ' + n + ' driver-active (no queue row yet)' : ''; }
+// Idle lane card text: "waiting - <why>" when the lane has pending work blocked (infra wait, held
+// behind a bundle, ...), else '' (plain idle). Daemon lane reason first, then the pending rows.
+function laneWaitText(lane, w, jobs, cpuPending) {
+  if (lane === 'cpu') return cpuPending ? 'waiting - ' + cpuPending + ' stage' + (cpuPending === 1 ? '' : 's') + ' for a runner' : '';
+  const ln = w && w.source === 'state' && w.lanes && w.lanes[lane];
+  const s = ln && ln.state === 'idle' && ln.pending && ln.reason && ln.reason.sentence;
+  if (s) return 'waiting - ' + String(s).replace(/^INFRA WAIT:\s*/i, '');
+  const pj = (jobs || []).find(j => j.status === 'pending' && laneOfJob(j) === lane);
+  return pj ? 'waiting - ' + (jobWaitText(pj) || 'queued') : '';
+}
+
 // "Running now" tile, idle case: ONE short plain line saying what the queue is waiting on.
 // Daemon state reason when it is live; else derived from API data (the committed bundle, the
 // pending count). NEVER daemon-log text (the log's HELD/focus lines can be stale).
-function idleWaitText(w, jobs, activeKey) {
+function idleWaitText(w, jobs, activeKey, views) {
   const pend = (jobs || []).filter(j => j.status === 'pending' || j.status === 'held');
-  if (!pend.length) return 'Queue empty';
+  if (!pend.length) {
+    // A bundle driver (slicer/chain) can be authoring a slice with NO queue row yet: the queue is
+    // not "empty" then, work is in flight (the owner 2026-10-10, rt-amazon-cardlink read "Queue empty").
+    const dr = typeof driverActiveSlices === 'function' ? driverActiveSlices(views, jobs) : [];
+    if (dr.length) return 'Bundle ' + dr[0].key + ': ' + dr[0].phase + ' in progress (driver working, queue job not enqueued yet)'
+      + (dr.length > 1 ? ' +' + (dr.length - 1) + ' more' : '');
+    const cn = typeof cpuQueueCounts === 'function' ? cpuQueueCounts(window.cpuLaneData) : {total: 0};
+    return cn.total ? 'GPU queue empty - CPU lane busy (' + cn.running + ' running' + (cn.pending ? ', ' + cn.pending + ' pending' : '') + ')' : 'Queue empty';
+  }
   if (w && w.source === 'state') {
     const out = [];
     for (const ln of Object.values(w.lanes || {})) {
@@ -2278,6 +2424,8 @@ function idleWaitText(w, jobs, activeKey) {
     }
     if (out.length) return 'Waiting on: ' + out.join(' | ');
   }
+  const jw = typeof jobWaitText === 'function' ? jobWaitText(pend.find(jobWaitText)) : '';
+  if (jw && jw !== 'next in line') return 'Waiting on: ' + jw;
   if (activeKey) return 'Waiting on: bundle ' + activeKey + ' to finish';
   return 'Waiting on: queued work (reason shows after the next daemon restart)';
 }
@@ -2305,7 +2453,9 @@ function laneStatusLine(j) {
   if (j.tok_s != null) bits.push(j.tok_s.toFixed(1) + ' tok/s');
   return bits.length ? bits.join(' - ') : 'running';
 }
-function laneNowRows(jobs, acts, cpuRunning) {
+function laneNowRows(jobs, acts, cpuRunning, cpuLocal, wv) {
+  // cpuLocal: stages running LOCALLY on the Mac (display-only records from cpu_stage; /api/cpu-lane.local_running)
+  if (cpuLocal === undefined) cpuLocal = (typeof window !== 'undefined' && window.cpuLaneLocal) || [];
   const by = {};
   for (const [k] of NOW_LANES) by[k] = [];
   const actOf = id => (acts || []).find(a => a.kind === 'gpu' && a.id === id) || {};
@@ -2320,16 +2470,139 @@ function laneNowRows(jobs, acts, cpuRunning) {
     by.cpu.push({label: c.label || String(c.id || '').slice(0, 8), model: c.stage || 'cpu', host: c.runner || 'cpu',
       elapsed_s: c.running_s, bundle: c.bundle || null, line: c.stage ? 'stage ' + c.stage : 'running', id: c.id});
   }
-  return NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k]}));
+  for (const c of (cpuLocal || [])) {
+    by.cpu.push({label: c.stage || 'cpu stage', model: c.stage || 'cpu', host: 'Mac (local, not the Unraid runner)',
+      elapsed_s: c.running_s, bundle: c.bundle || null, line: 'RUNNING LOCALLY - local: ' + (c.reason || 'fallback'),
+      id: 'local-' + (c.stage || '') + '-' + (c.bundle || ''), local: true});
+  }
+  if (wv === undefined) wv = (typeof queueWait !== 'undefined') ? queueWait : null;
+  const cpuPend = (typeof cpuQueueCounts === 'function' && typeof window !== 'undefined') ? cpuQueueCounts(window.cpuLaneData).pending : 0;
+  return NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k],
+    wait: (by[k].length || typeof laneWaitText !== 'function') ? '' : laneWaitText(k, wv, jobs, cpuPend)}));
 }
 function laneNowHtml(rows) {
   return '<div class="lane-now">' + rows.map(r => {
-    if (r.idle) return `<div class="lane-card idle" data-lane="${r.lane}"><span class="lane-name">${escapeHtml(r.name)}</span>: idle</div>`;
-    return r.jobs.map(x => `<div class="lane-card run" data-lane="${r.lane}"><span class="lane-name">${escapeHtml(r.name)}</span>`
+    if (r.idle) return `<div class="lane-card idle" data-lane="${r.lane}"><span class="lane-name">${escapeHtml(r.name)}</span>: ${r.wait ? '<span class="lane-wait">' + escapeHtml(r.wait) + '</span>' : 'idle'}</div>`;
+    return r.jobs.map(x => `<div class="lane-card run${x.local ? ' local' : ''}" data-lane="${r.lane}"><span class="lane-name">${escapeHtml(r.name)}</span>`
       + ` <b>${escapeHtml(x.label)}</b> <span class="lane-meta">model ${escapeHtml(x.model)} &middot; host ${escapeHtml(x.host)}`
       + ` &middot; ${formatElapsed(x.elapsed_s)}${x.bundle ? ' &middot; bundle ' + escapeHtml(x.bundle) : ''}</span>`
       + ` <span class="lane-line">${escapeHtml(x.line)}</span></div>`).join('');
   }).join('') + '</div>';
+}
+
+// CPU-LANE STAGES AS FIRST-CLASS QUEUE ROWS (the owner 2026-10-10: "CPU stages should be in the queue ...
+// running like others"). DISPLAY ONLY, from the same /api/cpu-lane payload the CPU lane panel uses:
+// d.running (Unraid runner), d.pending (waiting for a runner), d.local_running (stage running LOCALLY
+// on the Mac with its fallback reason, e.g. audit-determinism / audit-trivial). A GPU-idle but
+// CPU-busy queue therefore lists rows and never reads "The queue is empty."
+function cpuQueueRows(d) {
+  d = d || {};
+  const rows = [];
+  for (const c of (d.running || [])) rows.push({kind: 'running', status: 'running', stage: c.stage || 'cpu',
+    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', where: c.runner || 'runner', secs: c.running_s,
+    reason: '', id: c.id || ''});
+  for (const c of (d.local_running || [])) rows.push({kind: 'local_running', status: 'running', stage: c.stage || 'cpu',
+    label: c.stage || 'cpu stage', bundle: c.bundle || '', where: 'local (Mac)', secs: c.running_s,
+    reason: c.reason || 'fallback', id: ''});
+  for (const c of (d.pending || [])) rows.push({kind: 'pending', status: 'pending', stage: c.stage || 'cpu',
+    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', where: 'waiting for a runner', secs: c.waiting_s,
+    reason: '', id: c.id || ''});
+  return rows;
+}
+function cpuQueueRowHtml(r, nested) {
+  const secs = r.secs == null ? '?' : Math.round(r.secs) + 's';
+  const bundle = (r.bundle && !nested) ? ` <a href="#" class="cpu-bundle" data-bundle="${escapeHtml(r.bundle)}" title="Jump to the owning bundle in the queue">bundle ${escapeHtml(r.bundle)}</a>` : '';
+  const why = r.reason ? ` <span class="cpu-reason">RUNNING LOCALLY - local: ${escapeHtml(r.reason)}</span>` : '';
+  return `<td>CPU</td><td><b>${escapeHtml(r.stage)}</b> ${escapeHtml(r.label)}${bundle}`
+    + ` <span class="cpu-where">on ${escapeHtml(r.where)}</span>${why}</td>`
+    + `<td class="st"><span class="chip ${r.status}">${r.status}</span></td><td></td>`
+    + `<td>${r.kind === 'pending' ? 'waiting ' : 'running '}${secs}</td>`;
+}
+function cpuQueueCounts(d) {
+  const rows = cpuQueueRows(d);
+  return {running: rows.filter(r => r.status === 'running').length, pending: rows.filter(r => r.status === 'pending').length,
+          total: rows.length};
+}
+// Draw the rows and refresh everything that says whether the queue is "empty": the Queue panel count
+// and empty line. Called by the CPU-lane poll and by renderSummary (whichever runs last wins, both agree).
+// Where each CPU row goes (the owner 2026-10-10: CPU stages belong INSIDE their bundle group in #jobs, like GPU
+// jobs). hasHeader(key) says whether the queue table already has a bundle header for `key`. A row with a
+// bundle key that is not a bare job id nests (under the existing header, or under a CPU-only header made for
+// it); a row with no bundle, or whose "bundle" is only a standalone job id, falls back to the #cpuQueue table.
+function cpuPlaceRows(rows, hasHeader) {
+  const nested = {}, cpuOnly = [], standalone = [];
+  for (const r of rows) {
+    const k = r.bundle || '';
+    if (!k || (!hasHeader(k) && /^[0-9a-f]{12}$/.test(k))) { standalone.push(r); continue; }
+    if (!hasHeader(k) && !cpuOnly.includes(k)) cpuOnly.push(k);
+    (nested[k] = nested[k] || []).push(r);
+  }
+  return {nested, cpuOnly, standalone};
+}
+function renderCpuQueue(q) {
+  if (q) window.lastQueueQ = q;
+  q = window.lastQueueQ || {bundles: 0, jobs: 0};
+  const d = window.cpuLaneData || {};
+  const rows = cpuQueueRows(d);
+  // 1. idempotent: drop what an earlier call inserted into #jobs, then place again.
+  document.querySelectorAll('#jobs tbody tr.cpu-nested, #jobs tbody tr.cpu-only-hdr').forEach(t => t.remove());
+  const headers = {};
+  document.querySelectorAll('#jobs tbody tr.queue-parent').forEach(t => { if (t.dataset.bundle) headers[t.dataset.bundle] = t; });
+  const plan = cpuPlaceRows(rows, k => !!headers[k]);
+  for (const k of plan.cpuOnly) {
+    const run = plan.nested[k].filter(r => r.status === 'running').length;
+    const hd = document.createElement('tr');
+    hd.className = 'queue-parent cpu-only-hdr';
+    hd.dataset.bundle = k; hd.dataset.expanded = '1';
+    hd.innerHTML = `<td>&#9662;</td><td><span class="proj-name">${escapeHtml(k)}</span><span class="chip m-chip ${run ? 'running' : 'pending'}">${run ? 'running' : 'pending'}</span>`
+      + `<div class="sub proj-summary">CPU lane only: ${plan.nested[k].length} stage${plan.nested[k].length === 1 ? '' : 's'}</div></td>`
+      + `<td class="st"><span class="chip status-${run ? 'running' : 'pending'} ${run ? 'running' : 'pending'}">${run ? 'running' : 'pending'}</span></td><td class="when"></td><td class="acts"></td>`;
+    const body = document.querySelector('#jobs tbody');
+    if (body) { body.appendChild(hd); headers[k] = hd; }
+  }
+  for (const k of Object.keys(plan.nested)) {
+    const hd = headers[k];
+    if (!hd) { plan.standalone.push(...plan.nested[k]); continue; }   // header could not be made: never lose the row
+    if (hd.dataset.expanded === '0') continue;                         // collapsed bundle hides its children
+    let last = hd;
+    while (last.nextElementSibling && last.nextElementSibling.classList.contains('queue-child')
+           && !last.nextElementSibling.classList.contains('cpu-only-hdr')) last = last.nextElementSibling;
+    let ref = last.nextElementSibling;
+    for (const r of plan.nested[k]) {
+      const tr = document.createElement('tr');
+      tr.className = 'queue-child cpu-nested cpu-queue-row' + (r.kind === 'local_running' ? ' local' : '');
+      tr.dataset.kind = r.kind; tr.dataset.stage = r.stage; tr.dataset.bundle = r.bundle;
+      tr.innerHTML = cpuQueueRowHtml(r, true);
+      hd.parentNode.insertBefore(tr, ref);
+    }
+  }
+  // 2. the standalone table keeps only rows with no bundle group to live in.
+  const tbl = document.getElementById('cpuQueue');
+  if (tbl) {
+    const tb = tbl.querySelector('tbody');
+    tb.innerHTML = '';
+    plan.standalone.forEach(r => {
+      const tr = document.createElement('tr');
+      tr.className = 'cpu-queue-row' + (r.kind === 'local_running' ? ' local' : '');
+      tr.dataset.kind = r.kind; tr.dataset.stage = r.stage; tr.dataset.bundle = r.bundle;
+      tr.innerHTML = cpuQueueRowHtml(r);
+      tb.appendChild(tr);
+    });
+    tb.querySelectorAll('a.cpu-bundle').forEach(a => a.addEventListener('click', e => {
+      e.preventDefault();
+      const k = a.dataset.bundle;
+      const hit = [...document.querySelectorAll('#jobs tbody tr')].find(t => t.textContent.includes(k));
+      if (hit) { hit.scrollIntoView({block: 'center'}); hit.classList.add('flash'); setTimeout(() => hit.classList.remove('flash'), 1500); }
+    }));
+    tbl.hidden = !plan.standalone.length;
+  }
+  const n = cpuQueueCounts(d);
+  const ac = document.getElementById('activeCount');
+  if (ac) ac.textContent = `${q.bundles} bundle${q.bundles === 1 ? '' : 's'} · ${q.jobs} job${q.jobs === 1 ? '' : 's'}`
+    + (n.total ? ` · ${n.total} CPU stage${n.total === 1 ? '' : 's'} (${n.running} running${n.pending ? ', ' + n.pending + ' pending' : ''})` : '');
+  const ae = document.getElementById('activeEmpty');
+  if (ae) ae.hidden = !!(q.bundles || q.jobs || n.total);
+  return n;
 }
 
 function renderSummary(jobs, acts, attnStats, q) {
@@ -2363,17 +2636,19 @@ function renderSummary(jobs, acts, attnStats, q) {
     now.title = 'Open the live log';
   } else {
     now.innerHTML = `<div class="k"><span class="idle-dot"></span>Running now</div>
-      <div class="now-job" style="color:var(--muted);font-weight:500">Nothing on the GPU</div>
-      <div class="now-more" id="idleWait">${escapeHtml(idleWaitText(queueWait, jobs, bundleViews.active))}</div>
+      <div class="now-job" style="color:var(--muted);font-weight:500">Nothing on the GPU${cpuQueueCounts(window.cpuLaneData).running ? ' - CPU lane active (' + cpuQueueCounts(window.cpuLaneData).running + ' running)' : ''}</div>
+      <div class="now-more" id="idleWait">${escapeHtml(idleWaitText(queueWait, jobs, bundleViews.active, bundleViews))}</div>
       ${other.length ? `<div class="now-more">Off-GPU, live now: ${other.map(fmtAct).join(' &middot; ')}</div>` : ''}
       ${laneNowHtml(laneNowRows(jobs, acts, window.cpuLaneRunning))}`;
     now.style.cursor = ''; now.onclick = null; now.title = '';
   }
   const cnt = st => jobs.filter(j => j.status === st).length;
   const pend = cnt('pending'), paused = cnt('paused'), planned = cnt('planned');
+  const cpuN = cpuQueueCounts(window.cpuLaneData);
+  const drv = driverActiveSlices(bundleViews, jobs);
   document.getElementById('sumQueue').innerHTML = `<div class="k">Queue</div>
-    <div class="v">${pend + paused + planned}</div>
-    <div class="s">${pend} pending${paused ? ' &middot; ' + paused + ' paused' : ''} &middot; ${planned} planned</div>`;
+    <div class="v">${pend + paused + planned + cpuN.pending}</div>
+    <div class="s">${pend} pending${paused ? ' &middot; ' + paused + ' paused' : ''} &middot; ${planned} planned${cpuN.total ? ' &middot; CPU lane: ' + cpuN.running + ' running' + (cpuN.pending ? ', ' + cpuN.pending + ' pending' : '') : ''}${driverNote(drv.length)}</div>`;
   const nA = attnStats.failed + attnStats.parked + attnStats.blocked + (attnStats.stalled || 0);
   const nList = nA - (attnStats.stalled || 0);
   const brk = ['failed', 'parked', 'blocked', 'stalled'].filter(k => attnStats[k]).map(k => attnStats[k] + ' ' + k).join(' &middot; ');
@@ -2387,9 +2662,7 @@ function renderSummary(jobs, acts, attnStats, q) {
   document.querySelector('#attnEmpty .empty').textContent = attnStats.stalled
     ? attnStats.stalled + ' stalled/failed bundle' + (attnStats.stalled === 1 ? '' : 's') + ' (nothing live, not finished): see "Stalled / failed bundles" below.'
     : 'Nothing is stuck. Failed, parked and blocked work shows up here.';
-  document.getElementById('activeCount').textContent =
-    `${q.bundles} bundle${q.bundles === 1 ? '' : 's'} · ${q.jobs} job${q.jobs === 1 ? '' : 's'}`;
-  document.getElementById('activeEmpty').hidden = !!(q.bundles || q.jobs);
+  renderCpuQueue(q);
   document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString() + ' · refreshes every 4s';
 }
 // Menus: one open at a time; a click elsewhere, Escape, or picking an item closes it.
@@ -2859,13 +3132,14 @@ async function refresh() {
       str.className = 'queue-child slice-line' + (sl.phase === 'done' ? ' queue-done' : '');
       str.style.cursor = 'pointer';
       str.dataset.open = open ? '1' : '0';
-      const sDetail = (sl.detail || '').replace(/^refining \(round \d+\)( -- )?/, '');
+      const sp = sliceSuffixParts(sl);
+      const sc = sliceChipInfo(sl, g.children);   // only-pending live row: say WAITING + why, not "authoring"
+      const sPhase = sc.phase, sCls = sc.cls, sDetail = sc.detail;
       str.innerHTML = `
         <td class="slice-caret">${sl.history && sl.history.length ? (open ? '&#9662;' : '&#9656;') : ''}</td>
-        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sl.phase}">${sl.phase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}</td>
-        <td class="st"><span class="chip ph ph-${sl.phase}">${sl.phase}</span></td>
-        <td class="when">${escapeHtml(sliceSuffix(sl))}</td>
-        <td></td>`;
+        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sCls}">${sPhase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}${(sp.cause || sl.summary) ? '<div class="slice-cause" title="' + escapeHtml(sp.cause || sl.summary) + '">' + escapeHtml(sp.cause || sl.summary) + '</div>' : ''}</td>
+        <td class="st"><span class="chip ph ph-${sCls}">${sPhase}</span></td>
+        <td class="when slice-facts" colspan="2" title="${escapeHtml(sliceSuffix(sl))}">${sp.facts.map(f => '<span class="slice-fact">' + escapeHtml(f.replace(/^author jobs /, 'jobs ')) + '</span>').join('')}</td>`;
       str.addEventListener('click', () => {
         sliceExpanded[skey] = !open; saveExpandState(); refresh();
       });
@@ -2967,7 +3241,7 @@ async function refresh() {
           for (const it of stg.list) {
             if (!it.fold) { tbody.appendChild(histRow(it.h, false)); continue; }
             const fk = prefix + '#rounds';
-            const fo = (fk in sliceExpanded) ? sliceExpanded[fk] : false;
+            const fo = (fk in sliceExpanded) ? sliceExpanded[fk] : it.fold.some(h => isLiveRow(h));
             tbody.appendChild(foldRow(fk, it.label, fo, 'slice-fold'));
             if (fo) for (const h of it.fold) tbody.appendChild(histRow(h, true));
             else for (const h of it.fold) if (h.live && h.id) claimed.add(h.id);
@@ -3126,7 +3400,8 @@ async function refresh() {
     // unresolved failure => "failed"; stuck because it was held/paused => "parked";
     // only blocked rows => "blocked". A bundle that is still MOVING keeps its failure
     // as a quiet amber note in the Queue: a retry in flight is not an emergency.
-    const liveNow = !!(counts.running || counts.pending || counts.queued);
+    const gateHeldN = g.children.filter(isGateHeld).length;   // auto-releasing waits, not parks
+    const liveNow = !!(counts.running || counts.pending || counts.queued || gateHeldN || planFirst('plan_active_phase'));
     const hasAlert = alertSummary.alerts.length > 0 || badSlices > 0;
     const attnKind = (!liveNow && (counts.held || counts.paused)) ? 'parked'
       : (!liveNow && hasAlert) ? 'failed'
@@ -3201,6 +3476,7 @@ async function refresh() {
     const headWait = (g.children.find(c => c.wait_reason && ['pending', 'planned', 'queued'].includes(c.status)) || {}).wait_reason;
     const ptr = document.createElement('tr');
     ptr.className = 'queue-parent' + alertSummary.rowClass + (attnKind ? ' needs-attn' : '');
+    ptr.dataset.bundle = g.key; ptr.dataset.expanded = expanded ? '1' : '0';   // CPU-lane stages nest under this header
     ptr.innerHTML = `
       <td>${mpos >= 0 ? `<span class="bundle-grip" draggable="true" title="Drag to reorder this bundle in the queue" style="cursor:grab;margin-right:4px;opacity:0.55">&#10303;</span>` : ''}${expanded ? '&#9662;' : '&#9656;'}</td>
       <td><span class="proj-name">${escapeHtml(g.key)}</span><span class="chip m-chip ${chipTxt}">${chipTxt}</span>
@@ -4066,13 +4342,15 @@ async function refreshCpuLane() {
   try {
     const d = await (await fetch('/api/cpu-lane')).json();
     const panel = document.getElementById('cpuLanePanel');
-    if (!d.enabled) { panel.hidden = true; window.cpuLaneRunning = []; return; }
+    if (!d.enabled) { panel.hidden = true; window.cpuLaneRunning = []; window.cpuLaneData = {}; renderCpuQueue(); return; }
+    window.cpuLaneData = d;
     panel.hidden = false;
     const c = d.counts || {};
     const rn = (d.runners || []).filter(r => r.seen_s_ago < 120).length;
     document.getElementById('cpuLaneSummary').textContent =
       `${rn} runner(s) online - depth ${d.queue_depth} - running ${c.running || 0} - done ${c.done || 0}` +
-      ` - failed_infra ${c.failed_infra || 0} - local stages ${d.local_stages_active || 0}`;
+      ` - failed_infra ${c.failed_infra || 0} - local stages ${d.local_stages_active || 0}` +
+      ` - running locally on the Mac ${(d.local_running || []).length}`;
     const tb = document.querySelector('#cpuLaneTable tbody');
     tb.innerHTML = '';
     const add = (state, j, t) => {
@@ -4082,10 +4360,20 @@ async function refreshCpuLane() {
       tb.appendChild(tr);
     };
     window.cpuLaneRunning = d.running || [];
+    window.cpuLaneLocal = d.local_running || [];
     (d.running || []).forEach(j => add('running', j, Math.round(j.running_s) + 's'));
+    (d.local_running || []).forEach(j => add('RUNNING LOCALLY', {stage: j.stage, label: 'local: ' + (j.reason || ''),
+      bundle: j.bundle, runner: 'Mac', id: ''}, Math.round(j.running_s) + 's'));
+    // "Why local": the last N routing decisions of the lane log grouped by reason (ineligibility is visible).
+    const wl = d.why_local || {n: 0, groups: []};
+    document.getElementById('cpuWhyLocal').textContent = wl.n
+      ? `Why local (last ${wl.n} stage routings): ` + wl.groups.map(g =>
+          `${g.count}x ${g.path === 'runner' ? 'ran on the Unraid runner' : 'local: ' + g.reason}`).join(' | ')
+      : 'Why local: no stage routings logged yet';
     (d.pending || []).forEach(j => add('pending', j, 'waiting ' + Math.round(j.waiting_s) + 's'));
     (d.recent || []).forEach(j => add(j.status + (j.exit_code ? ' (exit ' + j.exit_code + ')' : ''), j,
       (j.duration_s == null ? '' : j.duration_s + 's') + (j.queue_wait_s == null ? '' : ' / wait ' + j.queue_wait_s + 's')));
+    renderCpuQueue();
   } catch (e) { /* lane is optional */ }
 }
 
@@ -6183,6 +6471,11 @@ def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
                              and bv.child_parent_id(j) is None) \
                     and q.job_group_key({"label": j.get("label")}, reverse) not in views:
                 _tagged.setdefault(t.strip(), []).append(j)
+        # a bundle whose chain driver is alive but has no queue row this instant
+        # (between rounds / preflight) still renders -- running, not absent
+        for _l, _b, _st in bv.load_active_runs():
+            if _b and _b not in views and not _b.startswith("esc-review-"):
+                _tagged.setdefault(_b, [])
         for t, tj in _tagged.items():
             # + this bundle's FINISHED jobs (durable bundle tag) and their children
             tj = tj + [h for h in history if h.get(q.BUNDLE_FIELD) == t
@@ -6196,7 +6489,9 @@ def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
                     return {"label": json.loads((log_dir / f"{i}.done.json").read_text()).get("label")}
                 except Exception:
                     return {}
-            v = bv.build_job_view(t, tj + kids, now=now, result_of=_lab)
+            v = bv.build_job_view(t, tj + kids, now=now, result_of=_lab,
+                                  passed_runs=bv.load_passed_runs(),
+                                  active_runs=bv.load_active_runs())
             if v:
                 views[t] = v
     except Exception:
@@ -6358,7 +6653,9 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
             v = None
         if not v:
             try:
-                v = bv.build_job_view(k, recs, now=now, result_of=_lab)
+                v = bv.build_job_view(k, recs, now=now, result_of=_lab,
+                                      passed_runs=bv.load_passed_runs(),
+                                  active_runs=bv.load_active_runs())
             except Exception:
                 v = None
         if not v:
@@ -6568,7 +6865,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # route, behind Cloudflare Access). Counts and ids only: never the spec/cmd/env.
             try:
                 import cpu_lane
-                return self._json(cpu_lane.get_store().summary())
+                _sum = cpu_lane.get_store().summary()
+                try:    # display-only: stages running LOCALLY on the Mac + why-local summary (cpu_stage)
+                    import cpu_stage
+                    _sum["local_running"] = cpu_stage.local_running()
+                    _sum["why_local"] = cpu_stage.why_local(50)
+                except Exception:  # noqa: BLE001
+                    _sum["local_running"], _sum["why_local"] = [], {"n": 0, "groups": []}
+                return self._json(_sum)
             except Exception as e:  # noqa: BLE001
                 return self._json({"enabled": False, "error": type(e).__name__})
         if self.path == "/chat" or self.path.startswith("/api/chat/"):
@@ -6581,11 +6885,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # The rendered order follows the daemon's OWN focused bundle (read from the
             # same state we just loaded), so a bundle that is first stays first across
             # the gap where its next slice has not been enqueued yet.
-            self._json(_annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_annotate_plan_rollup(
+            _rows = _annotate_plan_rollup(
                 _annotate_display_seq(
                     _annotate_job_groups([_job_summary(j, state["jobs"])
                                           for j in state["jobs"]]),
-                    focus_key=_focus_bundle_key(state))), state), state)))
+                    focus_key=_focus_bundle_key(state)))
+            try:    # fold the live slice view into the rollup (see _apply_view_activity)
+                _apply_view_activity(_rows, (_cached_response("bundle-views", _bundle_views, ttl=3)
+                                             or {}).get("views") or {})
+            except Exception:
+                pass
+            self._json(_annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_rows, state), state)))
         elif self.path == "/api/triage":
             # Open failure-signature triage packets (triage_packets.open_summary; read-only,
             # fail-open: an unreadable index is {"open": 0}).
@@ -8167,7 +8477,8 @@ console.log(JSON.stringify({
         const ga = groupAttempts(hh);
         return {nums: ga.nums, n1: ga.by[1].length, sum1: attemptSummary(1, ga.by[1]), sum2: attemptSummary(2, ga.by[2])}; })(),
   fold: [foldRounds([H('authoring', 1), H('refining (round 1)', 1), H('refining (round 2)', 1), H('refining (round 3)', 1)]).map(i => i.fold ? i.label : i.h.kind),
-         foldRounds([H('authoring', 1), H('refining (round 1)', 1), H('refining (round 2)', 1)]).map(i => i.fold ? 'F' : i.h.kind)],
+         foldRounds([H('authoring', 1), H('refining (round 1)', 1), H('refining (round 2)', 1)]).map(i => i.fold ? 'F' : i.h.kind),
+         foldRounds([H('refining (round 1)', 1, {status:'done'}), H('refining (round 2)', 1, {status:'done'}), H('refining (round 1)', 1, {status:'done'}), H('refining (round 1)', 1, {status:'running', live:true})]).map(i => i.fold ? 'F' + i.fold.length : (i.h.live ? 'LIVE' : i.h.kind))],
   trim: [trimBundle('b-s1-x', 'b'), trimBundle('s1-x', 'b'), trimBundle('b-', 'b'), trimBundle('s1', null)],
   openEsc: sliceOpenByDefault({attention: true}),
   openRun: sliceOpenByDefault({phase: 'coding', active: true, attention: false}),
@@ -8208,7 +8519,8 @@ console.log(JSON.stringify({
         check("earlier refine rounds fold into one line only when there are two or more",
               _s.get("fold"),
               [["authoring", "refine r1-r2 \u00b7 2 rounds", "refining (round 3)"],
-               ["authoring", "refining (round 1)", "refining (round 2)"]])
+               ["authoring", "refining (round 1)", "refining (round 2)"],
+               ["F2", "refining (round 2)", "LIVE"]])
         check("the bundle prefix is trimmed only when it is really a prefix",
               _s.get("trim"), ["s1-x", "s1-x", "b-", "s1"])
         check("an idle slice and a lone escalated slice carry no suffix",
