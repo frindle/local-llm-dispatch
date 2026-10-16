@@ -100,7 +100,9 @@ def main():
     ok("the refine loop checks driver_gone before EVERY round",
        "gone = driver_gone(a)" in src_auto and "EXIT_ORPHANED" in src_auto)
     ok("the job poller stops when the driver is gone (does not keep polling)",
-       "gone = driver_gone(a)" in inspect.getsource(m.dispatch_model))
+       "gone = driver_gone(a)" in (inspect.getsource(m.dispatch_model)
+                                   + (inspect.getsource(m._dispatch_model_inner)
+                                      if hasattr(m, "_dispatch_model_inner") else "")))
     ok("the orphan exit code is distinct from a plain failure (1)",
        getattr(m, "EXIT_ORPHANED", 1) not in (0, 1))
 

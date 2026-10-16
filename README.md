@@ -8,7 +8,7 @@ re-symlinked or restarted. The live code still runs from `~/bin` (see "Where it 
 | dir | contents |
 |---|---|
 | `bin/` | pipeline scripts, original filenames (no `.py` on the `ollama-dispatch-*` / `diagnosis-*` tools). Also helper dirs imported by them: `verify-claims/`, `dispatch-fixes/`, `dispatch-templates/`, `ts-mutator/` (JS/TS AST mutator, no `node_modules`), `ollama-dispatch-plan.fixtures/` |
-| `dashboard/` | the `ollama-queue-dashboard` repo: `src/` (`ollama-queue-api.py` HTTP API + UI, `bundle_view.py`, `dashboard_chat.py`, `runstatus_retention.py`), `tests/`, docs, Docker + deploy files, `bin/` (only the two files unique to that repo: `backend-dispatch.py`, `servers_config.py`) |
+| `dashboard/` | the dashboard (merged in from the former `ollama-queue-dashboard` repo, whose history is preserved here; now maintained in-repo, no longer synced): `src/` (`ollama-queue-api.py` HTTP API + UI, `bundle_view.py`, `dashboard_chat.py`, `runstatus_retention.py`), `tests/`, docs, Docker + deploy files, `bin/` (only the two files unique to that repo: `backend-dispatch.py`, `servers_config.py`) |
 | `tests/` | every non-symlinked `~/bin/test-*.py` plus the fixture dirs they use. Dashboard tests live in `dashboard/tests/` |
 | `config/` | `defaults.json`, `model-ladder.json`, signoff rules, diagnostics catalog, model prompt/template files |
 | `launchd/` | LaunchAgent plists: queue daemon, queue API, ack-reconcile, escalation-watcher |
@@ -77,7 +77,7 @@ qagent fix --repo R --verify "<cmd>" [--base REF] [--land] [--wait] "<problem>" 
 
 ## Where it runs from
 - Pipeline scripts: `~/bin/<name>` (real files), including `ollama-queue.py`, `ollama-worker.py`, `ollama-dispatch-*`, `gate-on-complete.py`, `handoff-emit.py`.
-- Dashboard: `~/bin/ollama-queue-api.py`, `bundle_view.py`, `dashboard_chat.py`, `runstatus_retention.py` and several `test-*.py` are **symlinks** into `~/Desktop/GitHub Projects/ollama-queue-dashboard/src|tests`; here they appear under `dashboard/`.
+- Dashboard: `~/bin/ollama-queue-api.py`, `bundle_view.py`, `dashboard_chat.py`, `runstatus_retention.py` and several `test-*.py` are **symlinks** into the dashboard sources in your live checkout; here they appear under `dashboard/`. The Docker build context is `dashboard/` (`cd dashboard && docker build -t ollama-queue-dashboard .`).
 - LaunchAgents: `~/Library/LaunchAgents/com.example.*.plist`. Hooks: `~/.claude/hooks/`. Config/state: `~/.ollama-dispatch/` (only config and proposals are copied; state, worktrees, decisions, logs are not).
 - Tests are written to sit beside the scripts (as in `~/bin`); use `./run-tests.sh` (builds a sandboxed overlay under a fake `$HOME`).
 

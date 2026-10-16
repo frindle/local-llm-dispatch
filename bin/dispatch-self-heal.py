@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Act on an escalation watcher diagnosis for a HARNESS-side slice escalation.
 
-THE GAP THIS CLOSES (Penn 2026-09-26: "I shouldn't be having to manually override
+THE GAP THIS CLOSES (the owner 2026-09-26: "I shouldn't be having to manually override
 things to get my queue to do what I want")
 -----------------------------------------------------------------------------
 dispatch-escalation-watcher.py detects an ESCALATED slice, has a headless reviewer
@@ -31,6 +31,9 @@ Actions by escalation class:
   relevance / preflight NO-GO   -> apply the validated harness-only diff, --regate
   authoring made no progress /
   deterministic authoring fail  -> --retry-slice (re-author clean)
+  converged harness, only blocker
+  verify-relevance (verdict c)  -> ONE in-place repair job in the KEPT worktree, then
+                                   --regate (harness_repair_sweep); see IN-PLACE HARNESS REPAIR
   anything else                 -> nothing (a human decision: gate FAIL on the
                                    coding job, integration, baseline-green audit ...)
 
@@ -208,7 +211,7 @@ def record(plan, sid, entry, ctx=None, count=False, ledger_path=None):
 
 
 # ----------------------------------------------------------------------------
-# verified auto-skip (Penn 2026-10-02: "when our own gates decide a slice is
+# verified auto-skip (the owner 2026-10-02: "when our own gates decide a slice is
 # already satisfied, the retirement must happen automatically, not by hand")
 # ----------------------------------------------------------------------------
 # A review that says VERDICT (a) / already satisfied is a CLAIM, never trusted as
@@ -555,7 +558,7 @@ def _slicer_detached(plan_path, args, log_path):
 
 
 # ----------------------------------------------------------------------------
-# the rung ladder (Penn 2026-10-02: "take Claude and me out of the loop for
+# the rung ladder (the owner 2026-10-02: "take Claude and me out of the loop for
 # escalations so nothing hangs for days")
 # ----------------------------------------------------------------------------
 # After the esc-review verdict the system ACTS, within MAX_ATTEMPTS per slice:
@@ -571,7 +574,7 @@ def _slicer_detached(plan_path, args, log_path):
 #                             Darkbloom model and Darkbloom sizes its own KV.
 # FINAL RUNG (the only one that parks for a human): the budget is spent, or the
 # escalation itself is "PIPELINE BUG SUSPECTED". It is never silent: ONE alert to
-# Penn (notify-penn.py, deduped) naming the slice and the exact qctl commands, and
+# The owner (notify-owner.py, deduped) naming the slice and the exact qctl commands, and
 # a decisions.jsonl entry that `qctl status` shows.
 DECISIONS = DISPATCH_DIR / "decisions.jsonl"
 _VERDICT_RE = re.compile(r"^\W*VERDICT\W*\(?\s*([abcd])\b", re.I)
@@ -646,7 +649,7 @@ def final_rung(plan, sid, why, ctx=None, ledger_path=None, notifier=None):
         if notifier is None:
             import importlib.util as _ilu
             _s = _ilu.spec_from_file_location(
-                "notify_penn", Path(__file__).resolve().parent / "notify-penn.py")
+                "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
             _m = _ilu.module_from_spec(_s)
             _s.loader.exec_module(_m)
             notifier = _m.notify
@@ -688,7 +691,7 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
     st = _load(Path(slice_runs or SLICE_RUNS) / f"{plan}.json") or {}
     s = (st.get("slices") or {}).get(sid) or {}
     # A HUMAN cancel is terminal (plan_cancel.py): the ev-service-screen retry of
-    # 2026-09-27 18:42Z re-enqueued a job Penn had cancelled 37 min earlier.
+    # 2026-09-27 18:42Z re-enqueued a job the owner had cancelled 37 min earlier.
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import plan_cancel
@@ -745,6 +748,25 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
     if rung == "final" and _vd["source"] == "default" and "PIPELINE BUG SUSPECTED" not in (reason or ""):
         rung = "retry-notes"
     notifier = getattr(heal, "_notifier", None)
+    # IN-PLACE HARNESS REPAIR (2026-10-10): a converged harness whose only blocker is
+    # verify-relevance (verdict c) is repaired in its KEPT worktree by one bounded queue
+    # job -- never wiped by --retry-slice, never parked for a human. Decided BEFORE the
+    # attempt budget / re-spec below (those end in --retry-slice or the final rung).
+    _rcause = harness_repair_cause(reason, verdict, kind)
+    _rstate = {"done": False, "act": None}
+
+    def _try_repair():
+        if not _rcause:
+            return None
+        if not _rstate["done"]:
+            _rstate["done"] = True
+            _rstate["act"] = heal_harness_repair(plan, sid, st, s, _rcause, review_text, ctx,
+                                                 ledger_path, getattr(heal, "_repair_hooks", None))
+        return _rstate["act"]
+    if _rcause and rung != "final" and not extract_patch(review_text or ""):
+        _ract = _try_repair()
+        if _ract:
+            return _ract
     if rung == "final":
         return final_rung(plan, sid, "no automatic action applies (verdict %s): %s"
                           % (verdict or "none", reason[:200]), ctx, ledger_path, notifier)
@@ -759,6 +781,9 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
     # ABANDON-AFTER-N (research 2026-10-09): the SAME mechanical failure signature N times
     # (default 2), or the attempt budget spent, means another identical retry is pointless:
     # go to RE-SPEC (one per slice) instead of parking for a human.
+    _ract = _try_repair()           # a spent attempt budget must not wipe a repairable harness
+    if _ract:
+        return _ract
     _cfg = _ev_.load_config()
     _sig = _ev_.failure_signature("slice", reason)
     _rec_s = _led.get(heal_key(plan, sid)) or {}
@@ -861,6 +886,384 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
 
 
 # ----------------------------------------------------------------------------
+# IN-PLACE HARNESS REPAIR (2026-10-10, aw-codec-floor s3 -- seen twice in one day)
+# ----------------------------------------------------------------------------
+# THE GAP. "HARNESS CONVERGED, PREFLIGHT NO-GO -- worktree KEPT ... last blockers=
+# ['verify-relevance']" with an esc-review verdict (c) ("the fixture's assertions are
+# satisfied by BOTH the baseline and the refimpl") and "proposed fix: none written".
+# The ladder then had only: apply a reviewed diff (none exists) or --retry-slice
+# (DELETES the converged worktree and re-authors, the thing the converged-harness
+# keep exists to prevent) -- and once the attempt budget was spent, a final-rung park.
+# A human/agent had to run the relevance gate, strengthen test_fixture.py in place,
+# re-run preflight --auto-seal and `--regate`.
+#
+# THE ACTION (owner: this file; table row harness_repair:*). When the escalation is
+# regate-class AND (the converged-harness-NO-GO reason names verify-relevance, OR the
+# review verdict is (c) and the reason is a verify-relevance NO-GO):
+#   1. run the relevance gate (preflight --json) on the KEPT worktree to get the exact
+#      SURVIVING mutants -- no survivors / no verify-relevance blocker = not ours, fall
+#      through to the existing ladder untouched;
+#   2. enqueue ONE queue job, label auto-refine-<plan>-<sid>-r10N (the existing
+#      refine-round lane: continuation-round launch baseline, authoring-tier, gate-
+#      exempt), stamped with the slice's bundle, on the slice's own local model, in the
+#      KEPT worktree. Its prompt (harness_repair.repair_prompt) carries the survivors
+#      and the review's reasoning and confines the edit to the fixture; its --verify is
+#      `python3 auto-harness-check.py && python3 harness-repair-verify.py <wt>`, i.e.
+#      VERIFY_OK AND the relevance gate reports no survivors -- the gate itself, never a
+#      bypass;
+#   3. harness_repair_sweep (every watcher pass, via --job-sweep) reads the finished
+#      job: scope-checks that only the fixture changed (a violation is reverted and
+#      counts as a failed attempt), then launches the existing `--regate` (never
+#      --retry-slice; the worktree is never deleted) so the slice re-enters through the
+#      normal preflight + enqueue. A failed attempt re-surveys and tries again.
+# BOUNDS. HARNESS_REPAIR_MAX attempts per slice (ledger self-heal.json
+# [plan/sid].repairs, survives restarts); one in flight at a time (ledger + queue
+# label scan + the queue's own duplicate-label refusal); a spent budget falls back to
+# the EXISTING park + ONE deduped alert (final_rung). Protected files are never edited.
+HARNESS_REPAIR_MAX = 2
+HARNESS_REPAIR_CAUSES = ("converged-nogo-verify-relevance", "review-c-relevance-survivors")
+_CONVERGED_NOGO_RE = re.compile(r"HARNESS CONVERGED,\s*PREFLIGHT NO-GO", re.I)
+_REPAIR_LIVE = ("pending", "running", "queued", "scheduled", "held", "paused", "planned")
+REPAIR_VERIFY = Path(__file__).resolve().parent / "harness-repair-verify.py"
+REPAIR_ROUND_BASE = 100          # label rounds r101, r102: never collide with authoring r1..rN
+
+
+def _hr():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import harness_repair
+    return harness_repair
+
+
+def harness_repair_cause(reason, verdict, kind):
+    """PURE. Which in-place-repair cause (HARNESS_REPAIR_CAUSES) an escalation is, or None.
+    Only regate-class reasons qualify (authoring / stale-base / already-satisfied /
+    PIPELINE BUG are other owners'); the converged-harness NO-GO needs verify-relevance
+    among its blockers; a verdict-(c) review qualifies on a verify-relevance NO-GO."""
+    r = reason or ""
+    if kind != "regate" or "PIPELINE BUG SUSPECTED" in r or "already satisfied" in r.lower():
+        return None
+    if _CONVERGED_NOGO_RE.search(r) and "verify-relevance" in r:
+        return HARNESS_REPAIR_CAUSES[0]
+    if verdict == "c" and ("verify-relevance" in r or "LOW relevance" in r):
+        return HARNESS_REPAIR_CAUSES[1]
+    return None
+
+
+def repair_label(plan, sid, n):
+    return "auto-refine-%s-%s-r%d" % (plan, sid, REPAIR_ROUND_BASE + int(n))
+
+
+_REPAIR_LABEL_RE = re.compile(r"-r10\d$")
+
+
+def _repair_state(led, plan, sid):
+    rp = ((led or {}).get(heal_key(plan, sid)) or {}).get("repairs") or {}
+    return {"n": int(rp.get("n") or 0), "jobs": list(rp.get("jobs") or []),
+            "clean_regates": int(rp.get("clean_regates") or 0)}
+
+
+def _repair_update(plan, sid, fn, ledger_path=None):
+    lp = Path(ledger_path or HEAL_LEDGER)
+    led = _load(lp) or {}
+    rec = led.setdefault(heal_key(plan, sid), {"attempts": 0, "log": []})
+    rp = rec.setdefault("repairs", {"n": 0, "jobs": []})
+    fn(rp)
+    rp["jobs"] = rp.get("jobs", [])[-6:]
+    try:
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = lp.with_suffix(".tmp")
+        tmp.write_text(json.dumps(led, indent=1))
+        tmp.replace(lp)
+    except OSError:
+        pass
+    return rp
+
+
+def _repair_job_row(jid, jobs):
+    return next((j for j in (jobs or []) if j.get("id") == jid), None)
+
+
+def _repair_live_jobs(plan, sid, jobs):
+    """Queue rows that are a LIVE repair/refine round of this slice (any -r10N label)."""
+    base = "%s-%s" % (plan, sid)
+    out = []
+    for j in jobs or []:
+        lab = str(j.get("label") or "")
+        if (lab.startswith("auto-refine-" + base + "-r") and _REPAIR_LABEL_RE.search(lab)
+                and j.get("status") in _REPAIR_LIVE):
+            out.append(j)
+    return out
+
+
+def _repair_model(s, jobs, sidecar=None):
+    """(model, host, num_ctx) of the slice's most recent authoring job -- the local model
+    the harness was authored with -- else the plan defaults."""
+    for jid in reversed(list(s.get("author_job_ids") or [])):
+        row = _repair_job_row(jid, jobs) or (sidecar or _sidecar)(jid) or {}
+        if row.get("model"):
+            return (str(row["model"]), str(row.get("host_pref") or row.get("host") or "studio"),
+                    int(row.get("num_ctx") or 131072))
+    return "qwen3.6-35b-a3b-vl-mtp-mxfp8", "studio", 131072
+
+
+def _auto_mod():
+    """ollama-dispatch-auto loaded as a module (refine wording + refresh_harness_check +
+    write_refine_guard are reused, not re-implemented). None when it cannot load."""
+    try:
+        from importlib.machinery import SourceFileLoader as _SFL
+        import importlib.util as _ilu
+        sl = _SFL("_oda_for_repair", str(AUTO_TOOL))
+        sp = _ilu.spec_from_loader("_oda_for_repair", sl)
+        m = _ilu.module_from_spec(sp)
+        sys.modules["_oda_for_repair"] = m
+        sl.exec_module(m)
+        return m
+    except BaseException:
+        return None
+
+
+def _latest_review(plan, sid, esc_dir=None):
+    try:
+        c = sorted(Path(esc_dir or ESC_DIR).glob("*-%s-%s*.review.md" % (plan, sid)))
+        return c[-1].read_text() if c else ""
+    except OSError:
+        return ""
+
+
+def heal_harness_repair(plan, sid, st, s, cause, review_text="", ctx=None, ledger_path=None,
+                        hooks=None):
+    """Enqueue ONE in-place harness-repair job for a parked slice (see the block comment).
+    Returns 'repair:<job id>' | 'regate' | 'wait:<why>' | None. None = not applicable /
+    budget spent -> the caller falls through to the existing ladder, which is unchanged.
+    `hooks` (tests): jobs, enqueue, survey, launch, auto_mod (False = none), esc_dir."""
+    hooks = hooks or {}
+    ev = _ev()
+    if ev.actions_killed():
+        return None
+    wt = s.get("worktree")
+    if not wt or not Path(wt).is_dir():
+        return None
+    if Path(wt, HAND_LOCK).exists():
+        return None
+    jobs = hooks["jobs"] if "jobs" in hooks else _queue_jobs()
+    led = _load(Path(ledger_path or HEAL_LEDGER)) or {}
+    rp = _repair_state(led, plan, sid)
+    if any(j.get("state") == "open" for j in rp["jobs"]) or _repair_live_jobs(plan, sid, jobs):
+        return "wait:a harness-repair job for %s/%s is already in flight" % (plan, sid)
+    if rp["n"] >= HARNESS_REPAIR_MAX:
+        record(plan, sid, {"action": "harness-repair-capped",
+                           "detail": "%d/%d in-place repair attempts spent -- falling back to the "
+                                     "existing ladder (park + alert)" % (rp["n"], HARNESS_REPAIR_MAX)},
+               ctx, ledger_path=ledger_path)
+        return None
+    hr = _hr()
+    man = _load(Path(wt) / ".dispatch-harness.json") or {}
+    target = man.get("target") or st.get("target") or "the target"
+    reqs = list(s.get("must_contain") or [])
+    sv = (hooks.get("survey") or hr.survey)(wt, reqs)
+    if hr.survey_clean(sv):
+        # the fixture already pins the property (fixed by hand / an earlier round): the
+        # only missing step is the re-gate. Once per slice, then the gate decides.
+        if rp["clean_regates"] >= 1:
+            return None
+        _repair_update(plan, sid, lambda r: r.__setitem__("clean_regates", rp["clean_regates"] + 1),
+                       ledger_path)
+        record(plan, sid, {"action": "harness-repair-regate", "detail":
+                           "[%s] relevance gate already reports no survivors on the kept harness -- "
+                           "re-gating (preflight decides GO)" % cause}, ctx, ledger_path=ledger_path)
+        (hooks.get("launch") or _slicer_detached)(
+            st.get("plan_path"), ["--regate", sid],
+            Path(hooks.get("slice_runs") or SLICE_RUNS) / ("%s.advance.log" % plan))
+        return "regate"
+    if not (sv.get("parsed") and sv.get("relevance_blocked") and sv.get("survivors")):
+        record(plan, sid, {"action": "harness-repair-none", "detail":
+                           "[%s] the relevance gate named no surviving mutants (%s) -- nothing "
+                           "mechanical to feed a repair; existing ladder applies"
+                           % (cause, (sv.get("reason") or "no verify-relevance survivors")[:160])},
+               ctx, ledger_path=ledger_path)
+        return None
+    fixtures = hr.fixture_files(wt, target)
+    if not fixtures:
+        return None
+    am = hooks["auto_mod"] if "auto_mod" in hooks else _auto_mod()
+    hints, line_map, lang = {}, None, st.get("lang") or "python"
+    if am:
+        try:
+            hints = {k: getattr(am, k, "") for k in
+                     ("SURVIVOR_KILL_RULE", "REFINE_WORK_RULE", "MOCK_FIDELITY_HINT")}
+            try:
+                line_map = am.map_survivor_lines(
+                    sv["survivors"], target, (Path(wt) / "refimpl.py").read_text(),
+                    am.patched_target_text(Path(wt), target))
+            except Exception:
+                line_map = None
+            am.refresh_harness_check(Path(wt), lang, reqs)
+            am.write_refine_guard(Path(wt), target, sv["survivors"], lang)
+        except Exception:
+            pass
+    n = rp["n"] + 1
+    label = repair_label(plan, sid, n)
+    prompt = hr.repair_prompt(fixtures[0], target, sv["survivors"], review_text,
+                              sv.get("other_blockers") or [], hints=hints, line_map=line_map)
+    esc = Path(hooks.get("esc_dir") or ESC_DIR)
+    try:
+        esc.mkdir(parents=True, exist_ok=True)
+        tf = esc / ("%s-%s-%s.repair-%d.task.md" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+                                                 plan, sid, n))
+        tf.write_text(prompt)
+    except OSError as e:
+        return "skip:cannot write the repair task: %s" % e
+    import shlex
+    model, host, nctx = _repair_model(s, jobs, hooks.get("sidecar"))
+    verify = "python3 auto-harness-check.py && python3 %s %s %s" % (
+        shlex.quote(str(REPAIR_VERIFY)), shlex.quote(str(wt)),
+        " ".join(shlex.quote("--require=" + r) for r in reqs))
+    bundle = st.get("bundle") or plan
+    argv = ["--model", model, "--host", host, "--cwd", str(wt), "--task-file", str(tf),
+            "--task-kind", "coding", "--verify", verify.strip(), "--max-iters", "24",
+            "--num-ctx", str(nctx), "--label", label, "--bundle", str(bundle)]
+    rc_, head_, _e = _git(wt, "rev-parse", "HEAD")
+    new_id, out = (hooks.get("enqueue") or _queue_enqueue)(argv)
+    if not new_id:
+        dup = re.search(r"duplicate-label\s+([0-9a-f]{8,})", out or "")
+        if dup:
+            return "wait:duplicate-label %s is already live" % dup.group(1)
+        record(plan, sid, {"action": "harness-repair-enqueue-failed", "detail": " ".join((out or "").split())[-200:]},
+               ctx, ledger_path=ledger_path)
+        return "skip:repair enqueue failed"
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _add(r):
+        r["n"] = int(r.get("n") or 0) + 1
+        r.setdefault("jobs", []).append({
+            "id": new_id, "label": label, "n": n, "cause": cause, "at": stamp,
+            "state": "open", "base_head": head_ if rc_ == 0 else None, "fixtures": fixtures,
+            "survivors": len(sv["survivors"])})
+    _repair_update(plan, sid, _add, ledger_path)
+    log_decision(plan, sid, "harness-repair", "enqueued",
+                 "[%s] job %s (%s, %s) fixes %d surviving mutant(s) in place in %s"
+                 % (cause, new_id, label, model, len(sv["survivors"]), wt))
+    record(plan, sid, {"action": "harness-repair", "detail":
+                       "[%s] enqueued in-place repair job %s (%s, model %s, bundle %s) for %d "
+                       "surviving mutant(s) in the KEPT worktree %s; success = VERIFY_OK + relevance "
+                       "gate clean, then --regate (attempt %d/%d)"
+                       % (cause, new_id, label, model, bundle, len(sv["survivors"]), wt, n,
+                          HARNESS_REPAIR_MAX)}, ctx, ledger_path=ledger_path)
+    return "repair:%s" % new_id
+
+
+def _repair_revert(wt, base_head, paths, run=subprocess.run):
+    """Undo out-of-scope edits a repair job made: restore tracked paths from `base_head`,
+    delete files it added. Best-effort; never touches the allowed fixture."""
+    for p in paths:
+        try:
+            r = run(["git", "-C", str(wt), "cat-file", "-e", "%s:%s" % (base_head, p)],
+                    capture_output=True, text=True, timeout=30)
+            if base_head and r.returncode == 0:
+                run(["git", "-C", str(wt), "checkout", base_head, "--", p],
+                    capture_output=True, text=True, timeout=60)
+            else:
+                run(["git", "-C", str(wt), "rm", "-f", "--quiet", "--", p],
+                    capture_output=True, text=True, timeout=60)
+                Path(wt, p).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def harness_repair_sweep(ledger_path=None, slice_runs=None, hooks=None):
+    """Every watcher pass. For each OPEN repair job in the ledger: wait while it is live;
+    when finished, scope-check it and (passed) launch the existing --regate, or (failed)
+    spend the next capped attempt / fall back to the park + alert. Returns
+    [(plan/sid, action)]."""
+    hooks = hooks or {}
+    lp = Path(ledger_path or HEAL_LEDGER)
+    led = _load(lp) or {}
+    jobs = hooks["jobs"] if "jobs" in hooks else _queue_jobs()
+    out = []
+    for key, rec in list(led.items()):
+        if "/" not in key or not isinstance(rec, dict) or not (rec.get("repairs") or {}).get("jobs"):
+            continue
+        plan, sid = key.split("/", 1)
+        for j in [x for x in rec["repairs"]["jobs"] if x.get("state") == "open"]:
+            jid = j.get("id")
+            row = _repair_job_row(jid, jobs)
+            if row and (row.get("status") in _REPAIR_LIVE):
+                out.append((key, "wait:%s is %s" % (jid, row.get("status"))))
+                continue
+            st = _load(Path(slice_runs or SLICE_RUNS) / ("%s.json" % plan)) or {}
+            s = (st.get("slices") or {}).get(sid) or {}
+            wt = s.get("worktree")
+            fin = row or (hooks.get("sidecar") or _sidecar)(jid) or {}
+            status = fin.get("status")
+            if not fin:
+                out.append((key, "wait:%s has no queue record yet" % jid))
+                continue
+            try:
+                passed = status in ("done", "done_unconverged") and int(fin.get("exit_code") or 0) == 0
+            except (TypeError, ValueError):
+                passed = False
+
+            def _close(state, why):
+                def _f(r):
+                    for x in r.get("jobs", []):
+                        if x.get("id") == jid:
+                            x["state"], x["closed_at"], x["why"] = state, time.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()), why[:300]
+                _repair_update(plan, sid, _f, ledger_path)
+            if s.get("status") != "escalated" or not wt or not Path(wt).is_dir():
+                _close("moot", "slice is %r / worktree gone" % s.get("status"))
+                out.append((key, "moot"))
+                continue
+            try:
+                (Path(wt) / ".refine-guard.json").unlink(missing_ok=True)
+            except OSError:
+                pass
+            viol = []
+            if passed:
+                viol = _hr().scope_violations(wt, j.get("base_head"), j.get("fixtures") or [])
+                if viol:
+                    _repair_revert(wt, j.get("base_head"), viol)
+                    passed = False
+            if str(status) == "needs_opus":
+                try:
+                    (hooks.get("resolve") or _queue_resolve)(jid)
+                except Exception:
+                    pass
+            if passed:
+                _close("passed", "verify green + relevance gate clean; --regate launched")
+                record(plan, sid, {"action": "harness-repair-regate", "detail":
+                                   "repair job %s passed (VERIFY_OK + relevance gate clean); "
+                                   "re-gating the kept worktree with --regate" % jid},
+                       None, ledger_path=ledger_path)
+                (hooks.get("launch") or _slicer_detached)(
+                    st.get("plan_path"), ["--regate", sid],
+                    Path(slice_runs or SLICE_RUNS) / ("%s.advance.log" % plan))
+                out.append((key, "regate"))
+                continue
+            why = ("repair job %s ended %s (exit %s)" % (jid, status, fin.get("exit_code"))
+                   + ("; reverted out-of-scope edits to %s" % viol if viol else ""))
+            _close("failed", why)
+            record(plan, sid, {"action": "harness-repair-failed", "detail": why}, None,
+                   ledger_path=ledger_path)
+            nxt = None
+            reason = s.get("escalation_reason") or ""
+            cause = harness_repair_cause(reason, "c", classify(reason)) or j.get("cause")
+            if cause:
+                nxt = heal_harness_repair(plan, sid, st, s, cause,
+                                          _latest_review(plan, sid, hooks.get("esc_dir")),
+                                          None, ledger_path, hooks)
+            if nxt is None:
+                final_rung(plan, sid, "in-place harness repair spent (%d/%d attempts) and the relevance "
+                           "gate still blocks: %s" % (_repair_state(_load(lp) or {}, plan, sid)["n"],
+                                                       HARNESS_REPAIR_MAX, reason[:200]),
+                           None, ledger_path, hooks.get("notifier"))
+                out.append((key, "park:final-rung"))
+            else:
+                out.append((key, nxt))
+    return out
+
+
+# ----------------------------------------------------------------------------
 # JOB-LEVEL heal for a NON-SLICE authoring job (2026-10-05, rt-bg-commitments-fix)
 # ----------------------------------------------------------------------------
 # THE GAP. A plain `ollama-dispatch-auto` run (no slicer) that cannot converge its
@@ -868,7 +1271,7 @@ def heal(plan, sid, ctx=None, review_text=None, slice_runs=None, ledger_path=Non
 # queue's needs_opus lane. The watcher detects it (source D), a local review runs and
 # gives a verdict -- and then self-heal answered "skip:job is not a slice of any plan",
 # because every lever above is a SLICER lever (--retry-slice / --regate). Nothing
-# acted, the driver had already exited, and the bundle parked "needs Penn"
+# acted, the driver had already exited, and the bundle parked "needs the owner"
 # (95234578bc40, verdict b: a fixture/harness defect). A human then enqueued exactly
 # the obvious remedy -- one more continuation authoring round on the SAME worktree
 # with --continues -- and it converged (3f75be3df79a, VERIFY_OK).
@@ -1718,7 +2121,7 @@ def _park_final(job, key, why, notifier, decisions, ledger_path, now, job_cap=Fa
         if notifier is None:
             import importlib.util as _ilu
             _s = _ilu.spec_from_file_location(
-                "notify_penn", Path(__file__).resolve().parent / "notify-penn.py")
+                "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
             _m = _ilu.module_from_spec(_s)
             _s.loader.exec_module(_m)
             notifier = _m.notify
@@ -1902,7 +2305,7 @@ def resume_auto_driver(job, cid, ledger_path=None, runs_dir=None, launch=None, n
             if notifier is None:
                 import importlib.util as _ilu
                 _s = _ilu.spec_from_file_location(
-                    "notify_penn", Path(__file__).resolve().parent / "notify-penn.py")
+                    "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
                 _m = _ilu.module_from_spec(_s)
                 _s.loader.exec_module(_m)
                 notifier = _m.notify
@@ -2149,7 +2552,7 @@ def _row_epoch(r):
 def passed_lineage_actions(jobs, runs, sidecars=None):
     """PURE. [('resolve', id, why)] for failed/needs_opus/blocked queue rows (and the
     job-form esc-review rows about them) whose lineage PROVABLY passed later, so a
-    superseded retry attempt no longer sits in Needs attention (Penn 2026-10-09,
+    superseded retry attempt no longer sits in Needs attention (the owner 2026-10-09,
     rt-bg-commitments-guard: 5 failed rows of a chain whose later round exited 0).
     Two proofs, nothing weaker:
       (1) an ended auto-run `exit 0` for chain L (same bundle) finished AFTER the row, and
@@ -2277,7 +2680,7 @@ def hygiene_sweep(jobs=None, ledger_path=None, sidecars=None, act=None, notifier
             if notifier is None:
                 import importlib.util as _ilu
                 _s = _ilu.spec_from_file_location(
-                    "notify_penn", Path(__file__).resolve().parent / "notify-penn.py")
+                    "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
                 _m = _ilu.module_from_spec(_s)
                 _s.loader.exec_module(_m)
                 notifier = _m.notify
@@ -2530,8 +2933,11 @@ def self_test():
         ctx.write_text("# ctx\n")
         calls, alerts = [], []
         launch = lambda pp, args, lp: calls.append(args)
-        # never alert Penn / write the live decisions log from a self-test
+        # never alert the owner / write the live decisions log from a self-test
         heal._notifier = lambda t, m, **k: alerts.append((m, k.get("dedupe_key")))
+        # the in-place repair rung would run the REAL relevance gate on this toy tree
+        heal._repair_hooks = {"jobs": [], "survey": lambda w, r: {
+            "parsed": False, "survivors": [], "reason": "self-test: no relevance gate"}}
         global DECISIONS, ESC_DIR
         _saved = (DECISIONS, ESC_DIR)
         DECISIONS, ESC_DIR = td / "decisions.jsonl", td / "esc"
@@ -2607,7 +3013,7 @@ def self_test():
         # a HUMAN cancel is terminal: no lever is pulled for a cancelled plan
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import plan_cancel
-        plan_cancel.mark_cancelled("p", "Penn cancelled", runs_dir=runs)
+        plan_cancel.mark_cancelled("p", "the owner cancelled", runs_dir=runs)
         base["slices"]["s2"]["status"] = "escalated"
         (runs / "p.json").write_text(json.dumps(base))
         calls.clear()
@@ -2671,7 +3077,7 @@ def main():
             try:
                 import importlib.util as _ilu
                 _s = _ilu.spec_from_file_location(
-                    "notify_penn", Path(__file__).resolve().parent / "notify-penn.py")
+                    "notify_owner", Path(__file__).resolve().parent / "notify-owner.py")
                 _m = _ilu.module_from_spec(_s)
                 _s.loader.exec_module(_m)
                 _m.notify("stale dispatch drivers", "; ".join(
@@ -2688,6 +3094,11 @@ def main():
     if a.job_sweep:
         for jid, act in job_heal_sweep():
             print("# job-heal sweep %s: %s" % (jid, act))
+        try:
+            for key, act in harness_repair_sweep():
+                print("# harness-repair sweep %s: %s" % (key, act))
+        except Exception as e:      # advisory: never break the watcher pass
+            print("# harness-repair sweep error: %s: %s" % (type(e).__name__, e))
         return 0
     if a.job_label and not (a.plan_label and a.slice):
         a.plan_label, a.slice = plan_slice_for_label(a.job_label)

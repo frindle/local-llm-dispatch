@@ -117,7 +117,7 @@ def main():
     code = st_.mint_enroll(3600)
     c, b = call(p, "POST", "/api/cpu/enroll", {"code": code, "runner_id": "u1"}, token=None)
     check("enroll: a live code returns the token + runner config (no bearer needed)",
-          (c, b.get("token"), b.get("config", {}).get("concurrency")), (200, "TOKEN", 2))
+          (c, b.get("token"), b.get("config", {}).get("concurrency")), (200, "TOKEN", 5))
     check("enroll: the same code a second time is refused (single use)",
           call(p, "POST", "/api/cpu/enroll", {"code": code, "runner_id": "u1"}, token=None)[0], 403)
     check("enroll: an unknown code is refused", call(p, "POST", "/api/cpu/enroll", {"code": "x" * 12}, token=None)[0], 403)
@@ -194,6 +194,10 @@ def main():
     c, claim2 = call(p, "POST", "/api/cpu/claim", {"runner_id": "r2", "lease_s": 30})
     check("claim: a second runner gets the NEXT job (atomic, no double claim)", claim2["job"]["id"], j2)
     check("claim: queue empty -> 204", call(p, "POST", "/api/cpu/claim", {"runner_id": "r1"})[0], 204)
+    call(p, "POST", "/api/cpu/claim", {"runner_id": "r1", "caps": {"node": 26, "python": "3.14"}})
+    rs = {x["runner"]: x for x in call(p, "GET", "/api/cpu/runners")[1]["runners"]}
+    check("claim caps: a runner's reported capabilities are served by /api/cpu/runners (r2 reported none)",
+          (rs["r1"].get("caps"), "caps" in rs["r2"]), ({"node": 26, "python": "3.14"}, False))
     st = call(p, "GET", f"/api/cpu/jobs/{j1}")[1]
     check("status: running with runner id", (st["status"], st["runner_id"], st["attempt"]), ("running", "r1", 1))
     check("heartbeat: ok + cancel false",

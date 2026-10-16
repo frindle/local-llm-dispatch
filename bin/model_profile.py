@@ -124,6 +124,14 @@ def get_profile(model, role="author", lane=None, data=None):
         entry, key = data["fallback"], "<fallback>"
     modes = entry.get("modes") or {}
     vals = dict(modes.get(mode) or modes.get("thinking_coding") or {})
+    # DISPATCH_SAMPLING=legacy (2026-10-10): A/B control arm + rollback. Replaces the card-derived
+    # sampling/budget/thinking values with the YAML `fallback` (pre-2026-10-08 hardcoded worker
+    # defaults: temp 0.15, rep 1.1, max_tokens 8192, ctx 16384, no top_p/top_k, no thinking control).
+    # Unset/anything else = card profile (the shipped default).
+    if os.environ.get("DISPATCH_SAMPLING", "").strip().lower() == "legacy":
+        vals = dict((data["fallback"].get("modes") or {}).get(mode) or
+                    (data["fallback"].get("modes") or {}).get("thinking_coding") or {})
+        _warn(("legacy", str(key)), f"DISPATCH_SAMPLING=legacy: using LEGACY sampling for {key}:{mode}")
     out = {k: vals.get(k) for k in MODE_KEYS}
     out["stop"] = list(vals.get("stop") or [])
     # Per-role thinking policy (2026-10-09): a mode may carry `thinking: off|low|on` (or a bool).

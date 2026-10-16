@@ -1,5 +1,6 @@
 # MANIFEST: <repo-dest-dir>|<live source path>   (one per line; files or whole dirs; '~' = $HOME)
 # Consumed by SYNC.sh (one-way, live -> repo). Edit this file to add/remove tracked pieces.
+# NOTE: dashboard/ is now maintained in-repo (merged from frindle/ollama-queue-dashboard); it is no longer synced from a separate checkout.
 bin|~/bin/ollama-queue.py
 bin|~/bin/ollama-worker.py
 bin|~/bin/ollama-dispatch
@@ -333,21 +334,6 @@ hooks|~/.claude/hooks/session-start-live-validation.sh
 hooks|~/.claude/hooks/vault-agent-dispatch-reminder.sh
 docs|~/.ollama-dispatch/proposals/bundle-triage-2026-10-06.md
 docs|~/.ollama-dispatch/proposals/unattended-signoff-by-exception.md
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/src
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/tests
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/docs
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/chat
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/config
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/docker
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/assets
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/LaunchAgents
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/README.md
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/Dockerfile
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/docker-compose.yml
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/requirements.txt
-dashboard|~/Desktop/GitHub Projects/ollama-queue-dashboard/.gitignore
-dashboard/bin|~/Desktop/GitHub Projects/ollama-queue-dashboard/bin/backend-dispatch.py
-dashboard/bin|~/Desktop/GitHub Projects/ollama-queue-dashboard/bin/servers_config.py
 harness/ollama-dispatch-pkg|~/Desktop/GitHub Projects/ollama-dispatch
 harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-bonsai-ternary-macstudio.sh
 harness/bakeoff|~/Desktop/GitHub Projects/bakeoff/bakeoff-bonsai-ternary-unraid.sh

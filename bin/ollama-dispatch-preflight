@@ -779,6 +779,24 @@ class Preflight:
             return 124, f"TIMEOUT after {timeout}s\n" + (r.stdout or "") + (r.stderr or "")
         return r.exit_code, (r.stdout or "") + (r.stderr or "")
 
+    def local_visible(self, stage, fn, timeout=VERIFY_TIMEOUT_S):
+        """Run fn() locally BY DESIGN (the trivial-solution battery rewrites the target in this
+        worktree; the determinism re-runs belong with it) but register a display-only 'running
+        locally' record + a START line with the reason, so the stage shows in /api/cpu-lane and the
+        dashboard like any other CPU stage instead of being invisible. Never changes the result."""
+        cs = self._lane()
+        end = lambda: None                                           # noqa: E731
+        if cs is not None:
+            try:
+                end = cs.local_run_begin(stage, self._bundle(), "ineligible: runs locally by design "
+                                         "(audit rewrites the target in this worktree)", timeout)
+            except Exception:
+                pass
+        try:
+            return fn()
+        finally:
+            end()
+
     def measure_relevance_lane(self, mod, diff_text, kw, signoff):
         """mod.measure_applied(self.wt, verify, diff_text, **kw) on the CPU runner when possible
         (cpu_vr_measure.py does the same call there and prints the record as JSON), else locally
@@ -3318,7 +3336,7 @@ class Preflight:
                     and self.baseline_rc not in (None, 124):
                 runs = [(self.baseline_rc, self.baseline_out)]
                 for _ in range(2):
-                    runs.append(self.sh(self.a.verify))
+                    runs.append(self.sh_lane(self.a.verify, "audit-determinism"))
                 warn("determinism", gm.determinism_findings(runs),
                      "the verify must give the same verdict on the same tree: remove the flake source")
                 if tgt and lits:
@@ -3331,7 +3349,8 @@ class Preflight:
                         self._journal_open()
                         try:
                             warn("trivial-solution", gm.run_trivial_battery(
-                                self.wt, tgt, variants, lambda: self.sh(self.a.verify)),
+                                self.wt, tgt, variants,
+                                lambda: self.sh_lane(self.a.verify, "audit-trivial")),
                                 "the verify must be RED for a literals-only / no-op / return-None target")
                         finally:
                             self._journal_close()

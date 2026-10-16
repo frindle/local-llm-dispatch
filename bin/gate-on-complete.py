@@ -351,6 +351,26 @@ def _load_scaffold_basenames() -> set:
 
 _SCAFFOLD_BASENAMES = _load_scaffold_basenames()
 
+# Files the PIPELINE itself drops into a harness-authoring worktree (the vetted, read-only
+# environment fixtures the scaffold installs and auto-harness-check restores byte-for-byte).
+# They are not in ollama-queue.py::_SCAFFOLD_BASENAMES, so on an auto-author job (no pinned
+# digests yet) the 963-line dispatch-env.ts rode into the diff as a "new file" and the
+# reviewer cited it against the real target (b90e77ace2b2: "lib/costcoReceiptMatch.ts:976"
+# is dispatch-env.ts:949). Unioned here so the gate does not depend on the queue module
+# (which the live daemon only re-reads on restart) carrying them.
+PIPELINE_HARNESS_BASENAMES = frozenset({"dispatch-env.ts", "dispatch_env.py"})
+_SCAFFOLD_BASENAMES = set(_SCAFFOLD_BASENAMES) | PIPELINE_HARNESS_BASENAMES
+
+
+def _manifest_authored(cwd) -> set:
+    """Paths the scaffold's .dispatch-harness.json declares as authored harness output
+    (the same exemption the queue's launch-baseline count grants). Empty on any error."""
+    try:
+        d = json.loads((Path(cwd) / ".dispatch-harness.json").read_text()) or {}
+        return {h for h in (d.get("authored") or []) if isinstance(h, str) and h}
+    except Exception:
+        return set()
+
 # --- MODEL-FALLBACK LADDER (Tier 1; the owner 2026-09-17) --------------------------
 # When a job's OWN model has exhausted its self-fix budget on a CAPABILITY failure
 # (the classifier said `requeue` but the round cap or the anti-thrash guard blocked
@@ -714,6 +734,34 @@ def _file_in_diff(finding_file, diff_files):
         return True
     base = ff.rsplit("/", 1)[-1]
     return any(df == ff or df.rsplit("/", 1)[-1] == base for df in diff_files)
+
+
+def finding_line_out_of_range(cwd, finding, diff_files=()) -> bool:
+    """PURE-ish (reads one file). True when a reviewer finding cites a line number BEYOND
+    the end of the file it cites -- a position that does not exist, so the claim cannot be
+    about that file (b90e77ace2b2: `lib/costcoReceiptMatch.ts:976` on a 21-line file; the
+    quoted text was dispatch-env.ts:949, a different file the reviewer was shown). The cited
+    file is the worktree copy (exact path, else the diff file with the same basename).
+    Abstains (False) on no line, no file, unreadable/missing/binary file, no worktree."""
+    try:
+        ln = int(finding.get("line") or 0)
+        ff = str(finding.get("file") or "").strip()
+        if ln <= 0 or not ff or not cwd:
+            return False
+        root = Path(str(cwd)).expanduser()
+        cand = [root / ff]
+        base = ff.rsplit("/", 1)[-1]
+        cand += [root / df for df in (diff_files or ()) if df.rsplit("/", 1)[-1] == base]
+        for c in cand:
+            if c.is_file():
+                data = c.read_bytes()
+                if b"\x00" in data[:8192]:
+                    return False
+                n = data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+                return ln > n
+    except Exception:
+        pass
+    return False
 
 
 _SO_MOD = None
@@ -1207,6 +1255,23 @@ def merge_review(a, out_dir: Path, prefix: str = "gate-",
                 print(f"[gate] {parent} pre-gate: dropped {len(_dropped)} code finding(s) "
                       f"citing file(s) not in the diff (uncorroborated -- not about this change)")
                 issues = _kept
+        # GROUND THE LINE: a finding citing line N of a file with fewer than N lines is
+        # fabricated (or mis-attributed to another file); drop it at the pre-gate tier.
+        _gcwd = payload.get("job_cwd") or ""
+        _kept, _dropped = [], []
+        for _i in issues:
+            if (_i.get("source") == "review" and _i.get("category") == "code"
+                    and finding_line_out_of_range(_gcwd, _i, _diff_files or ())):
+                _dropped.append(_i)
+            else:
+                _kept.append(_i)
+        if _dropped:
+            payload["pregate_dropped_ungrounded_line"] = [
+                {"file": d.get("file"), "line": d.get("line"), "what": d.get("what")}
+                for d in _dropped]
+            print(f"[gate] {parent} pre-gate: dropped {len(_dropped)} code finding(s) "
+                  f"citing a line beyond the end of the cited file (ungrounded)")
+            issues = _kept
     # INHERITED OBLIGATIONS (slice_obligations): concerns an earlier slice's gate
     # deferred onto THIS slice. A reviewer NOT-RESTORED answer is a code HIGH here.
     try:
@@ -2174,6 +2239,83 @@ def job_is_ungateable(rec) -> bool:
     return False
 
 
+def harness_residue_paths(cwd) -> list:
+    """TRACKED product files currently modified that are EXACTLY what the tree's own
+    `refimpl.py` produces from their HEAD text -- i.e. the pipeline's harness-check output
+    (refimpl applied by hand by the authoring model, or left by a killed self-check), not
+    anyone's work. [] unless EVERY currently-modified tracked non-harness file is explained
+    (one unexplained path means real work is mixed in: explain nothing). refimpl runs in a
+    scratch dir holding only the HEAD copies of those files, so it can neither touch the
+    worktree nor succeed on a path it was not given. Fail-closed ([]) on any error."""
+    import tempfile
+    cwd = Path(cwd)
+    try:
+        ref = cwd / "refimpl.py"
+        if not ref.is_file():
+            return []
+        d = subprocess.run(["git", "-C", str(cwd), "diff", "--name-only", "HEAD"],
+                           capture_output=True, text=True, timeout=60)
+        if d.returncode != 0:
+            return []
+        keep = {"task.md", "auto-task.md", "verify.sh", "refimpl.py", "check_literals.py",
+                "auto-harness-check.py", ".dispatch-harness.json", "dispatch-env.ts",
+                "dispatch_env.py", ".preflight-state.json", "test_fixture.py"}
+        files = [f.strip() for f in d.stdout.splitlines()
+                 if f.strip() and Path(f.strip()).name.lower() not in keep
+                 and not _VERIFY_TEST_RE.match(Path(f.strip()).name)
+                 and not _VERIFY_FILE_RE.match(Path(f.strip()).name)]
+        if not files:
+            return []
+        with tempfile.TemporaryDirectory(prefix="gate-residue-") as td:
+            tdp = Path(td)
+            for f in files:
+                g = subprocess.run(["git", "-C", str(cwd), "show", f"HEAD:{f}"],
+                                   capture_output=True, timeout=60)
+                if g.returncode != 0:
+                    return []
+                (tdp / f).parent.mkdir(parents=True, exist_ok=True)
+                (tdp / f).write_bytes(g.stdout)
+            r = subprocess.run([sys.executable, str(ref), str(tdp)], cwd=str(tdp),
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                return []
+            for f in files:
+                if (tdp / f).read_bytes() != (cwd / f).read_bytes():
+                    return []
+        return files
+    except Exception:
+        return []
+
+
+def effective_launch_baseline(lb: dict | None, cwd, job_label: str, override: int = -1):
+    """The launch baseline the gate should JUDGE. A HARNESS-AUTHORING job (auto-author-*)
+    that launched `dirty` only because the previous stage left the reference solution
+    applied to the tracked target is not "unattributable": the dirt is the pipeline's own
+    harness-check output and the job's deliverable is the harness STATE, not a product
+    diff (b90e77ace2b2 / rt-costco-receipt-attach-s2: stage-2's model ran `python3
+    refimpl.py` by hand, stage 3 launched dirty=1, the gate called it UNTRUSTED and
+    escalated an authoritative regate that froze other bundles). Only when the tree STILL
+    shows that residue (harness_residue_paths) and it accounts for the whole count; the
+    original is kept under dirty_raw. Everything else -- coding jobs, real dirt, an
+    explicit --launch-dirty override -- is returned untouched."""
+    try:
+        if override >= 0 or not isinstance(lb, dict) or not _is_authoring_label(job_label):
+            return lb
+        raw = lb.get("dirty")
+        if not isinstance(raw, int) or raw <= 0:
+            return lb
+        res = harness_residue_paths(cwd)
+        if res and raw <= len(res):
+            out = dict(lb)
+            out["dirty"] = 0
+            out["dirty_raw"] = raw
+            out["dirty_explained_by"] = "harness-check residue: " + ", ".join(res[:4])
+            return out
+    except Exception:
+        pass
+    return lb
+
+
 def apply_baseline(payload: dict, lb: dict | None, override: int,
                    measured_at: str | None = None) -> None:
     """Flag a dispatch that STARTED from a dirty tree. Decidable, no model.
@@ -2319,6 +2461,7 @@ def get_diff(cwd: Path, out: Path, scaffold: dict | None = None,
     # Built with `git diff --no-index`, which is READ-ONLY. The obvious
     # alternative, `git add -N`, mutates the index of a tree we do not own.
     extra, added = [], 0
+    _authored = _manifest_authored(cwd)
     try:
         u = subprocess.run(["git", "-C", str(cwd), "ls-files", "--others",
                             "--exclude-standard"],
@@ -2353,6 +2496,7 @@ def get_diff(cwd: Path, out: Path, scaffold: dict | None = None,
             # truth shared with the apply step; union it with the legacy extras below.
             _scaffold_lc = {n.lower() for n in _SCAFFOLD_BASENAMES}
             if (_name in _scaffold_lc
+                    or rel in _authored
                     or _name in {"task.md", "task.json", "verify.sh", "verify_impl.mjs",
                           "verify_impl.js", "task.txt", "run.json", "refimpl.py",
                           ".preflight-state.json"}
@@ -2401,6 +2545,16 @@ def get_diff(cwd: Path, out: Path, scaffold: dict | None = None,
         return None, "no changes to review (git diff is empty)"
     out.write_text(text)
     return out, ("git diff HEAD" + (f" + {added} untracked file(s)" if added else ""))
+
+
+def get_diff_locked(cwd, out, scaffold=None, excluded=None, base: str = ""):
+    """get_diff() taken under the worktree's tree lock (see the TREE RACE note at the
+    call site). A lock held past TREE_LOCK_WAIT_S is not fatal: read the diff anyway."""
+    _dlk = _tree_lock_acquire(cwd, timeout=TREE_LOCK_WAIT_S)
+    try:
+        return get_diff(cwd, out, scaffold, excluded, base=base)
+    finally:
+        _tree_lock_release(_dlk)
 
 
 RELEVANCE_MAX_MUTANTS = int(os.environ.get("GATE_RELEVANCE_MAX_MUTANTS") or 40)
@@ -5931,8 +6085,13 @@ def main() -> int:
 
     scaffold_excluded: list = []
     _chain_base = autofix_chain_base(a.job_id, cwd)
-    diff_path, how = get_diff(cwd, out_dir / f"{a.job_id}.diff",
-                              scaffold_digests(cwd), scaffold_excluded, base=_chain_base)
+    # TREE RACE (b90e77ace2b2): the driver's authoring self-check APPLIES refimpl.py to the
+    # tracked target and reverts it a few seconds later, under the worktree's tree lock.
+    # `git diff HEAD` taken in that window put +15 lines of the reference solution into the
+    # job's diff (a job that never touched the target). Read the diff under the same lock.
+    # A lock held past the window is not fatal here: proceed, as before.
+    diff_path, how = get_diff_locked(cwd, out_dir / f"{a.job_id}.diff",
+                                     scaffold_digests(cwd), scaffold_excluded, base=_chain_base)
     if _chain_base and diff_path is not None:
         how = f"{how} [auto-fix chain: cumulative vs root baseline {_chain_base[:12]}]"
     if diff_path is None:
@@ -5996,8 +6155,9 @@ def main() -> int:
         payload.setdefault("not_checked", []).append(
             "verify-exit (the queue record carries no terminal exit_code for this "
             "job, so whether its own verify passed is unknown)")
-    apply_baseline(payload, launch_baseline(a.job_id), a.launch_dirty,
-                   baseline_at(a.job_id))
+    _lb_eff = effective_launch_baseline(launch_baseline(a.job_id), cwd, a.job_label,
+                                        a.launch_dirty)
+    apply_baseline(payload, _lb_eff, a.launch_dirty, baseline_at(a.job_id))
 
     # --- verify RELEVANCE on the model's ACTUAL diff ---------------------------
     # The preflight measured relevance against the REFERENCE impl and wrote it to
@@ -6233,7 +6393,7 @@ def _self_test() -> bool:
         _gsrc = Path(__file__).read_text().split("def _self_test", 1)[0]
         check("scoping control: the self-test half is excluded",
               "def _self_test" not in _gsrc, True)
-        _needle = "a.launch_dirty,\n                   " + "baseline_at(a.job_id))"
+        _needle = "a.launch_dirty, " + "baseline_at(a.job_id))"
         check("the gate actually PASSES the provenance into apply_baseline",
               _needle in _gsrc, True)
 

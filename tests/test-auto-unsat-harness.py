@@ -92,6 +92,21 @@ wt = build(GOOD_RI, V1)
 run(wt); rc, out3 = run(wt)
 chk("one repeating case keeps SUSPECT THE FIXTURE", "SUSPECT THE FIXTURE" in out3 and "COMMON CAUSE" not in out3, out3[-700:])
 
+# --- Python-fixture runner format (2026-10-10, aw-codec-floor s3) -------------------------
+# The scaffold's test_fixture.py prints `  FAIL <desc> -- raised ...` + `  K/N case(s) passed`.
+# That shape used to emit NO FAILING CASES block, so PLAN SUSPECT / the queue's all-unsat
+# class could never fire for a python harness whose stubs fail every case.
+PYV = ('if grep -q GOOD target.txt 2>/dev/null; then echo VERIFY_OK; exit 0; fi\n'
+       + "".join("echo '  FAIL desc number %d -- raised AssertionError: Expected 1 got 0'\n" % i for i in range(1, 7))
+       + "echo '  0/6 case(s) passed'\nexit 1\n")
+wt = build(GOOD_RI, PYV)
+rc, out = run(wt)
+chk("python-fixture format: FAILING CASES block emitted (6 of 6)", "(6 of 6 failed with refimpl.py applied)" in out, out[-900:])
+chk("python-fixture format: every case named", all("FAILED CASE: desc number %d" % i in out for i in range(1, 7)), out[-900:])
+_uc, _ut = oda.unsat_cases(out)
+chk("python-fixture format: unsat_cases parses it and plan_suspect fires on a repeat",
+    len(_uc) == 6 and _ut == 6 and oda.plan_suspect(_uc, _uc, _ut) is True, (_uc, _ut))
+
 # --- shape conflict hints ----------------------------------------------------------------
 wt = build("open('target.txt','w').write('MARK\\nconst q = req.nextUrl.searchParams\\n')\n", VERIFY_5OF6,
            task_extra="The PUT body is JSON.\n", fx_text="const r = new Request('http://x', {method:'PUT', body: new FormData()});\n")

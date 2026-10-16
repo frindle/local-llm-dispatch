@@ -58,4 +58,20 @@ check("drift counted", stats.get("identifier_drift_rejected"), 1)
 check("real-identifier finding kept", any(c.startswith("`OrderEgiftLink.orderId`") for c in claims), True)
 check("spec-named identifier finding kept", any("OrderEgiftLinks" in c for c in claims), True)
 check("identifier from full source kept", any("OrderEgiftLog" in c for c in claims), True)
+# ANCHOR regression (2026-10-10): a finding's path:line is computed from the PROMPT rendering
+# ("FILE:", "HUNK:", ```diff wrapper lines). Those are not file lines; counting them put
+# lib/fmt.ts:5 on a 3-line file and the gate then dropped the real finding as ungrounded.
+_d = ("diff --git a/lib/fmt.ts b/lib/fmt.ts\n--- a/lib/fmt.ts\n+++ b/lib/fmt.ts\n@@ -1,2 +1,3 @@\n"
+      "-// stub\n-export {};\n+export function formatRange(lo: number, hi: number): string {\n"
+      "+  return `[${lo}, ${hi}]`;\n+}\n")
+_h = cra.parse_diff(_d)
+class M2:
+    def chat_json(self, *a, **k):
+        return {"findings": [{"quote": "return `[${lo}, ${hi}]`;", "severity": "medium",
+                              "claim": "formatRange may mis-handle NaN", "failure_scenario": SCEN}]}
+_c = cra.diff_corpus("\n".join(h.header + "\n" + h.text() for h in _h))
+_o = cra.stage_review(M2(), _h, "add formatRange", "", _c,
+                      {"quote_rejected": 0, "no_failure_scenario": 0, "review_parse_fail": 0})
+check("review finding anchors to the real file line (2), not prompt-wrapper-shifted",
+      cra._anchor(_o[0]) if _o else None, "lib/fmt.ts:2")
 print("ALL PASS" if ok else "SOME FAILED"); sys.exit(0 if ok else 1)

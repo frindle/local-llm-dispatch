@@ -94,6 +94,74 @@ def _save(p: Path, obj):
     os.replace(tmp, p)
 
 
+ACTED_LASTGOOD = ACTED.with_name(ACTED.name + ".lastgood")
+ACTED_RESTORE_LOG = ACTED.with_name("acted.restore.log")
+
+
+def _load_acted_strict():
+    """acted.json as a dict. A MISSING file is a fresh folder ({}); an UNREADABLE or
+    CORRUPT one is an error, never "empty". ROOT CAUSE class (2026-10-09, handoff-
+    autoclear cleared the same 217 ids five times over 16h; acted.json held nothing
+    older than the last clear): `_load` swallows every exception into `{}`, and
+    `_locked_acted` then saved `{}`+one new entry over the real file -- one transient
+    read failure silently erased every acted mark. Fall back to the last-good copy,
+    else refuse (raise) so nothing is written over a file we could not read."""
+    try:
+        txt = ACTED.read_text()
+    except FileNotFoundError:
+        return {}
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, dict):
+            return obj
+        raise ValueError("acted.json is not a JSON object")
+    except ValueError as exc:
+        err = exc
+    except Exception as exc:  # pragma: no cover
+        err = exc
+    lg = _load(ACTED_LASTGOOD, None)
+    if isinstance(lg, dict) and lg:
+        _log_restore("acted.json unreadable (%s); using last-good" % err, list(lg))
+        return dict(lg)
+    raise RuntimeError("acted.json unreadable and no last-good copy: %s" % err)
+
+
+def _log_restore(why, ids):
+    try:
+        with open(ACTED_RESTORE_LOG, "a") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "why": why, "n": len(ids), "ids": ids[:20],
+                                "pid": os.getpid(), "ppid": os.getppid(),
+                                "argv": sys.argv[:6]}) + "\n")
+    except OSError:
+        pass
+
+
+def _restore_missing(acted, log=True):
+    """Merge back every acted mark the last-good copy has that `acted` lost. The ONLY
+    legitimate removal is `--unact`, and that path rewrites last-good in the same
+    locked cycle, so a key present in last-good but absent from the live file was
+    erased by something else (truncation, a stale writer, a failed read). Marks are
+    permanent by contract (see module docstring), so put them back. Opt out with
+    HANDOFF_ACTED_NO_RESTORE=1. Returns the ids restored."""
+    if os.environ.get("HANDOFF_ACTED_NO_RESTORE") == "1":
+        return []
+    lg = _load(ACTED_LASTGOOD, None)
+    if not isinstance(lg, dict):
+        return []
+    lost = [k for k in lg if k not in acted]
+    for k in lost:
+        acted[k] = lg[k]
+    if lost and log:
+        _log_restore("acted.json lost %d mark(s) that last-good holds; restored" % len(lost), lost)
+    return lost
+
+
+def _save_acted(acted):
+    _save(ACTED, acted)
+    _save(ACTED_LASTGOOD, acted)
+
+
 @contextlib.contextmanager
 def _locked_acted():
     """One locked read-modify-write cycle on acted.json (mirrors ollama-queue.py's
@@ -107,15 +175,18 @@ def _locked_acted():
     other's addition with a stale copy that never saw it. Yields the loaded dict;
     the caller mutates it in place and the lock releases (and the file saves) on
     context exit -- every scattered `acted = _load(ACTED, {})` / `_save(ACTED,
-    acted)` pair in main() goes through this instead."""
+    acted)` pair in main() goes through this instead.
+    2026-10-09: the load is strict (unreadable != empty) and heals marks erased by
+    an outside writer from the last-good copy (see _restore_missing)."""
     lock_path = ACTED.with_suffix(ACTED.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "a+") as lf:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         try:
-            acted = _load(ACTED, {})
+            acted = _load_acted_strict()
+            _restore_missing(acted)
             yield acted
-            _save(ACTED, acted)
+            _save_acted(acted)
         finally:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
@@ -664,10 +735,11 @@ def rebuild(only_id=None):
     with open(lock_path, "a+") as lf:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         try:
-            acted = _load(ACTED, {})
+            acted = _load_acted_strict()
+            _healed = _restore_missing(acted)
             acted, newly = reconcile_removals(jobs, acted)
-            if newly:
-                _save(ACTED, acted)
+            if newly or _healed:
+                _save_acted(acted)
         finally:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
     if newly:
@@ -863,7 +935,14 @@ def main():
         a.unact = [jid for tok in a.unact for jid in tok.split(",") if jid]
 
     if a.json:
+        # Read path: never raises on a bad file (the dashboard polls it) and never
+        # writes, but DOES overlay last-good so a lost mark cannot resurface a row.
         acted = _load(ACTED, {})
+        if not isinstance(acted, dict):
+            acted = {}
+        _restore_missing_view = dict(acted)
+        _restore_missing(_restore_missing_view, log=False)
+        acted = _restore_missing_view
         pending, complete = collect(acted)
         # Same exclusion the INDEX applies, on the dashboard's read path. The
         # dashboard iterates data.complete / data.pending straight into its tables,

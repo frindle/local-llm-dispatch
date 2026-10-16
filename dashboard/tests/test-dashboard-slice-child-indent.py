@@ -52,6 +52,9 @@ const escapeHtml=x=>String(x); const stageLabel=(k,l)=>String(k||l||'');
 const formatElapsed=s=>String(s); const sliceSuffix=()=>''; const saveExpandState=()=>{};
 const refresh=()=>{}; const openLivelog=()=>{}; const buildQueueRow=()=>new El('tr');
 const sliceOpenByDefault=()=>true;
+const bundleVerdicts={rows:{},bundles:{},unattached:[]}; const verdictRowsForSlice=()=>[]; const sliceExtraVerdictRows=()=>[]; const verdictRowEl=()=>new El('tr'); const verdictInline=()=>new El('div'); const worstOf=()=>null; const verdictClass=()=>'';
+const sliceChipInfo=sl=>({phase:sl.phase,cls:sl.phase,detail:sl.detail||''});
+const sliceSuffixParts=()=>({facts:[], cause:''});
 const sliceHeader=sl=>({num:'Slice '+sl.sid, entry:'', tip:''});
 __FUNCS__
 const sliceExpanded=__EXP__;
@@ -83,7 +86,7 @@ def run_render(fe, view, expanded):
     r = subprocess.run(["node", f.name], capture_output=True, text=True, timeout=60)
     os.unlink(f.name)
     if r.returncode:
-        print(r.stderr[-600:])
+        print(r.stderr[:900])
         return None
     return json.loads(r.stdout.strip().splitlines()[-1])
 
