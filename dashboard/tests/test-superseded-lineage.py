@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression (the owner 2026-10-09, rt-bg-commitments-guard "9/9 jobs 5 failed"): failed job
+"""Regression (Penn 2026-10-09, rt-bg-commitments-guard "9/9 jobs 5 failed"): failed job
 pseudo-slices whose LINEAGE later passed (or is still retrying) must not turn the bundle red
 or count in "N failed". Pure bundle_view.build_job_view / bundle_outcome.
 Run: python3 test-superseded-lineage.py [--revert-check]  -> prints ALL PASSED."""

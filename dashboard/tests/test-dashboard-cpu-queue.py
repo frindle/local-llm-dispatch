@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU-lane stages as first-class QUEUE rows (the owner 2026-10-10): the dashboard showed CPU activity in the
+"""CPU-lane stages as first-class QUEUE rows (Penn 2026-10-10): the dashboard showed CPU activity in the
 CPU lane panel but the Queue panel said "The queue is empty." Proves, running the page's own
 cpuQueueRows()/cpuQueueRowHtml()/renderCpuQueue() under node with a stub DOM:
   * running (runner), pending, and local_running (audit-trivial on the Mac, with its fallback reason)
@@ -29,7 +29,12 @@ MUTANTS = [
     ("fallback reason is not shown",
      "const why = r.reason ? ", "const why = false ? "),
     ("owning bundle is not shown",
-     "const bundle = (r.bundle && !nested) ? ", "const bundle = false ? "),
+     "const bundle = nested ? '' : (standaloneHash", "const bundle = true ? '' : (standaloneHash"),
+    ("owner label never shown on standalone rows",
+     "const owner = (r.owner && !nested) ? ", "const owner = false ? "),
+    ("standalone hash row shows a fake bundle link instead of the tag",
+     "const standaloneHash = !r.bundle || /^[0-9a-f]{12}$/.test(r.bundle);", "const standaloneHash = false;"),
+    ("pending rows drop the owner", "owner: c.owner || '', where: 'waiting for a runner'", "owner: '', where: 'waiting for a runner'"),
     ("summary never renders the cpu rows",
      "  renderCpuQueue(q);\n", ""),
     ("cpu poll never renders the cpu rows",
@@ -106,7 +111,7 @@ const escapeHtml=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
 
 
 def nest(code, d):
-    """CPU stages render INSIDE their bundle's group in #jobs (the owner 2026-10-10)."""
+    """CPU stages render INSIDE their bundle's group in #jobs (Penn 2026-10-10)."""
     d = dict(d); d["local_running"] = [dict(d["local_running"][0], bundle="rt-amazon-cardlink-rs1")]
     d["running"] = [dict(d["running"][0], bundle="rt-amazon-cardlink-rs1")]
     d["pending"] = [dict(d["pending"][0], bundle="cpu-only-bundle")]
@@ -166,6 +171,19 @@ def run(src):
     check("local row shows the fallback reason", "local: runs locally by design" in h[1], True)
     check("local row names the owning bundle as a link", 'data-bundle="rt-amazon-cardlink-rs1"' in h[1], True)
     check("elapsed / wait seconds shown", ("running 188s" in h[0], "running 62s" in h[1], "waiting 2s" in h[2]), (True, True, True))
+    # owner provenance (2026-10-10): a bare 12-hex "bundle" is a standalone harness, not a queue bundle
+    d_o = {"pending": [{"id": "f1", "label": "relevance@f92d4002bea1:cf6b1a322604e0e7f5ef320a", "stage": "relevance",
+                        "bundle": "d698b2cdbee3", "owner": "preflight: ab-sampling v2 d698b2cdbee3", "waiting_s": 3}],
+           "running": [{"id": "f2", "label": "x", "stage": "audit-trivial", "bundle": "rt-amazon-cardlink-rs1", "owner": "slice y", "running_s": 1}]}
+    ro = node(code + "console.log(JSON.stringify(cpuQueueRows(" + json.dumps(d_o) + ").map(r => cpuQueueRowHtml(r))));")
+    ho = ro if isinstance(ro, list) else ["", ""]
+    check("standalone hash row: owner shown", "preflight: ab-sampling v2 d698b2cdbee3" in ho[1], True)
+    check("standalone hash row: muted 'standalone preflight' tag, no fake bundle link",
+          ("standalone preflight" in ho[1], "bundle d698b2cdbee3" in ho[1], "cpu-bundle" in ho[1]), (True, False, False))
+    check("real bundle row keeps its bundle link", ('data-bundle="rt-amazon-cardlink-rs1"' in ho[0], "standalone preflight" in ho[0]), (True, False))
+    rn = node(code + "console.log(JSON.stringify(cpuQueueRowHtml({kind:'pending',status:'pending',stage:'a',label:'b',bundle:'d698b2cdbee3',owner:'OWN',where:'w',secs:1,reason:''}, true)));")
+    check("nested rows stay unchanged (no owner/tag/link)", ("OWN" in str(rn), "standalone" in str(rn), "cpu-bundle" in str(rn)), (False, False, False))
+    check("old payload without owner still renders (fail-open)", "standalone preflight" in str(node(code + "console.log(JSON.stringify(cpuQueueRowHtml({kind:'pending',status:'pending',stage:'a',label:'b',bundle:'d698b2cdbee3',where:'w',secs:1,reason:''})));")), True)
     check("counts", r.get("counts"), {"running": 2, "pending": 1, "total": 3})
 
     # GPU idle + CPU running -> rows, NOT empty

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression: a bundle whose slice VIEW is active (authoring/coding/...) must not roll up to
 `pending` from queue rows alone, and a failed row for that in-flight slice must not raise
-needs_attention (the owner 2026-10-09, rt-costco-receipt-attach: pill `pending` beside slice
+needs_attention (Penn 2026-10-09, rt-costco-receipt-attach: pill `pending` beside slice
 `authoring 2:45` and a yellow "1 failed").  Pure: exercises _apply_view_activity only.
 Run: python3 test-bundle-active-pill.py"""
 import importlib.util, os, sys

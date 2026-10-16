@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Regression test: a failed bundle/slice that a LATER bundle superseded must not read
-"failed" / count as Stalled forever (bfmr-auth first slice vs -impl2, the owner 2026-10-06).
+"failed" / count as Stalled forever (bfmr-auth first slice vs -impl2, Penn 2026-10-06).
 
 `qctl supersede BUNDLE --by TARGET --reason R [--slice SID]` records a marker; the REAL
 _finished_bundle_views (stubbed state + temp fixtures, never the live queue) must then

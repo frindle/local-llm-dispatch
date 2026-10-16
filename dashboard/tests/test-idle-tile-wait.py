@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Idle "Running now" tile says what the queue waits on (the owner 2026-10-06): one short plain
+"""Idle "Running now" tile says what the queue waits on (Penn 2026-10-06): one short plain
 line, never daemon-log text. Runs the page's own idleWaitText() under node against cases.
 Run: python3 tests/test-idle-tile-wait.py [--revert-check]  (--revert-check runs it against
 the committed HEAD source and expects FAILURE; run it BEFORE committing the change).

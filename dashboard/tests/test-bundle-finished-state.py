@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression test: "finished" means EVERY slice done, not "nothing live" (the owner 2026-10-06:
+"""Regression test: "finished" means EVERY slice done, not "nothing live" (Penn 2026-10-06:
 "considered finished but have failed flags").
 
 Bug: /api/bundle-history listed every bundle with no queue row left as FINISHED, so

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression (the owner 2026-10-09 dashboard screenshot): card 'Job - needs-opus-auto-rt-bg-
+"""Regression (Penn 2026-10-09 dashboard screenshot): card 'Job - needs-opus-auto-rt-bg-
 getcommitments-status' read red `failed` while its own `escalation / heal` row was still
 `pending` ("held on running job 48c096d8d690 (rt-bg-sync-zero-guard)"). Two defects:
 

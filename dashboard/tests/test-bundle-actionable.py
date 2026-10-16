@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Regression test: the Needs-attention tile counted every stalled bundle (527 headline,
-The owner 2026-10-06). Only ACTIONABLE stalled bundles (recent <= 7 days, or listed in the
+Penn 2026-10-06). Only ACTIONABLE stalled bundles (recent <= 7 days, or listed in the
 attention file = triage REAL-UNFINISHED / NEEDS-REVIEW) may count; old unclassified ones
 are the "stale backlog" (still listed in the Stalled panel, never hidden); superseded
 ones are in neither. Runs the REAL _finished_bundle_views on temp fixtures.

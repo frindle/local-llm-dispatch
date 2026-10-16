@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression: a row the QUEUE held behind a pending gate/regate (hold_reason 'pending gate')
 auto-releases, so it is WAITING, not parked: no Needs-attention entry, no Resume button
-(the owner 2026-10-09: card-bonus/giftcard/amazon showed 'parked' + Resume while only waiting on
+(Penn 2026-10-09: card-bonus/giftcard/amazon showed 'parked' + Resume while only waiting on
 regate-f749...).  A person-held row (any other hold_reason) still parks.
 Runs the page's own JS functions under node.  Run: python3 test-gate-held-not-parked.py"""
 import os, re, subprocess, sys

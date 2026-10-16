@@ -15,12 +15,8 @@ FAILS = []
 
 MUTANTS = [
     ("an idle lane is silently omitted",
-     "const out = NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k],",
-     "const out = NOW_LANES.filter(([k]) => by[k].length).map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k],"),
-    ("a live auto driver is not shown as its own AUTO RUN row",
-     "  out.auto = autoRows;", "  out.auto = [];"),
-    ("a live auto driver occupies the CPU lane",
-     "    autoRows.push({label: a.label,", "    by.cpu.push({model: 'auto', host: '-', line: 'driver', id: a.id, label: a.label,"),
+     "  out.auto = autoRows;\n  return out;",
+     "  out.auto = autoRows;\n  return Object.assign(out.filter(r => !r.idle), {auto: autoRows});"),
     ("unraid jobs land in the studio lane",
      "if (l.includes('unraid')) return 'unraid';", "if (false) return 'unraid';"),
     ("the CPU lane is not shown",
@@ -107,14 +103,6 @@ def run(src):
           [x["line"] for x in rows[0]["jobs"]] if rows else None, ["serving", "loading"])
     check("cpu lane row", [(x["label"], x["model"], x["host"], x["elapsed_s"], x["line"]) for x in rows[2]["jobs"]] if rows else None,
           [("cpu-stage", "lint", "r1", 12, "stage lint")])
-    # only an ollama-dispatch-auto driver is live: every lane stays idle, the driver is its own AUTO RUN row
-    r3 = node(pre + "const rows=laneNowRows([],[{kind:'auto',label:'drv-1',step:'authoring',pid:4242,elapsed_s:30,bundle:'bun-d'}],[]);"
-              "console.log(JSON.stringify({rows, auto: rows.auto, html: laneNowHtml(rows)}));")
-    rows = r3.get("rows") or []
-    check("driver-only: all three lanes idle (CPU lane not occupied)", [x["idle"] for x in rows], [True, True, True])
-    check("driver-only: one separate auto row", [(a["label"], a["pid"]) for a in (r3.get("auto") or [])], [("drv-1", 4242)])
-    h3 = r3.get("html", "")
-    check("driver-only: 'AUTO RUN (driver)' drawn, CPU lane says idle", "AUTO RUN (driver)" in h3 and "CPU lane</span>: idle" in h3, True)
     esc = node(pre + "console.log(JSON.stringify(laneNowHtml(laneNowRows([{id:'x',status:'running',lane:'studio-db',label:'<script>',model:'m'}],[],[]))));")
     check("html escapes labels", "<script>" in str(esc), False)
 

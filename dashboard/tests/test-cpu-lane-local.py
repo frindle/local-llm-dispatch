@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU LANE panel truthfulness (the owner 2026-10-09): the panel showed 'idle' forever because every recent stage
+"""CPU LANE panel truthfulness (Penn 2026-10-09): the panel showed 'idle' forever because every recent stage
 was routed to the Mac (ineligible for the Unraid runner) and the Mac-side work was invisible.
 
 Proves, against the REAL cpu_stage.py + the REAL dashboard source:

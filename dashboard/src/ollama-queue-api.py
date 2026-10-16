@@ -51,6 +51,11 @@ PORT = 7684
 _ITER_RE = re.compile(r"--- iteration (\d+)/(\d+) ---")
 _TOKS_RE = re.compile(r"\(([\d.]+) tok/s\)")
 _LOG_TAIL_BYTES = 16_384  # comfortably more than one iteration's log output
+# The worker's end-of-run line: "[worker] USAGE SUMMARY: prompt_tokens=N completion_tokens=M tok_s=X decode_tok_s=Y calls=K"
+# (n/a = the backend reported nothing). Shown on finished job rows only; absent line = no usage shown.
+_USAGE_RE = re.compile(r"USAGE SUMMARY: prompt_tokens=(\S+) completion_tokens=(\S+) tok_s=(\S+) decode_tok_s=(\S+) calls=(\S+)")
+_USAGE_TAIL_BYTES = 65_536
+_USAGE_CACHE = {}
 
 # Sort TIERS for the queue panel's display order. ONE definition, injected into the
 # front-end below (see FRONTEND_HTML's `const STATUS_ORDER = __QUEUE_STATUS_ORDER__`)
@@ -796,6 +801,117 @@ def _needs_attention_ids(rows, state_of=None, log_dir=None,
     return out
 
 
+# NEEDS-ATTENTION PRESENTATION (Penn 2026-10-11: "can we clean up the needs attention
+# area of the dashboard for the queue"). DISPLAY ONLY: needs_attention keeps its meaning
+# for every other consumer (handoff, escalation); this only stamps HOW the panel should
+# present each flagged row so 59 rows stop reading as 59 to-dos. Nothing is dropped --
+# the front-end files demoted rows under one collapsed "N more hidden" disclosure and the
+# raw rows stay in the normal views. Stamped on every row:
+#   attn_reason   None (top-level) | 'experiment' | 'superseded' | 'child' | 'attempt'
+#   attn_group    the slice/chain key the row belongs to (needs_attention rows only)
+#   attn_attempts N failed attempts in the group (on the group's LATEST row)
+#   attn_history  ids of the group's earlier attempts, newest first (on the latest row)
+#   attn_parent   id of the explicit parent job (child rows only)
+# CONSERVATIVE: experiment = label prefix only; child = an explicit parent id in the
+# label that resolves to a row still in the payload; superseded = a LATER run of the same
+# slice is done (verdict not FAIL) or queued/running, or the queue's own
+# superseded_by chain ends in one. Anything else stays top-level.
+_ATTN_EXPERIMENT_PREFIXES = ("absamp-", "cr:")
+_ATTN_LIVE_STATUSES = ("running", "pending", "queued")
+_ATTN_CHILD_RES = (re.compile(r"^secondop-([0-9a-f]{12})$"),
+                   re.compile(r"^esc-review-.*-job-([0-9a-f]{12})$"),
+                   re.compile(r"^(?:re)?gate-([0-9a-f]{12})$"))
+
+
+def _attn_parent_ref(label):
+    """PURE. The 12-hex parent job id a meta row (secondop-/esc-review-/gate-/regate-)
+    names in its label, else None."""
+    s = re.sub(r"\s*\[[^\]]*\]\s*$", "", str(label or "")).strip()
+    for rx in _ATTN_CHILD_RES:
+        m = rx.match(s)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _annotate_attention_groups(rows, verdict_of=_durable_verdict_tag, log_dir=None):
+    """PURE apart from the injected verdict read. Stamp attn_* (see above) on `rows`.
+    Only mutates the passed rows; never drops or reorders."""
+    rows = rows if rows is not None else []
+    by_id = {r.get("id"): r for r in rows if r.get("id")}
+    for r in rows:
+        r["attn_reason"], r["attn_group"], r["attn_attempts"] = None, None, 0
+        r["attn_history"], r["attn_parent"] = [], None
+    att = [r for r in rows if r.get("needs_attention")]
+
+    def gkey(r):
+        # The author stage appends its own `-sN`/`-cN` round to a slice label
+        # (`...-s3-update-post-route-s3`, `...-s2b-name-var-s2`). Strip ONE such
+        # trailing token, but only when a real slice id (`-sN[a-z]?-`) remains earlier in
+        # the label, so `pa-supersede-on-import-s1` is never folded into its siblings.
+        b = _slice_base_label(r.get("label"))
+        b = re.sub(r"\s*\[[^\]]*\]\s*$", "", b).strip()
+        m = re.match(r"^(.*-s\d+[a-z]?-.*)-[sc]\d+$", b)
+        return (r.get("group_key") or None, m.group(1) if m else b)
+
+    def later_ok(r):
+        t = str(r.get("enqueued_at") or "")
+        if not t:
+            return False
+        for o in rows:
+            if o is r or gkey(o) != gkey(r) or str(o.get("enqueued_at") or "") <= t:
+                continue
+            st = o.get("status")
+            if st in _ATTN_LIVE_STATUSES:
+                return True
+            if st == "done":
+                try:
+                    tag = verdict_of(o.get("id"), log_dir) if verdict_of else None
+                except Exception:
+                    tag = None
+                if "FAIL" not in str(tag or "").upper():
+                    return True
+        return False
+
+    def chain_ok(r):
+        cur, hops = r, 0
+        while cur and cur.get("superseded_by") and hops < 10:
+            cur, hops = by_id.get(cur.get("superseded_by")), hops + 1
+            if cur is None:
+                return False            # superseder pruned: cannot tell -> keep
+            if cur.get("status") in _ATTN_LIVE_STATUSES:
+                return True
+            if cur.get("status") == "done":
+                return True
+        return False
+
+    rest = []
+    for r in att:
+        lab = str(r.get("label") or "")
+        par = _attn_parent_ref(lab)
+        if lab.startswith(_ATTN_EXPERIMENT_PREFIXES) or r.get("eval_arm"):
+            r["attn_reason"] = "experiment"
+        elif par and par != r.get("id") and par in by_id:
+            r["attn_reason"], r["attn_parent"] = "child", par
+        elif later_ok(r) or chain_ok(r):
+            r["attn_reason"] = "superseded"
+        else:
+            rest.append(r)
+        k = gkey(r)
+        r["attn_group"] = f"{k[0] or ''}|{k[1]}"
+    groups = {}
+    for r in rest:
+        groups.setdefault(r["attn_group"], []).append(r)
+    for g in groups.values():
+        g.sort(key=lambda r: (str(r.get("enqueued_at") or ""), str(r.get("id") or "")))
+        latest = g[-1]
+        latest["attn_attempts"] = len(g)
+        latest["attn_history"] = [x.get("id") for x in reversed(g[:-1])]
+        for x in g[:-1]:
+            x["attn_reason"] = "attempt"
+    return rows
+
+
 # The status a SUPERSEDED failed row reports when it is all a bundle has left to
 # speak with. `done` on purpose: it goes through the SAME incomplete-clamp as any
 # other terminal lead status, so a bundle that still owes slices reads `pending`
@@ -1182,7 +1298,7 @@ def _annotate_plan_rollup(rows, runs_dir=None, log_dir=None):
     return rows
 
 
-# BUNDLE ROLLUP PRECEDENCE (the owner 2026-10-09, rt-costco-receipt-attach read `pending` while its
+# BUNDLE ROLLUP PRECEDENCE (Penn 2026-10-09, rt-costco-receipt-attach read `pending` while its
 # slice 1 said `authoring 2:45`, beside a yellow "1 failed" for a round that was being
 # retried). _annotate_plan_rollup sees QUEUE ROWS only, so "2 pending, none running"
 # rolled up to `pending` even though a slicer/chain driver was authoring a slice
@@ -1404,7 +1520,7 @@ def _wait_reason_for(r, active, by_id, running, db_status=None):
 
 
 def _busy_job_phrase(r, b):
-    """'waiting for job <id> (<label>) to finish' + WHOSE job it is (the owner 2026-10-09: an
+    """'waiting for job <id> (<label>) to finish' + WHOSE job it is (Penn 2026-10-09: an
     escalation row read 'held on running job 48c096d8d690 (rt-bg-sync-zero-guard)' as if the
     failed job itself were running; that job belonged to a different bundle)."""
     key = r.get("group_key") or r.get("bundle") or None
@@ -1472,6 +1588,12 @@ def _queue_wait_payload(now=None):
     for ln in (v.get("lanes") or {}).values():
         (ln.get("reason") or {}).pop("sig", None)
     v.pop("jobs", None)
+    # UNSATISFIABLE-JOB WARNINGS (2026-10-13): pending jobs no host can serve for > the threshold
+    # (queue.unsat_warnings_from_state: read-only, warning only). Never worth a 500 / lost banner.
+    try:
+        v["unsat"] = list(q.unsat_warnings_from_state(now=now))
+    except Exception:       # noqa: BLE001 -- includes an older queue module without the probe
+        v["unsat"] = []
     return v
 
 
@@ -1580,6 +1702,7 @@ FRONTEND_HTML = r"""<!doctype html>
   .lane-card.idle .lane-wait { color: var(--warn); }
   .lane-card.run { border-left: 3px solid var(--run); }
   .lane-card.run.local { border-left-color: #d9822b; }
+  .lane-card.auto-run { border-left: 3px dashed var(--muted); color: var(--muted); }
   #cpuWhyLocal { margin: 6px 10px 2px; font-size: 12px; color: var(--muted); }
   .lane-name { font-weight: 650; text-transform: uppercase; font-size: .72rem; letter-spacing: .05em; color: var(--muted); }
   .lane-meta, .lane-line { color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -1662,6 +1785,10 @@ FRONTEND_HTML = r"""<!doctype html>
   .waitbanner .badge { display: inline-block; font-size: .68rem; font-weight: 700; letter-spacing: .06em;
     text-transform: uppercase; padding: 1px 6px; border-radius: 6px; border: 1px solid currentColor; margin-right: 6px; }
   .waitbanner .log { opacity: .85; font-weight: 400; font-size: .78rem; }
+  .lanechips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+  .lchip { border: 1px solid var(--warn); background: var(--warn-bg); color: var(--warn); border-radius: 999px;
+    padding: 2px 10px; font-size: .78rem; cursor: help; }
+  .lchip.stuck { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); font-weight: 650; }
   .wait-reason { color: var(--muted); font-size: .79rem; display: block; margin-top: 2px; }
   span.qpos { font-size: .72rem; color: var(--muted); margin-right: 6px; font-variant-numeric: tabular-nums;
               white-space: nowrap; cursor: help; }
@@ -1736,6 +1863,12 @@ FRONTEND_HTML = r"""<!doctype html>
   tr.run-subplan td { font-size: .8rem; }
   tr.run-project { cursor: pointer; background: var(--surface-2); }
   tr.run-project .proj-name { font-weight: 700; }
+  .vinline { font-size: .78rem; margin-top: .1rem; }
+  .vinline .vchip { font-weight: 600; } .vinline .vwhy { color: var(--muted); }
+  .vinline.vgrp-handled { opacity: .65; } .vinline .vbtns { margin-left: .4rem; }
+  .vbadge { font-size: .72rem; font-weight: 600; border: 1px solid currentColor; border-radius: 3px; padding: 0 .3rem; white-space: nowrap; }
+  .vbadge.vbadge-eyes { background: color-mix(in srgb, currentColor 12%, transparent); }
+  tr.slice-verdict td { font-size: .85em; }
   .eyes-badge { font-weight: 600; }
   .eyes-badge.eyes-ok { color: var(--run); } .eyes-badge.eyes-warn { color: var(--warn); }
   .eyes-badge.eyes-bad { color: var(--bad); }
@@ -1792,6 +1925,7 @@ FRONTEND_HTML = r"""<!doctype html>
   <div class="tile attn" id="sumAttn"><div class="k">Needs attention</div><div class="v">&ndash;</div></div>
 </div>
 
+<div id="laneChips" class="lanechips" hidden></div>
 <div id="waitBanner" class="waitbanner" hidden></div>
 
 <section class="panel" id="activePanel">
@@ -1807,6 +1941,10 @@ FRONTEND_HTML = r"""<!doctype html>
   <div class="panel-head"><h2>Needs attention</h2><span class="count" id="attnCount"></span></div>
   <div class="list attn" id="attnList"><table class="q" id="attnTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table></div>
   <div class="list" id="attnEmpty" hidden><div class="empty">Nothing is stuck. Failed, parked and blocked work shows up here.</div></div>
+  <div class="list" id="attnHiddenWrap" hidden><details class="fin" id="attnHiddenDetails">
+    <summary id="attnHiddenSummary"></summary>
+    <table class="q" id="attnHiddenTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
+  </details></div>
 </section>
 
 <section class="panel" id="stalledPanel" hidden>
@@ -1825,6 +1963,14 @@ FRONTEND_HTML = r"""<!doctype html>
   </details></div>
 </section>
 
+<section class="panel" id="unattachedPanel" hidden>
+  <div class="list"><details class="fin" id="unattachedDetails" open>
+    <summary id="unattachedSummary"><b>Unattached</b> verdicts</summary>
+    <div class="empty" style="padding:.4rem .8rem;color:var(--muted)">Finished jobs with a gate verdict that could not be tied to any bundle or parent job (e.g. an old escalation review). Same fields and same clear path as Run Status.</div>
+    <table class="q" id="unattachedTable"><colgroup><col class="c0"><col><col class="c2"><col class="c3"><col class="c4"></colgroup><tbody></tbody></table>
+  </details></div>
+</section>
+
 <!-- UNIFIED run-status list (2026-09-17, the user: "complete jobs and handoff should
      essentially be the same one list when qwen is done that shows the run status
      that we can clear once it's handled"). ONE surface replacing the old split
@@ -1837,12 +1983,15 @@ FRONTEND_HTML = r"""<!doctype html>
      Backed by /api/runs; /api/jobs/completed and /api/handoff still exist for other
      consumers but the dashboard no longer renders their two separate tables. -->
 <section class="panel" id="runPanel">
-<div class="panel-head"><h2>Run Status</h2><span class="count">qwen finished: verdict + run status; clear once handled</span></div>
+<details class="fin" id="runStatusDetails">
+<summary id="runStatusSummary"><b>Run Status</b> <span class="count">flat list of every verdict -- verdicts now live with their bundles above (inline on each job, roll-up on the bundle header); open this for the full cross-bundle list</span></summary>
+<div class="panel-head"><span class="count">qwen finished: verdict + run status; clear once handled</span></div>
 <div class="list tablewrap">
 <table id="runStatus"><thead><tr>
   <th>verdict</th><th>label</th><th>model</th><th>host</th><th>files</th><th>when</th><th>flags</th><th></th>
 </tr></thead><tbody></tbody></table>
 </div>
+</details>
 </section>
 
 <section class="panel" id="cpuLanePanel">
@@ -1915,6 +2064,42 @@ FRONTEND_HTML = r"""<!doctype html>
       <span id="hostsMsg" style="font-size:.78rem;"></span>
     </div>
   </div>
+  <div>   <!-- Settings: Log retention -->
+    <details id="logRetention">
+      <summary><h2 style="display:inline">Log retention</h2> <span id="lrSummary" style="font-size:.78rem; opacity:.65"></span></summary>
+      <div style="font-size:.78rem; opacity:.65; margin:.4rem 0;">
+        Days to keep queue and dispatch logs. The rotation job runs <strong>daily at 04:17</strong> and re-reads
+        these values each run. Failures and Successful default to <em>inherit</em> (= All). A pinned job or
+        bundle is held until you unpin it. Anything a live queue row, pending handoff or open escalation
+        references is never deleted.
+      </div>
+      <table id="lrLevels" style="width:100%; border-collapse:collapse; font-size:.8rem;">
+        <thead><tr><th style="text-align:left">Level</th><th style="text-align:left">Keep (days, 1-365)</th>
+          <th style="text-align:left">Would delete now</th></tr></thead>
+        <tbody>
+          <tr><td>All</td><td><input id="lrAll" inputmode="numeric" style="width:5em; font-size:.8rem" placeholder="30"></td>
+            <td id="lrPrevAll">&mdash;</td></tr>
+          <tr><td>Failures</td><td><input id="lrFailures" inputmode="numeric" style="width:5em; font-size:.8rem" placeholder="inherit"></td>
+            <td id="lrPrevFailures">&mdash;</td></tr>
+          <tr><td>Successful</td><td><input id="lrSuccessful" inputmode="numeric" style="width:5em; font-size:.8rem" placeholder="inherit"></td>
+            <td id="lrPrevSuccessful">&mdash;</td></tr>
+        </tbody>
+      </table>
+      <div id="lrPrevTotal" style="font-size:.78rem; opacity:.8; margin-top:.3rem;"></div>
+      <div style="margin-top:.5rem; display:flex; gap:.4rem; align-items:center; flex-wrap:wrap;">
+        <button id="lrSave" type="button">save</button>
+        <span id="lrMsg" style="font-size:.78rem;"></span>
+      </div>
+      <h3 style="font-size:.85rem; margin:.8rem 0 .3rem">Pins (held until unpinned)</h3>
+      <div id="lrPins" style="font-size:.8rem;"></div>
+      <div style="margin-top:.4rem; display:flex; gap:.4rem; align-items:center; flex-wrap:wrap;">
+        <input id="lrPinId" style="width:12em; font-size:.8rem" placeholder="job id or bundle name">
+        <input id="lrPinWhy" style="flex:1; min-width:10em; font-size:.8rem" maxlength="200" placeholder="why">
+        <button id="lrPinAdd" type="button">pin</button>
+      </div>
+      <div id="lrLast" style="font-size:.78rem; margin-top:.6rem; opacity:.85;"></div>
+    </details>
+  </div>
 </div>
 </div><!-- .wrap -->
 
@@ -1924,6 +2109,7 @@ FRONTEND_HTML = r"""<!doctype html>
 // before each bundle or row, so every row builder below appends exactly as before.
 const activeBody = document.querySelector('#jobs tbody');
 const attnBody = document.querySelector('#attnTable tbody');
+const attnHiddenBody = document.querySelector('#attnHiddenTable tbody');
 const finBody = document.querySelector('#finishedTable tbody');
 const stalledBody = document.querySelector('#stalledTable tbody');
 let tbody = activeBody;
@@ -1943,6 +2129,84 @@ let planExpanded = {};
 // planExpanded. Absent key = the default (open only for failed/escalated slices).
 let sliceExpanded = {};
 let bundleViews = {views: {}, activity: [], active: null};
+// Gate verdicts JOINED to their bundle (/api/bundle-verdicts, a read-only view over the
+// same annotated rows Run Status shows -- see _bundle_verdict_index). Verdicts live with
+// their bundle: inline on each job row, a roll-up on the bundle header.
+let bundleVerdicts = {rows: {}, bundles: {}, unattached: []};
+let _bvBySlice = {};
+function indexBundleVerdicts() {
+  _bvBySlice = {};
+  for (const i of Object.values((bundleVerdicts && bundleVerdicts.rows) || {})) {
+    if (!i.bundle) continue;
+    const k = i.bundle + '\u0000' + (i.slice || '');
+    (_bvBySlice[k] = _bvBySlice[k] || []).push(i);
+  }
+}
+function verdictRowsForSlice(key, sid) { return _bvBySlice[key + '\u0000' + (sid || '')] || []; }
+const VGROUP_LABEL = {needs_eyes: 'needs eyes', good_to_go: 'good to go', handled: 'handled'};
+function worstOf(infos) {
+  let w = null;
+  for (const i of infos) { const r = verdictRankJS(i.raw_verdict); if (!w || r > w.r) w = {r, v: i.raw_verdict || '?'}; }
+  return w ? w.v : null;
+}
+function verdictRankJS(raw) {
+  const t = String(raw || '?').toUpperCase();
+  for (const [p, r] of [['FAIL', 5], ['BLOCKED', 4], ['CONCERNS', 3], ['PENDING', 2], ['IN PROGRESS', 2], ['NO-GATE', 2], ['?', 2], ['SKIP', 1], ['PASS', 0]]) if (t.startsWith(p)) return r;
+  return 2;
+}
+// One job's verdict, inline: verdict chip, its group (needs eyes / good to go / handled),
+// the reason, an 'issues' button (same gate-detail view Run Status opens) and a 'clear'
+// button that is the SAME shared-ledger path as Run Status (POST /api/runs/<id>/clear).
+// A row still owing sign-off (or owned by a live auto run) gets NO clear button here:
+// that stays an explicit override in the Run Status panel.
+function verdictInline(info) {
+  const el = document.createElement('div');
+  el.className = 'vinline vgrp-' + info.group;
+  const sev = info.group === 'needs_eyes' ? (info.eyes_severity || 'warn') : (info.group === 'good_to_go' ? 'ok' : '');
+  const why = info.group === 'handled' ? (info.handled_reason || 'auto-handled')
+    : [info.eyes_label, info.blocked_reason].filter(Boolean).join(' -- ');
+  el.innerHTML = `<span class="vchip ${verdictClass(info.raw_verdict)}">${escapeHtml(info.verdict)}</span> `
+    + `<span class="eyes-badge${sev ? ' eyes-' + sev : ''} vgrp">${escapeHtml(VGROUP_LABEL[info.group] || info.group || '')}</span>`
+    + (why ? ` <span class="vwhy">${escapeHtml(why)}</span>` : '');
+  const btnBox = document.createElement('span');
+  btnBox.className = 'vbtns';
+  if (info.has_gate) {
+    const b = document.createElement('button');
+    b.textContent = 'issues'; b.className = 'iconbtn';
+    b.onclick = ev => { ev.stopPropagation(); openGateDetail(info.id, info.label); };
+    btnBox.appendChild(b);
+  }
+  if (info.clearable) {
+    const b = document.createElement('button');
+    b.textContent = 'clear'; b.className = 'iconbtn';
+    b.title = 'Handled -- archive this row (same shared ledger as Run Status)';
+    b.onclick = async ev => { ev.stopPropagation(); await clearRun(info.id, info.label, false); finishedFetchedAt = 0; refresh(); };
+    btnBox.appendChild(b);
+  }
+  if (btnBox.children.length) el.appendChild(btnBox);
+  return el;
+}
+// Roll-up for a bundle header: worst verdict across its jobs + how many need eyes.
+function bundleVerdictBadge(key) {
+  const b = ((bundleVerdicts && bundleVerdicts.bundles) || {})[key];
+  if (!b || !b.total) return '';
+  const eyes = b.needs_eyes ? ` &middot; ${b.needs_eyes} need${b.needs_eyes === 1 ? 's' : ''} eyes` : '';
+  return `<span class="vbadge ${verdictClass(b.worst)}${b.needs_eyes ? ' vbadge-eyes' : ''}" data-vbadge="${escapeHtml(key)}" title="Worst gate verdict across this bundle's ${b.total} finished job(s); ${b.needs_eyes} need eyes, ${b.good_to_go} good to go, ${b.handled} handled. Open the bundle for each job's verdict.">gate: ${escapeHtml(b.worst)}${eyes}</span> `;
+}
+// Extra verdict rows under a slice: finished jobs attached to it that are not one of its
+// history entries (esc-review / auto-fix children, label/plan-matched rows).
+function sliceExtraVerdictRows(key, sl) {
+  const have = new Set((sl.history || []).map(h => h.id).filter(Boolean));
+  return verdictRowsForSlice(key, sl.sid).filter(i => !have.has(i.id));
+}
+function verdictRowEl(info, cls, pad) {
+  const tr = document.createElement('tr');
+  tr.className = 'queue-child slice-verdict ' + cls;
+  tr.dataset.verdictId = info.id;
+  tr.innerHTML = `<td></td><td colspan="4" style="padding-left:${pad}"><span class="vlabel" title="${escapeHtml(info.label || '')}">${escapeHtml(info.display_label || info.label || info.id)}</span> <span style="opacity:.5">${escapeHtml(info.id)}</span></td>`;
+  tr.children[1].appendChild(verdictInline(info));
+  return tr;
+}
 let queueWait = null;   // last /api/queue-wait payload, read by the idle tile
 // FINISHED bundles (the user 2026-10-05): bundles with no queue row left, each with its
 // full per-slice history, newest activity first. Paged + age-bounded server-side
@@ -2057,7 +2321,7 @@ function foldRounds(entries) {
   const max = rounds.reduce((m, h) => Math.max(m, rnd(h)), 0);
   // A LIVE (running/pending/...) row is never folded away: a chain relaunch restarts the
   // round counter, so a running r1 can sit below an older done r2 and would otherwise be
-  // swallowed into the collapsed "refine r1-r1" group (the owner 2026-10-09).
+  // swallowed into the collapsed "refine r1-r1" group (Penn 2026-10-09).
   const early = rounds.filter(h => rnd(h) < max && !isLiveRow(h));
   if (early.length < 2) return entries.map(h => ({h}));
   const out = []; let placed = false;
@@ -2198,12 +2462,13 @@ const ALERT_STATUSES = __PLAN_ALERT_STATUSES__;
 // round on a slice that already landed is reported in the faint breakdown like any
 // other count and never alarms. An alarm that cries wolf trains the eye to skip it,
 // which costs more than the alarm was ever worth.
-function planAlertSummary(counts, alertCounts) {
+function planAlertSummary(counts, alertCounts, attempts) {
   const ac = alertCounts || {};
+  const at = attempts || {};
   const alerts = [], rest = [];
   const push = s => {
     const n = ALERT_STATUSES.includes(s) ? (ac[s] || 0) : 0;
-    if (n) alerts.push(`${n} ${s}`);
+    if (n) alerts.push(`${n} ${s}` + (at[s] > n ? ` (${at[s]} attempts)` : ''));
     if (counts[s] - n > 0) rest.push(`${counts[s] - n} ${s}`);
   };
   for (const s of STATUS_SUMMARY_ORDER) if (counts[s]) push(s);
@@ -2215,6 +2480,29 @@ function planAlertSummary(counts, alertCounts) {
           rowClass: alerts.length ? ' queue-parent-alert' : ''};
 }
 // END planAlertSummary
+
+// ---- Needs-attention presentation math --------------------------------------
+// BEGIN attnPanelMath (extracted verbatim and EXECUTED by --self-test)
+// h = {experiment, superseded, child} counts of DEMOTED top-level entries. Nothing demoted
+// is dropped: the same entries render in the collapsed disclosure this text labels.
+function attnHiddenTotal(h) { h = h || {}; return (h.experiment || 0) + (h.superseded || 0) + (h.child || 0); }
+function attnHiddenSummary(h) {
+  h = h || {};
+  const parts = [];
+  if (h.experiment) parts.push(`${h.experiment} experiment replay${h.experiment === 1 ? '' : 's'}`);
+  if (h.superseded) parts.push(`${h.superseded} superseded attempt${h.superseded === 1 ? '' : 's'}`);
+  if (h.child) parts.push(`${h.child} child row${h.child === 1 ? '' : 's'}`);
+  const n = attnHiddenTotal(h);
+  return n ? `${n} more hidden: ${parts.join(' / ')}` : '';
+}
+// The tile/header number is ONLY the top-level entries actually shown in the panel.
+function attnTileText(shown, h) {
+  const n = attnHiddenTotal(h);
+  return {count: String(shown), hidden: n ? ` (+${n} hidden)` : ''};
+}
+// Which bucket a demoted entry belongs to ('attempt' folds into 'superseded').
+function attnBucket(reason) { return reason === 'attempt' ? 'superseded' : (reason || null); }
+// END attnPanelMath
 
 // The build this document was served as. Every JSON response carries the server's
 // current one in X-Frontend-Version; when they differ, THIS TAB is running an old
@@ -2323,22 +2611,86 @@ function bundleAttention(g, view, kind) {
 // Summary strip: running now / queue depth / needs attention, plus section counts.
 // "Waiting on" banner: one line per lane that is IDLE while work is pending, from the
 // daemon's queue-wait.json. RED when the same reason has held an idle lane > stuck_after_s.
-function renderWaitBanner(w, jobs) {
-  const el = document.getElementById('waitBanner');
-  if (!el) return;
-  const dur = s => { s = Math.max(0, Math.round(s)); return s >= 3600 ? Math.floor(s / 3600) + 'h' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm' : s >= 60 ? Math.floor(s / 60) + 'm' : s + 's'; };
-  const now = w.now || Date.now() / 1000;
-  const lines = [];
-  let stuck = false;
-  if (w.source === 'state') {
+// WARNING lines for jobs NO host can serve (w.unsat from /api/queue-wait: pending longer than the
+// daemon-side threshold with a model that cannot load). Display only; never throws.
+function fmtDur(s) {
+  s = Math.max(0, Math.round(Number(s) || 0));
+  return s >= 3600 ? Math.floor(s / 3600) + 'h' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm' : s >= 60 ? Math.floor(s / 60) + 'm' : s + 's';
+}
+// Identical unsatisfiable warnings (same kind + model + reason once the drifting numbers -- GB figures,
+// "Ns ago" ages -- are blanked) collapse into ONE line: "N jobs waiting: <model> needs X GB, Y GB usable
+// (Z GB short), oldest 16m". Job ids/labels ride in the title tooltip. Display only; never throws.
+function unsatBannerLines(w) {
+  try {
+    const groups = new Map();
+    for (const u of ((w && Array.isArray(w.unsat)) ? w.unsat : [])) {
+      if (!u || typeof u !== 'object' || !(u.id || u.label)) continue;
+      const reason = String(u.reason || 'reason unknown');
+      const key = (u.kind === 'capacity' ? 'capacity' : 'unsat') + '|' + String(u.model || '') + '|'
+        + reason.replace(/\d+(?:\.\d+)?\s*(?:GB|s|m|h)\b/g, '#');
+      let g = groups.get(key);
+      if (!g) { g = {kind: u.kind === 'capacity' ? 'capacity' : 'unsat', model: String(u.model || 'model?'), reason, ids: [], oldest: 0}; groups.set(key, g); }
+      g.ids.push(String(u.label || u.id));
+      const age = Math.max(0, Number(u.age_s) || 0);
+      if (age >= g.oldest) { g.oldest = age; g.reason = reason; }   // newest numbers come from the oldest job's reason
+    }
+    const out = [];
+    for (const g of groups.values()) {
+      const n = g.ids.length, jobs = n + (n === 1 ? ' job' : ' jobs');
+      const m = g.reason.match(/needs ([\d.]+ GB),? (?:have )?([\d.]+ GB) usable(?: \(([\d.]+ GB) short\))?/);
+      const nums = m ? `needs ${m[1]}, ${m[2]} usable` + (m[3] ? ` (${m[3]} short)` : '') : g.reason.slice(0, 90);
+      const tip = escapeHtml(g.ids.join(', ') + ' -- ' + g.reason);
+      const head = g.kind === 'capacity' ? `${jobs} waiting for Darkbloom capacity: ` : `${jobs} waiting, no host can serve: `;
+      out.push(`<span class="lane" title="${tip}"><span class="badge">WARNING</span>${head}<b>${escapeHtml(g.model)}</b> ${escapeHtml(nums)}, oldest ${fmtDur(g.oldest)} `
+        + `<span class="log">(still queued, nothing was changed; hover for job ids)</span></span>`);
+    }
+    return out;
+  } catch (e) { return []; }
+}
+// One compact chip per lane in the summary strip: "studio-db: idle 16m, waiting on memory/model load (25 pending)";
+// the full daemon sentence is the hover title.
+function laneChipReason(sentence) {
+  const t = String(sentence || '');
+  if (/cannot load|load_usable|needs [\d.]+ GB|out of memory|\bOOM\b|memory/i.test(t)) return 'waiting on memory/model load';
+  if (!t) return 'reason unknown';
+  const c = t.split(/[:;(]/)[0].trim();
+  return 'waiting on ' + (c.length > 60 ? c.slice(0, 57) + '...' : c);
+}
+function renderLaneChips(w, now) {
+  const box = document.getElementById('laneChips');
+  if (!box) return;
+  const chips = [];
+  if (w && w.source === 'state') {
     for (const [lane, ln] of Object.entries(w.lanes || {})) {
       if (ln.state !== 'idle' || !ln.pending) continue;
       const r = ln.reason || {};
       const isStuck = (w.stuck || []).includes(lane);
-      stuck = stuck || isStuck;
-      lines.push(`<span class="lane"><span class="badge">${escapeHtml(lane)} idle ${dur(now - (ln.idle_since || now))}</span>`
-        + `${isStuck ? '<b>POSSIBLE STUCK SEAM (same reason &gt; ' + Math.round((w.stuck_after_s || 300) / 60) + ' min): </b>' : ''}`
-        + `Waiting on: ${escapeHtml(r.sentence || 'reason unknown')} <span class="log">(${ln.pending} pending, same reason ${dur(now - (r.since || now))})</span></span>`);
+      const full = String(r.sentence || 'reason unknown') + ` (${ln.pending} pending, same reason ${fmtDur(now - (r.since || now))})`
+        + (isStuck ? ' -- POSSIBLE STUCK SEAM' : '');
+      chips.push(`<span class="lchip${isStuck ? ' stuck' : ''}" title="${escapeHtml(full)}">${escapeHtml(lane)}: idle ${fmtDur(now - (ln.idle_since || now))}, `
+        + `${escapeHtml(laneChipReason(r.sentence))} (${ln.pending} pending)</span>`);
+    }
+  }
+  box.hidden = !chips.length;
+  box.innerHTML = chips.join('');
+}
+function renderWaitBanner(w, jobs, fetchedAt) {
+  const el = document.getElementById('waitBanner');
+  if (!el) return;
+  if (!w) { el.hidden = true; el.classList.remove('stuck'); el.innerHTML = ''; renderLaneChips(null, 0); return; }
+  // Ages tick on the CLIENT clock from the moment this payload arrived (fetchedAt), so a payload that
+  // stops being refreshed visibly ages instead of reading "1m" forever.
+  const now = (w.now || Date.now() / 1000) + (fetchedAt ? (Date.now() - fetchedAt) / 1000 : 0);
+  const lines = [];
+  let stuck = false;
+  if (w.source === 'state') {
+    // Idle lanes live in the lane-summary chips; the banner only adds a short red line for a stuck lane.
+    for (const lane of (w.stuck || [])) {
+      const ln = (w.lanes || {})[lane];
+      if (!ln || ln.state !== 'idle' || !ln.pending) continue;
+      stuck = true;
+      lines.push(`<span class="lane"><span class="badge">${escapeHtml(lane)} idle ${fmtDur(now - (ln.idle_since || now))}</span>`
+        + `<b>POSSIBLE STUCK SEAM (same reason &gt; ${Math.round((w.stuck_after_s || 300) / 60)} min)</b> <span class="log">see lane chip above</span></span>`);
     }
   } else if ((jobs || []).some(j => j.status === 'pending' || j.status === 'held')) {
     lines.push(`<span class="lane">${escapeHtml(w.message || 'reason unavailable')}</span>`);
@@ -2346,9 +2698,44 @@ function renderWaitBanner(w, jobs) {
     if (lg.focus_line) lines.push(`<span class="lane log">from daemon log (last focus line, untimestamped): ${escapeHtml(lg.focus_line)}</span>`);
     for (const l of (lg.held_lines || [])) lines.push(`<span class="lane log">from daemon log: ${escapeHtml(l)}</span>`);
   }
+  for (const l of unsatBannerLines(w)) lines.push(l);
+  renderLaneChips(w, now);
   el.hidden = !lines.length;
   el.classList.toggle('stuck', stuck);
   el.innerHTML = lines.join('');
+}
+
+// The banner refreshes on its OWN timer + fetch (5s abort), independent of refresh()'s slowest fetch.
+// On failure / non-ok / timeout it never keeps presenting the last "Waiting on" line as current.
+let waitBannerJobs = [], waitBannerOkAt = 0, WAIT_BANNER_TIMEOUT_MS = 5000, waitBannerBusy = false;
+function renderWaitBannerUnavailable() {
+  const el = document.getElementById('waitBanner');
+  if (!el) return;
+  const ago = waitBannerOkAt ? ' (last seen ' + Math.max(0, Math.round((Date.now() - waitBannerOkAt) / 1000)) + 's ago)' : '';
+  el.hidden = false;
+  el.classList.remove('stuck');
+  renderLaneChips(null, 0);
+  el.innerHTML = '<span class="lane log">Queue wait status unavailable' + ago + '</span>';
+}
+async function refreshWaitBanner() {
+  if (waitBannerBusy) return;
+  waitBannerBusy = true;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), WAIT_BANNER_TIMEOUT_MS);
+  try {
+    const r = await fetch('/api/queue-wait', {cache: 'no-store', signal: ac.signal});
+    if (!r || !r.ok) throw new Error('queue-wait not ok');
+    const w = await r.json();
+    queueWait = w;
+    waitBannerOkAt = Date.now();
+    renderWaitBanner(w, waitBannerJobs, waitBannerOkAt);
+  } catch (e) {
+    queueWait = null;
+    renderWaitBannerUnavailable();
+  } finally {
+    clearTimeout(timer);
+    waitBannerBusy = false;
+  }
 }
 
 // Why ONE queue row is waiting: the daemon's own reason (queue_wait.short) beats the API's derived
@@ -2409,7 +2796,11 @@ function idleWaitText(w, jobs, activeKey, views) {
   const pend = (jobs || []).filter(j => j.status === 'pending' || j.status === 'held');
   if (!pend.length) {
     // A bundle driver (slicer/chain) can be authoring a slice with NO queue row yet: the queue is
-    // not "empty" then, work is in flight (the owner 2026-10-10, rt-amazon-cardlink read "Queue empty").
+    // not "empty" then, work is in flight (Penn 2026-10-10, rt-amazon-cardlink read "Queue empty").
+    // a bundle-less auto run (ollama-dispatch-auto) works OUTSIDE the queue between its jobs
+    const au = ((views && views.activity) || []).filter(a => a.kind === 'auto' && !a.bundle);
+    if (au.length) return 'Auto run ' + au[0].label + ': ' + (au[0].step || au[0].phase) + ' (driver working outside the queue, no queue job right now)'
+      + (au.length > 1 ? ' +' + (au.length - 1) + ' more' : '');
     const dr = typeof driverActiveSlices === 'function' ? driverActiveSlices(views, jobs) : [];
     if (dr.length) return 'Bundle ' + dr[0].key + ': ' + dr[0].phase + ' in progress (driver working, queue job not enqueued yet)'
       + (dr.length > 1 ? ' +' + (dr.length - 1) + ' more' : '');
@@ -2431,7 +2822,7 @@ function idleWaitText(w, jobs, activeKey, views) {
 }
 
 
-// PER-LANE "RUNNING NOW" (the owner 2026-10-09): one equal row per lane -- studio-db, unraid, CPU
+// PER-LANE "RUNNING NOW" (Penn 2026-10-09): one equal row per lane -- studio-db, unraid, CPU
 // lane -- each with label, model, host, elapsed, bundle and a short live status line; an
 // idle lane says so explicitly ("unraid: idle"). A gpu-exclusive job shows its PHASE.
 const NOW_LANES = [['studio-db', 'studio-db'], ['unraid', 'unraid'], ['cpu', 'CPU lane']];
@@ -2453,6 +2844,7 @@ function laneStatusLine(j) {
   if (j.tok_s != null) bits.push(j.tok_s.toFixed(1) + ' tok/s');
   return bits.length ? bits.join(' - ') : 'running';
 }
+function fmtTok(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n); }
 function laneNowRows(jobs, acts, cpuRunning, cpuLocal, wv) {
   // cpuLocal: stages running LOCALLY on the Mac (display-only records from cpu_stage; /api/cpu-lane.local_running)
   if (cpuLocal === undefined) cpuLocal = (typeof window !== 'undefined' && window.cpuLaneLocal) || [];
@@ -2475,10 +2867,31 @@ function laneNowRows(jobs, acts, cpuRunning, cpuLocal, wv) {
       elapsed_s: c.running_s, bundle: c.bundle || null, line: 'RUNNING LOCALLY - local: ' + (c.reason || 'fallback'),
       id: 'local-' + (c.stage || '') + '-' + (c.bundle || ''), local: true});
   }
+  // live ollama-dispatch-auto drivers: the thin orchestrator process (NOT a lane occupant; its real work
+  // runs as queue jobs). Shown as a separate AUTO RUN (driver) row, never under a lane label.
+  const autoRows = [];
+  for (const a of (acts || [])) {
+    if (a.kind !== 'auto' || (jobs || []).some(j => j.status === 'running' && j.id === a.job)) continue;
+    const mine = (a.bundle || a.job) ? (cpuRunning || []).find(c => (a.job && c.id === a.job) || (a.bundle && c.bundle === a.bundle)) : null;
+    const gj = (!mine && a.bundle) ? (acts || []).find(g => g.kind === 'gpu' && g.group_key === a.bundle) : null;
+    const inflight = mine ? {label: mine.label || mine.stage || String(mine.id || '').slice(0, 8), host: mine.runner || 'cpu'}
+      : gj ? {label: gj.display || gj.label || gj.id, host: gj.host || '?'} : null;
+    autoRows.push({label: a.label, step: a.step || a.phase || 'running', pid: a.pid, elapsed_s: a.elapsed_s,
+      bundle: a.bundle || null, inflight});
+  }
   if (wv === undefined) wv = (typeof queueWait !== 'undefined') ? queueWait : null;
   const cpuPend = (typeof cpuQueueCounts === 'function' && typeof window !== 'undefined') ? cpuQueueCounts(window.cpuLaneData).pending : 0;
-  return NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k],
+  const out = NOW_LANES.map(([k, name]) => ({lane: k, name, idle: !by[k].length, jobs: by[k],
     wait: (by[k].length || typeof laneWaitText !== 'function') ? '' : laneWaitText(k, wv, jobs, cpuPend)}));
+  out.auto = autoRows;
+  return out;
+}
+function autoRunHtml(a) {
+  return `<div class="lane-card auto-run" data-auto="${escapeHtml(a.label)}"><span class="lane-name">AUTO RUN (driver)</span>`
+    + ` <b>${escapeHtml(a.label)}</b> <span class="lane-meta">${escapeHtml(a.step)} &middot; ${formatElapsed(a.elapsed_s)}`
+    + ` &middot; pid ${escapeHtml(a.pid)}${a.bundle ? ' &middot; bundle ' + escapeHtml(a.bundle) : ''}</span>`
+    + ` <span class="lane-line">orchestrating; work runs as queue jobs`
+    + `${a.inflight ? ' (queue job in flight: ' + escapeHtml(a.inflight.label) + ' on host ' + escapeHtml(a.inflight.host) + ')' : ''}</span></div>`;
 }
 function laneNowHtml(rows) {
   return '<div class="lane-now">' + rows.map(r => {
@@ -2487,10 +2900,10 @@ function laneNowHtml(rows) {
       + ` <b>${escapeHtml(x.label)}</b> <span class="lane-meta">model ${escapeHtml(x.model)} &middot; host ${escapeHtml(x.host)}`
       + ` &middot; ${formatElapsed(x.elapsed_s)}${x.bundle ? ' &middot; bundle ' + escapeHtml(x.bundle) : ''}</span>`
       + ` <span class="lane-line">${escapeHtml(x.line)}</span></div>`).join('');
-  }).join('') + '</div>';
+  }).join('') + ((rows.auto || []).map(autoRunHtml).join('')) + '</div>';
 }
 
-// CPU-LANE STAGES AS FIRST-CLASS QUEUE ROWS (the owner 2026-10-10: "CPU stages should be in the queue ...
+// CPU-LANE STAGES AS FIRST-CLASS QUEUE ROWS (Penn 2026-10-10: "CPU stages should be in the queue ...
 // running like others"). DISPLAY ONLY, from the same /api/cpu-lane payload the CPU lane panel uses:
 // d.running (Unraid runner), d.pending (waiting for a runner), d.local_running (stage running LOCALLY
 // on the Mac with its fallback reason, e.g. audit-determinism / audit-trivial). A GPU-idle but
@@ -2499,19 +2912,25 @@ function cpuQueueRows(d) {
   d = d || {};
   const rows = [];
   for (const c of (d.running || [])) rows.push({kind: 'running', status: 'running', stage: c.stage || 'cpu',
-    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', where: c.runner || 'runner', secs: c.running_s,
+    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', owner: c.owner || '', where: c.runner || 'runner', secs: c.running_s,
     reason: '', id: c.id || ''});
   for (const c of (d.local_running || [])) rows.push({kind: 'local_running', status: 'running', stage: c.stage || 'cpu',
-    label: c.stage || 'cpu stage', bundle: c.bundle || '', where: 'local (Mac)', secs: c.running_s,
+    label: c.stage || 'cpu stage', bundle: c.bundle || '', owner: c.owner || '', where: 'local (Mac)', secs: c.running_s,
     reason: c.reason || 'fallback', id: ''});
   for (const c of (d.pending || [])) rows.push({kind: 'pending', status: 'pending', stage: c.stage || 'cpu',
-    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', where: 'waiting for a runner', secs: c.waiting_s,
+    label: c.label || String(c.id || '').slice(0, 8), bundle: c.bundle || '', owner: c.owner || '', where: 'waiting for a runner', secs: c.waiting_s,
     reason: '', id: c.id || ''});
   return rows;
 }
 function cpuQueueRowHtml(r, nested) {
   const secs = r.secs == null ? '?' : Math.round(r.secs) + 's';
-  const bundle = (r.bundle && !nested) ? ` <a href="#" class="cpu-bundle" data-bundle="${escapeHtml(r.bundle)}" title="Jump to the owning bundle in the queue">bundle ${escapeHtml(r.bundle)}</a>` : '';
+  // A bare 12-hex "bundle" is a snapshot/worktree hash of a harness that is NOT a queue bundle (standalone
+  // preflight, A/B replay set...): show WHO owns it (r.owner) + a muted tag instead of a fake bundle link.
+  const standaloneHash = !r.bundle || /^[0-9a-f]{12}$/.test(r.bundle);
+  const owner = (r.owner && !nested) ? ` <span class="cpu-owner" title="Submitted by">${escapeHtml(r.owner)}</span>` : '';
+  const bundle = nested ? '' : (standaloneHash
+    ? `${owner} <span class="cpu-standalone" style="opacity:.6;font-size:.85em" title="Not a queue bundle: a preflight/harness running on its own">standalone preflight</span>`
+    : `${owner} <a href="#" class="cpu-bundle" data-bundle="${escapeHtml(r.bundle)}" title="Jump to the owning bundle in the queue">bundle ${escapeHtml(r.bundle)}</a>`);
   const why = r.reason ? ` <span class="cpu-reason">RUNNING LOCALLY - local: ${escapeHtml(r.reason)}</span>` : '';
   return `<td>CPU</td><td><b>${escapeHtml(r.stage)}</b> ${escapeHtml(r.label)}${bundle}`
     + ` <span class="cpu-where">on ${escapeHtml(r.where)}</span>${why}</td>`
@@ -2525,7 +2944,7 @@ function cpuQueueCounts(d) {
 }
 // Draw the rows and refresh everything that says whether the queue is "empty": the Queue panel count
 // and empty line. Called by the CPU-lane poll and by renderSummary (whichever runs last wins, both agree).
-// Where each CPU row goes (the owner 2026-10-10: CPU stages belong INSIDE their bundle group in #jobs, like GPU
+// Where each CPU row goes (Penn 2026-10-10: CPU stages belong INSIDE their bundle group in #jobs, like GPU
 // jobs). hasHeader(key) says whether the queue table already has a bundle header for `key`. A row with a
 // bundle key that is not a bare job id nests (under the existing header, or under a CPU-only header made for
 // it); a row with no bundle, or whose "bundle" is only a standalone job id, falls back to the #cpuQueue table.
@@ -2651,12 +3070,17 @@ function renderSummary(jobs, acts, attnStats, q) {
     <div class="s">${pend} pending${paused ? ' &middot; ' + paused + ' paused' : ''} &middot; ${planned} planned${cpuN.total ? ' &middot; CPU lane: ' + cpuN.running + ' running' + (cpuN.pending ? ', ' + cpuN.pending + ' pending' : '') : ''}${driverNote(drv.length)}</div>`;
   const nA = attnStats.failed + attnStats.parked + attnStats.blocked + (attnStats.stalled || 0);
   const nList = nA - (attnStats.stalled || 0);
+  const _hn0 = attnHiddenTotal(attnStats.hidden);
   const brk = ['failed', 'parked', 'blocked', 'stalled'].filter(k => attnStats[k]).map(k => attnStats[k] + ' ' + k).join(' &middot; ');
   const at = document.getElementById('sumAttn');
   at.classList.toggle('has', nA > 0);
   at.innerHTML = `<div class="k">Needs attention</div><div class="v">${nA}</div>
-    <div class="s">${nA ? brk + (attnStats.stalled ? ' (bundles)' : '') : 'nothing stuck'}${(triageOpen && triageOpen.open) ? ` &middot; <span title="python3 ~/bin/triage-emit.py --json">triage: ${triageOpen.open} signature${triageOpen.open === 1 ? '' : 's'}${triageOpen.repeats ? ' (' + triageOpen.repeats + ' repeated)' : ''}</span>` : ''}${attnStats.stale ? ` &middot; <a href="#stalledPanel" class="stale-link" style="color:var(--muted)" onclick="var d=document.getElementById('stalledDetails');if(d)d.open=true">stale backlog: ${attnStats.stale}</a>` : ''}</div>`;
-  document.getElementById('attnCount').textContent = nA ? String(nA) : '';
+    <div class="s">${nA ? brk + (attnStats.stalled ? ' (bundles)' : '') : 'nothing stuck'}${_hn0 ? ` &middot; <a href="#attnHiddenWrap" class="stale-link" style="color:var(--muted)" onclick="var d=document.getElementById('attnHiddenDetails');if(d)d.open=true">${attnTileText(nA, attnStats.hidden).hidden.trim()}</a>` : ''}${(triageOpen && triageOpen.open) ? ` &middot; <span title="python3 ~/bin/triage-emit.py --json">triage: ${triageOpen.open} signature${triageOpen.open === 1 ? '' : 's'}${triageOpen.repeats ? ' (' + triageOpen.repeats + ' repeated)' : ''}</span>` : ''}${attnStats.stale ? ` &middot; <a href="#stalledPanel" class="stale-link" style="color:var(--muted)" onclick="var d=document.getElementById('stalledDetails');if(d)d.open=true">stale backlog: ${attnStats.stale}</a>` : ''}</div>`;
+  const _tile = attnTileText(nA, attnStats.hidden);
+  document.getElementById('attnCount').textContent = (nA ? _tile.count : '') + _tile.hidden;
+  const _hn = attnHiddenTotal(attnStats.hidden);
+  document.getElementById('attnHiddenWrap').hidden = !_hn;
+  document.getElementById('attnHiddenSummary').textContent = attnHiddenSummary(attnStats.hidden);
   document.getElementById('attnList').hidden = !nList;
   document.getElementById('attnEmpty').hidden = !!nList;
   document.querySelector('#attnEmpty .empty').textContent = attnStats.stalled
@@ -2705,18 +3129,19 @@ async function refresh() {
   if (document.querySelector('details.menu[open]') && Date.now() - menuOpenedAt < 20000) return;
   // finished bundles change slowly: refetch at most every 15s (or right after a control)
   const wantFinished = Date.now() - finishedFetchedAt > 15000;
-  const [res, bvRes, fbRes, qwRes, trRes] = await Promise.all([fetch('/api/jobs'),
+  const [res, bvRes, fbRes, trRes, vdRes] = await Promise.all([fetch('/api/jobs'),
     fetch('/api/bundle-views').catch(() => null),
     wantFinished ? fetch('/api/bundle-history?days=' + finishedDays + '&limit=' + finishedLimit)
       .catch(() => null) : null,
-    fetch('/api/queue-wait').catch(() => null),
-    fetch('/api/triage').catch(() => null)]);
+    fetch('/api/triage').catch(() => null),
+    fetch('/api/bundle-verdicts?days=' + finishedDays + '&limit=' + finishedLimit).catch(() => null)]);
   checkFrontendVersion(res);   // an open tab notices a new build and reloads once
   const jobs = await res.json();
-  try { if (qwRes && qwRes.ok) { queueWait = await qwRes.json(); renderWaitBanner(queueWait, jobs); } } catch (e) { /* keep last */ }
+  waitBannerJobs = jobs;   // the banner's own timer (refreshWaitBanner) reads these for its no-state fallback
   try { if (trRes && trRes.ok) triageOpen = await trRes.json(); } catch (e) { /* keep last */ }
   // Dashboard B: live per-slice truth; an older API (404) just renders as before.
   try { if (bvRes && bvRes.ok) bundleViews = await bvRes.json(); } catch (e) { /* keep last */ }
+  try { if (vdRes && vdRes.ok) { bundleVerdicts = await vdRes.json(); indexBundleVerdicts(); } } catch (e) { /* keep last */ }
   try { if (fbRes && fbRes.ok) { finishedBundles = await fbRes.json(); finishedFetchedAt = Date.now(); } }
   catch (e) { /* keep last */ }
   // pendingIds MUST reflect true FIFO enqueue order (the daemon's actual launch
@@ -2788,7 +3213,7 @@ async function refresh() {
   const _scrollY = window.scrollY;
   // An open overflow menu survives the re-render (same key => reopened below).
   const _openMenu = (document.querySelector('details.menu[open]') || {dataset: {}}).dataset.menu;
-  activeBody.innerHTML = ''; attnBody.innerHTML = ''; finBody.innerHTML = '';
+  activeBody.innerHTML = ''; attnBody.innerHTML = ''; attnHiddenBody.innerHTML = ''; finBody.innerHTML = '';
   tbody = activeBody;
   // LIVE ACTIVITY (Dashboard B): what is happening RIGHT NOW, GPU or not -- the
   // running job(s) and every off-GPU step (preflight, verify-relevance mutants), so
@@ -2797,7 +3222,9 @@ async function refresh() {
   const acts = (bundleViews.activity || []);
   // Needs-attention bookkeeping, filled while the bundles render below.
   const attnStats = {failed: 0, parked: 0, blocked: 0, stalled: ((finishedBundles || {}).stalled || []).filter(v => v.actionable !== false).length,
-    stale: ((finishedBundles || {}).stalled || []).filter(v => v.actionable === false).length};
+    stale: ((finishedBundles || {}).stalled || []).filter(v => v.actionable === false).length,
+    hidden: {experiment: 0, superseded: 0, child: 0}};
+  const deferredKids = [];   // standalone child rows: attach under a shown parent, else hidden
   let activeBundles = 0, activeJobs = 0;
   // ONE definition of a queue row, used for both a top-level (standalone) row and a
   // plan's child row -- the child only differs by an indent class, so every per-row
@@ -2941,13 +3368,14 @@ async function refresh() {
       isGpuJob && j.gpu_wait ? 'waiting: ' + escapeHtml(j.gpu_wait) : '',
       (j.model && !isGpuJob) ? escapeHtml(j.model) : '', escapeHtml(j.lane || j.host_pref || ''),
       progress ? 'iter ' + progress : '', toks ? toks + ' tok/s' : '',
+      (j.usage && j.usage.completion_tokens != null) ? ((j.usage.prompt_tokens != null ? fmtTok(j.usage.prompt_tokens) + ' in / ' : '') + fmtTok(j.usage.completion_tokens) + ' out' + (j.usage.tok_s != null ? ' @ ' + j.usage.tok_s + ' tok/s avg' : '')) : '',
       j.pid != null ? 'pid ' + j.pid : '', j.exit_code != null ? 'exit ' + j.exit_code : '']
       .filter(Boolean).map(x => `<span>${x}</span>`).join('');
     const why = j.status === 'failed' ? failReason(j) : '';
     const stCls = j.phase === 'warming' ? 'warming' : j.status;
     tr.innerHTML = `
       <td${isPending ? ' title="Drag to reorder, or drop onto the running job to run this one now"' : ''}>${isPending ? '☰' : ''}</td>
-      <td>${escapeHtml(j.label || '')}${j.rerun ? ` <span class="rerun" title="${escapeHtml(j.rerun.cause || '')}">#${escapeHtml(String(j.rerun.n))}</span>` : ''}<span class="chip m-chip ${escapeHtml(stCls)}">${statusLabel}</span>${meta ? `<div class="sub">${meta}</div>` : ''}${why ? `<div class="reason bad">${escapeHtml(why)}</div>` : ''}${waitHtml}</td>
+      <td>${escapeHtml(j.label || '')}${j.rerun ? ` <span class="rerun" title="${escapeHtml(j.rerun.cause || '')}">#${escapeHtml(String(j.rerun.n))}</span>` : ''}${j.attn_attempts > 1 ? ` <span class="rerun" title="${j.attn_attempts} failed attempts of this slice; the earlier ones are under the hidden disclosure below">(${j.attn_attempts} attempts)</span>` : ''}<span class="chip m-chip ${escapeHtml(stCls)}">${statusLabel}</span>${meta ? `<div class="sub">${meta}</div>` : ''}${why ? `<div class="reason bad">${escapeHtml(why)}</div>` : ''}${waitHtml}</td>
       <td class="st"><span class="chip status-${escapeHtml(stCls)} ${escapeHtml(stCls)}">${statusLabel}</span></td>
       <td class="when">${j.elapsed_s == null && !isRunning ? '' : elapsed}</td>
       <td class="acts">${actions}</td>
@@ -3137,7 +3565,7 @@ async function refresh() {
       const sPhase = sc.phase, sCls = sc.cls, sDetail = sc.detail;
       str.innerHTML = `
         <td class="slice-caret">${sl.history && sl.history.length ? (open ? '&#9662;' : '&#9656;') : ''}</td>
-        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sCls}">${sPhase}</span>${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}${(sp.cause || sl.summary) ? '<div class="slice-cause" title="' + escapeHtml(sp.cause || sl.summary) + '">' + escapeHtml(sp.cause || sl.summary) + '</div>' : ''}</td>
+        <td title="${escapeHtml(hdr.tip)}">${mark} ${escapeHtml(hdr.num)}${hdr.entry ? ' <span style="opacity:.6">&middot; ' + escapeHtml(hdr.entry) + '</span>' : ''}<span class="chip m-chip ph-${sCls}">${sPhase}</span>${(() => { const vr = verdictRowsForSlice(g.key, sl.sid); if (!vr.length) return ''; const ne = vr.filter(i => i.group === 'needs_eyes').length; return ' <span class="vbadge ' + verdictClass(worstOf(vr)) + (ne ? ' vbadge-eyes' : '') + '" title="gate verdict(s) for this slice">' + escapeHtml(worstOf(vr)) + (ne ? ' &middot; ' + ne + ' eyes' : '') + '</span>'; })()}${sDetail ? '<div class="sub">' + escapeHtml(sDetail) + '</div>' : ''}${(sp.cause || sl.summary) ? '<div class="slice-cause" title="' + escapeHtml(sp.cause || sl.summary) + '">' + escapeHtml(sp.cause || sl.summary) + '</div>' : ''}</td>
         <td class="st"><span class="chip ph ph-${sCls}">${sPhase}</span></td>
         <td class="when slice-facts" colspan="2" title="${escapeHtml(sliceSuffix(sl))}">${sp.facts.map(f => '<span class="slice-fact">' + escapeHtml(f.replace(/^author jobs /, 'jobs ')) + '</span>').join('')}</td>`;
       str.addEventListener('click', () => {
@@ -3148,6 +3576,7 @@ async function refresh() {
         for (const h of sl.history || []) if (h.live && h.id) claimed.add(h.id);
         continue;
       }
+      for (const xi of sliceExtraVerdictRows(g.key, sl)) tbody.appendChild(verdictRowEl(xi, '', SLICE_KID));
       // One history entry as a row: a live queue row (all actions kept) or a read-only line.
       const histRow = (h, indent) => {
         const live = h.live && g.children.find(c => c.id === h.id);
@@ -3162,6 +3591,8 @@ async function refresh() {
             const rr = lc.querySelector('.rerun');
             if (rr) rr.remove();      // the "#N" rerun counter is noise under a slice
           }
+          const vi = (bundleVerdicts.rows || {})[live.id];
+          if (vi && r.children[1]) r.children[1].appendChild(verdictInline(vi));
           return r;
         }
         const htr = document.createElement('tr');
@@ -3176,6 +3607,8 @@ async function refresh() {
           <td class="st"><span class="chip status-${escapeHtml(h.status || '')} ${escapeHtml(h.status || '')}">${escapeHtml(h.status || '')}</span></td>
           <td class="when" title="${escapeHtml(when)}">${h.duration_s != null ? formatElapsed(h.duration_s) : ''}</td>
           <td></td>`;
+        const vi = h.id && (bundleVerdicts.rows || {})[h.id];
+        if (vi && htr.children[1]) htr.children[1].appendChild(verdictInline(vi));
         return htr;
       };
       // A collapsible summary line (an earlier attempt, or earlier refine rounds).
@@ -3294,6 +3727,10 @@ async function refresh() {
     }
     // live rows no slice claimed (an unmapped gate, a hand-enqueued row) still render
     for (const c of g.children) if (!claimed.has(c.id)) tbody.appendChild(buildQueueRow(c, true));
+    // finished jobs joined to this bundle but to no rendered slice (plan-key match only)
+    const _sids = new Set(view.slices.map(x => x.sid));
+    for (const i of Object.values(bundleVerdicts.rows || {}))
+      if (i.bundle === g.key && !_sids.has(i.slice)) tbody.appendChild(verdictRowEl(i, 'slice-verdict-orphan', SLICE_KID));
   };
   for (const g of planEntries) {
     // Render as a BUNDLE whenever the group is keyed. A key is set only when the row's
@@ -3307,8 +3744,16 @@ async function refresh() {
         // A standalone job that failed or is parked goes to Needs attention, with its
         // reason on the row; everything else is ordinary queue work.
         const kind = jobAttentionKind(c);
-        if (kind) attnStats[kind]++; else activeJobs++;
-        tbody = kind ? attnBody : activeBody;
+        // A demoted failure (experiment replay / superseded attempt / child) is filed
+        // under the collapsed disclosure -- same row, same buttons, never dropped.
+        const demote = kind === 'failed' && c.needs_attention && c.attn_reason;
+        if (demote && c.attn_reason === 'child' && c.attn_parent) {
+          deferredKids.push(c);
+          continue;
+        }
+        if (demote) attnStats.hidden[attnBucket(c.attn_reason)]++;
+        else if (kind) attnStats[kind]++; else activeJobs++;
+        tbody = demote ? attnHiddenBody : (kind ? attnBody : activeBody);
         const r = buildQueueRow(c, false);
         if (kind) r.classList.add('needs-attn');
         tbody.appendChild(r);
@@ -3343,16 +3788,27 @@ async function refresh() {
     })();
     const planMax = f => g.children.reduce((m, c) => Math.max(m, c[f] || 0), 0);
     const planFirst = f => (g.children.find(c => c[f] != null) || {})[f];
-    const counts = {}, alertCounts = {};
+    const counts = {}, alertCounts = {}, attemptCounts = {}, hiddenKidReasons = {};
+    let anyFlagged = false;
     for (const c of g.children) {
       counts[c.status] = (counts[c.status] || 0) + 1;
       // needs_attention is the SERVER's judgement (is this row's slice unresolved),
       // never re-derived from the status here -- only it can see the plan run state.
-      if (c.needs_attention) alertCounts[c.status] = (alertCounts[c.status] || 0) + 1;
+      // The server also files each flagged row (attn_reason): a demoted one (experiment
+      // replay / superseded or earlier attempt / child) leaves the alarm badge and falls
+      // to the faint breakdown; a slice's failed attempts read as ONE alert + "N attempts".
+      if (c.needs_attention) {
+        anyFlagged = true;
+        if (c.attn_reason) { const b = attnBucket(c.attn_reason); hiddenKidReasons[b] = (hiddenKidReasons[b] || 0) + 1; }
+        else {
+          alertCounts[c.status] = (alertCounts[c.status] || 0) + 1;
+          attemptCounts[c.status] = (attemptCounts[c.status] || 0) + (c.attn_attempts || 1);
+        }
+      }
     }
     // Anything that did not succeed leaves the faint breakdown and becomes its own
     // badge -- see planAlertSummary. `parts` is what is LEFT, i.e. routine only.
-    const alertSummary = planAlertSummary(counts, alertCounts);
+    const alertSummary = planAlertSummary(counts, alertCounts, attemptCounts);
     // Slice-level truth: a failed/escalated SLICE badges the header even when no queue
     // row of the bundle is failed (the counts above are queue ROWS, not slices).
     const badView = (bundleViews.views || {})[g.key] || null;   // NOT `view`: declared further down (TDZ)
@@ -3404,8 +3860,12 @@ async function refresh() {
     const liveNow = !!(counts.running || counts.pending || counts.queued || gateHeldN || planFirst('plan_active_phase'));
     const hasAlert = alertSummary.alerts.length > 0 || badSlices > 0;
     const attnKind = (!liveNow && (counts.held || counts.paused)) ? 'parked'
-      : (!liveNow && hasAlert) ? 'failed'
+      : (!liveNow && (hasAlert || anyFlagged)) ? 'failed'
       : (!liveNow && counts.blocked) ? 'blocked' : null;
+    // A stuck bundle whose EVERY flagged row was demoted (experiment replay, superseded,
+    // child) is filed under the collapsed disclosure instead of the alarm list.
+    const attnHide = attnKind === 'failed' && !hasAlert;
+    const hideBucket = attnHide ? (['experiment', 'child', 'superseded'].sort((a, b) => (hiddenKidReasons[b] || 0) - (hiddenKidReasons[a] || 0))[0]) : null;
     const attnInfo = attnKind ? bundleAttention(g, badView, attnKind) : null;
     // Button order (the user 2026-09-18): upup, up, down, downdown, hold, cancel -- kept,
     // now as one overflow menu with words beside the arrows.
@@ -3480,7 +3940,7 @@ async function refresh() {
     ptr.innerHTML = `
       <td>${mpos >= 0 ? `<span class="bundle-grip" draggable="true" title="Drag to reorder this bundle in the queue" style="cursor:grab;margin-right:4px;opacity:0.55">&#10303;</span>` : ''}${expanded ? '&#9662;' : '&#9656;'}</td>
       <td><span class="proj-name">${escapeHtml(g.key)}</span><span class="chip m-chip ${chipTxt}">${chipTxt}</span>
-          <div class="sub">${total ? progHtml(through, total, unitName, fracTitle) : ''}${lead}${alertSummary.badge}${sliceBadge}</div>
+          <div class="sub">${total ? progHtml(through, total, unitName, fracTitle) : ''}${lead}${alertSummary.badge}${sliceBadge}${bundleVerdictBadge(g.key)}</div>
           ${summary ? `<div class="sub proj-summary">${summary}</div>` : ''}
           ${attnInfo && attnInfo.reason ? `<div class="reason${attnKind === 'failed' ? ' bad' : ''}">${escapeHtml(attnInfo.reason)}</div>`
             : (headWait && !counts.running ? `<span class="wait-reason">${escapeHtml(headWait)}</span>` : '')}</td>
@@ -3623,8 +4083,9 @@ async function refresh() {
     if (planLogBtn) planLogBtn.addEventListener('click', () =>
       openLivelog(planLogBtn.dataset.planLog, planLogBtn.dataset.logLabel || planLogBtn.dataset.planLog));
     // Route the bundle (header + everything under it) to its section.
-    if (attnKind) attnStats[attnKind]++; else activeBundles++;
-    tbody = attnKind ? attnBody : activeBody;
+    if (attnHide) attnStats.hidden[hideBucket]++;
+    else if (attnKind) attnStats[attnKind]++; else activeBundles++;
+    tbody = attnHide ? attnHiddenBody : (attnKind ? attnBody : activeBody);
     tbody.appendChild(ptr);
     if (expanded && view && view.slices && view.slices.length) {
       renderSliceLines(g, view);
@@ -3686,10 +4147,21 @@ async function refresh() {
     }
     tbody = activeBody;
   }
+  // Standalone child rows (secondop-/esc-review-/gate- naming a parent job): attach
+  // directly under the parent's row when that is on the panel, else file them under the
+  // collapsed disclosure -- either way the row (and its buttons) still renders.
+  for (const c of deferredKids) {
+    const pr = attnBody.querySelector(`tr[data-id="${c.attn_parent}"]`);
+    const r = buildQueueRow(c, true);
+    r.classList.add('needs-attn');
+    if (pr) pr.insertAdjacentElement('afterend', r);
+    else { attnStats.hidden.child++; attnHiddenBody.appendChild(r); }
+  }
   renderStalledBundles(renderSliceLines);
   tbody = finBody;
   renderFinishedBundles(renderSliceLines);
   tbody = activeBody;
+  renderUnattachedVerdicts();
   renderSummary(jobs, acts, attnStats, {bundles: activeBundles, jobs: activeJobs});
   if (_openMenu) {
     const m = document.querySelector(`details.menu[data-menu="${CSS.escape(_openMenu)}"]`);
@@ -3703,7 +4175,7 @@ async function refresh() {
   // the same per-slice lines + full history the live bundles get. Read-only.
   function renderStalledBundles(renderSlices) {
     // STALLED / FAILED bundles: nothing live, but NOT finished (a slice failed/ended or
-    // slices are still owed). Their own panel + count, never aged out (the owner 2026-10-06).
+    // slices are still owed). Their own panel + count, never aged out (Penn 2026-10-06).
     const allStalled = (finishedBundles || {}).stalled || [];
     const views = allStalled.slice(0, stalledShown);
     const panel = document.getElementById('stalledPanel');
@@ -3733,7 +4205,7 @@ async function refresh() {
         <td>${open ? '&#9662;' : '&#9656;'}</td>
         <td><span class="proj-name">${escapeHtml(view.key)}</span><span class="chip m-chip failed">${label}</span>
           <div class="sub">${progHtml(view.through, view.total, view.unit || 'slices', '')}
-          <span class="plan-alert">&#9888; ${bad ? bad + ' failed' : 'slices still owed, nothing running'}</span>
+          <span class="plan-alert">&#9888; ${bad ? bad + ' failed' : 'slices still owed, nothing running'}</span>${bundleVerdictBadge(view.key)}
           <span class="proj-summary">${view.runs || 0} runs &middot; ${escapeHtml(dayLabel(view.last_activity))}</span></div></td>
         <td class="st"><span class="chip status-failed failed">${label}</span></td>
         <td class="when" title="${when ? escapeHtml(when.toLocaleString()) : ''}">${when ? when.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : ''}</td><td></td>`;
@@ -3787,7 +4259,7 @@ async function refresh() {
         <td>${open ? '&#9662;' : '&#9656;'}</td>
         <td><span class="proj-name">${escapeHtml(view.key)}</span><span class="chip m-chip ${bad ? 'failed' : 'done'}">${bad ? 'failed' : 'done'}</span>
           <div class="sub">${progHtml(view.through, view.total, view.unit || 'slices', '')}
-          ${bad ? `<span class="plan-alert">&#9888; ${bad} failed</span>` : ''}
+          ${bad ? `<span class="plan-alert">&#9888; ${bad} failed</span>` : ''}${bundleVerdictBadge(view.key)}
           <span class="proj-summary">${view.runs || 0} runs</span></div></td>
         <td class="st"><span class="chip status-${bad ? 'failed' : 'done'} ${bad ? 'failed' : 'done'}">${bad ? 'failed' : 'done'}</span></td>
         <td class="when" title="${when ? escapeHtml(when.toLocaleString()) : ''}">${when ? when.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : ''}</td><td></td>`;
@@ -3796,6 +4268,22 @@ async function refresh() {
       if (open && view.slices && view.slices.length) renderSlices({key: view.key, children: []}, view);
     }
   }
+}
+
+// Finished jobs whose verdict could not be tied to ANY bundle (esc-review of an old job,
+// stand-alone one-offs): listed here, never dropped.
+function renderUnattachedVerdicts() {
+  const un = (bundleVerdicts.unattached || []).map(id => (bundleVerdicts.rows || {})[id]).filter(Boolean);
+  const panel = document.getElementById('unattachedPanel');
+  if (!panel) return;
+  panel.hidden = !un.length;
+  const ne = un.filter(i => i.group === 'needs_eyes').length;
+  document.getElementById('unattachedSummary').innerHTML = `<b>Unattached</b> verdicts
+    <span class="count" style="color:var(--muted)">${un.length} finished job(s) not under any bundle</span>
+    ${ne ? `<span class="chip bad">${ne} need eyes</span>` : ''}`;
+  const body = document.querySelector('#unattachedTable tbody');
+  body.innerHTML = '';
+  for (const i of un) body.appendChild(verdictRowEl(i, 'unattached-verdict', '.6rem'));
 }
 
 document.getElementById('clearFinished').addEventListener('click', async () => {
@@ -3922,6 +4410,198 @@ document.getElementById('saveHosts').addEventListener('click', async () => {
   }
 });
 
+// ---- Settings: Log retention ------------------------------------------------
+// Everything shown comes from the server's last answer; nothing is optimistic. A failed or
+// hung fetch (aborted at LR_TIMEOUT_MS) replaces the panel state with 'unavailable', never
+// leaves the previous numbers standing as if they were current.
+let lrOkAt = 0, lrBusy = false, lrSaving = false, lrPrevSeq = 0, lrPrevTimer = null, lrPrevAbort = null;
+let LR_TIMEOUT_MS = 8000, LR_DEBOUNCE_MS = 400, lrLoaded = null;
+function lrEl(id) { return document.getElementById(id); }
+function lrMB(b) { return (Math.round((b || 0) / 1048576 * 10) / 10).toFixed(1) + ' MB'; }
+async function lrFetchJson(url, opts) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), LR_TIMEOUT_MS);
+  try {
+    const o = Object.assign({cache: 'no-store'}, opts || {}, {signal: ac.signal});
+    const r = await fetch(url, o);
+    let d = null;
+    try { d = await r.json(); } catch (e) { d = null; }
+    if (!r || !r.ok) throw new Error((d && d.error) || ('HTTP ' + (r && r.status)));
+    if (d === null || typeof d !== 'object') throw new Error('bad response');
+    return d;
+  } finally { clearTimeout(timer); }
+}
+function lrPost(url, obj, method) {
+  return lrFetchJson(url, {method: method || 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Requested-With': 'dashboard'},
+    body: obj === undefined ? undefined : JSON.stringify(obj)});
+}
+function lrSetMsg(text, color) {
+  const m = lrEl('lrMsg'); if (!m) return;
+  m.style.color = color || '';
+  m.textContent = text;
+}
+function lrRenderUnavailable() {
+  const ago = lrOkAt ? ' (last seen ' + Math.max(0, Math.round((Date.now() - lrOkAt) / 1000)) + 's ago)' : '';
+  lrLoaded = null;
+  ['All', 'Failures', 'Successful'].forEach(k => { lrEl('lrPrev' + k).textContent = '—'; });
+  lrEl('lrPrevTotal').textContent = '';
+  lrEl('lrPins').innerHTML = '<em>Log retention unavailable' + escapeHtml(ago) + '</em>';
+  lrEl('lrLast').textContent = '';
+  lrEl('lrSummary').textContent = 'unavailable' + ago;
+  lrEl('lrSave').disabled = true;
+  lrEl('lrPinAdd').disabled = true;
+  lrSetMsg('unavailable — nothing shown here is current', '#c00');
+}
+function lrRenderPins(pins) {
+  const box = lrEl('lrPins');
+  if (!pins || !pins.length) { box.innerHTML = '<em style="opacity:.6">no pins</em>'; return; }
+  box.innerHTML = '<table style="width:100%; border-collapse:collapse"><tbody>' + pins.map(p =>
+    '<tr><td style="padding:.1rem .3rem"><code>' + escapeHtml(p.id) + '</code> <span style="opacity:.6">' + escapeHtml(p.type) + '</span></td>'
+    + '<td style="padding:.1rem .3rem">' + escapeHtml(p.why) + '</td>'
+    + '<td style="padding:.1rem .3rem; opacity:.6">' + escapeHtml(p.who) + ' ' + escapeHtml(String(p.when || '').slice(0, 10)) + '</td>'
+    + '<td><button type="button" class="lr-unpin" data-id="' + escapeHtml(p.id) + '">unpin</button></td></tr>').join('') + '</tbody></table>';
+}
+function lrRenderLast(lr) {
+  const el = lrEl('lrLast');
+  const run = lr && lr.last_run, ap = lr && lr.last_apply;
+  let t = 'Rotation runs ' + escapeHtml((lr && lr.schedule) || 'daily at 04:17') + '. ';
+  if (!run) t += 'No rotation recorded yet.';
+  else {
+    t += 'Last run: ' + escapeHtml(run.ts) + ' (' + escapeHtml(run.mode) + ', ' + (run.mode === 'apply' ? 'freed ' : 'would free ') + lrMB(run.freed_bytes) + ', ' + (run.deleted == null ? '?' : run.deleted) + ' files).';
+    if (ap && ap.ts !== run.ts) t += ' Last delete run: ' + escapeHtml(ap.ts) + ', freed ' + lrMB(ap.freed_bytes) + '.';
+    if (!ap) t += ' No deleting run recorded yet.';
+  }
+  el.innerHTML = t;
+}
+function lrRenderPreview(pv) {
+  const L = (pv && pv.levels) || {};
+  const set = (id, lv) => { lrEl(id).textContent = lv ? lv.count + ' logs, ' + lrMB(lv.bytes) : '—'; };
+  set('lrPrevAll', L.all); set('lrPrevFailures', L.failures); set('lrPrevSuccessful', L.successful);
+  const tot = pv && pv.total;
+  lrEl('lrPrevTotal').textContent = tot
+    ? 'Total: ' + tot.count + ' logs, ' + lrMB(tot.bytes) + (L.ledger ? ' (sidecars ' + L.ledger.count + ', ' + lrMB(L.ledger.bytes) + ')' : '')
+      + (pv.pinned ? '; held by pins: ' + pv.pinned.count + ' (' + lrMB(pv.pinned.bytes) + ')' : '') : '';
+}
+function lrRenderState(d) {
+  const c = d.config || {};
+  lrLoaded = {all: c.all, failures: c.failures == null ? null : c.failures, successful: c.successful == null ? null : c.successful};
+  lrEl('lrAll').value = c.all == null ? '' : String(c.all);
+  lrEl('lrFailures').value = c.failures == null ? '' : String(c.failures);
+  lrEl('lrSuccessful').value = c.successful == null ? '' : String(c.successful);
+  lrEl('lrFailures').placeholder = 'inherit (' + c.all + ')';
+  lrEl('lrSuccessful').placeholder = 'inherit (' + c.all + ')';
+  lrEl('lrSave').disabled = false;
+  lrEl('lrPinAdd').disabled = false;
+  lrRenderPins(c.pins || []);
+  lrRenderLast(d.last_rotation);
+  if (d.preview && !(d.preview.errors && d.preview.errors.length)) lrRenderPreview(d.preview);
+  else {
+    lrRenderPreview(null);
+    if (d.preview && d.preview.errors && d.preview.errors.length) lrEl('lrPrevTotal').textContent = 'preview unavailable: ' + d.preview.errors.join('; ');
+  }
+  lrEl('lrSummary').textContent = 'keep ' + c.all + 'd' + (c.failures != null ? ', failures ' + c.failures + 'd' : '')
+    + (c.successful != null ? ', successful ' + c.successful + 'd' : '') + ', ' + (c.pins || []).length + ' pin(s)';
+  const warn = [].concat(d.errors || [], d.validation || []);
+  lrSetMsg(warn.length ? 'config file warning: ' + warn.join('; ') : '', warn.length ? '#c60' : '');
+}
+async function refreshLogRetention() {
+  if (lrBusy || lrSaving) return;
+  lrBusy = true;
+  try {
+    const d = await lrFetchJson('/api/log-retention');
+    lrOkAt = Date.now();
+    lrRenderState(d);
+  } catch (e) {
+    lrRenderUnavailable();
+  } finally { lrBusy = false; }
+}
+function lrReadInputs() {
+  const one = (id, name, req) => {
+    const s = lrEl(id).value.trim();
+    if (s === '') return req ? {err: name + ' is required (1-365)'} : {v: null};
+    if (!/^\d{1,3}$/.test(s)) return {err: name + ' must be a whole number 1-365'};
+    const n = parseInt(s, 10);
+    if (n < 1 || n > 365) return {err: name + ' must be 1-365'};
+    return {v: n};
+  };
+  const a = one('lrAll', 'All', true), f = one('lrFailures', 'Failures', false), s = one('lrSuccessful', 'Successful', false);
+  for (const r of [a, f, s]) if (r.err) return {err: r.err};
+  return {cfg: {all: a.v, failures: f.v, successful: s.v}};
+}
+function lrSchedulePreview() {
+  clearTimeout(lrPrevTimer);
+  lrPrevTimer = setTimeout(lrRunPreview, LR_DEBOUNCE_MS);
+}
+async function lrRunPreview() {
+  const inp = lrReadInputs();
+  if (inp.err) { lrRenderPreview(null); lrSetMsg(inp.err, '#c00'); return; }
+  const seq = ++lrPrevSeq;
+  try {
+    const d = await lrPost('/api/log-retention/preview', {config: inp.cfg});
+    if (seq !== lrPrevSeq) return;   // a newer edit superseded this answer
+    lrRenderPreview(d.preview);
+    lrSetMsg('', '');
+  } catch (e) {
+    if (seq !== lrPrevSeq) return;
+    lrRenderPreview(null);
+    lrSetMsg('preview unavailable: ' + (e && e.message || e), '#c00');
+  }
+}
+async function lrSave() {
+  if (lrSaving) return;
+  const inp = lrReadInputs();
+  if (inp.err) { lrSetMsg('NOT saved: ' + inp.err, '#c00'); return; }
+  lrSaving = true;
+  lrSetMsg('saving...', '');
+  try {
+    const d = await lrPost('/api/log-retention', {config: inp.cfg});
+    lrOkAt = Date.now();
+    lrLoaded = null;
+    lrRenderState(Object.assign({}, d, {preview: null}));   // show what the SERVER stored, not what was typed
+    lrSetMsg('saved', '#0a0');
+    setTimeout(() => { if (lrEl('lrMsg').textContent === 'saved') lrSetMsg('', ''); }, 3000);
+    lrSchedulePreview();
+  } catch (e) {
+    lrSetMsg('NOT saved: ' + (e && e.name === 'AbortError' ? 'timed out' : (e && e.message || e)), '#c00');
+  } finally { lrSaving = false; }
+}
+async function lrPinAction(fn, label) {
+  if (lrSaving) return;
+  lrSaving = true;
+  try {
+    const d = await fn();
+    lrOkAt = Date.now();
+    lrRenderPins((d.config || {}).pins || []);
+    lrRenderLast(d.last_rotation);
+    lrSetMsg(label + ' done', '#0a0');
+    lrSchedulePreview();
+  } catch (e) {
+    lrSetMsg(label + ' failed: ' + (e && e.name === 'AbortError' ? 'timed out' : (e && e.message || e)), '#c00');
+  } finally { lrSaving = false; }
+}
+function lrAddPin() {
+  const id = lrEl('lrPinId').value.trim(), why = lrEl('lrPinWhy').value.trim();
+  if (!id || !why) { lrSetMsg('pin needs a job id / bundle name and a reason', '#c00'); return; }
+  return lrPinAction(async () => {
+    const d = await lrPost('/api/log-retention/pin', {job_or_bundle: id, reason: why});
+    lrEl('lrPinId').value = ''; lrEl('lrPinWhy').value = '';
+    return d;
+  }, 'pin');
+}
+function lrUnpin(id) {
+  return lrPinAction(() => lrPost('/api/log-retention/pin?id=' + encodeURIComponent(id), undefined, 'DELETE'), 'unpin');
+}
+['lrAll', 'lrFailures', 'lrSuccessful'].forEach(id => lrEl(id).addEventListener('input', lrSchedulePreview));
+lrEl('lrSave').addEventListener('click', lrSave);
+lrEl('lrPinAdd').addEventListener('click', lrAddPin);
+lrEl('lrPins').addEventListener('click', ev => {
+  const b = ev.target && ev.target.closest ? ev.target.closest('.lr-unpin') : null;
+  if (b) lrUnpin(b.getAttribute('data-id'));
+});
+lrEl('logRetention').addEventListener('toggle', () => { if (lrEl('logRetention').open) refreshLogRetention(); });
+setInterval(() => { if (lrEl('logRetention').open) refreshLogRetention(); }, 60000);
+
 // Unified run-status table: backed by /api/runs (see ollama-queue-api.py's
 // _run_status_jobs), which reads the NEVER-PRUNED gate sidecars minus anything
 // cleared/archived. A row lands here when qwen finishes and stays until it is
@@ -3933,7 +4613,7 @@ function verdictClass(tag) {
   if (t.startsWith('FAIL')) return 'verdict-fail';
   if (t.startsWith('CONCERNS')) return 'verdict-concerns';
   if (t.startsWith('SKIPPED')) return 'verdict-skipped';
-  if (t.startsWith('PENDING')) return 'verdict-pending';
+  if (t.startsWith('PENDING') || t.startsWith('IN PROGRESS')) return 'verdict-pending';
   if (t.startsWith('BLOCKED')) return 'verdict-blocked';
   return 'verdict-unknown';
 }
@@ -4008,6 +4688,13 @@ function loadExpandState() {
   } catch (e) { /* unreadable/corrupt -- defaults are correct, never block the render */ }
 }
 loadExpandState();
+// Run Status starts COLLAPSED (verdicts live with their bundles); a hand toggle is remembered.
+(() => {
+  const rd = document.getElementById('runStatusDetails');
+  if (!rd) return;
+  rd.open = !!planExpanded['__runStatusOpen'];
+  rd.addEventListener('toggle', () => { planExpanded['__runStatusOpen'] = rd.open; saveExpandState(); });
+})();
 // Finished bundles start collapsed; an open/close by hand is remembered.
 (() => {
   const fd = document.getElementById('finishedDetails');
@@ -4045,12 +4732,15 @@ function renderRunRow(r, handled, isChild) {
     btn.onclick = () => openGateDetail(r.id, r.label);
     actionCell.appendChild(btn);
   }
-  const clearBtn = document.createElement('button');
-  clearBtn.textContent = 'clear';
-  clearBtn.className = 'iconbtn';
-  clearBtn.title = 'Handled -- archive this row out of the list (recoverable)';
-  clearBtn.onclick = () => clearRun(r.id, r.label, r.awaiting_signoff);
-  actionCell.appendChild(clearBtn);
+  // a row owned by a LIVE auto run is not clearable (clearing would orphan the run)
+  if (!r.auto_run_live) {
+    const clearBtn = document.createElement('button');
+    clearBtn.textContent = 'clear';
+    clearBtn.className = 'iconbtn';
+    clearBtn.title = 'Handled -- archive this row out of the list (recoverable)';
+    clearBtn.onclick = () => clearRun(r.id, r.label, r.awaiting_signoff);
+    actionCell.appendChild(clearBtn);
+  }
   return tr;
 }
 
@@ -4120,7 +4810,7 @@ function headerRow(opts) {
 // Bulk-clear button for a header: archives every already-handled descendant in one
 // click (skips anything still awaiting sign-off -- those still refuse a plain clear).
 function attachBulkClear(hdr, rows, what) {
-  const clearable = rows.filter(r => r.group === 'handled' && !r.awaiting_signoff);
+  const clearable = rows.filter(r => r.group === 'handled' && !r.awaiting_signoff && !r.auto_run_live);
   if (!clearable.length) return;
   const cbtn = document.createElement('button');
   cbtn.textContent = `clear ${clearable.length} handled`;
@@ -4378,12 +5068,14 @@ async function refreshCpuLane() {
 }
 
 refresh();
+refreshWaitBanner();
 refreshHosts();
 refreshHostSettings();
 refreshRuns();
 refreshCpuLane();
 setInterval(refreshCpuLane, 5000);
 setInterval(refresh, 4000);
+setInterval(refreshWaitBanner, 4000);
 setInterval(refreshHosts, 4000);
 setInterval(refreshRuns, 5000);
 
@@ -4511,6 +5203,38 @@ def _tail_progress(log_path):
     warm_idx = tail.rfind("warming up")
     warming = warm_idx != -1 and "loaded and warm" not in tail[warm_idx:]
     return iteration, max_iters, tok_s, warming
+
+
+def _usage_summary(log_path):
+    """{prompt_tokens, completion_tokens, tok_s, decode_tok_s, calls} (each a number or None) parsed from
+    the worker's USAGE SUMMARY log line, or None when the log has none. Best-effort: any failure -> None,
+    never an exception. Cached on (path, mtime, size) so polling finished jobs does not re-read logs."""
+    if not log_path:
+        return None
+    try:
+        st = os.stat(log_path)
+        key = (str(log_path), st.st_mtime_ns, st.st_size)
+        if key in _USAGE_CACHE:
+            return _USAGE_CACHE[key]
+        with open(log_path, "rb") as f:
+            f.seek(max(0, st.st_size - _USAGE_TAIL_BYTES))
+            tail = f.read().decode("utf-8", errors="replace")
+        m = _USAGE_RE.findall(tail)
+        out = None
+        if m:
+            def _n(x):
+                try:
+                    return float(x) if "." in x else int(x)
+                except ValueError:
+                    return None
+            pt, ct, ts, dts, calls = (_n(x) for x in m[-1])
+            out = {"prompt_tokens": pt, "completion_tokens": ct, "tok_s": ts, "decode_tok_s": dts, "calls": calls}
+        if len(_USAGE_CACHE) > 2000:
+            _USAGE_CACHE.clear()
+        _USAGE_CACHE[key] = out
+        return out
+    except Exception:
+        return None
 
 
 def _ollama_resident_models(url):
@@ -4777,7 +5501,10 @@ def _job_summary(j, jobs=None):
           "error", "enqueued_at", "after", "plan_note",
           # WHY it failed (worker's terminal_reason) and WHOSE fault it is
           # (ollama-queue.py's classify_failure) -- stamped at reap, read here.
-          "terminal_reason", "failure_class", "failure_detail")}
+          "terminal_reason", "failure_class", "failure_detail",
+          # the queue's own supersession record (ollama-queue.py _mark_superseded),
+          # read by _annotate_attention_groups
+          "superseded_by")}
     # GPU-EXCLUSIVE rows (ollama-queue.py `enqueue-gpu`): a non-LLM shell job that has a
     # lane's GPU to itself. The model field is only a placeholder, so the row carries
     # its own label: kind + one-line summary + what it is waiting for.
@@ -4814,6 +5541,7 @@ def _job_summary(j, jobs=None):
     d["iteration"] = iteration
     d["max_iters"] = max_iters
     d["tok_s"] = tok_s
+    d["usage"] = _usage_summary(j.get("log_path")) if j.get("status") not in ("pending", "running") else None
     # Only meaningful overlaid on a "running" job -- iteration is still None
     # at that point precisely because it hasn't started iterating yet.
     d["phase"] = "warming" if (j.get("status") == "running" and warming and iteration is None) else None
@@ -5150,6 +5878,115 @@ def _completed_jobs(limit=50):
 # Archived rows STAY archived (recoverable by hand from LOG_DIR/archive/); they do
 # not come back into the list.
 
+# --- SHARED HANDLED LEDGER (2026-10-14, Penn: "clearing a job in one doesn't clear it in
+# the other, I have to clear things twice"). Verified from the code before this change:
+#   * handoff `--acted` wrote ONLY acted.json; this list never read it, so an acted
+#     deliverable stayed in needs_eyes/good_to_go (54 of the 100 live rows were acted).
+#   * this list's clear ARCHIVED sidecars, but handoff-emit's load_jobs() also lists
+#     every job still in queue-state.json (336 terminal rows live), so a cleared slice
+#     member kept showing on the handoff panel -- the "drops off BOTH" note above is
+#     only true for reaped jobs.
+#   * the 100-row cap hid an awaiting-sign-off row (arr-webhook 8557454d853b) that the
+#     handoff panel shows.
+# Fix: handoff's acted.json is the ONE handled ledger. A clear here also writes an acted
+# mark there; an acted mark there folds the row here into 'handled' with the acted
+# reason (nothing archived, verdict untouched, row still listed). A required, unapproved
+# sign-off is NEVER folded by an acted mark unless that mark recorded an explicit
+# sign-off override. Only applies when this list reads the SAME log dir handoff-emit
+# does (so fixture LOG_DIRs never touch the real ledger). Kill switch:
+# RUNSTATUS_SHARED_LEDGER=off (both directions + the beyond-cap sign-off rows).
+SHARED_LEDGER_MODE = os.environ.get("RUNSTATUS_SHARED_LEDGER", "on").lower()
+
+
+def _shared_ledger_on():
+    if SHARED_LEDGER_MODE in ("off", "0", "false", "no"):
+        return False
+    try:
+        return Path(q.LOG_DIR).resolve() == Path(ho.LOGS).resolve()
+    except Exception:
+        return False
+
+
+def _shared_acted_view():
+    """Read-only acted.json, with the same last-good overlay `handoff-emit --json`
+    applies (so a mark it honours is a mark this list honours). {} when off/unreadable."""
+    if not _shared_ledger_on():
+        return {}
+    try:
+        acted = ho._load(ho.ACTED, {})
+        view = dict(acted) if isinstance(acted, dict) else {}
+        ho._restore_missing(view, log=False)
+        return view
+    except Exception:
+        return {}
+
+
+def _acted_fold_reason(meta):
+    """PURE. The handled_reason for a row folded by a handoff acted mark."""
+    meta = meta if isinstance(meta, dict) else {}
+    why = meta.get("reason") or meta.get("how") or "marked acted"
+    ts = meta.get("ts") or meta.get("archived_at") or ""
+    return f"acted on in handoff{(' ' + ts) if ts else ''}: {why}"
+
+
+def _signoff_path():
+    """The signoff.json handoff-emit's signoff_blocks_acting reads (next to it)."""
+    return Path(ho.__file__).parent / "signoff.json"
+
+
+def _signoff_rows_beyond_cap(rows, acted):
+    """Rows still owing a REQUIRED unapproved sign-off that the newest-`limit` cap
+    dropped (the handoff panel shows them; this list must too). Skips acted ids (the
+    handoff panel hides those as well) and anything without a durable result."""
+    if not _shared_ledger_on():
+        return []
+    have = {r.get("id") for r in rows}
+    try:
+        so = ho._load(_signoff_path(), {}) or {}
+    except Exception:
+        return []
+    out = []
+    for jid, rec in so.items():
+        if jid in have or jid in acted or not isinstance(rec, dict):
+            continue
+        if not rec.get("required") or rec.get("verdict") == "approve":
+            continue
+        try:
+            res = q._load_job_result(jid, q.LOG_DIR)
+            if res is None:
+                continue
+            s = _completed_summary(res)
+        except Exception:
+            continue
+        if s.get("status") in _LIVE_QUEUE_STATUSES or str(s.get("label") or "").startswith(("gate-", "regate-")):
+            continue
+        s["beyond_cap"] = True
+        out.append(s)
+    return out
+
+
+def _mark_shared_acted(job_id, label, how, override=None):
+    """Write the shared-ledger mark for a run-status clear. Never overwrites an
+    existing mark (the first decision stays authoritative). Returns 'marked',
+    'already', 'off', or 'error: ...' -- best effort, the archive already happened."""
+    if not _shared_ledger_on():
+        return "off"
+    try:
+        with ho._locked_acted() as acted:
+            if job_id in acted:
+                return "already"
+            entry = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "how": f"cleared in run-status ({how})", "label": label,
+                     "reason": how}
+            if override:
+                entry["how"] += " (SIGN-OFF OVERRIDDEN)"
+                entry["signoff_override_reason"] = override
+            acted[job_id] = entry
+        return "marked"
+    except Exception as e:
+        return f"error: {type(e).__name__}: {e}"
+
+
 def _run_status_jobs(limit=100):
     """The unified run-status list: every durable completed result that is NOT a
     live queue row and has NOT been cleared/archived, newest first, each annotated
@@ -5161,6 +5998,8 @@ def _run_status_jobs(limit=100):
     handoff INDEX can never disagree about which jobs a human still owes a decision.
     """
     rows = _completed_jobs(limit=limit)
+    acted = _shared_acted_view()
+    rows += _signoff_rows_beyond_cap(rows, acted)
     for r in rows:
         r["awaiting_signoff"] = ho.signoff_blocks_acting(r["id"], r.get("label")) is not None
     # Live queue labels count as "newer stages" for supersede detection: a finished
@@ -5171,11 +6010,131 @@ def _run_status_jobs(limit=100):
             live_labels = _live_queue_labels(lock.load().get("jobs", []))
     except Exception:
         live_labels = []
-    _annotate_run_groups(rows, live_labels)
+    _annotate_run_groups(rows, live_labels, auto_runs=_auto_run_states(), acted=acted)
     _annotate_run_parents(rows)
     _annotate_run_projects(rows)
     _annotate_eyes_labels(rows)
     return rows
+
+
+# --- BUNDLE VERDICTS (2026-10-14, Penn: "gate verdicts should stay with their bundle").
+# The verdict / needs_eyes|good_to_go|handled group / reason that Run Status shows is
+# ALSO surfaced inline on each job row under its bundle and as a roll-up on the bundle
+# header. Single source: the /api/runs rows (_run_status_jobs -> _annotate_run_groups);
+# this only JOINS those annotated rows to the bundle views by job id / parent / label
+# and copies the fields -- it never recomputes a group or a verdict. /api/runs and
+# /api/runs/tree are untouched (five tools read them).
+_BV_VERDICT_RANK = (("FAIL", 5), ("BLOCKED", 4), ("CONCERNS", 3), ("PENDING", 2),
+                    ("IN PROGRESS", 2), ("NO-GATE", 2), ("?", 2), ("SKIP", 1), ("PASS", 0))
+_BV_ROW_FIELDS = ("id", "label", "display_label", "verdict", "raw_verdict", "group",
+                  "handled_reason", "eyes_label", "eyes_severity", "blocked_reason",
+                  "has_gate", "awaiting_signoff", "auto_run_live", "regate",
+                  "terminal_reason", "parent", "slice_id", "timestamp")
+_BV_SUFFIX_RE = re.compile(r"(?: \[auto-fix r\d+\])?(?:-lc\d+|-rr)?$")
+
+
+def _bv_verdict_rank(raw):
+    t = str(raw or "?").strip().upper()
+    for pre, rank in _BV_VERDICT_RANK:
+        if t.startswith(pre):
+            return rank
+    return 2
+
+
+def _bundle_verdict_index(rows, view_list):
+    """PURE. Join annotated run-status `rows` to bundle `view_list` (live + finished +
+    stalled views, each {key, slices:[{sid, history:[{id,label}]}]}).
+
+    Attach order per row: (1) its own job id appears in a slice history; (2) it is a
+    gate/regate/esc-review child naming a parent job id that is in a slice history or
+    is itself an attached row; (3) its label (minus ' [auto-fix rN]' / '-lcN' / '-rr')
+    equals a history label; (4) its slicer `parent` plan key is a bundle key. Anything
+    else is UNATTACHED -- listed, never dropped. Returns
+    {rows: {id: info}, bundles: {key: roll-up}, unattached: [ids]} where info copies the
+    row's annotation fields plus bundle/slice/via/clearable, and roll-up carries the
+    WORST raw verdict over ALL attached rows and the needs_eyes count."""
+    ids, labs, keys = {}, {}, set()
+    for v in view_list or []:
+        k = v.get("key")
+        if not k:
+            continue
+        keys.add(k)
+        for sl in v.get("slices") or []:
+            for h in sl.get("history") or []:
+                if h.get("id") and h["id"] not in ids:
+                    ids[h["id"]] = (k, sl.get("sid"))
+                if h.get("label") and h["label"] not in labs:
+                    labs[h["label"]] = (k, sl.get("sid"))
+    try:
+        child_pid = _bundle_view_lib()[0].child_parent_id
+    except Exception:
+        child_pid = lambda _j: None
+    by_id = {r.get("id"): r for r in rows}
+    attach = {}
+
+    def _find(r, depth=0):
+        rid = r.get("id")
+        if rid in attach:
+            return attach[rid]
+        hit = None
+        if rid in ids:
+            hit = ids[rid] + ("job",)
+        if hit is None:
+            pid = child_pid({"label": r.get("label")})
+            if pid and pid in ids:
+                hit = ids[pid] + ("parent job",)
+            elif pid and pid in by_id and depth < 4 and by_id[pid] is not r:
+                ph = _find(by_id[pid], depth + 1)
+                hit = (ph[0], ph[1], "parent job") if ph else None
+        if hit is None:
+            lab = str(r.get("label") or "")
+            base = _BV_SUFFIX_RE.sub("", lab)
+            for cand in (lab, base):
+                if cand in labs:
+                    hit = labs[cand] + ("label",)
+                    break
+        if hit is None and r.get("parent") in keys:
+            hit = (r["parent"], r.get("slice_id"), "plan")
+        attach[rid] = hit
+        return hit
+
+    out_rows, bundles, unattached = {}, {}, []
+    for r in rows:
+        info = {k: r.get(k) for k in _BV_ROW_FIELDS}
+        # sign-off-protected (or live-auto-run-owned) rows are NEVER clearable from the
+        # inline UI; the Run Status panel keeps its explicit override prompt.
+        info["clearable"] = not (r.get("awaiting_signoff") or r.get("auto_run_live"))
+        hit = _find(r)
+        info["bundle"], info["slice"], info["via"] = (hit if hit else (None, None, None))
+        out_rows[r.get("id")] = info
+        if not hit:
+            unattached.append(r.get("id"))
+            continue
+        b = bundles.setdefault(hit[0], {"worst": None, "worst_rank": -1, "needs_eyes": 0,
+                                        "good_to_go": 0, "handled": 0, "total": 0, "ids": []})
+        b["total"] += 1
+        b["ids"].append(r.get("id"))
+        g = r.get("group")
+        if g in ("needs_eyes", "good_to_go", "handled"):
+            b[g] += 1
+        rk = _bv_verdict_rank(r.get("raw_verdict"))
+        if rk > b["worst_rank"]:
+            b["worst_rank"], b["worst"] = rk, r.get("raw_verdict") or "?"
+    return {"rows": out_rows, "bundles": bundles, "unattached": unattached}
+
+
+def _bundle_verdicts_payload(days=None, limit=None):
+    """I/O wrapper: the cached /api/runs rows joined to the same cached bundle views
+    the queue panel renders (live + finished page + stalled)."""
+    days = FINISHED_BUNDLE_DAYS if days is None else days
+    limit = FINISHED_BUNDLE_PAGE if limit is None else limit
+    rows = _cached_response("runs", _run_status_jobs, ttl=10, stale=120)
+    live = (_cached_response("bundle-views", _bundle_views, ttl=3, stale=60) or {}).get("views") or {}
+    a = {"days": float(days), "limit": int(limit), "offset": 0}
+    fin = _cached_response("bundle-history:" + json.dumps(a, sort_keys=True),
+                           lambda: _finished_bundle_views(**a), ttl=15, stale=120) or {}
+    views = list(live.values()) + list(fin.get("views") or []) + list(fin.get("stalled") or [])
+    return _bundle_verdict_index(rows, views)
 
 
 # --- run-status RETENTION (2026-10-02, the user via coordinator): harness rows
@@ -5542,7 +6501,116 @@ _QUEUE_LIVE_STATUSES = frozenset({"pending", "queued", "scheduled", "planned",
                                   "running", "paused", "held"})
 
 
-def _annotate_run_groups(rows, live_labels=None):
+# --- LIVE AUTO RUNS (2026-10-11, Penn: run-status showed "BLOCKED -- authoring stage
+# only, the coding slice never ran" + a clear button for auto-author-* rows whose
+# ollama-dispatch-auto run was STILL ALIVE and advancing, and a bundle-less run (outside
+# the queue between its jobs) was invisible on the dashboard). The driver's own state
+# file (~/.ollama-dispatch/auto-runs/<key>.json, runs[<label>] records) is the truth:
+# a run is LIVE only when its outcome is unset, its phase is advancing/waiting AND its
+# pid is alive AND that pid's command line is really `ollama-dispatch-auto ... <label>`
+# (pid reuse by an unrelated process must not count; a dead pid with phase "advancing"
+# is a crashed driver, not progress).
+_AUTO_LIVE_PHASES = frozenset({"advancing", "waiting"})
+
+
+def _auto_runs_dir():
+    return Path(os.environ.get("OLLAMA_DISPATCH_AUTO_RUNS_DIR",
+                               Path.home() / ".ollama-dispatch" / "auto-runs"))
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _pid_cmdline(pid):
+    """Full command line of `pid`, or '' when it is gone / unreadable."""
+    try:
+        r = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _auto_run_states(runs_dir=None, alive=None, cmdline=None, now=None):
+    """Every NON-ENDED auto run in the state dir, each tagged `live` (bool) and, when
+    not live, `dead_note` (why). Ended/outcome-set runs are skipped: they keep the old
+    behaviour. Never raises."""
+    runs_dir = Path(runs_dir) if runs_dir else _auto_runs_dir()
+    alive = alive or _pid_alive
+    cmdline = cmdline or _pid_cmdline
+    now = time.time() if now is None else now
+    out, seen = [], set()
+    try:
+        files = sorted(runs_dir.glob("*.json"))
+    except OSError:
+        return out
+    for fp in files:
+        if fp.name.endswith(".attempts.json"):
+            continue
+        try:
+            doc = json.loads(fp.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        recs = [v for v in (doc.get("runs") or {}).values() if isinstance(v, dict)] \
+            if isinstance(doc.get("runs"), dict) else [doc]
+        for rec in recs:
+            label = rec.get("label") or rec.get("key")
+            if not label or label in seen or rec.get("outcome") \
+                    or rec.get("phase") not in _AUTO_LIVE_PHASES:
+                continue
+            seen.add(label)
+            pid = rec.get("pid")
+            r = {"key": rec.get("key"), "label": label, "bundle": rec.get("bundle"),
+                 "pid": pid, "phase": rec.get("phase"), "step": rec.get("step"),
+                 "job": rec.get("job"), "rounds": list(rec.get("rounds") or []),
+                 "started_at": rec.get("started_at"),
+                 "phase_since": rec.get("phase_since"), "live": False}
+            try:
+                t0 = datetime.strptime(str(rec.get("started_at")), "%Y-%m-%dT%H:%M:%SZ") \
+                    .replace(tzinfo=timezone.utc).timestamp()
+                r["elapsed_s"] = max(0, round(now - t0))
+            except (ValueError, TypeError):
+                r["elapsed_s"] = None
+            if not isinstance(pid, int) or not alive(pid):
+                r["dead_note"] = f"auto run died at step '{rec.get('step')}' (pid {pid} is gone)"
+            else:
+                cmd = cmdline(pid) or ""
+                if "ollama-dispatch-auto" in cmd and (str(label) in cmd or str(rec.get("key")) in cmd):
+                    r["live"] = True
+                else:
+                    r["dead_note"] = (f"auto run died at step '{rec.get('step')}' "
+                                      f"(pid {pid} is now an unrelated process)")
+            out.append(r)
+    return out
+
+
+def _live_auto_runs(**kw):
+    return [r for r in _auto_run_states(**kw) if r["live"]]
+
+
+def _auto_run_for_row(row, runs):
+    """The auto run (live or dead) that owns this run-status row: its job id is one the
+    run enqueued (rounds/job), or its label is that run's auto-author/refine stage."""
+    jid, lab = str(row.get("id") or ""), str(row.get("label") or "")
+    for r in runs or []:
+        if jid and (jid in (r.get("rounds") or []) or jid == r.get("job")):
+            return r
+    for r in runs or []:
+        if re.match(r"^auto-(author|refine)-" + re.escape(str(r.get("label"))) + r"-s\d", lab):
+            return r
+    return None
+
+
+def _annotate_run_groups(rows, live_labels=None, auto_runs=None, acted=None):
     """Tag every run-status row with a `group` ('needs_eyes' | 'handled') and, when
     handled, a `handled_reason`. NOTHING is hidden or archived here -- this only
     SORTS the one list so the surface can show a small trustworthy 'needs your eyes'
@@ -5587,6 +6655,15 @@ def _annotate_run_groups(rows, live_labels=None):
 
     for r in rows:
         lab = str(r.get("label") or "")
+        # SHARED HANDLED LEDGER: a handoff acted mark IS a clear (see
+        # _shared_acted_view). Fold, never archive; a sign-off still owed only folds
+        # when the mark itself recorded an explicit sign-off override.
+        _am = (acted or {}).get(r.get("id")) if acted else None
+        if _am is not None and (not r.get("awaiting_signoff")
+                                or (isinstance(_am, dict) and _am.get("signoff_override_reason"))):
+            r["group"], r["handled_reason"] = "handled", _acted_fold_reason(_am)
+            r["handoff_acted"] = True
+            continue
         if r.get("awaiting_signoff"):
             r["group"], r["handled_reason"] = "needs_eyes", ""
             continue
@@ -5637,6 +6714,20 @@ def _annotate_run_groups(rows, live_labels=None):
         # really did stop at the harness. Rewrite the verdict so it can never read
         # as a shipped PASS, and keep it in needs_eyes: it is a stall, not a win.
         blocked = _run_blocked_reason(r, lab)
+        if blocked:
+            _ar = _auto_run_for_row(r, auto_runs)
+            if _ar and _ar.get("live"):
+                # the owning auto run is alive and advancing: authoring is DONE, the
+                # coding slice simply has not been enqueued yet -- not a stall.
+                _msg = f"authoring done, auto run advancing: {_ar.get('step') or _ar.get('phase')}"
+                r["group"], r["handled_reason"] = "handled", f"IN PROGRESS -- {_msg}"
+                r["auto_run_live"] = True
+                r["gate_verdict"] = r.get("verdict")
+                r["raw_verdict"] = "IN PROGRESS"
+                r["verdict"] = f"IN PROGRESS -- {_msg}"
+                continue
+            if _ar and _ar.get("dead_note"):
+                blocked = f"{blocked} -- {_ar['dead_note']}"
         if blocked:
             r["group"], r["handled_reason"] = "needs_eyes", ""
             r["blocked_reason"] = blocked
@@ -6151,6 +7242,12 @@ def _archive_run(job_id, override=None, how=None):
     res = q._load_job_result(job_id, ld)
     if res is None:
         return {"ok": False, "code": 404, "error": "no durable result for this job id"}
+    # never orphan a live run: a row owned by an alive auto run is not clearable
+    _own = _auto_run_for_row({"id": job_id}, _live_auto_runs())
+    if _own:
+        return {"ok": False, "code": 409, "auto_run_live": True,
+                "error": (f"auto run '{_own['label']}' (pid {_own['pid']}) is still "
+                          f"advancing ({_own.get('step')}); clearing its rows would orphan it")}
     label = res.get("label")
     block = ho.signoff_blocks_acting(job_id, label)
     if block and not override:
@@ -6178,8 +7275,12 @@ def _archive_run(job_id, override=None, how=None):
         entry["how"] = "cleared from dashboard (SIGN-OFF OVERRIDDEN)"
         entry["signoff_override_reason"] = override
     _clear_manifest_append(archive, entry)
+    # SHARED HANDLED LEDGER: the same clear also marks the job acted on the handoff
+    # panel, so it never has to be cleared twice (see _mark_shared_acted).
+    ledger = _mark_shared_acted(job_id, label, how or "cleared from dashboard",
+                                override=override if block else None)
     return {"ok": True, "id": job_id, "moved": moved,
-            "signoff_overridden": bool(block and override)}
+            "signoff_overridden": bool(block and override), "handoff_acted": ledger}
 
 
 def _web_search_usage():
@@ -6300,11 +7401,45 @@ _RESP_CACHE_LOCKS = {}    # key -> threading.Lock (single-flight per key)
 _RESP_CACHE_GUARD = threading.Lock()
 
 
+_LL_INDEX = {}            # dir -> (dir mtime_ns, {job id: [filenames]}); see _dir_index
+_LL_INDEX_LOCK = threading.Lock()
+
+
+def _dir_index(d):
+    """{job id: [filename]} for every `<id>-*` file directly in `d`. The log dirs hold
+    ~14k files; globbing them on EVERY /livelog request (3 globs + a stat per hit) was
+    a measurable slice of the 2026-10-10 pile-up. The index is rebuilt only when the
+    directory's mtime moves (a file was created/removed), so a lookup is one stat."""
+    try:
+        mt = os.stat(d).st_mtime_ns
+    except OSError:
+        return {}
+    key = str(d)
+    with _LL_INDEX_LOCK:
+        hit = _LL_INDEX.get(key)
+        if hit and hit[0] == mt:
+            return hit[1]
+    idx = {}
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                n = e.name
+                k = n.find("-")
+                if k > 0:
+                    idx.setdefault(n[:k], []).append(n)
+    except OSError:
+        return {}
+    with _LL_INDEX_LOCK:
+        _LL_INDEX[key] = (mt, idx)
+    return idx
+
+
 def _livelog_path(job, job_id, live_dir=None, log_dir=None):
     """The transcript to show for `job_id`: its recorded live log, else (the row was
     reaped, or never recorded one) the durable files by id -- LIVE_LOG_DIR's
     <id>-*.livelog, then LOG_DIR's <id>-*.log run transcript (and LOG_DIR/archive).
-    Only a plain hex id is globbed, so a crafted id can never escape the log dirs."""
+    Only a plain hex id is looked up, so a crafted id can never escape the log dirs.
+    Lookups go through _dir_index (no per-request directory glob)."""
     p = (job or {}).get("live_log_path")
     if p and os.path.isfile(p):
         return p
@@ -6312,14 +7447,17 @@ def _livelog_path(job, job_id, live_dir=None, log_dir=None):
         return None
     live_dir = Path(live_dir) if live_dir else q.LIVE_LOG_DIR
     log_dir = Path(log_dir) if log_dir else q.LOG_DIR
-    for d, pat in ((live_dir, f"{job_id}-*.livelog"), (log_dir, f"{job_id}-*.log"),
-                   (log_dir / "archive", f"{job_id}-*.log")):
-        try:
-            hits = sorted(d.glob(pat), key=lambda x: x.stat().st_mtime, reverse=True)
-        except OSError:
-            hits = []
+    jid = str(job_id)
+    for d, ext in ((live_dir, ".livelog"), (log_dir, ".log"), (log_dir / "archive", ".log")):
+        names = [n for n in _dir_index(d).get(jid, ()) if n.endswith(ext)]
+        hits = []
+        for n in names:
+            try:
+                hits.append((os.stat(d / n).st_mtime, d / n))
+            except OSError:
+                pass        # listed, then reaped: the index refreshes on the next dir change
         if hits:
-            return str(hits[0])
+            return str(max(hits)[1])
     return None
 
 
@@ -6534,7 +7672,25 @@ def _bundle_views(state=None, runs_dir=None, chain_dir=None, log_dir=None,
         activity.append({"kind": "cpu", "tool": r.get("tool"), "what": dp.describe(r),
                          "wt": Path(str(r.get("wt") or "")).name,
                          "elapsed_s": round(now - t, 1)})
-    return {"views": views, "activity": activity, "active": active}
+    # live auto runs (driver processes outside the queue between their jobs): show them,
+    # so a bundle-less run is not invisible. A run whose own job is running right now is
+    # already shown as that GPU job and not repeated.
+    auto_runs = []
+    try:
+        _running_ids = {j.get("id") for j in jobs if j.get("status") == "running"}
+        auto_runs = _live_auto_runs(runs_dir=chain_dir, alive=alive, now=now)
+        for ar in auto_runs:
+            if ar.get("job") in _running_ids:
+                continue
+            activity.append({"kind": "auto", "tool": "ollama-dispatch-auto",
+                             "what": f"auto run {ar['label']}: {ar.get('step') or ar.get('phase')} (driver, not in queue)",
+                             "wt": f"pid {ar['pid']}", "label": ar["label"], "job": ar.get("job"),
+                             "step": ar.get("step"), "phase": ar.get("phase"),
+                             "bundle": ar.get("bundle"), "pid": ar.get("pid"),
+                             "elapsed_s": ar.get("elapsed_s")})
+    except Exception:
+        auto_runs = []
+    return {"views": views, "activity": activity, "active": active, "auto_runs": auto_runs}
 
 
 # --- FINISHED bundles (the user 2026-10-05: "I want to see the full history of each
@@ -6663,7 +7819,7 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
         starts = [h.get("launched_at") for h in recs if h.get("launched_at")]
         outcome, nbad = bv.bundle_outcome(v, sup, _plan_cancel_rec(k))
         # FINISHED = every slice done/landed/skipped. A bundle with nothing live that
-        # failed (or still owes slices) is STALLED, not finished (the owner 2026-10-06).
+        # failed (or still owes slices) is STALLED, not finished (Penn 2026-10-06).
         v.update(finished=(outcome == "finished"), outcome=outcome, failed_slices=nbad,
                  last_activity=last[k],
                  first_activity=min(starts) if starts else None, runs=len(recs))
@@ -6715,25 +7871,65 @@ def _finished_bundle_views(days=FINISHED_BUNDLE_DAYS, limit=FINISHED_BUNDLE_PAGE
     return out
 
 
-def _cached_response(key, fn, ttl=_RESP_CACHE_TTL):
+_RESP_CACHE_GEN = [0]       # bumped by _invalidate_response_cache; a computation that started
+_RESP_REFRESHING = set()    # before a bump never stores its (now stale) value
+
+
+def _cache_store(key, gen, val):
+    if gen == _RESP_CACHE_GEN[0]:
+        _RESP_CACHE[key] = (time.monotonic(), val)
+
+
+def _refresh_async(key, fn, lock):
+    """One background recompute per key (stale-while-revalidate). Never raises."""
+    with _RESP_CACHE_GUARD:
+        if key in _RESP_REFRESHING:
+            return
+        _RESP_REFRESHING.add(key)
+
+    def _run():
+        try:
+            with lock:
+                gen = _RESP_CACHE_GEN[0]
+                _cache_store(key, gen, fn())
+        except Exception as e:  # noqa: BLE001 -- the stale value keeps being served
+            sys.stderr.write(f"[queue-api] background refresh of {key!r} failed: {e!r}\n")
+        finally:
+            with _RESP_CACHE_GUARD:
+                _RESP_REFRESHING.discard(key)
+
+    threading.Thread(target=_run, name=f"refresh-{key}", daemon=True).start()
+
+
+def _cached_response(key, fn, ttl=_RESP_CACHE_TTL, stale=0):
     """fn() at most once per `ttl` seconds per key; concurrent callers share the
-    one in-flight computation instead of each running their own."""
+    one in-flight computation instead of each running their own.
+
+    `stale` (seconds) turns on stale-while-revalidate for the slow endpoints: once the
+    entry is older than `ttl` but younger than ttl+stale it is served AT ONCE and one
+    background thread recomputes it, so no poll ever waits on a multi-second rebuild
+    (only the very first call, or one after an invalidation, computes inline)."""
     now = time.monotonic()
     hit = _RESP_CACHE.get(key)
     if hit and now - hit[0] < ttl:
         return hit[1]
     with _RESP_CACHE_GUARD:
         lock = _RESP_CACHE_LOCKS.setdefault(key, threading.Lock())
+    if hit and stale and now - hit[0] < ttl + stale:
+        _refresh_async(key, fn, lock)
+        return hit[1]
     with lock:
         hit = _RESP_CACHE.get(key)
         if hit and time.monotonic() - hit[0] < ttl:
             return hit[1]
+        gen = _RESP_CACHE_GEN[0]
         val = fn()
-        _RESP_CACHE[key] = (time.monotonic(), val)
+        _cache_store(key, gen, val)
         return val
 
 
 def _invalidate_response_cache():
+    _RESP_CACHE_GEN[0] += 1
     _RESP_CACHE.clear()
 
 
@@ -6774,7 +7970,306 @@ def _chat_module():
     return importlib.import_module("dashboard_chat")
 
 
+# Concurrency cap (2026-10-10 pile-up: ~170 stacked request threads, load avg ~80). The server
+# is thread-per-request; once the in-flight count reaches the cap a new request is answered
+# with a fast 503 + Retry-After instead of joining the pile. /api/cpu/* (the Unraid runner's
+# claim / heartbeat / result calls) draws from its OWN pool so dashboard load can never starve
+# it, and a runner burst can never eat the dashboard's slots.
+try:
+    MAX_INFLIGHT = max(1, int(os.environ.get("OLLAMA_QUEUE_API_MAX_INFLIGHT", "48")))
+    MAX_INFLIGHT_CPU = max(1, int(os.environ.get("OLLAMA_QUEUE_API_MAX_INFLIGHT_CPU", "32")))
+except ValueError:
+    MAX_INFLIGHT, MAX_INFLIGHT_CPU = 48, 32
+RETRY_AFTER_S = 2
+_API_SLOTS = threading.BoundedSemaphore(MAX_INFLIGHT)
+_CPU_SLOTS = threading.BoundedSemaphore(MAX_INFLIGHT_CPU)
+
+
+# ---- Log retention panel (config contract: ~/bin/log_retention_config.py) ----------------
+# User-editable log retention. The client sends ONLY the three level values and job/bundle
+# ids; it never supplies a path, never the pin metadata (who/when) and never ledger_days.
+# Every body is shape-checked here regardless of the page (the chat route's body check was
+# once assumed, not enforced). Responses are pure data so the tests can drive _lr_handle()
+# without a socket.
+LR_MAX_BODY = 16 * 1024
+LR_MAX_PINS = 200
+LR_MAX_REASON = 200
+LR_SCHEDULE = "daily at 04:17"
+LR_LEVEL_KEYS = ("all", "failures", "successful")
+LR_PIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+LR_JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+_LR_LOCK = threading.Lock()          # serializes read-modify-write of the config
+_LR_PREVIEW_LOCK = threading.Lock()  # a preview walks ~20k files (~2s): one at a time
+
+
+def _lr_mod():
+    import log_retention_config
+    return log_retention_config
+
+
+def _lr_is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _lr_audit_summary(max_bytes=256 * 1024):
+    """Last rotation run + last config save, parsed from the audit log (read-only)."""
+    out = {"last_run": None, "last_apply": None, "last_config_saved": None, "schedule": LR_SCHEDULE}
+    try:
+        p = _lr_mod().audit_path()
+        with open(p, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return out
+    for ln in reversed(lines):
+        ts, _, rest = ln.partition(" ")
+        if rest.startswith("rotate "):
+            kv = dict(re.findall(r"(\w+)=(\d+|[\w-]+)", rest.split(" skipped[")[0]))
+            row = {"ts": ts, "mode": kv.get("mode"),
+                   "deleted": int(kv["deleted"]) if kv.get("deleted", "").isdigit() else None,
+                   "freed_bytes": int(kv["freed_bytes"]) if kv.get("freed_bytes", "").isdigit() else None}
+            if out["last_run"] is None:
+                out["last_run"] = row
+            if out["last_apply"] is None and row["mode"] == "apply":
+                out["last_apply"] = row
+        elif rest.startswith("config-saved") and out["last_config_saved"] is None:
+            out["last_config_saved"] = {"ts": ts, "detail": rest[:300]}
+        if out["last_run"] and out["last_apply"] and out["last_config_saved"]:
+            break
+    return out
+
+
+def _lr_preview_cached(cfg):
+    """Dry run for cfg, serialized and cached 10s by config content (never raises)."""
+    key = json.dumps(cfg, sort_keys=True)
+    hit = _lr_preview_cache.get(key)
+    if hit and time.time() - hit[0] < 10:
+        return hit[1]
+    if not _LR_PREVIEW_LOCK.acquire(timeout=15):
+        return {"errors": ["preview busy, try again"]}
+    try:
+        try:
+            res = _lr_mod().preview(cfg)
+        except Exception as e:  # noqa: BLE001
+            return {"errors": [f"preview failed: {type(e).__name__}: {e}"[:300]]}
+        if not res.get("errors"):
+            if len(_lr_preview_cache) > 16:
+                _lr_preview_cache.clear()
+            _lr_preview_cache[key] = (time.time(), res)
+        return res
+    finally:
+        _LR_PREVIEW_LOCK.release()
+
+
+_lr_preview_cache = {}
+
+
+def _lr_levels_from(obj, what="config"):
+    """Strict shape check for a client-supplied levels object -> (levels, error).
+    Exactly the keys all/failures/successful; all required int; the others int or null.
+    Numeric strings, floats, bools and unknown keys are rejected (range is validate()'s job)."""
+    if not isinstance(obj, dict):
+        return None, f"{what} must be a JSON object"
+    extra = sorted(str(k) for k in obj if k not in LR_LEVEL_KEYS)
+    if extra:
+        return None, f"{what} has unknown field(s): {', '.join(extra)[:80]}"
+    if "all" not in obj:
+        return None, f"{what}.all is required"
+    out = {}
+    for k in LR_LEVEL_KEYS:
+        v = obj.get(k)
+        if k == "all" and not _lr_is_int(v):
+            return None, "all must be a whole number of days"
+        if k != "all" and v is not None and not _lr_is_int(v):
+            return None, f"{k} must be a whole number of days or null (inherit)"
+        out[k] = v
+    return out, None
+
+
+def _lr_merge(levels):
+    """Server-owned fields (pins, ledger_days) come from the current file, never the client."""
+    cfg, _ = _lr_mod().load_checked()
+    cfg = dict(cfg)
+    cfg.update(levels)
+    return cfg
+
+
+def _lr_state():
+    C = _lr_mod()
+    cfg, errs = C.load_checked()
+    return {"config": cfg, "errors": errs, "validation": C.validate(cfg),
+            "preview": _lr_preview_cached(cfg), "last_rotation": _lr_audit_summary(),
+            "schedule": LR_SCHEDULE}
+
+
+def _lr_pin_state(cfg):
+    return {"ok": True, "config": cfg, "last_rotation": _lr_audit_summary(), "schedule": LR_SCHEDULE}
+
+
+def _lr_clean_text(s):
+    return "".join(ch for ch in s if ch.isprintable()).strip()
+
+
+def _lr_handle(method, path, headers, body):
+    """-> (status, json-able). method GET/POST/DELETE; path may carry ?query; headers is a
+    case-insensitive Mapping; body is bytes (already length-capped by the caller)."""
+    u = urllib.parse.urlsplit(path)
+    route = u.path.rstrip("/")
+    if method in ("POST", "DELETE"):
+        # CSRF: a cross-site form/fetch cannot send JSON or a custom header without a CORS
+        # preflight, and this server answers none. The page always sends both.
+        ctype = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if method == "POST" and ctype != "application/json":
+            return 415, {"ok": False, "error": "Content-Type must be application/json"}
+        if headers.get("X-Requested-With") != "dashboard":
+            return 403, {"ok": False, "error": "missing X-Requested-With header"}
+
+    def parse():
+        if len(body) > LR_MAX_BODY:
+            return None, (413, {"ok": False, "error": f"body too large (max {LR_MAX_BODY} bytes)"})
+        try:
+            data = json.loads(body.decode("utf-8") if body else "")
+        except (ValueError, UnicodeDecodeError):
+            return None, (400, {"ok": False, "error": "body must be valid JSON"})
+        if not isinstance(data, dict):
+            return None, (400, {"ok": False, "error": "body must be a JSON object"})
+        return data, None
+
+    C = _lr_mod()
+    if route == "/api/log-retention" and method == "GET":
+        return 200, _lr_state()
+    if route == "/api/log-retention/preview" and method == "POST":
+        data, err = parse()
+        if err:
+            return err
+        if set(data) - {"config"}:
+            return 400, {"ok": False, "error": "body must be {config: {...}} only"}
+        levels, e = _lr_levels_from(data.get("config"))
+        if e:
+            return 400, {"ok": False, "error": e}
+        cfg = _lr_merge(levels)
+        errs = C.validate(cfg)
+        if errs:
+            return 400, {"ok": False, "error": "; ".join(errs)[:400], "errors": errs}
+        res = _lr_preview_cached(cfg)
+        if res.get("errors"):
+            return 503, {"ok": False, "error": "; ".join(res["errors"])[:400]}
+        return 200, {"ok": True, "preview": res}
+    if route == "/api/log-retention" and method == "POST":
+        data, err = parse()
+        if err:
+            return err
+        if set(data) - {"config"}:
+            return 400, {"ok": False, "error": "body must be {config: {...}} only"}
+        levels, e = _lr_levels_from(data.get("config"))
+        if e:
+            return 400, {"ok": False, "error": e}
+        with _LR_LOCK:
+            cfg = _lr_merge(levels)
+            errs = C.validate(cfg)
+            if errs:
+                return 400, {"ok": False, "error": "; ".join(errs)[:400], "errors": errs}
+            try:
+                saved = C.save(cfg, who="dashboard")
+            except ValueError as ve:
+                return 400, {"ok": False, "error": str(ve)[:400]}
+            except OSError as oe:
+                return 500, {"ok": False, "error": f"could not write config: {oe}"[:300]}
+        _lr_preview_cache.clear()
+        return 200, _lr_pin_state(saved)
+    if route == "/api/log-retention/pin" and method == "POST":
+        data, err = parse()
+        if err:
+            return err
+        if set(data) - {"job_or_bundle", "reason"}:
+            return 400, {"ok": False, "error": "body must be {job_or_bundle, reason} only"}
+        pid, reason = data.get("job_or_bundle"), data.get("reason")
+        if not isinstance(pid, str) or not isinstance(reason, str):
+            return 400, {"ok": False, "error": "job_or_bundle and reason must be strings"}
+        pid, reason = pid.strip(), _lr_clean_text(reason)
+        if not LR_PIN_ID_RE.match(pid):
+            return 400, {"ok": False, "error": "job_or_bundle must be a 12-hex job id or a bundle name (letters, digits, . _ -; max 80)"}
+        if not reason or len(reason) > LR_MAX_REASON:
+            return 400, {"ok": False, "error": f"reason required (1..{LR_MAX_REASON} chars)"}
+        ptype = "job" if LR_JOB_ID_RE.match(pid) else "bundle"
+        with _LR_LOCK:
+            cfg, _ = C.load_checked()
+            cfg = dict(cfg)
+            pins = list(cfg.get("pins") or [])
+            if any(p.get("id") == pid for p in pins):
+                return 409, {"ok": False, "error": f"{pid} is already pinned"}
+            if len(pins) >= LR_MAX_PINS:
+                return 400, {"ok": False, "error": f"too many pins (max {LR_MAX_PINS})"}
+            pins.append({"type": ptype, "id": pid, "who": "dashboard",
+                         "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "why": reason})
+            cfg["pins"] = pins
+            try:
+                saved = C.save(cfg, who="dashboard")
+            except ValueError as ve:
+                return 400, {"ok": False, "error": str(ve)[:400]}
+            except OSError as oe:
+                return 500, {"ok": False, "error": f"could not write config: {oe}"[:300]}
+        _lr_preview_cache.clear()
+        return 200, _lr_pin_state(saved)
+    if route == "/api/log-retention/pin" and method == "DELETE":
+        q = urllib.parse.parse_qs(u.query)
+        ids = q.get("id") or []
+        if len(ids) != 1 or not LR_PIN_ID_RE.match(ids[0]):
+            return 400, {"ok": False, "error": "exactly one valid ?id= required"}
+        pid = ids[0]
+        with _LR_LOCK:
+            cfg, _ = C.load_checked()
+            cfg = dict(cfg)
+            pins = list(cfg.get("pins") or [])
+            keep = [p for p in pins if p.get("id") != pid]
+            if len(keep) == len(pins):
+                return 404, {"ok": False, "error": f"{pid} is not pinned"}
+            cfg["pins"] = keep
+            try:
+                saved = C.save(cfg, who="dashboard")
+            except ValueError as ve:
+                return 400, {"ok": False, "error": str(ve)[:400]}
+            except OSError as oe:
+                return 500, {"ok": False, "error": f"could not write config: {oe}"[:300]}
+        _lr_preview_cache.clear()
+        return 200, _lr_pin_state(saved)
+    return 404, {"ok": False, "error": "not found"}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    _slot = None
+
+    def parse_request(self):
+        """Admission control, run once the request line + headers are parsed and before any
+        do_* handler: take a slot from the right pool or refuse with 503 + Retry-After."""
+        if not super().parse_request():
+            return False
+        pool = _CPU_SLOTS if self.path.startswith("/api/cpu/") else _API_SLOTS
+        if not pool.acquire(blocking=False):
+            body = b"server busy, retry shortly"
+            self.send_response(503)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Retry-After", str(RETRY_AFTER_S))
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            self.close_connection = True
+            return False
+        self._slot = pool
+        return True
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        finally:
+            slot, self._slot = self._slot, None
+            if slot is not None:
+                slot.release()
+
     # A client that connects and then stalls (a backgrounded phone tab, a proxy
     # holding the socket) otherwise pins a thread and a descriptor forever --
     # part of the same fd pile-up. The server speaks HTTP/1.0 (no keep-alive), so
@@ -6841,6 +8336,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(out)
 
+    def _log_retention(self, method):
+        """/api/log-retention*: thin socket wrapper over _lr_handle (all rules live there).
+        The body is read only after its declared length passes the cap."""
+        try:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > LR_MAX_BODY:
+                return self._json({"ok": False, "error": "bad or oversized Content-Length"},
+                                  413 if length > LR_MAX_BODY else 400)
+            body = self.rfile.read(length) if length else b""
+            status, obj = _lr_handle(method, self.path, self.headers, body)
+        except Exception as e:  # noqa: BLE001
+            status, obj = 500, {"ok": False, "error": f"log retention error: {type(e).__name__}"}
+        self.send_response(status)
+        out = json.dumps(obj).encode()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frontend-Version", FRONTEND_VERSION)
+        self.end_headers()
+        self.wfile.write(out)
+
     def _cpu_lane(self, method):
         """/api/cpu/* = the Unraid CPU runner's API. It enforces its OWN bearer token and
         refuses Cloudflare-fronted requests (cpu_lane.handle); everything else on this
@@ -6851,11 +8370,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._text("cpu lane unavailable: %s" % type(e).__name__, 503)
         return cpu_lane.handle(self, method)
 
+    def _invalidate_for_write(self):
+        """Drop the response cache on a state-changing request -- EXCEPT the Unraid runner's
+        /api/cpu/* claim / heartbeat / result calls. Those arrive every few seconds around the
+        clock and change nothing the cached payloads contain (the lane panel reads the uncached
+        /api/cpu-lane); invalidating on each one kept every heavy endpoint permanently cold,
+        which is what turned the ~6s payload builds into the 2026-10-10 thread pile-up."""
+        if not self.path.startswith("/api/cpu/"):
+            _invalidate_response_cache()
+
     def do_PUT(self):
-        _invalidate_response_cache()
+        self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("PUT")
         self._text("not found", 404)
+
+    def _build_jobs_payload(self):
+        with q._Locked() as lock:
+            state = lock.load()
+        # The rendered order follows the daemon's OWN focused bundle (read from the
+        # same state we just loaded), so a bundle that is first stays first across
+        # the gap where its next slice has not been enqueued yet.
+        _rows = _annotate_plan_rollup(
+            _annotate_display_seq(
+                _annotate_job_groups([_job_summary(j, state["jobs"])
+                                      for j in state["jobs"]]),
+                focus_key=_focus_bundle_key(state)))
+        try:    # fold the live slice view into the rollup (see _apply_view_activity)
+            _apply_view_activity(_rows, (_cached_response("bundle-views", _bundle_views, ttl=3, stale=60)
+                                         or {}).get("views") or {})
+        except Exception:
+            pass
+        try:    # presentation-only grouping of needs_attention rows (see _annotate_attention_groups)
+            _annotate_attention_groups(_rows)
+        except Exception:
+            pass
+        return _annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_rows, state), state))
 
     def do_GET(self):
         if self.path.startswith("/api/cpu/"):
@@ -6880,26 +8430,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/" or self.path == "/index.html":
             self._html(FRONTEND_HTML)
         elif self.path == "/api/jobs":
-            with q._Locked() as lock:
-                state = lock.load()
-            # The rendered order follows the daemon's OWN focused bundle (read from the
-            # same state we just loaded), so a bundle that is first stays first across
-            # the gap where its next slice has not been enqueued yet.
-            _rows = _annotate_plan_rollup(
-                _annotate_display_seq(
-                    _annotate_job_groups([_job_summary(j, state["jobs"])
-                                          for j in state["jobs"]]),
-                    focus_key=_focus_bundle_key(state)))
-            try:    # fold the live slice view into the rollup (see _apply_view_activity)
-                _apply_view_activity(_rows, (_cached_response("bundle-views", _bundle_views, ttl=3)
-                                             or {}).get("views") or {})
-            except Exception:
-                pass
-            self._json(_annotate_queue_wait(_annotate_wait_reason(_annotate_bundle_rank(_rows, state), state)))
+            # Whole payload is single-flight cached: it costs ~6s of CPU to build (load_history, darkbloom_status,
+            # plan rollup), and uncached each dashboard poll recomputed it -> 100+ stacked threads, GIL-starved API.
+            self._json(_cached_response("api-jobs", self._build_jobs_payload, ttl=3, stale=120))
         elif self.path == "/api/triage":
             # Open failure-signature triage packets (triage_packets.open_summary; read-only,
             # fail-open: an unreadable index is {"open": 0}).
-            self._json(_triage_summary())
+            self._json(_cached_response("triage", _triage_summary, ttl=10))
         elif self.path == "/api/queue-wait":
             # Lane-level "what is the queue waiting on" (daemon queue-wait.json, or the
             # clearly-labelled daemon-log fallback until the daemon is restarted).
@@ -6907,7 +8444,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/bundle-views":
             # Dashboard B: one line per slice with its LIVE phase + history, per plan
             # in the queue, and the live off-GPU activity row (see _bundle_views).
-            self._json(_cached_response("bundle-views", _bundle_views, ttl=3))
+            self._json(_cached_response("bundle-views", _bundle_views, ttl=3, stale=60))
         elif self.path == "/api/bundle-history" or self.path.startswith("/api/bundle-history?"):
             # FINISHED bundles with their full per-slice history, newest first, paged
             # (see _finished_bundle_views). ?days=N (0 = all ages) &limit= &offset=
@@ -6920,33 +8457,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._text("days/limit/offset must be numbers", 400)
             self._json(_cached_response(
                 "bundle-history:" + json.dumps(a, sort_keys=True),
-                lambda: _finished_bundle_views(**a), ttl=15))
+                lambda: _finished_bundle_views(**a), ttl=15, stale=120))
         elif self.path == "/api/jobs/completed":
-            self._json(_cached_response("completed", _completed_jobs))
+            self._json(_cached_response("completed", _completed_jobs, ttl=10, stale=120))
         elif self.path == "/api/runs":
             # Unified run-status list (see _run_status_jobs). Supersedes the split
             # between /api/jobs/completed and /api/handoff; those endpoints remain
             # for any other consumer, but the dashboard front-end now reads this one.
-            self._json(_cached_response("runs", _run_status_jobs))
+            self._json(_cached_response("runs", _run_status_jobs, ttl=10, stale=120))
+        elif self.path == "/api/bundle-verdicts" or self.path.startswith("/api/bundle-verdicts?"):
+            # Per-job verdicts joined to their bundle (see _bundle_verdict_index). Read-only
+            # view over /api/runs; ?days=&limit= mirror /api/bundle-history so the join
+            # sees the same finished bundles the panel renders.
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                _d = float(qs.get("days", [FINISHED_BUNDLE_DAYS])[0])
+                _l = int(qs.get("limit", [FINISHED_BUNDLE_PAGE])[0])
+            except ValueError:
+                return self._text("days/limit must be numbers", 400)
+            self._json(_bundle_verdicts_payload(_d, _l))
         elif self.path == "/api/runs/retention":
             # Retention preview: every row the auto-retention predicate would archive,
             # with the reason (never clears). See runstatus_retention.py.
-            self._json(_retention_preview())
+            self._json(_cached_response("runs/retention", _retention_preview, ttl=30, stale=300))
         elif self.path == "/api/runs/tree":
             # The same rows as /api/runs, pre-nested project > slice > run with the
             # worst-of rollup already computed (see _build_run_tree). The panel reads
             # THIS; /api/runs stays exactly as it was for any other consumer.
             self._json(_cached_response("runs/tree",
-                                        lambda: _build_run_tree(_run_status_jobs())))
+                                        lambda: _build_run_tree(_run_status_jobs()), ttl=10, stale=120))
         elif self.path == "/api/hosts":
-            self._json(_hosts_summary())
+            self._json(_cached_response("hosts", _hosts_summary, ttl=10, stale=60))
         elif self.path == "/api/settings/hosts":
             # The editable host table behind the Settings panel. Reads through
             # ollama-worker.py's live config loader, so it never disagrees with
             # what the dispatcher/fit-router is actually using.
-            self._json(_hosts_settings())
+            self._json(_cached_response("settings/hosts", _hosts_settings, ttl=5))
+        elif self.path.split("?")[0].rstrip("/") == "/api/log-retention":
+            return self._log_retention("GET")
         elif self.path == "/api/web-search-usage":
-            self._json(_web_search_usage())
+            self._json(_cached_response("web-search-usage", _web_search_usage, ttl=15, stale=120))
         elif self.path == "/api/handoff":
             # Read the handoff data from handoff-emit.py --json. Bounded: an
             # untimed child here held a request thread (and its socket) for as long
@@ -7017,13 +8567,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         # Any state change must be visible on the very next poll.
-        _invalidate_response_cache()
+        self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("POST")
         if self.path.startswith("/api/chat/"):
             return self._chat("POST")
         if self.path == "/api/jobs":
             self._enqueue()
+        elif self.path.split("?")[0].rstrip("/").startswith("/api/log-retention"):
+            return self._log_retention("POST")
         elif self.path == "/api/settings/hosts":
             return self._save_hosts()
         elif self.path == "/api/jobs/move":
@@ -7055,9 +8607,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._text("not found", 404)
 
     def do_DELETE(self):
-        _invalidate_response_cache()
+        self._invalidate_for_write()
         if self.path.startswith("/api/cpu/"):
             return self._cpu_lane("DELETE")
+        if self.path.startswith("/api/log-retention"):
+            return self._log_retention("DELETE")
         if self.path.startswith("/api/jobs/"):
             _p, _, _qs = self.path[len("/api/jobs/"):].partition("?")
             self._cancel(_p, force="force=1" in _qs.split("&"))
@@ -7383,6 +8937,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+    # socketserver's default listen backlog is 5: a burst of dashboard tabs/polls overflowed it and
+    # clients saw ECONNRESET / SYN retries (1s+ stalls) before a request ever reached a handler.
+    request_queue_size = 128
+
+
+_PRIME_PATHS = ("/api/bundle-views", "/api/jobs", "/api/runs", "/api/runs/tree", "/api/jobs/completed",
+                "/api/runs/retention", "/api/hosts", "/api/web-search-usage", "/api/triage")
+
+
+def _prime_caches(port, paths=_PRIME_PATHS):
+    """Warm the heavy endpoints ONE AT A TIME right after start. Left to the first dashboard
+    polls, ~8 cold multi-second builds run concurrently on one GIL (a restart under load took
+    40s+ to answer /api/jobs and every waiter held a request slot); serial priming finishes each
+    build at its single-thread speed and later polls are cache hits. Never raises."""
+    import urllib.request
+    for p in paths:
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}{p}", timeout=120).read()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[queue-api] cache prime {p} failed: {e!r}\n")
 
 
 def _self_test():
@@ -8256,6 +9830,123 @@ console.log(JSON.stringify({
               _a.get("unknown"), ["1 weird"])
     elif not _node:
         print("  SKIP planAlertSummary behavioural checks: no `node` on PATH")
+
+    # --- Needs-attention cleanup (Penn 2026-10-11): presentation only, nothing hidden ---
+    _na = lambda **k: dict({"status": "failed", "needs_attention": True,
+                            "group_key": "p1"}, **k)
+    _pv = lambda j, ld=None: "PASS"
+    _t = lambda n: f"2026-10-11T0{n}:00:00+00:00"
+    _grp = _annotate_attention_groups([
+        _na(id="e1", label="absamp-10110043-aG-s1-1f9e", group_key="absamp-10110043-aG-s1", enqueued_at=_t(1)),
+        _na(id="a1", label="auto-author-p1-s3", enqueued_at=_t(1)),
+        _na(id="a2", label="auto-author-p1-s3-r1", enqueued_at=_t(2)),
+        _na(id="a3", label="auto-author-p1-s3-r2", enqueued_at=_t(3)),
+        _na(id="b1", label="auto-author-p1-s4", enqueued_at=_t(1)),
+        {"id": "b2", "label": "auto-author-p1-s4-r1", "group_key": "p1", "status": "done",
+         "enqueued_at": _t(2), "needs_attention": False},
+        _na(id="c1", label="auto-author-p1-s5", enqueued_at=_t(1)),
+        {"id": "c2", "label": "auto-author-p1-s5-r1", "group_key": "p1", "status": "running",
+         "enqueued_at": _t(2)},
+        _na(id="d1", label="auto-author-p1-s6", enqueued_at=_t(5)),
+        {"id": "d2", "label": "auto-author-p1-s6-r1", "group_key": "p1", "status": "done",
+         "enqueued_at": _t(2), "needs_attention": False},      # EARLIER than d1: not a later success
+        _na(id="k1", label="secondop-aaaaaaaaaaaa", enqueued_at=_t(1)),
+        {"id": "aaaaaaaaaaaa", "label": "p1-s1", "group_key": "p1", "status": "done",
+         "enqueued_at": _t(1)},
+        _na(id="k2", label="secondop-bbbbbbbbbbbb", enqueued_at=_t(1)),     # parent pruned
+        _na(id="q1", label="qagent-failed-cluster-202520", group_key="qagent-failed-cluster-202520",
+            enqueued_at=_t(1)),
+    ], verdict_of=_pv)
+    _g = {r["id"]: r for r in _grp}
+    check("attn: an absamp- experiment replay is demoted as 'experiment'",
+          _g["e1"]["attn_reason"], "experiment")
+    check("attn: 3 failed attempts of one slice collapse to ONE top-level row (latest) with the count",
+          ([_g[i]["attn_reason"] for i in ("a1", "a2", "a3")], _g["a3"]["attn_attempts"]),
+          (["attempt", "attempt", None], 3))
+    check("attn: the latest row carries the earlier attempts' ids (expandable history), newest first",
+          _g["a3"]["attn_history"], ["a2", "a1"])
+    check("attn: a failure with a LATER done run of the same slice is demoted as 'superseded'",
+          _g["b1"]["attn_reason"], "superseded")
+    check("attn: the author stage's trailing -sN token does not hide a later success of the same slice",
+          _annotate_attention_groups([_na(id="t1", label="auto-author-p1-s3-update-post-route-s3", enqueued_at=_t(1)),
+                                      {"id": "t2", "label": "p1-s3-update-post-route", "group_key": "p1",
+                                       "status": "done", "enqueued_at": _t(2)}],
+                                     verdict_of=_pv)[0]["attn_reason"], "superseded")
+    check("attn: ...but a slice-id-only suffix (p1-s1) is never stripped into a sibling slice",
+          _annotate_attention_groups([_na(id="t3", label="auto-author-p1-s1", enqueued_at=_t(1)),
+                                      {"id": "t4", "label": "p1", "group_key": "p1",
+                                       "status": "done", "enqueued_at": _t(2)}],
+                                     verdict_of=_pv)[0]["attn_reason"], None)
+    check("attn: a failure with a LATER running retry is demoted as 'superseded'",
+          _g["c1"]["attn_reason"], "superseded")
+    check("attn: an EARLIER success does not supersede a later failure (unsure -> top-level)",
+          _g["d1"]["attn_reason"], None)
+    check("attn: a done retry whose gate verdict is FAIL does not supersede",
+          _annotate_attention_groups([_na(id="f1", label="auto-author-p1-s7", enqueued_at=_t(1)),
+                                      {"id": "f2", "label": "auto-author-p1-s7-r1", "group_key": "p1",
+                                       "status": "done", "enqueued_at": _t(2)}],
+                                     verdict_of=lambda j, ld=None: "FAIL")[0]["attn_reason"], None)
+    check("attn: the queue's own superseded_by record ending in a done row demotes (no label match needed)",
+          _annotate_attention_groups([_na(id="s1", label="odd-name-one", superseded_by="s2", enqueued_at=_t(1)),
+                                      {"id": "s2", "label": "other-name", "status": "done", "enqueued_at": _t(2)}],
+                                     verdict_of=_pv)[0]["attn_reason"], "superseded")
+    check("attn: ...but a superseded_by pointing at a pruned/failed row does not",
+          _annotate_attention_groups([_na(id="s1", label="odd-name-one", superseded_by="gone"),
+                                      _na(id="s3", label="odd-name-two", superseded_by="s4"),
+                                      _na(id="s4", label="odd-name-three")],
+                                     verdict_of=_pv)[0]["attn_reason"], None)
+    check("attn: a secondop row whose explicit parent id is in the payload attaches as a 'child'",
+          (_g["k1"]["attn_reason"], _g["k1"]["attn_parent"]), ("child", "aaaaaaaaaaaa"))
+    check("attn: a meta row whose parent is gone, and a qagent row with no parent link, stay top-level",
+          (_g["k2"]["attn_reason"], _g["q1"]["attn_reason"]), (None, None))
+    check("attn: needs_attention itself is untouched (other consumers keep their semantics)",
+          all(r["needs_attention"] for r in _grp if r["id"] in ("e1", "a1", "b1", "k1")), True)
+    check("attn: rows that are not flagged get no group/reason",
+          (_g["b2"]["attn_reason"], _g["b2"]["attn_group"]), (None, None))
+    _mjs = re.search(r"// BEGIN attnPanelMath[^\n]*\n(.*?)// END attnPanelMath", FRONTEND_HTML, re.S)
+    check("attn: the executable attnPanelMath block is delimited in the page", bool(_mjs), True)
+    if _mjs and shutil.which("node"):
+        _mprobe = _mjs.group(1) + """
+const h = {experiment: 3, superseded: 2, child: 1};
+console.log(JSON.stringify({
+  sum: attnHiddenSummary(h), none: attnHiddenSummary({experiment: 0}), one: attnHiddenSummary({child: 1}),
+  tile: attnTileText(4, h), tile0: attnTileText(4, {}), total: attnHiddenTotal(h),
+  bucket: [attnBucket('attempt'), attnBucket('superseded'), attnBucket('experiment'), attnBucket(null)],
+}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as _mf:
+            _mf.write(_mprobe)
+            _mpath = _mf.name
+        try:
+            _mr = subprocess.run([shutil.which("node"), _mpath], capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(_mpath)
+        _m = json.loads(_mr.stdout) if _mr.returncode == 0 else {}
+        check("attn: the disclosure names every demoted class and the total",
+              _m.get("sum"), "6 more hidden: 3 experiment replays / 2 superseded attempts / 1 child row")
+        check("attn: nothing hidden -> no disclosure text", _m.get("none"), "")
+        check("attn: tile = shown top-level count, '(+N hidden)' exactly the disclosure total",
+              (_m.get("tile"), _m.get("tile0"), _m.get("total")),
+              ({"count": "4", "hidden": " (+6 hidden)"}, {"count": "4", "hidden": ""}, 6))
+        check("attn: an earlier 'attempt' is counted in the superseded bucket",
+              _m.get("bucket"), ["superseded", "superseded", "experiment", None])
+        _pjs = _ajs.group(1) + """
+console.log(JSON.stringify(planAlertSummary({failed: 3}, {failed: 1}, {failed: 3}).alerts));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as _pf:
+            _pf.write(_pjs)
+            _ppath = _pf.name
+        try:
+            _pr = subprocess.run([shutil.which("node"), _ppath], capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(_ppath)
+        check("attn: a bundle badge reads '1 failed (3 attempts)' for one slice with 3 failed rows",
+              _pr.stdout.strip(), '["1 failed (3 attempts)"]')
+    check("attn: the page wires the disclosure and routes demoted entries into it",
+          ("attnHiddenBody.appendChild(r)" in FRONTEND_HTML
+           and 'id="attnHiddenDetails"' in FRONTEND_HTML
+           and "tbody = attnHide ? attnHiddenBody" in FRONTEND_HTML
+           and "demote ? attnHiddenBody" in FRONTEND_HTML), True)
 
     # --- second-opinion rows resolve through their PARENT job id (the user 2026-10-01) ---
     _bvs = _bundle_view_lib()[0]
@@ -9932,6 +11623,7 @@ if __name__ == "__main__":
     except Exception as _e:  # noqa: BLE001
         print(f"[queue-api] cpu lane disabled: {_e!r}", flush=True)
     srv = ThreadingServer((BIND_ADDR, PORT), Handler)
+    threading.Thread(target=_prime_caches, args=(PORT,), name="prime-caches", daemon=True).start()
     # flush=True: under launchd stdout is a file, so it is block-buffered and
     # this one-line banner would otherwise sit in the buffer forever (the
     # per-request lines go via stderr, which is unbuffered).

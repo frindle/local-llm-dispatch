@@ -33,13 +33,13 @@ def run():
         import triage_packets as _tp
         _tp.INDEX = Path("/nonexistent/zzz/index.json")
         chk("missing index -> zero, no exception", ns["_triage_summary"]()["open"] == 0)
-    chk("GET /api/triage routed to _triage_summary", '"/api/triage"' in js and "self._json(_triage_summary())" in js)
+    chk("GET /api/triage routed to _triage_summary", '"/api/triage"' in js and "_cached_response(\"triage\", _triage_summary" in js)
     chk("page fetches /api/triage", "fetch('/api/triage')" in js)
     chk("tile renders triage count with the command", "triage: ${triageOpen.open}" in js and "triage-emit.py --json" in js)
     return fails
 
 
-MUT = {"route": ('self._json(_triage_summary())', 'self._json({})'),
+MUT = {"route": ('self._json(_cached_response("triage", _triage_summary, ttl=10))', 'self._json({})'),
        "fetch": ("fetch('/api/triage')", "fetch('/api/queue-wait')"),
        "tile": ("triage: ${triageOpen.open}", "triage: x"),
        "open-only": ('if status and e.get("status") != status', None)}

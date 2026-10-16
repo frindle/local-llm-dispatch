@@ -6,8 +6,8 @@ deploy once the API restarts**.
 1. Edit `src/` (or `chat/chat.html`), run the dashboard tests from the repo root
    (see README "Live deployment"); for API glue changes also run
    `python3 tests/test-runstatus-retention-api.py --revert-check`.
-2. Restart only `com.example.ollama-queue-api` (bootout + bootstrap). Never restart
-   `com.example.ollama-queue-daemon` for a dashboard change; the API reads the queue
+2. Restart only `com.penn.ollama-queue-api` (bootout + bootstrap). Never restart
+   `com.penn.ollama-queue-daemon` for a dashboard change; the API reads the queue
    state under its own flock and the daemon keeps running jobs.
 3. Check `curl http://127.0.0.1:7684/`, `/api/bundle-history`, `/chat` return 200 and
    the public tunnel URL loads.
@@ -25,7 +25,7 @@ Rules:
 - The `machine-config` mirror of `~/bin` should treat these as symlinks (or skip them);
   this repo is their home.
 - Rollback: `~/bin/*.bak-<ts>-prerepo` are the pre-move copies and
-  `~/Library/LaunchAgents/com.example.ollama-queue-api.plist.bak-<ts>` the old plist
+  `~/Library/LaunchAgents/com.penn.ollama-queue-api.plist.bak-<ts>` the old plist
   (pointed at `~/bin/ollama-queue-api.py`).
 - `bin/` + `Dockerfile` are the Docker fork; changes to the live dashboard do not flow
   there automatically.

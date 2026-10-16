@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression test: the queue says WHAT it is waiting on (the owner 2026-10-06: "queue looks idle
+"""Regression test: the queue says WHAT it is waiting on (Penn 2026-10-06: "queue looks idle
 while jobs are pending and I can't see why"). Stubbed state + temp files only -- never the
 live queue. Covers: the daemon-side aggregation (build_wait_state), the shared reader
 (wait_view: state / stale / log-fallback / none), `status` header lines, the dashboard's

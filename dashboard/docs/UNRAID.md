@@ -68,7 +68,7 @@ The container calls the `url` of each server in `servers.json`. Make sure Ollama
 is bound to a reachable interface (`OLLAMA_HOST=0.0.0.0:11434`), then:
 
 - **Ollama on another LAN box** (most common): use its LAN URL directly, e.g.
-  `http://198.51.100.236:11434`. No special Docker settings needed.
+  `http://192.168.1.50:11434`. No special Docker settings needed.
 - **Ollama on the Unraid host itself:** with `--add-host
   host.docker.internal:host-gateway` (in the template above), use
   `http://host.docker.internal:11434`.

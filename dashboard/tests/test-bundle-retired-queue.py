@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression (the owner 2026-10-08 dashboard triage): a human-CANCELLED plan (plan_cancel
+"""Regression (Penn 2026-10-08 dashboard triage): a human-CANCELLED plan (plan_cancel
 `.cancelled` marker) or a `qctl supersede`d bundle with NO live (pending/running) job is
 RETIRED -- it must not sit in the live Queue panel ("pending 5/9 slices, 0 jobs", replay-
 endorse, because 21 done rows remained) nor raise Needs attention. A retired bundle that

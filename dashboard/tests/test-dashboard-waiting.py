@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WAITING is visible (the owner 2026-10-10, rt-amazon-cardlink): the author job sat PENDING while
+"""WAITING is visible (Penn 2026-10-10, rt-amazon-cardlink): the author job sat PENDING while
 the queue waited on Darkbloom (INFRA WAIT), yet the slice row said a green "authoring", the
 lane cards said plain "idle", and the tiles said "Nothing on the GPU / Queue empty".
 Runs the page's own functions under node against fake state:
@@ -66,7 +66,7 @@ def grab(html, name):
 def run(src):
     html = html_of(src)
     names = ["jobWaitText", "driverActiveSlices", "sliceWaitInfo", "sliceChipInfo", "driverNote", "laneWaitText", "laneOfJob", "idleWaitText",
-             "cpuQueueRows", "cpuQueueCounts", "laneNowRows", "laneNowHtml", "escapeHtml", "formatElapsed"]
+             "cpuQueueRows", "cpuQueueCounts", "laneNowRows", "autoRunHtml", "laneNowHtml", "escapeHtml", "formatElapsed"]
     parts = {n: grab(html, n) for n in names}
     for n, p in parts.items():
         check(f"{n} present", bool(p), True)

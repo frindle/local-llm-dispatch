@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   The ollama-queue RUNNER daemon (`ollama-queue.py run`) -- the process that actually
-  launches jobs. Distinct from com.example.ollama-queue-api, which is only the HTTP
+  launches jobs. Distinct from com.penn.ollama-queue-api, which is only the HTTP
   dashboard; the two coordinate through ollama-queue.py's state file under its own
   flock and never race.
 
@@ -26,9 +26,9 @@
   all, and the failure surfaces as "the model couldn't do it" rather than as a PATH bug.
   That confusion has a track record on this box; keep this in sync with `zsh -lc 'echo $PATH'`.
 
-  Stop it:    launchctl bootout gui/501/com.example.ollama-queue-daemon
-  Start it:   launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.example.ollama-queue-daemon.plist
-  Check it:   launchctl print gui/501/com.example.ollama-queue-daemon
+  Stop it:    launchctl bootout gui/501/com.penn.ollama-queue-daemon
+  Start it:   launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.penn.ollama-queue-daemon.plist
+  Check it:   launchctl print gui/501/com.penn.ollama-queue-daemon
   Log:        ~/bin/ollama-queue-daemon.log   (shared with the hand-run history, deliberately)
 
   SIGTERM is handled -- the daemon logs "received signal 15" and running jobs are
@@ -37,7 +37,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.example.ollama-queue-daemon</string>
+  <string>com.penn.ollama-queue-daemon</string>
 
   <key>ProgramArguments</key>
   <array>
@@ -53,7 +53,7 @@
     <key>HOME</key>
     <string>/opt/ollama-queue</string>
     <key>USER</key>
-    <string>owner</string>
+    <string>penn</string>
   </dict>
 
   <key>WorkingDirectory</key>

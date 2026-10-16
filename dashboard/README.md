@@ -29,15 +29,15 @@ worker, gates, preflight) stays in `~/bin` and is **not** part of this repo's ru
 the API loads `~/bin/ollama-queue.py` and `~/bin/handoff-emit.py` by absolute path and
 finds `dispatch_progress` on `~/bin` (searched after `src/`).
 
-**How it runs:** launchd `com.example.ollama-queue-api`
-(`~/Library/LaunchAgents/com.example.ollama-queue-api.plist`) runs
+**How it runs:** launchd `com.penn.ollama-queue-api`
+(`~/Library/LaunchAgents/com.penn.ollama-queue-api.plist`) runs
 `/opt/homebrew/bin/python3 <repo>/src/ollama-queue-api.py`, KeepAlive, log at
 `/tmp/ollama-queue-api.log`. Restart **only** the API (never the queue daemon):
 
 ```bash
 U=gui/$(id -u)
-launchctl bootout $U/com.example.ollama-queue-api
-launchctl bootstrap $U ~/Library/LaunchAgents/com.example.ollama-queue-api.plist
+launchctl bootout $U/com.penn.ollama-queue-api
+launchctl bootstrap $U ~/Library/LaunchAgents/com.penn.ollama-queue-api.plist
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7684/
 ```
 
@@ -54,6 +54,7 @@ for t in tests/test-bundle-history.py tests/test-dashboard-b.py tests/test-dashb
          tests/test-dashboard-slice-child-indent.py tests/test-runstatus-retention-api.py; do
   python3 "$t" || echo "FAIL $t"; done
 python3 tests/test-runstatus-retention-api.py --revert-check
+python3 tests/test-runstatus-shared-ledger.py --revert-check
 ```
 
 **Page layout** (top to bottom): a summary strip (running now with model/host/elapsed/tok/s,
@@ -67,6 +68,15 @@ in the Queue even when an earlier run failed (amber note); it moves to Needs att
 only when nothing of it is running or waiting. System fonts only, light/dark via
 `prefers-color-scheme`, no horizontal scroll at phone width. `tests/test-dashboard-layout.py`
 renders the page in headless Chrome against fixtures (`--shots DIR` saves screenshots).
+
+**Run Status and the handoff panel share ONE "handled" ledger** (handoff's `acted.json`,
+2026-10-14). `handoff-emit.py --acted <id>` folds the Run Status row into the collapsed
+*auto-handled* group with the acted reason (verdict kept, sidecars not archived); a Run
+Status `clear` (button, `qctl`, gate janitor, retention) also writes an acted mark, so a job
+is never cleared twice. A required, unapproved sign-off is never folded by a plain acted
+mark. Sign-off rows older than the newest-100 cap are still listed (`beyond_cap`). Kill
+switch: `RUNSTATUS_SHARED_LEDGER=off`. Test: `tests/test-runstatus-shared-ledger.py`
+(`--revert-check` proves each piece).
 
 **GPU-EXCLUSIVE rows** come from `ollama-queue.py enqueue-gpu`: a non-LLM shell job (for
 example a native model-server trial on the Unraid 3080) that has one lane's GPU to itself.
@@ -218,6 +228,8 @@ token, `api_key = <your QUEUE_API_TOKEN>`.
 ## Using the dashboard
 
 **Waiting on (2026-10-06).** The daemon writes `~/.ollama-dispatch/queue-wait.json` (per lane busy/idle, the reason an idle lane is not launching, since-when; per-job short reasons). The dashboard shows a "Waiting on" banner (red if an idle lane has had the same reason for over 5 minutes), adds `queue_wait` to each `/api/jobs` row, and serves the lane view at `/api/queue-wait`; `ollama-queue.py status` prints the same as a header. Until the daemon is restarted onto the new code it degrades to the last focus/HELD lines of the daemon log, labelled as such.
+
+**Compact wait display (2026-10-13).** Idle-lane status is now one chip per lane under the summary strip (`studio-db: idle 16m, waiting on memory/model load (25 pending)`, full daemon sentence on hover; red when stuck). The yellow banner no longer repeats it: it shows only a stuck-lane line, the fallback/unavailable lines, and unsatisfiable-job warnings GROUPED by model + reason (drifting GB/age numbers ignored) as one line (`9 jobs waiting, no host can serve: <model> needs 30.3 GB, 23.3 GB usable (7.0 GB short), oldest 16m`, job ids in the hover title). Test: `tests/test-dashboard-wait-banner.py [--mutants]`.
 
 **Idle "Running now" tile (2026-10-06).** When nothing is on the GPU the tile says "Nothing on the GPU" plus one short line: "Queue empty" if nothing is pending/held, else "Waiting on: <daemon reason for the idle lane(s)>" when the state file is live, else "Waiting on: bundle <committed bundle> to finish" (from `/api/bundle-views` `active`), else "Waiting on: queued work (reason shows after the next daemon restart)". It never prints daemon-log lines. Test: `tests/test-idle-tile-wait.py [--revert-check]`.
 
