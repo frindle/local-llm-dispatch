@@ -1985,6 +1985,18 @@ def _anchor(f: dict) -> str:
     # only by checking a produced anchor against the actual file -- a plausible
     # line number is not a correct one.
     for line in ht.splitlines():
+        # hunk_text on a REVIEW finding is the prompt rendering ("FILE: x", "HUNK: @@ ..",
+        # a ```diff fence). Those wrapper lines are not file lines: counting them as
+        # context shifted every anchor by 3 (lib/fmt.ts:5 on a 3-line file), and the
+        # gate's ungrounded-line drop then discarded a real finding. A later HUNK:
+        # header in a batch re-bases the counters.
+        if line.startswith("```") or line.startswith("FILE:"):
+            continue
+        if line.startswith("HUNK:"):
+            _hm = re.search(r"@@\s*-(\d+)(?:,\d+)?\s+\+(\d+)", line)
+            if _hm:
+                old_ln, new_ln = int(_hm.group(1)), int(_hm.group(2))
+            continue
         if line.startswith("+"):
             if line[1:].strip() == quote:
                 return f"{f.get('path','?')}:{new_ln}"

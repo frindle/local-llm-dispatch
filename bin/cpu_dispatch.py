@@ -59,6 +59,45 @@ def _runner_online(api, token):
         return False
 
 
+def _sat_wait():
+    try:
+        return float(os.environ.get("CPU_LANE_SATURATION_WAIT_S", 1200))
+    except ValueError:
+        return 1200.0
+
+
+LEGACY_NODE = 22     # what a runner that reports no caps (pre-1.3 image) is known to have
+
+
+def combine_caps(runners):
+    """Conservative capability set for a list of fresh runners (any may take the job): the weakest value of each
+    capability. A runner with no caps is the legacy image (node 22, no job python, no sqlite3). None for no runners."""
+    if not runners:
+        return None
+    cs = [r.get("caps") if isinstance(r.get("caps"), dict) else {} for r in runners]
+    nodes = [c.get("node") if isinstance(c.get("node"), int) else LEGACY_NODE for c in cs]
+    pys = {c.get("python") for c in cs}
+    mods = [set(c.get("py_modules") or ()) for c in cs]
+    return {"node": min(nodes),
+            "python": pys.pop() if len(pys) == 1 and None not in pys else None,
+            "py_modules": sorted(set.intersection(*mods)) if mods else [],
+            "sqlite3": all(bool(c.get("sqlite3")) for c in cs),
+            "runners": len(cs), "legacy": sum(1 for c in cs if not c)}
+
+
+def _runner_caps(api, token):
+    """combine_caps() over the runners that polled within RUNNER_FRESH_S; None when unknown (API trouble,
+    no runners) -> callers treat that exactly like a legacy runner. Never raises."""
+    try:
+        req = urllib.request.Request(api.rstrip("/") + "/api/cpu/runners")
+        req.add_header("Authorization", "Bearer " + token)
+        with urllib.request.urlopen(req, timeout=4) as r:
+            runners = json.loads(r.read()).get("runners") or []
+        return combine_caps([x for x in runners if float(x.get("seen_s_ago", 1e9)) < RUNNER_FRESH_S])
+    except Exception:
+        return None
+
+
 def _marker(stage, bundle_id, timeout_s):
     """(end_fn) registering a local-stage marker so the queue sees it. Best effort."""
     try:
@@ -70,6 +109,15 @@ def _marker(stage, bundle_id, timeout_s):
         return lambda code=None: s.end_local(jid, code)
     except Exception:
         return lambda code=None: None
+
+
+def _owner(worktree, stage):
+    """Display-only owner label (cpu_stage.owner_label); '' on any trouble (fail-open)."""
+    try:
+        import cpu_stage
+        return cpu_stage.owner_label(worktree, stage)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def run_cpu_stage(worktree, cmd, timeout_s, stage, bundle_id, lockfile_hash=None, tools=None,
@@ -87,8 +135,9 @@ def run_cpu_stage(worktree, cmd, timeout_s, stage, bundle_id, lockfile_hash=None
         try:
             return cj.submit_cpu_job(worktree, cmd, timeout_s, cwd_rel=cwd_rel, env=env, stage=stage,
                                      label=label or stage, bundle_id=bundle_id, tools=tools, mode=mode,
-                                     api=api, claim_timeout_s=claim_timeout_s, fallback=False,
-                                     lockfile_hash=lockfile_hash)
+                                     api=api, claim_timeout_s=max(claim_timeout_s, _sat_wait()), fallback=False,
+                                     should_abort=lambda: None if _runner_online(api, cj._token()) else "runner offline (heartbeat stale) while waiting",
+                                     lockfile_hash=lockfile_hash, owner=_owner(worktree, stage))
         except RuntimeError as e:
             why = str(e)
         except Exception as e:          # noqa: BLE001 -- the pipeline must not die on lane trouble

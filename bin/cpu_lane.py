@@ -56,7 +56,7 @@ OUTSTANDING = ("uploading", "pending", "running")
 TERMINAL = ("done", "failed_infra", "cancelled", "expired")
 BLOB_NAMES = ("payload", "patch", "tools")
 ENROLL_TTL_S = 3600
-DEFAULT_RUNNER_CONFIG = {"concurrency": 2, "lease_s": 60, "max_job_timeout_s": 3600, "cache_max_entries": 8,
+DEFAULT_RUNNER_CONFIG = {"concurrency": 5, "lease_s": 60, "max_job_timeout_s": 3600, "cache_max_entries": 24,
                          "node_options": "--max-old-space-size=6144"}
 _enroll_fail = []              # monotonic timestamps of recent failed enrollments (global rate limit)
 _ENROLL_MAX_FAILS, _ENROLL_WINDOW_S = 5, 60
@@ -130,6 +130,10 @@ def via_proxy(headers):
 
 
 # ------------------------------------------------------------------ store
+# A runner re-sends its caps every ~60s; caps older than this are ignored (an old image that no longer
+# reports must not keep advertising what a previous image had).
+CAPS_FRESH_S = 180
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, kind TEXT NOT NULL DEFAULT 'remote',
@@ -143,6 +147,14 @@ CREATE TABLE IF NOT EXISTS runners(runner_id TEXT PRIMARY KEY, last_seen REAL, c
 """
 
 
+def _spec_owner(spec):
+    """Display-only owner label carried in the job spec by cpu_stage (additive; '' when absent/unparseable)."""
+    try:
+        return str((json.loads(spec) if spec else {}).get("owner") or "")[:160]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 class Store:
     def __init__(self, base=None, clock=time.time, max_attempts=MAX_ATTEMPTS):
         self.base = Path(base or BASE)
@@ -154,6 +166,14 @@ class Store:
         self.lock = threading.RLock()
         with self._conn() as c:
             c.executescript(SCHEMA)
+            # runner capability report (additive, backward compatible: old rows/old runners have NULLs)
+            cols = {r[1] for r in c.execute("PRAGMA table_info(runners)")}
+            for col, typ in (("caps", "TEXT"), ("caps_t", "REAL"), ("slots", "INTEGER")):
+                if col not in cols:
+                    try:
+                        c.execute("ALTER TABLE runners ADD COLUMN %s %s" % (col, typ))
+                    except sqlite3.OperationalError:       # another process migrated first
+                        pass
 
     # one short-lived autocommit connection per operation: safe across threads and
     # across processes (the queue daemon reads the same file).
@@ -335,14 +355,32 @@ class Store:
                 raise
         return n
 
-    def claim(self, runner_id, lease_s=60):
-        """Atomic: oldest pending remote job -> running.  -> job dict | None."""
+    @staticmethod
+    def _caps_json(caps):
+        """Validated, size-capped JSON for a runner's reported capabilities, or None (ignore)."""
+        if not isinstance(caps, dict):
+            return None
+        try:
+            s = json.dumps(caps, sort_keys=True)
+        except (TypeError, ValueError):
+            return None
+        return s if len(s) <= 16384 else None
+
+    def claim(self, runner_id, lease_s=60, caps=None, slots=None):
+        """Atomic: oldest pending remote job -> running.  -> job dict | None.
+        caps: the runner's capability report (node/python/packages/sqlite3); kept with a timestamp so a
+        runner that stops reporting (older image) ages out instead of leaving stale claims behind."""
         now = self.clock()
         lease_s = int(lease_s or 60)
         self.reap()
+        cj = self._caps_json(caps)
         with self.lock, self._conn() as c:
             c.execute("INSERT INTO runners(runner_id,last_seen,claims) VALUES(?,?,0) "
                       "ON CONFLICT(runner_id) DO UPDATE SET last_seen=excluded.last_seen", (runner_id, now))
+            if cj is not None:
+                c.execute("UPDATE runners SET caps=?, caps_t=? WHERE runner_id=?", (cj, now, runner_id))
+            if isinstance(slots, int) and not isinstance(slots, bool) and 1 <= slots <= 256:
+                c.execute("UPDATE runners SET slots=? WHERE runner_id=?", (slots, runner_id))
             c.execute("BEGIN IMMEDIATE")
             try:
                 r = c.execute("SELECT * FROM jobs WHERE kind='remote' AND status='pending' AND cancel=0 "
@@ -465,10 +503,12 @@ class Store:
             local_active = c.execute("SELECT COUNT(*) FROM jobs WHERE kind='local' AND status='running' "
                                      "AND expires_at>=?", (now,)).fetchone()[0]
             running = [dict(id=r["id"], label=r["label"], stage=r["stage"], bundle=r["bundle_id"],
+                            owner=_spec_owner(r["spec"]),
                             runner=r["runner_id"], attempt=r["attempt"],
                             running_s=round(now - (r["claimed_at"] or now), 1))
                        for r in c.execute("SELECT * FROM jobs WHERE kind='remote' AND status='running' ORDER BY seq")]
             pending = [dict(id=r["id"], label=r["label"], stage=r["stage"], bundle=r["bundle_id"],
+                            owner=_spec_owner(r["spec"]),
                             waiting_s=round(now - (r["ready_at"] or r["created"] or now), 1))
                        for r in c.execute("SELECT * FROM jobs WHERE kind='remote' AND status='pending' ORDER BY seq LIMIT 20")]
             done = []
@@ -481,8 +521,20 @@ class Store:
                                  duration_s=round(r["finished_at"] - r["claimed_at"], 1) if r["claimed_at"] else None,
                                  queue_wait_s=round(r["claimed_at"] - (r["ready_at"] or r["created"]), 1)
                                  if r["claimed_at"] else None, finished_at=r["finished_at"]))
-            runners = [dict(runner=r["runner_id"], seen_s_ago=round(now - r["last_seen"], 1), claims=r["claims"])
-                       for r in c.execute("SELECT * FROM runners ORDER BY last_seen DESC LIMIT 10")]
+            runners = []
+            for r in c.execute("SELECT * FROM runners ORDER BY last_seen DESC LIMIT 10"):
+                ent = dict(runner=r["runner_id"], seen_s_ago=round(now - r["last_seen"], 1), claims=r["claims"])
+                if r["slots"]:                      # saturation: every slot of this runner holds a running job
+                    ent["slots"] = r["slots"]
+                    ent["busy"] = sum(1 for j in running if j["runner"] == r["runner_id"])
+                    ent["saturated"] = ent["busy"] >= ent["slots"]
+                ct = r["caps_t"]
+                if r["caps"] and ct is not None and now - ct <= CAPS_FRESH_S:
+                    try:
+                        ent["caps"] = json.loads(r["caps"])
+                    except ValueError:
+                        pass
+                runners.append(ent)
         waiting = self.outstanding_by_bundle()
         return {"enabled": True, "counts": counts, "queue_depth": counts.get("pending", 0),
                 "running": running, "pending": pending, "recent": done, "runners": runners,
@@ -660,7 +712,7 @@ def handle(h, method, store=None, token=None):
             b = _json_body(h)
             if not b.get("runner_id"):
                 return _send(h, 400, {"error": "runner_id required"})
-            job = S.claim(str(b["runner_id"]), b.get("lease_s"))
+            job = S.claim(str(b["runner_id"]), b.get("lease_s"), caps=b.get("caps"), slots=b.get("slots"))
             return _send(h, 200, {"job": job}) if job else _send(h, 204)
         if method == "GET" and path == "/api/cpu/config":
             return _send(h, 200, {"config": S.runner_config()})

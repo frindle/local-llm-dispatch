@@ -637,6 +637,7 @@ def author_budget_block(st, sid, s, rows=None):
 _ESC_KINDS = (  # (regex on escalation_reason, short TRUE label) -- FIRST match wins
     (r"SPEC_DEFECT: already satisfied at base", "spec defect -- already satisfied at base (skip, or restate)"),
     (r"SPEC_DEFECT: ", "spec defect -- spec contradicts the base tree (RE-SPEC the intent)"),
+    (r"ADMISSION_REFUSED: ", "harness admission refused -- defective harness (re-spec / repair, then it must re-pass the gate)"),
     (r"^HARNESS CONVERGED, PREFLIGHT NO-GO", "converged harness, preflight NO-GO (worktree kept; --regate)"),
     (r"^PIPELINE BUG SUSPECTED", "baseline-green claim disagrees with a re-run (pipeline bug?)"),
     (r"GREEN at the untouched baseline", "verify green at baseline (already satisfied, or leaky fixture)"),
@@ -723,6 +724,8 @@ def respec_class(s, sig):
       'generic'     -- anything else."""
     if is_spec_defect(sig):
         return "spec_defect"
+    if is_admission_refusal(sig):
+        return "admission"
     blob = " ".join([str(sig or ""), str(s.get("escalation_reason") or ""),
                      " ".join(str(n) for n in (s.get("review_notes") or []))]).lower()
     if any(p in blob for p in FIXTURE_CLASS_PATTERNS):
@@ -735,7 +738,36 @@ def respec_class(s, sig):
 RESPEC_CAP = 1   # bounded: one re-spec per slice, then the old ESCALATED park applies
 
 
-def respec_on_cap(s, sig, streak, attempts):
+def reach_probe_note(wt):
+    """REACH PROBE block for the failing fixture in `wt` (refimpl applied in a COPY, real tree untouched),
+    or "". Non-empty only when the refimpl fails ALL K>=2 fixture cases (python fixtures). Fail-open."""
+    try:
+        if not wt or not Path(wt).is_dir():
+            return ""
+        import importlib.util as _iu
+        sp = _iu.spec_from_file_location("reach_probe", str(Path(__file__).resolve().parent / "reach_probe.py"))
+        m = _iu.module_from_spec(sp)
+        sp.loader.exec_module(m)
+        return (m.probe_copy(wt) or "").strip()
+    except Exception:
+        return ""
+
+
+def fixture_origin_note(wt):
+    """FIXTURE-ORIGIN block the last harness-check run stashed for `wt` (fixture_origin.py), or "". Fail-open."""
+    try:
+        if not wt:
+            return ""
+        import importlib.util as _iu
+        sp = _iu.spec_from_file_location("fixture_origin", str(Path(__file__).resolve().parent / "fixture_origin.py"))
+        m = _iu.module_from_spec(sp)
+        sp.loader.exec_module(m)
+        return (m.read_stash(wt) or "").strip()
+    except Exception:
+        return ""
+
+
+def respec_on_cap(s, sig, streak, attempts, wt=None):
     """RETRY-STORM -> RE-SPEC (Phase 2, 2026-10-08). The author-attempt cap used to park the
     slice (ESCALATED) no matter why it stalled -- but 'N attempts, same or changing failure'
     is evidence the SPEC is the problem. At the cap, once per slice, fold the observed failure
@@ -763,6 +795,12 @@ def respec_on_cap(s, sig, streak, attempts):
         note += (" The failure was a SPEC_DEFECT: the spec contradicts the BASE tree. Do not "
                  "'create' files that already exist at base (modify/extend them instead) and "
                  "do not demand literals the base already satisfies.")
+    if cls == "admission":
+        note += (" PROBLEM CLASS: HARNESS ADMISSION REFUSED. The previous harness was refused by the "
+                 "admission gate (named cause in the line above): author a SMALLER, fully traceable "
+                 "harness -- every fixture literal must appear in TASK.md or the base target, refimpl.py "
+                 "must apply to the HEAD text and write source that parses, and the fixture must fail "
+                 "at baseline and pass with the refimpl.")
     if cls == "fixture":
         note += (" PROBLEM CLASS: NON-DISCRIMINATING FIXTURE. The attempts kept failing for "
                  "changing reasons because the fixture does not separate the original code "
@@ -772,6 +810,18 @@ def respec_on_cap(s, sig, streak, attempts):
                  "it is RED -- narrowed to the ONE property in the intent; every line the "
                  "refimpl adds must be exercised by some case, and do not add a redundant "
                  "line (e.g. re-initialising a variable already set) no case can observe.")
+    _reach = reach_probe_note(wt)
+    if _reach:
+        # WHY the fixture never reaches the asserted behaviour (traced with the refimpl applied):
+        # without this the re-authored fixture repeats the same unreached-path defect (aw-codec-floor s3).
+        note += ("\n\nREACH PROBE of the previous fixture (every case failed against the reference "
+                 "implementation; this is what actually happened when it ran -- fix THAT in the new "
+                 "fixture's stubs/inputs/per-case state, do not rewrite the same shape):\n" + _reach)
+    _fxo = fixture_origin_note(wt)
+    if _fxo:
+        # the failure was raised in the FIXTURE's own mock/stub (any language): without this the re-authored
+        # fixture keeps the same bad stub and the author edits refimpl.py (rt-costco-receipt-attach s3).
+        note += "\n\n" + _fxo
     s["intent"] = (s.get("intent") or "").rstrip() + "\n\n" + note
     s["respec_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     s["respec_history"] = (s.get("respec_history") or []) + [{"sig": str(sig)[:300], "attempts": attempts}]
@@ -1625,6 +1675,46 @@ def spec_satisfiability_reason(st, s, baseline_root):
     return "; ".join(f"must_contain {lit!r}: {why}" for lit, why in bad)
 
 
+_AIDS_MOD = []
+
+
+def _aids():
+    """~/bin/dispatch_authoring_aids.py (shared pure helpers), loaded once; None when unloadable."""
+    if not _AIDS_MOD:
+        try:
+            import importlib.util as _ilu
+            _sp = _ilu.spec_from_file_location(
+                "dispatch_authoring_aids", Path(__file__).resolve().parent / "dispatch_authoring_aids.py")
+            _m = _ilu.module_from_spec(_sp)
+            _sp.loader.exec_module(_m)
+            _AIDS_MOD.append(_m)
+        except Exception:
+            _AIDS_MOD.append(None)
+    return _AIDS_MOD[0]
+
+
+def edit_surface_warnings(st, s, baseline_root):
+    """EDIT-SURFACE LINT (PILOT, 2026-10-09): [warning, ...] when this slice's target file is very
+    large (> DISPATCH_EDIT_SURFACE_LINES, default 2000 lines) and the slice carries no excerpt /
+    extraction hint. A WARNING ONLY -- it never blocks, never changes decomposition, and is silenced by
+    `surface_ack: true` on the slice or DISPATCH_EDIT_SURFACE_WARN=0. Research basis (secondhand,
+    to be piloted): small-model failure tracks edit surface and context size, not intent count; finer
+    slicing of the SAME huge file keeps the whole file + globals in context. Fail-open."""
+    try:
+        am = _aids()
+        rel = slice_target(st, s)
+        if am is None or not rel or not baseline_root:
+            return []
+        p = os.path.join(baseline_root, rel)
+        if not os.path.isfile(p):
+            return []
+        with open(p, "rb") as fh:
+            n = sum(chunk.count(b"\n") for chunk in iter(lambda: fh.read(1 << 20), b""))
+        return am.edit_surface_findings(rel, n, s)
+    except Exception:
+        return []
+
+
 def uncovered_edit_files(st, s):
     """PURE. Files the slice INTENT says to create/edit/add-to/mount-in that are not in
     the slice's scope (slice_target + edit_files) and not declared read-only (`reads`).
@@ -2144,6 +2234,12 @@ def remove_worktree(cwt, wt):
     # slice then failed deterministically (Rivian s3, 2026-10-02: "git worktree
     # add failed: fatal: not a git repository: (null)" -> AUTO rc=2 -> escalated).
     subprocess.run(["git", "-C", cwt, "worktree", "prune"], capture_output=True, text=True)
+    try:        # the worktree is gone: its harness-admission state (reslice mark, freeze snapshot) goes with it
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import harness_admission as _ha_mod
+        _ha_mod.clear_state(wt)
+    except Exception:
+        pass
 
 
 def topo_sort(slices):
@@ -2988,8 +3084,9 @@ def advance_detached(st, plan_arg, extra_args=None):
 # a slice row (status, job_id, worktree, counters, reasons) is run history.
 # target / edit_files / reads (2026-10-05, rt-egift-link-s1): per-slice file scope --
 # see slice_target().
+# excerpt / surface_ack (2026-10-09): edit-surface lint hints (edit_surface_warnings) -- plan-owned.
 SPEC_FIELDS = ("title", "intent", "must_contain", "verify_shape", "kind", "entry_point",
-               "target", "edit_files", "reads")
+               "target", "edit_files", "reads", "excerpt", "surface_ack")
 
 
 def refresh_spec_from_plan(st, plan):
@@ -4872,6 +4969,8 @@ def dry_run(st):
             print(f"#     depends_on: {', '.join(s['depends_on'])}")
         print(f"#     must_contain: {', '.join(s['must_contain'])}")
         print(f"#     verify: {s['verify_shape']}")
+        for _w in edit_surface_warnings(st, s, st.get("repo")):
+            print(f"#     WARNING (spec): {_w}")
     print("\n# --execute advances to the next checkpoint (author / review / enqueue / poll).")
     print("# at an 'awaiting_review' pause: read the slice worktree's test_fixture.py, then")
     print("#   ollama-dispatch-slice <plan> --confirm-slice <id> ; then --execute again.")
@@ -5020,6 +5119,17 @@ def is_spec_defect(sig):
     """PURE. True when a failure signature is a pre-dispatch SPEC_DEFECT (the spec
     contradicts the base tree). Those route to RE-SPEC on first sight, not a retry."""
     return SPEC_DEFECT_MARK in str(sig or "")
+
+
+ADMISSION_MARK = "ADMISSION_REFUSED: "      # == harness_admission.ADMISSION_ROUTE_PREFIX
+
+
+def is_admission_refusal(sig):
+    """PURE. True when a failure signature is a HARNESS ADMISSION refusal (harness_admission.admit).
+    It has its OWN marker so is_spec_defect (a substring match on "SPEC_DEFECT: ") is False for it:
+    the re-spec budget has ONE owner -- the admission branch in the failure handler below, which spends
+    respec_on_cap's single bounded re-spec once; it never also takes the spec-defect branch."""
+    return ADMISSION_MARK in str(sig or "")
 
 
 def _baseline_args(cwt):
@@ -5848,6 +5958,25 @@ def confirm_and_enqueue(st, sid, s, wt, model, host, max_iters, chat_timeout,
               f"To resolve: fix the harness in {wt}, then --regate {sid} "
               f"(or --retry-slice {sid} to re-author from scratch).")
         return
+    # HARNESS ADMISSION GATE (2026-10-10, harness_admission.py): the coding job is never enqueued
+    # against a defective/oversize harness. preflight (above) just proved fail-before/pass-after,
+    # so only the cheap static checks run here (dynamic=False). A refusal parks the slice with a named cause.
+    try:
+        import importlib.util as _ilu
+        _sp = _ilu.spec_from_file_location("harness_admission",
+                                           os.path.join(os.path.dirname(os.path.realpath(__file__)), "harness_admission.py"))
+        _ha = _ilu.module_from_spec(_sp)
+        _sp.loader.exec_module(_ha)
+    except Exception:
+        _ha = None
+    if _ha is not None:
+        _adm = _ha.admit(wt, f"{st['label']}-{sid}", target=slice_target(st, s), dynamic=False)
+        if not _adm["ok"]:
+            s["status"] = ESCALATED
+            s["escalation_reason"] = _adm["message"]
+            save_state(st)
+            print(f"# {sid}: ESCALATED -- {_adm['message']}")
+            return
     cp = subprocess.run(
         ["python3", QUEUE, "enqueue", "--model", model, "--host", host,
          "--cwd", wt, "--task-file", os.path.join(wt, "TASK.md"),
@@ -6325,13 +6454,36 @@ def bound_stale_worktree_retry(st, sid, s, wt, cwt, origin):
     if is_spec_defect(sig) and "already satisfied at base" in str(sig):
         park_if_already_satisfied(st, sid, s, wt, origin)
         return False
-    if is_spec_defect(sig) and respec_on_cap(s, sig, streak, int(s.get("author_attempts") or 0)):
+    if is_spec_defect(sig) and respec_on_cap(s, sig, streak, int(s.get("author_attempts") or 0), wt=wt):
         save_state(st)
         print(f"# {sid}: SPEC_DEFECT -- RE-SPEC'd on first sight (one bounded respec); "
               f"re-authoring from a clean baseline with the defect folded into the intent. "
               f"Latest: {sig}")
         remove_worktree(cwt, wt)
         return True
+    if is_admission_refusal(sig):
+        # HARNESS ADMISSION REFUSED (harness_admission.admit): the harness is defective and another identical
+        # round cannot change it. ONE owner for the re-spec budget: this branch -> respec_on_cap (single
+        # bounded re-spec, worktree removed => admission state cleared, fresh scaffold). Spent -> ESCALATED.
+        # Never falls through to the generic streak/attempt cap (that would spend the budget a second time).
+        # A refusal ran NO model job: it is a NON-ATTEMPT. note_author_failure just counted it as an attempt +
+        # a launch; hand both back so refusals neither trip the K-identical-failures / attempt / lifetime-launch
+        # caps nor block the one bounded re-spec (respec_on_cap's own lifetime-launch check).
+        s["author_attempts"] = max(0, int(s.get("author_attempts") or 0) - 1)
+        s["author_launches_total"] = max(0, int(s.get("author_launches_total") or 0) - 1)
+        if respec_on_cap(s, sig, streak, int(s.get("author_attempts") or 0), wt=wt):
+            save_state(st)
+            print(f"# {sid}: ADMISSION REFUSED -- RE-SPEC'd (one bounded respec); re-authoring from a clean "
+                  f"baseline with the defect folded into the intent. Latest: {sig}")
+            remove_worktree(cwt, wt)
+            return True
+        s["status"] = ESCALATED
+        s["escalation_reason"] = (f"{sig} -- re-spec budget already spent ({s.get('respec_count')}x) and the "
+                                  f"re-authored harness was refused again; repair the harness (--retry-slice "
+                                  f"{sid} / --regate {sid}) so it re-passes the admission gate.")
+        save_state(st)
+        print(f"# {sid}: ESCALATED -- {s['escalation_reason']}")
+        return False
     if is_spec_defect(sig):
         # the one re-spec is spent and the SAME contradiction came back: another launch
         # cannot change it -- park it where a human/Claude re-specs the plan.
@@ -6346,7 +6498,7 @@ def bound_stale_worktree_retry(st, sid, s, wt, cwt, origin):
     _budget_why = author_budget_block(st, sid, s)
     if (not _budget_why and (streak >= MAX_IDENTICAL_AUTHOR_FAILURES
                              or attempts >= MAX_AUTHOR_ATTEMPTS)
-            and respec_on_cap(s, sig, streak, attempts)):
+            and respec_on_cap(s, sig, streak, attempts, wt=wt)):
         save_state(st)
         print(f"# {sid}: authoring cap reached (streak {streak}, {attempts} attempts) -- "
               f"RE-SPEC'd instead of parking (one bounded respec); re-authoring from a clean "
@@ -6975,6 +7127,8 @@ def execute(st, model, host, max_iters, chat_timeout, author_mode, num_ctx,
                 save_state(st)
                 print(f"# {sid}: ESCALATED -- {s['escalation_reason']} Nothing enqueued.")
                 return
+            for _w in edit_surface_warnings(st, s, cwt):
+                print(f"# {sid}: WARNING (spec, not blocking): {_w}")
             _unsat = spec_satisfiability_reason(st, dict(s, id=sid), cwt)
             if _unsat:
                 s["status"] = ESCALATED

@@ -173,6 +173,9 @@ ALLOWED_RUNNERS = {
     str(Path.home() / "bin" / "goose-chat-runner.py"),
     # 2026-10-05: the runner for `enqueue-gpu` jobs (see GPU-EXCLUSIVE JOBS below).
     str(Path.home() / "bin" / "gpu-exclusive-runner.py"),
+    # 2026-10-09: runs darkbloom-field-probe.py as ONE queue job (which request fields the
+    # live Darkbloom honors: top_k, min_p, presence/repetition penalty, chat_template_kwargs).
+    str(Path.home() / "bin" / "darkbloom-field-probe-runner.py"),
 }
 # RESOLVED FORMS TOO (2026-10-06, found by pipeline-canary.py): enqueue compares
 # Path(--runner).resolve() against these Path.home() strings, so a HOME that has a
@@ -538,6 +541,30 @@ _LIVE_LABEL_STATES = ("pending", "queued", "scheduled", "running", "paused", "he
 # so a caller can tell "there is already a live job for this label, adopt it" apart
 # from a real enqueue error.
 _DUPLICATE_LABEL_RC = 7
+
+
+def slice_worktree_live_owner(jobs, cwd):
+    """PURE. The LIVE queue row that already owns the SLICE worktree `cwd`, or None.
+
+    Only dispatch slice worktrees (a directory named wt-slice-*, not the shared
+    -chain checkout) are single-flight: other cwds (a repo root, $HOME for
+    read-only research) are legitimately shared. Live = _LIVE_LABEL_STATES, which
+    excludes planned placeholders and every terminal/parked state."""
+    try:
+        mine = Path(cwd).resolve()
+    except Exception:
+        return None
+    if not mine.name.startswith("wt-slice-") or mine.name.endswith("-chain"):
+        return None
+    for j in (jobs.values() if isinstance(jobs, dict) else jobs):
+        if not isinstance(j, dict) or j.get("status") not in _LIVE_LABEL_STATES:
+            continue
+        try:
+            if j.get("cwd") and Path(j["cwd"]).resolve() == mine:
+                return j
+        except Exception:
+            continue
+    return None
 
 _RETRY_SUFFIX_RE = re.compile(r"-(?:r|round|retry)\d+$", re.IGNORECASE)
 # needs-opus-auto-/auto-author-: the PIPELINE-STAGE rows of the same work. Live
@@ -1548,6 +1575,24 @@ def _streak_exempt(j):
         return False
 
 
+def focus_release_log_step(state, pre_release, active, why):
+    """Transition-only logging for the EXHAUSTED focus release. Returns (message_or_None,
+    state_changed). The signature lives in state["_focus_release_logged"] and the caller MUST
+    persist `state` when state_changed (the tick reloads state from disk each time); the stamp is
+    cleared when no release is in force so the next release prints again."""
+    if not why:
+        if state.get("_focus_release_logged") is not None:
+            state["_focus_release_logged"] = None
+            return None, True
+        return None, False
+    sig = [pre_release, active]
+    if sig == state.get("_focus_release_logged"):
+        return None, False
+    state["_focus_release_logged"] = sig
+    return (f"[queue] focus: RELEASED bundle {pre_release} -- EXHAUSTED: "
+            f"{why}; lanes to {active}"), True
+
+
 def update_bundle_fail_streaks(jobs, streaks, pk, verdict=None, now=None):
     """Fold newly-terminal WORK jobs into `streaks` ({bundle: consecutive non-PASS
     count}) per the rules above, stamping `_streak_counted` so a job counts once. A
@@ -1728,6 +1773,10 @@ BUNDLE_FLAP_WINDOW_S = 30 * 60.0    # ...trip the breaker (parked `flapping`, ON
 BUNDLE_FLAP_COOLDOWN_S = 15 * 60.0  # ...and it may resume on its own only after this
 BUNDLE_KICK_AFTER_S = 60.0          # idle with due slicer work -> fire the slicer's advance
 BUNDLE_KICK_INTERVAL_S = 300.0      # ...at most this often per plan
+BUNDLE_KICK_GRACE_S = float(os.environ.get("QUEUE_KICK_GRACE_S", "90") or 0)
+                                    # a kicked advance that left NO driver, NO request marker, NO row and
+                                    # the same slice states this long after the kick did nothing: the
+                                    # bundle is STALLED (parked loudly, lanes released), not "owned by the slicer"
 HEAL_WINDOW_S = 30 * 60.0           # an escalation self-heal may still act on (watcher: 5 min + review)
 _LIVE_ROW_STATES = frozenset({"pending", "running", "queued", "scheduled", "held", "paused"})
 # ============ ORCHESTRATION HARDENING (research 2026-10-09, backlog H1/H4/H5/H6/H7) ============
@@ -2013,13 +2062,15 @@ def slice_plan_runnability(key, runs_dir=None, alive=None, now=None, esc_seen=No
        "stuck": [(label, sid, reason)],   # ESCALATED, nothing will heal it
        "blocked": [(label, sid)],         # depends (transitively) on a stuck slice
        "plans": {label: plan_path},       # for the idle kick
+       "heal": [(label, sid)],            # the subset of `live` that only a self-heal can move: an
+                                          # escalated slice whose heal is pending + its dependents
        "esc_keys": {"label/sid"}}         # escalations currently seen (for esc_seen GC)
     A FAILED slice is live (execute() auto-retries it, bounded, then escalates); a
     PENDING one behind a live dependency is live (it is waiting, not blocked).
     `esc_seen` {"label/sid": first_seen_ts}; `heal_pending(label, sid, reason,
     seen_at)` -> bool; `cancelled(label)` -> rec|None."""
     out = {"known": False, "cancelled": None, "driver_live": False, "marker": False,
-           "live": [], "stuck": [], "blocked": [], "plans": {}, "esc_keys": set()}
+           "live": [], "stuck": [], "blocked": [], "plans": {}, "heal": [], "esc_keys": set()}
     if not key:
         return out
     alive = alive or _pid_alive
@@ -2080,8 +2131,9 @@ def slice_plan_runnability(key, runs_dir=None, alive=None, now=None, esc_seen=No
                 out["esc_keys"].add(k)
                 seen = esc_seen.setdefault(k, now)
                 if heal_pending(label, sid, s.get("escalation_reason") or "", seen):
-                    eff[sid] = "live"
+                    eff[sid] = "healwait"
                     out["live"].append((label, sid, "escalated (self-heal pending)"))
+                    out["heal"].append((label, sid))
                 else:
                     eff[sid] = "stuck"
                     out["stuck"].append((label, sid, (s.get("escalation_reason") or
@@ -2091,7 +2143,13 @@ def slice_plan_runnability(key, runs_dir=None, alive=None, now=None, esc_seen=No
                 eff[sid] = "blocked"
                 out["blocked"].append((label, sid))
                 continue
-            eff[sid] = "live"
+            if stt != "enqueued" and any(eff.get(x) in ("healwait", "healdep") for x in deps):
+                # waits (transitively) on a slice only a self-heal can move: still `live` (it IS
+                # coming back if the heal lands) but it cannot advance on its own.
+                eff[sid] = "healdep"
+                out["heal"].append((label, sid))
+            else:
+                eff[sid] = "live"
             out["live"].append((label, sid, stt))
         if order and all(eff.get(x) == "done" for x in order) \
                 and not isinstance(d.get("integration"), dict):
@@ -2378,7 +2436,8 @@ def heal_continuation_live(j, by_id):
 
 
 def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
-                         final_verdict=None, esc_state=None, cpu_wait=None, next_step=None, now=None):
+                         final_verdict=None, esc_state=None, cpu_wait=None, next_step=None, now=None,
+                         kick_stalled=None, driverless_since=None, exhausted_yield=None):
     """PURE given `plan` (slice_plan_runnability) / `chain` (chain_run_progress).
     ("working" | "blocked" | "complete", why, moving: bool). `moving` = something is
     running/launchable or a driver is live right now (the idle clock's reset).
@@ -2400,7 +2459,21 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
     `next_step` (NEXT-STEP DECLARATION, 2026-10-09) = this bundle's _bundle_next record
     (next_step_for_terminal): a non-expired "continue" holds the lane ("working", moving)
     BEFORE the CPU-wait/idle logic because the system KNOWS a row is coming; an expired or
-    explicitly blocked one is "blocked". Absent -> unchanged."""
+    explicitly blocked one is "blocked". Absent -> unchanged.
+    `kick_stalled` (LANE-HOLD FIX, 2026-10-09, rt-costco-receipt-attach) = {plan label: seconds}:
+    the queue already fired that plan's slicer advance that long ago and NOTHING came of it (no
+    driver, no marker, no row, slice states unchanged -- computed by _apply_bundle_commit). Runnable
+    slicer work in such a plan is not "coming": the bundle is BLOCKED (parked loudly, lanes released).
+    A plan whose ONLY live slices are an escalated one whose self-heal is still pending (and what
+    waits on it) with no row/driver/hook is "waiting" (lanes released at once, silent park; it
+    resumes FIRST the moment the heal enqueues a row, and parks loudly when the heal window ends).
+    `driverless_since` (IDLE-DRIVERLESS HOLD FIX, 2026-10-10, rt-amazon-cardlink) = when this bundle's
+    only remaining work became slicer-owned slices (or a chain `waiting`) with NO job, NO live driver
+    and NO marker (stamped by _apply_bundle_commit; reset when the plan's slice states change). Past
+    SLICER_GAP_YIELD_S that is the same CPU/driver gap as a live driver's: "waiting", holds no GPU lane
+    (parked cpu_wait, resumes FIRST when a row appears). `exhausted_yield` = truthy when the bundle's
+    focus was released EXHAUSTED and another bundle has work: with nothing moving it yields at once
+    (the commit path must honour the release instead of re-holding the lane it just freed)."""
     if key is None:
         return "complete", "no bundle", False
     plan = plan or {}
@@ -2441,9 +2514,25 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
                            # a SLICED plan with runnable slices / a pending completion event is owned by the
                            # slicer, not by this chain stage: it keeps its hold (canary: decoy must wait)
                            and not plan.get("live") and not plan.get("marker"))
+    # NEXT-STEP HOLD vs THE GAP YIELD (2026-10-10, rt-costco-receipt-attach 00:14-00:33 idle lane):
+    # a live driver re-extends a "continue" declaration by 30s up to NEXT_STEP_HARD_S (30 min), and
+    # the hold below returned working+moving BEFORE the slicer-gap / chain checks, so a bundle with
+    # NO GPU row (its driver in a CPU preflight) held the lane the whole 30 min while 7 jobs waited.
+    # The declaration's `at` is when the bundle's last GPU row ended: that is the gap's start. Past
+    # SLICER_GAP_YIELD_S the declaration no longer holds the lane (it still holds the bundle's place:
+    # it resumes FIRST the moment its next row exists, which pops the declaration).
+    _now_t = time.time() if now is None else now
+    _ns_at = None
+    if isinstance(next_step, dict) and next_step.get("kind") == "continue":
+        try:
+            _ns_at = float(next_step.get("at")) if next_step.get("at") is not None else None
+        except (TypeError, ValueError):
+            _ns_at = None
+    _ns_gap = (_now_t - _ns_at) if _ns_at is not None else 0.0
+    _ns_yield = bool(SLICER_GAP_YIELD_S > 0 and _ns_at is not None and _ns_gap >= SLICER_GAP_YIELD_S)
     if next_step:
-        _nk, _nw = next_step_holds(next_step, time.time() if now is None else now)
-        if _nk == "hold" and not _chain_cpu_only:
+        _nk, _nw = next_step_holds(next_step, _now_t)
+        if _nk == "hold" and not _chain_cpu_only and not _ns_yield:
             return "working", _nw, True
         if _nk in ("expired", "blocked"):
             return "blocked", _nw, False
@@ -2467,7 +2556,7 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
         # CPU/driver work. Past SLICER_GAP_YIELD_S it holds no GPU lane (the owner: the GPU must not wait on
         # CPU work); bundle_commit_step parks it and resumes it first when its next row appears.
         _since = plan.get("driver_since")
-        _gap = ((time.time() if now is None else now) - _since) if _since else 0.0
+        _gap = (_now_t - _since) if _since else 0.0
         if SLICER_GAP_YIELD_S > 0 and _since and _gap >= SLICER_GAP_YIELD_S:
             return "waiting", (f"slicer advance in flight {_gap:.0f}s with no GPU row (CPU/driver gap) "
                                f"-- holds no GPU lane"), False
@@ -2476,13 +2565,47 @@ def bundle_commit_status(key, jobs, pk, plan=None, chain=None, settling=None,
         return "waiting", (f"{chain.get('why') or 'chain driver advancing'} -- CPU-only stage, "
                            f"holds no GPU lane"), False
     if chain.get("driver_live"):
+        if _ns_yield:
+            return "waiting", (f"chain driver advancing {_ns_gap:.0f}s with no GPU row (CPU/driver gap) "
+                               f"-- holds no GPU lane"), False
         return "working", chain.get("why") or "chain driver advancing", True
+    _dl_gap = ((_now_t - float(driverless_since)) if driverless_since is not None else 0.0)
+    _dl_yield = bool(SLICER_GAP_YIELD_S > 0 and driverless_since is not None and _dl_gap >= SLICER_GAP_YIELD_S)
     if chain.get("waiting"):
+        if exhausted_yield:
+            return "waiting", f"{exhausted_yield}; chain idle, no driver -- holds no GPU lane", False
+        if _dl_yield:
+            return "waiting", (f"chain idle {_dl_gap:.0f}s, no job and no live driver -- "
+                               f"holds no GPU lane"), False
         return "working", chain.get("why") or "chain driver about to advance", False
     if plan.get("marker"):
         return "working", "a completion event is waiting for the slicer", False
     if plan.get("live"):
         lbl, sid, stt = plan["live"][0]
+        _heal = set(plan.get("heal") or ())
+        _adv = [x for x in plan["live"] if (x[0], x[1]) not in _heal]
+        _ks = kick_stalled or {}
+        _dead = [x for x in _adv if x[0] in _ks]
+        if _dead:
+            # every runnable slicer slice sits in a plan whose advance was already fired and did
+            # nothing -> nothing is coming; park loudly naming the slice and its state.
+            if len(_dead) == len(_adv):
+                _l, _s, _t = _dead[0]
+                return "blocked", (f"slicer STALLED: slice {_s} is {_t} but the slicer advance fired "
+                                   f"{int(_ks[_l])}s ago left no driver, no job and no change "
+                                   f"({len(plan['live'])} slice(s) not advancing; nothing will move "
+                                   f"it until a human/event re-runs the slicer)"), False
+        elif _heal and not _adv:
+            _l, _s = sorted(_heal)[0]
+            _t = next((x[2] for x in plan["live"] if x[0] == _l and x[1] == _s), "escalated")
+            return "waiting", (f"slice {_s} {_t}; {len(plan['live'])} slice(s) behind it, no job/driver/"
+                               f"hook -- holds no GPU lane until the heal enqueues a row"), False
+        if exhausted_yield:
+            return "waiting", (f"{exhausted_yield}; {len(plan['live'])} slice(s) owned by the slicer but IDLE "
+                               f"(no job, no live driver) -- holds no GPU lane"), False
+        if _dl_yield:
+            return "waiting", (f"{len(plan['live'])} slice(s) owned by the slicer but IDLE {_dl_gap:.0f}s "
+                               f"(no job, no live driver) -- holds no GPU lane"), False
         return "working", f"{len(plan['live'])} runnable slice(s) (next {sid} {stt})", False
     # JOB LADDER (2026-10-05, rt-bg-commitments-fix): a needs_opus row whose
     # continuation already PASSED parked its bundle "needs the owner" 25 min after the
@@ -3131,6 +3254,23 @@ def wait_note(code, short, sentence=None, waiting_on=None):
             "waiting_on": waiting_on or {"kind": code, "detail": short}}
 
 
+def commit_wait_why(why, status, commit):
+    """PURE. The text other bundles' `waiting: behind bundle X (...)` shows. bundle_incomplete's
+    "N slice(s) still owned by the slicer" is only true while the slicer is actually advancing: when
+    the commitment itself reads the bundle as not working (waiting/blocked) or it has sat idle with
+    no job and no driver, say THAT instead of claiming live slicer ownership."""
+    why = str(why or "")
+    try:
+        if status and status[0] != "working":
+            return f"{status[0]}: {status[1]}"
+        if (commit or {}).get("idle_since") is not None and "slice(s) still owned by the slicer" in why:
+            return why.replace("slice(s) still owned by the slicer",
+                               "slice(s) owned by the slicer but IDLE (no job, no live driver)")
+    except Exception:
+        pass
+    return why
+
+
 def focus_wait_note(active, why, committed, backfill_ok_note="", next_job=None, holder=None):
     """PURE. The note for a job skipped because a bundle owns the lanes, built from the
     SAME `_active_why` string the focus log line uses (bundle_incomplete's text)."""
@@ -3422,9 +3562,41 @@ def cpu_outstanding_by_bundle():
         return {}
 
 
+_LAST_COMMIT_STATUS = {}    # {bundle: (status, why, moving)} of the last tick (for the wait-reason text)
+
+
+def _plan_sig(plan, label):
+    """PURE. Stable signature of one plan's live slices+states (a changed slice state = something moved)."""
+    return json.dumps(sorted([sid, str(stt)] for l, sid, stt in (plan.get("live") or ()) if l == label))
+
+
+def _kick_stalled(plan, src, now, grace=None):
+    """PURE. {plan label: seconds since its kick} for plans whose slicer advance was fired >= grace ago
+    and left the plan exactly as it was (same live slice states) with no live driver and no request
+    marker. `src` = the commit (or a parked record's `kick`) carrying {kicked, kick_sig}."""
+    grace = BUNDLE_KICK_GRACE_S if grace is None else grace
+    out = {}
+    if not isinstance(src, dict) or plan.get("driver_live") or plan.get("marker"):
+        return out
+    kicked = src.get("kicked") or {}
+    sigs = src.get("kick_sig") or {}
+    for lbl, ts in kicked.items():
+        try:
+            if now - float(ts) >= grace and sigs.get(lbl) == _plan_sig(plan, lbl):
+                out[lbl] = now - float(ts)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def moving_hint_guard(plan, chain):
+    """PURE. True when a live driver / marker means the bundle IS advancing (never an exhausted-yield)."""
+    return bool(plan.get("driver_live") or chain.get("driver_live") or plan.get("marker"))
+
+
 def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, alert=None,
                          runs_dir=None, chain_dir=None, override_key=None, hooks=None,
-                         log_dir=None, cpu_outstanding=None):
+                         log_dir=None, cpu_outstanding=None, exhausted=None):
     """The effectful half of the commitment for one daemon tick: evaluates the bundles
     (bundle_commit_status over slice_plan_runnability + chain_run_progress), runs
     bundle_commit_step, persists state["_bundle_commit"/"_bundle_parked"/
@@ -3485,13 +3657,41 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
             else:
                 since = (parked.get(k) or {}).get("commit_since")
             fv = chain_final_nonpass(k, chain, accepted, since, log_dir)
+            _ksrc = prev if (prev and prev.get("key") == k) else ((parked.get(k) or {}).get("kick") or {})
+            _kst = _kick_stalled(plan, _ksrc, now)
+            # IDLE-DRIVERLESS clock: slicer-owned slices / a waiting chain with no live driver and no marker.
+            _dls = state.setdefault("_bundle_driverless", {})
+            _dl_since = None
+            if ((plan.get("live") or chain.get("waiting")) and not plan.get("driver_live")
+                    and not chain.get("driver_live") and not plan.get("marker")):
+                _sig = json.dumps(sorted([str(l), str(x), str(t)] for l, x, t in (plan.get("live") or ()))) \
+                    + ("|chainwait" if chain.get("waiting") else "")
+                _rec = _dls.get(k)
+                if not isinstance(_rec, dict) or _rec.get("sig") != _sig:
+                    _rec = {"sig": _sig, "since": now}
+                    _dls[k] = _rec
+                _dl_since = _rec.get("since")
+            else:
+                _dls.pop(k, None)
+            _exy = None
+            if exhausted is not None and not moving_hint_guard(plan, chain):
+                try:
+                    _ex, _exw = exhausted(k)
+                except Exception:
+                    _ex, _exw = False, None
+                if _ex and any(c_ is not None and c_ != k and c_ not in parked and not exhausted(c_)[0]
+                               for c_ in (cand_keys or ())):
+                    _exy = f"EXHAUSTED focus release honoured ({_exw})"
             st, why, moving = bundle_commit_status(k, jobs, pk, plan, chain,
                                                    settling=settling_by.get(k),
                                                    final_verdict=fv,
                                                    esc_state=_esc_state,
                                                    cpu_wait=cpu_by.get(k),
-                                                   next_step=_nxt_all.get(k), now=now)
+                                                   next_step=_nxt_all.get(k), now=now,
+                                                   kick_stalled=_kst, driverless_since=_dl_since,
+                                                   exhausted_yield=_exy)
             cache[k] = (st, why, moving, plan)
+            _LAST_COMMIT_STATUS[k] = (st, why, moving)
         return cache[k][:3]
 
     # skip_grace always True: completion is settled by the tracked hooks above, so
@@ -3528,6 +3728,13 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
             parked[_pk] = {"since": now, "why": _why, "kind": "blocked",
                            "commit_since": parked[_pk].get("commit_since")}
             events.append(("park", _pk, _why))
+    # the slicer-kick record travels with a parked bundle, so it is not re-committed by the very
+    # idle slicer work whose kick already failed (it would bounce park/resume every tick)
+    for ev, k, why in events:
+        if ev in ("park", "cpu_wait") and prev and prev.get("key") == k and prev.get("kicked") \
+                and k in parked:
+            parked[k]["kick"] = {"kicked": dict(prev.get("kicked") or {}),
+                                 "kick_sig": dict(prev.get("kick_sig") or {})}
     for ev, k, why in events:
         if ev == "park":
             print(f"[queue] bundle-commit: PARKED bundle {k} -- nothing in it can run: {why}. "
@@ -3572,8 +3779,38 @@ def _apply_bundle_commit(state, pk, running_key, cand_keys, now, kick=None, aler
                     continue
                 if kick(lbl, ppath):
                     kicked[lbl] = now
+                    commit.setdefault("kick_sig", {})[lbl] = _plan_sig(plan, lbl)
                     print(f"[queue] bundle-commit: {k} idle {idle_for:.0f}s with runnable "
                           f"slice work ({why}) -- fired {lbl}'s slicer advance")
+    # PARKED-DRIVERLESS KICK (2026-10-10): a bundle that yielded its lane (waiting/cpu_wait or stalled)
+    # because its slicer work has no driver is no longer the commitment, so the idle kick above never
+    # fires for it and nothing would re-fire its advance. Fire it here (rate-limited, recorded in the
+    # parked record's `kick` so a no-op advance is still parked loudly by kick_stalled).
+    for _pk2, _prec in list(parked.items()):
+        if commit is not None and commit.get("key") == _pk2:
+            continue
+        try:
+            status_of(_pk2)
+            _st2, _why2, _mv2, _plan2 = cache[_pk2]
+        except Exception:
+            continue
+        _heal2 = set(_plan2.get("heal") or ())
+        if (_st2 in ("working", "waiting") and not _mv2
+                and any((x[0], x[1]) not in _heal2 for x in (_plan2.get("live") or ()))
+                and not _plan2.get("driver_live") and not _plan2.get("marker")
+                and _prec.get("kind") in ("cpu_wait", "stalled", "blocked")):
+            _krec = _prec.setdefault("kick", {})
+            _kd = _krec.setdefault("kicked", {})
+            for lbl, ppath in (_plan2.get("plans") or {}).items():
+                if not any(x[0] == lbl and (x[0], x[1]) not in _heal2 for x in _plan2["live"]):
+                    continue
+                if now - float(_kd.get(lbl) or 0) < BUNDLE_KICK_INTERVAL_S:
+                    continue
+                if kick(lbl, ppath):
+                    _kd[lbl] = now
+                    _krec.setdefault("kick_sig", {})[lbl] = _plan_sig(_plan2, lbl)
+                    print(f"[queue] bundle-commit: parked {_pk2} has runnable slice work with no driver "
+                          f"({_why2}) -- fired {lbl}'s slicer advance")
     # forget escalations that are no longer escalated (a re-escalation restarts its clock)
     for kk in [x for x in esc_seen if x not in live_esc and x.split("/", 1)[0] in
                {l for k2 in cache for l in (cache[k2][3].get("plans") or {})}]:
@@ -5901,6 +6138,25 @@ def _log_tail(log_path, nbytes=_FAILURE_SCAN_BYTES):
 
 _FAILURE_TOOL_LINE_RE = re.compile(r"^\[worker\] tool .*$", re.M)
 _TODO_MARKER_RE = re.compile(r"TASK\.md still has TODO placeholders")
+_FAILURE_TOOLNAME_RE = re.compile(r"^\[worker\] tool (\w+)\(", re.M)
+_READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "web_search", "web_fetch", "request_diagnostics"})
+_BASH_WRITES_RE = re.compile(r">|\btee\b|sed\s+-i|\b(?:cp|mv|rm|touch|dd)\b|python|open\(|\bgit\s+(?:apply|checkout|stash)", re.I)
+
+
+def _tools_read_only(tail, names):
+    """True when every tool call in the tail is a read/diagnostic (run_bash only when its command writes nothing)."""
+    for line in re.findall(r"^\[worker\] tool .*$", tail, re.M):
+        m = re.match(r"\[worker\] tool (\w+)\(", line)
+        n = m.group(1) if m else ""
+        if n in _READ_ONLY_TOOLS:
+            continue
+        if n == "run_bash" and not _BASH_WRITES_RE.search(line.split(" -> ")[0]):
+            continue
+        return False
+    return True
+
+
+_ALL_UNSAT_RE = re.compile(r"=== FAILING CASES \((\d+) of (\d+) failed with refimpl\.py applied\) ===")
 
 
 def classify_failure(terminal_reason, log_tail, exit_code=None, authoring=False):
@@ -5944,6 +6200,16 @@ def classify_failure(terminal_reason, log_tail, exit_code=None, authoring=False)
             continue   # TODO placeholders in an authoring round = unfinished authoring (model)
         if rx.search(spec_scan):
             return "spec", detail
+    # ALL-CASES-UNSAT (2026-10-10, aw-codec-floor s3: 6 stage-3 jobs filed class=model): an
+    # authoring round whose FINAL self-check shows the harness's OWN refimpl failing EVERY case
+    # (K of K, K>=2) is a fixture/refimpl disagreement shared by all cases -- almost always the
+    # fixture's stubs never reaching the asserted behaviour -- not model incapacity. Re-running
+    # stage 3 unchanged cannot fix it; it is a spec-class (re-author fixture / re-spec) failure.
+    if authoring:
+        _um = _ALL_UNSAT_RE.search(scan)
+        if _um and _um.group(1) == _um.group(2) and int(_um.group(2)) >= 2:
+            return "spec", (f"refimpl fails ALL {_um.group(2)} fixture cases (fixture/refimpl disagree "
+                            f"on every case -- re-author the fixture or re-spec, not a model retry)")
     iters = _FAILURE_ITER_RE.findall(tail)
     verifies = _FAILURE_VERIFY_RE.findall(tail)
     if not iters and not verifies:
@@ -5966,6 +6232,15 @@ def classify_failure(terminal_reason, log_tail, exit_code=None, authoring=False)
             detail.append(("VERIFY " + re.split(r"\. Do not trust| -- ", last)[0]).strip()[:80])
     if authoring and _TODO_MARKER_RE.search(spec_scan):
         detail.append("authoring unfinished: TASK.md TODO placeholders still unfilled at the final self-check")
+    # EXPLORATION-EXHAUSTED (pa-supersede-on-import, 2026-10-10): an authoring round that hit its iteration cap with
+    # TASK.md still unfilled whose tool calls were ALL reads/diagnostics never tried to write anything -- it spent the
+    # budget paging a huge target file. That is the slice's size, not model incapacity; a plain retry repeats it.
+    if authoring and iters and int(iters[-1][0]) >= int(iters[-1][1]) and _TODO_MARKER_RE.search(spec_scan):
+        _tools = _FAILURE_TOOLNAME_RE.findall(tail)
+        if _tools and _tools_read_only(tail, _tools):
+            return "exploration-exhausted", ("; ".join(detail) + f"; {len(_tools)} tool call(s), ALL read/diagnostic, none wrote "
+                    "TASK.md/refimpl -- the iteration budget went on exploring a target too large to page; re-cut the slice "
+                    "(small new module + a separate wiring slice), do not retry")
     return "model", "; ".join(detail) or "did not converge"
 
 
@@ -6104,6 +6379,75 @@ def stale_base_touched(cwd, baseline_head, ref, scope=None, run=None):
         return []
     return sorted({c for c in changed
                    if c in scope or any(sc.endswith("/") and c.startswith(sc) for sc in scope)})
+
+
+def refresh_stale_base(job, run=None, git_run=None):
+    """Bring a STALE authoring worktree up to its base BEFORE launch, so the round runs
+    against the tree it will be verified/landed on instead of failing class=stale-base.
+
+    WHY (stale-base audit 2026-10-09, 21 daemon-log failures = ~9 incidents). A dispatch
+    worktree is cut at ENQUEUE time and its HEAD never moves; stale_base_behind() only
+    REPORTED the drift after a whole 12-24 iteration round had been burned against a tree
+    lacking commits that the job's files depend on, and every c1/c2/r1/r2 continuation
+    re-launched in the SAME worktree on the SAME old HEAD (rt-egift-link s1-s4/s5: 3+3
+    rounds on baseline 3e28274a, smoke-egift 5 rounds on d87790e6, ...). The drift is a
+    measurable fact, so close it at the source: at launch, when the commits that landed
+    since HEAD touch this task's declared files (the same scope evidence the classifier
+    demands), fast-forward HEAD to the base ref -- or, when earlier rounds' sealed commits
+    sit on HEAD, rebase them onto it. Plain `git` refusals (a tracked edit that overlaps an
+    incoming file, an untracked file the incoming commits add, a rebase conflict) leave the
+    tree exactly as found (rebase is aborted): FAIL-OPEN, the launch proceeds and the
+    classifier still reports stale-base if it bites.
+
+    Skipped for: non-authoring jobs, an in-place resume (resume_transcript /
+    continuation_active -- the model continues its OWN half-done tree and its transcript
+    describes that exact HEAD), and a worktree whose drift touches none of the task's files.
+    Returns None when nothing was done, else {"from","to","ref","behind","touched","how"}
+    or {"skipped": why, ...} when a refresh was due but git refused.
+    `git_run` is injectable for tests; never raises."""
+    try:
+        if job.get("resume_transcript") or job.get("continuation_active"):
+            return None
+        if not _is_authoring_job(job):
+            return None
+        cwd = job.get("cwd")
+        if not cwd or not os.path.isdir(str(cwd)):
+            return None
+        def _g(*args):
+            cp = (git_run or subprocess.run)(["git", "-C", str(cwd), *args],
+                                             capture_output=True, text=True, timeout=60)
+            return cp.returncode, ((cp.stdout or "") + (cp.stderr or "")).strip()
+        rc, head = _g("rev-parse", "HEAD")
+        if rc != 0 or not head:
+            return None
+        behind, ref = stale_base_behind(cwd, head, run=run or git_run)
+        if not behind or not ref:
+            return None
+        touched = stale_base_touched(cwd, head, ref, run=run or git_run)
+        if not touched:
+            return None
+        info = {"from": head[:12], "ref": ref, "behind": behind, "touched": touched[:20]}
+        rc, out = _g("merge", "--ff-only", ref)
+        if rc == 0:
+            how = "fast-forward"
+        else:
+            # HEAD carries sealed commits of earlier rounds: replay them on the new base.
+            # Only from a TRACKED-clean tree (git rebase refuses otherwise) and abort on
+            # any conflict so a failed refresh never leaves a half-rebased worktree.
+            rc2, porc = _g("status", "--porcelain", "--untracked-files=no")
+            if rc2 != 0 or porc.strip():
+                return {**info, "skipped": f"ff refused ({out[-160:]}); tracked edits present"}
+            rc3, out3 = _g("rebase", ref)
+            if rc3 != 0:
+                _g("rebase", "--abort")
+                return {**info, "skipped": f"ff and rebase refused ({out3[-160:]})"}
+            how = "rebase"
+        rc, new = _g("rev-parse", "HEAD")
+        info.update({"to": (new or "")[:12], "how": how})
+        job["base_refreshed"] = info
+        return info
+    except Exception:
+        return None
 
 
 # PROGRESSING NONCONVERGENCE (smoke 2026-10-09, defect D7). An authoring job (its verify
@@ -8678,8 +9022,39 @@ VERIFY_TIMEOUT_S = 300   # mirrors ollama-worker.py's verify subprocess timeout
 PREFLIGHT_SLOW_S = 240   # refuse if the verify eats most of that budget (would time out in the worker)
 
 
+# BASELINE-RED CLASSIFIER (2026-10-10, A/B replay discrepancy 7a34a4de3553). The enqueue preflight used to stamp
+# "preflight-verify-ok (baseline fails as designed)" for ANY non-zero exit. For a verify that is itself a harness
+# self-check (python3 auto-harness-check.py) the red can be the REPORT OF A DEFECT ("FAIL: verify.sh PASSES at
+# baseline -- the fixture cannot fail"), i.e. the exact opposite of "the property is not built yet"; and a crash
+# (Traceback / ImportError) is not "fails as designed" either. Same exit code, opposite meaning; the stamp (and the
+# worker's "BASELINE PROVEN FAILING") then asserted a fact nobody had checked. The boolean contract is unchanged
+# (non-zero => failed_at_baseline) so the worker semantics do not move; only the HONESTY of the verdict does.
+_BASELINE_META_RED_RE = re.compile(r"verify\.sh PASSES at baseline|the fixture cannot fail|certifies nothing", re.I)
+_BASELINE_ASSERT_RE = re.compile(r"\bFAIL(?:ED)?\b|AssertionError|\bnot ok\b|\bassert", re.I)
+_BASELINE_CRASH_RE = re.compile(r"Traceback \(most recent call last\)|ModuleNotFoundError|ImportError|SyntaxError|"
+                                r"command not found|Cannot find module|ENOENT", re.I)
+
+
+def _classify_baseline_red(output: str):
+    """PURE. None => the red looks like an assertion failure (fails as designed, or at least no contrary evidence).
+    str => a short reason the red is NOT proof that the property is unbuilt."""
+    out = output or ""
+    if _BASELINE_META_RED_RE.search(out):
+        return ("the red is a HARNESS-DEFECT report (the inner verify PASSES at baseline: the fixture cannot fail), "
+                "not a failing property")
+    if _BASELINE_CRASH_RE.search(out) and not _BASELINE_ASSERT_RE.search(out):
+        return "the red is a crash/import error with NO assertion output (cannot tell 'fails as designed' from a broken env)"
+    return None
+
+
 def _preflight_verify(verify: str, cwd: Path) -> bool:
-    """Returns True when the verify FAILED at baseline (before any model edit).
+    """Back-compat wrapper: True when the verify FAILED at baseline. See _preflight_verify_full."""
+    return _preflight_verify_full(verify, cwd)[0]
+
+
+def _preflight_verify_full(verify: str, cwd: Path):
+    """Returns (failed_at_baseline, suspect_reason). failed_at_baseline is True when the verify FAILED at baseline
+    (before any model edit); suspect_reason is None or why that red is NOT proof the property is unbuilt.
 
     That return value is the authoritative baseline reading: it is taken in the
     job's own cwd, at enqueue, before the model touches anything. The worker
@@ -8752,12 +9127,16 @@ def _preflight_verify(verify: str, cwd: Path) -> bool:
             f"auto-harness-check.py at enqueue) and re-enqueue. Last output:\n  {tail}\n"
             f"(override with --no-preflight)")
     _failed_at_baseline = r.returncode != 0
+    _suspect = _classify_baseline_red(_combined) if _failed_at_baseline else None
+    if _suspect:
+        print(f"[queue] pre-flight WARNING: --verify exits {r.returncode} at baseline but {_suspect}. "
+              f"It is NOT being stamped 'fails as designed'.", file=sys.stderr)
     verdict = "PASSES" if r.returncode == 0 else (f"exits {r.returncode} -- OK IF it verifies the FIX "
                                                   f"(fails at baseline by design); a red flag if it's "
                                                   f"meant to just check 'nothing broke'")
     print(f"[queue] pre-flight OK: --verify {verdict}, ran in {dt:.1f}s (worker gate = {VERIFY_TIMEOUT_S}s).",
           file=sys.stderr)
-    return _failed_at_baseline
+    return _failed_at_baseline, _suspect
 
 def _repo_toplevel(repo: Path):
     r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
@@ -9596,6 +9975,18 @@ def cmd_enqueue(args):
             _lang_why = None
         if _lang_why:
             sys.exit(f"[queue] REFUSING enqueue: {_lang_why}")
+    # HARNESS ADMISSION BACKSTOP (2026-10-10, harness_admission.py): an auto-author/auto-refine job
+    # whose harness has a recorded reslice-required stop at its CURRENT fingerprint is refused here,
+    # whichever tool (a relaunched driver, a hand enqueue) is enqueueing it. Repair labels (-r10N)
+    # are exempt. Undecidable / helper missing -> allowed (never refuse blind).
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import harness_admission as _ha_bs
+        _ha_why = _ha_bs.backstop_refusal(args.cwd, getattr(args, "label", None))
+    except Exception:
+        _ha_why = None
+    if _ha_why:
+        sys.exit(f"[queue] REFUSING enqueue: {_ha_why}")
     runner = None
     if getattr(args, "runner", None):
         runner = str(Path(args.runner).resolve())
@@ -9642,13 +10033,15 @@ def cmd_enqueue(args):
     # --verify, --no-preflight, or a non-dir cwd), and the panel keeps "not-run".
     _preflight_verdict = None
     if args.verify and cwd.is_dir() and not getattr(args, "no_preflight", False):
-        _verify_failed_at_baseline = _preflight_verify(args.verify, cwd)
+        _verify_failed_at_baseline, _baseline_suspect = _preflight_verify_full(args.verify, cwd)
         # A preflight is NOT a gate PASS -- it only timed the verify and read the
         # baseline. Say exactly that, and distinguish the healthy bug-fix shape
         # (verify RED at baseline, as designed) from the red flag (verify GREEN at
         # baseline, so it certifies nothing).
         _preflight_verdict = (
-            "preflight-verify-ok (baseline fails as designed)"
+            ("preflight-verify-ran (baseline red but UNPROVEN as 'fails as designed': " + _baseline_suspect + ")")
+            if (_verify_failed_at_baseline and _baseline_suspect)
+            else "preflight-verify-ok (baseline fails as designed)"
             if _verify_failed_at_baseline
             else "preflight-verify-ran (baseline PASSES -- verify may check nothing)")
 
@@ -9846,6 +10239,25 @@ def cmd_enqueue(args):
                   f"duplicate. Poll/adopt that job, wait for it to reach a "
                   f"terminal state, or pass --allow-duplicate-label if you "
                   f"really do want two jobs under one label.", file=sys.stderr)
+            sys.exit(_DUPLICATE_LABEL_RC)
+        # --- SINGLE-FLIGHT PER SLICE WORKTREE (2026-10-09) --------------------
+        # rt-costco-receipt-attach-s1 had FOUR author rows (-s1, -s1-r1, -s1-r2,
+        # -c1) on ONE worktree: every round carries a DIFFERENT label, so the
+        # duplicate-label guard above never fired. An orphaned AUTO driver
+        # enqueued them back to back before the first had run; the slicer's
+        # preflight then NO-GO'd on cwd-exclusive for a slice that was fine. A
+        # slice worktree has exactly one live owner: refuse a second row on it
+        # and name the owner on the first stdout line (same protocol as
+        # duplicate-label, so ollama-dispatch-auto ADOPTS and polls the owner
+        # rather than counting a failed attempt).
+        _owner = slice_worktree_live_owner(state["jobs"], args.cwd)
+        if _owner and not getattr(args, "allow_duplicate_label", False):
+            print(f"duplicate-label {_owner['id']} {_label}")
+            print(f"[queue] REFUSED: slice worktree {args.cwd} is already owned by "
+                  f"LIVE job {_owner['id']} ({_owner.get('status')}, "
+                  f"{_owner.get('label')}) -- NOT enqueuing a second row on it "
+                  f"(single-flight per worktree). Poll/adopt that job or wait for "
+                  f"it to reach a terminal state.", file=sys.stderr)
             sys.exit(_DUPLICATE_LABEL_RC)
         job_id = uuid.uuid4().hex[:12]
         after_id = None
@@ -13866,12 +14278,16 @@ def cmd_run(args):
             _pre_release = _active
             _active, _released_why = release_exhausted_focus(
                 _active, _running_key, _cand_keys, _exhausted)
+            # Transition-only log (2026-10-09): the stamp must PERSIST (state is reloaded from disk
+            # every tick and only `changed` saves it) or the line re-prints each tick (133x for
+            # strata-h2h in ~14 days); it clears when the release ends so a re-release logs again.
+            _rel_msg, _rel_chg = focus_release_log_step(
+                state, _pre_release, _active, _released_why)
+            if _rel_chg:
+                changed = True
+            if _rel_msg:
+                print(_rel_msg)
             if _released_why:
-                _rel_sig = [_pre_release, _active]
-                if _rel_sig != state.get("_focus_release_logged"):
-                    state["_focus_release_logged"] = _rel_sig
-                    print(f"[queue] focus: RELEASED bundle {_pre_release} -- EXHAUSTED: "
-                          f"{_released_why}; lanes to {_active}")
                 if _focus_override is not None and _exhausted(_focus_override.get("key"))[0]:
                     state["_focus_override"] = None
                     _focus_override = None
@@ -13915,7 +14331,7 @@ def cmd_run(args):
                         register_gate_hook(_gj.get("id"), _pk(_gj), now=None)
                 _commit_key, _cmt_events = _apply_bundle_commit(
                     state, _pk, _running_key, _cand_keys, _now,
-                    override_key=_override_live)
+                    override_key=_override_live, exhausted=_exhausted)
                 if _cmt_events or state.get("_bundle_commit") != _commit_before:
                     changed = True
             except Exception as _ce:   # never let the commitment take the daemon down
@@ -13947,6 +14363,8 @@ def cmd_run(args):
                     for j in state["jobs"])
                 _active_incomplete, _active_driver, _active_why = bundle_incomplete(
                     _active, state["jobs"], _pk)
+                _active_why = commit_wait_why(_active_why, _LAST_COMMIT_STATUS.get(_active),
+                                              state.get("_bundle_commit"))
             # A bundle parked THIS tick (or still sticky from before) must not keep the lanes
             # (focus_drop_parked): other bundles run immediately.
             if _commit_key is None and _active is not None:
@@ -14401,6 +14819,17 @@ def cmd_run(args):
                              f"deliverable -- sealing it makes the harness self-certifying)"
                              if _sealed.get("target_reset") else ""),
                           file=sys.stderr)
+                try:
+                    _rb = refresh_stale_base(job)   # stale-base fix: re-base BEFORE the baseline is stamped
+                    if _rb:
+                        print(f"[queue] {job['id']} ({job['label']}): stale base "
+                              + (f"REFRESHED {_rb['from']} -> {_rb.get('to')} onto {_rb['ref']} "
+                                 f"({_rb['behind']} commit(s) behind, via {_rb.get('how')}; touched "
+                                 f"{', '.join(_rb['touched'][:3])})" if not _rb.get("skipped") else
+                                 f"refresh SKIPPED ({_rb['skipped']}); launching on the old base"),
+                              file=sys.stderr)
+                except Exception:
+                    pass
                 logf = None
                 try:
                     if resume_keeps_launch_baseline(job, _head_of(job["cwd"])):
@@ -17821,7 +18250,31 @@ def _self_test():
     # --- authoring TODO-placeholder class + progressing nonconvergence (smoke D6/D7) -
     _ait = "--- iteration 24/24 ---\n"
     _todo_final = "[worker] verify stdout:\n  FAIL: TASK.md still has TODO placeholders -- fill them in\n\n[worker] VERIFY FAILED (exit 1). Do not trust this output as-is.\n"
+    _allun = ("[worker] verify stdout:\n  FAIL: x\n=== FAILING CASES (6 of 6 failed with refimpl.py applied) ===\n"
+              "  FAILED CASE: a\n\n[worker] VERIFY FAILED (exit 1). Do not trust this output as-is.\n")
+    check("authoring: refimpl fails ALL K>=2 fixture cases -> spec (re-author fixture), never model",
+          classify_failure("nonconvergence", _ait + _allun, authoring=True)[0], "spec")
+    check("...a partial failure (2 of 6) stays model",
+          classify_failure("nonconvergence", _ait + _allun.replace("(6 of 6", "(2 of 6"), authoring=True)[0], "model")
+    check("...a single-case harness (1 of 1) stays model",
+          classify_failure("nonconvergence", _ait + _allun.replace("(6 of 6", "(1 of 1"), authoring=True)[0], "model")
+    check("...non-authoring job with that block is untouched (model)",
+          classify_failure("nonconvergence", _ait + _allun, authoring=False)[0], "model")
     check("authoring: final-check TODO placeholders is an unfinished MODEL round, not a spec defect",
+          classify_failure("nonconvergence", _ait + _todo_final, authoring=True)[0], "model")
+    _rd = ('[worker] tool read_file({"length": 100, "offset": 1, "path": "arr-webhook.py"}) -> [read_file arr-webhook.py: lines 1-100 of 7060]\n'
+           '[worker] tool list_files({"path": "."}) -> x\n')
+    check("authoring: iteration cap + TODO unfilled + ONLY read/diagnostic tool calls -> exploration-exhausted (not model)",
+          classify_failure("nonconvergence", _rd + _ait + _todo_final, authoring=True)[0], "exploration-exhausted")
+    check("...a write_file call anywhere in the round keeps it model",
+          classify_failure("nonconvergence", _rd + '[worker] tool write_file({"path": "TASK.md"}) -> ok\n' + _ait + _todo_final, authoring=True)[0], "model")
+    check("...a run_bash that redirects into a file keeps it model",
+          classify_failure("nonconvergence", _rd + '[worker] tool run_bash({"command": "cat > TASK.md"}) -> ok\n' + _ait + _todo_final, authoring=True)[0], "model")
+    check("...a read-only run_bash (grep) still counts as exploration",
+          classify_failure("nonconvergence", _rd + '[worker] tool run_bash({"command": "grep -n def arr-webhook.py"}) -> ok\n' + _ait + _todo_final, authoring=True)[0], "exploration-exhausted")
+    check("...below the iteration cap it is not exploration-exhausted",
+          classify_failure("nonconvergence", _rd + "--- iteration 3/24 ---\n" + _todo_final, authoring=True)[0], "model")
+    check("...no tool calls at all stays model",
           classify_failure("nonconvergence", _ait + _todo_final, authoring=True)[0], "model")
     check("...while a non-authoring job with that marker stays spec",
           classify_failure("nonconvergence", _ait + _todo_final, authoring=False)[0], "spec")
@@ -18149,7 +18602,7 @@ def _self_test():
         # A FINAL-RUNG-only reason: since the ladder-aware heal predicate (2026-10-02)
         # a plain gate-FAIL escalation is healable (b/c/d review -> retry-notes) for
         # HEAL_WINDOW_S, so "needs a human" has to be one the ladder will not touch.
-        def _wA(s2="escalated", s4="pending", s2_reason="PIPELINE BUG SUSPECTED: gate verdict "
+        def _wA(s2="escalated", s4="pending", s3="pending", s2_reason="PIPELINE BUG SUSPECTED: gate verdict "
                 "fail on coding job j2: correctness -- needs a human"):
             (_crd / "bA.json").write_text(json.dumps({
                 "label": "bA", "plan_path": str(_cplan), "repo": "/r",
@@ -18157,7 +18610,7 @@ def _self_test():
                 "slices": {"s1": {"status": "done", "depends_on": []},
                            "s2": {"status": s2, "depends_on": ["s1"],
                                   "escalation_reason": s2_reason},
-                           "s3": {"status": "pending", "depends_on": ["s2"]},
+                           "s3": {"status": s3, "depends_on": ["s2"]},
                            "s4": {"status": s4, "depends_on": ["s1"]}}}))
         _cpk = lambda j: j.get("bundle")
         _alerts, _kicks = [], []
@@ -18222,6 +18675,9 @@ def _self_test():
         _k, _ev = _hkw(400.0 + 5.0)
         check("commit: B's rows done but its gate hook is still RUNNING and fresh -> B holds "
               "(no timer completes it)", (_k, [e[0] for e in _ev]), ("bB", []))
+        # the slicer ADVANCED A meanwhile (slice state changed -> the driverless clock restarts; an
+        # un-advanced idle A would, correctly, no longer out-rank C: see test-idle-driverless-hold)
+        _wA(s2="confirmed", s4="done", s3="authored")
         _k, _ev = _hkw(400.0 + max(SLICER_GAP_YIELD_S, 1.0) + 1)
         check("commit: ...hook still running past SLICER_GAP_YIELD_S -> B yields the lane "
               "(cpu_wait, not complete) and parked A RESUMES before the new bundle C",

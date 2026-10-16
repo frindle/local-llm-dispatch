@@ -391,12 +391,39 @@ def _tsc_target_grep(target: str) -> str:
 # defect is worse than a blank one: it reads as confirmed when nobody confirmed
 # it.
 # ---------------------------------------------------------------------------
+_AIDS_MOD = []
+
+
+def _aids():
+    """~/bin/dispatch_authoring_aids.py (shared pure helpers), loaded once; None when unloadable.
+    FAIL-OPEN: a missing module only means the optional guidance is not injected."""
+    if not _AIDS_MOD:
+        try:
+            import importlib.util as _iu
+            _p = Path(__file__).resolve().parent / "dispatch_authoring_aids.py"
+            _s = _iu.spec_from_file_location("dispatch_authoring_aids", _p)
+            _m = _iu.module_from_spec(_s)
+            _s.loader.exec_module(_m)
+            _AIDS_MOD.append(_m)
+        except Exception:
+            _AIDS_MOD.append(None)
+    return _AIDS_MOD[0]
+
+
+_DEFECT_TODO_FALLBACK = (
+    "TODO -- state the CONFIRMED defect: the observed symptom and how you\n"
+    "verified it. Not a suspected mechanism, not a named culprit. If you\n"
+    "have not actually reproduced it, stop and reproduce it first: a task\n"
+    "asserting a defect that does not exist still gets you a change.")
+
+
 def task_md(a):
-    defect = a.defect or (
-        "TODO -- state the CONFIRMED defect: the observed symptom and how you\n"
-        "verified it. Not a suspected mechanism, not a named culprit. If you\n"
-        "have not actually reproduced it, stop and reproduce it first: a task\n"
-        "asserting a defect that does not exist still gets you a change.")
+    # NO INVENTED DEFECTS (2026-10-09, aw-codec-floor s2b): the placeholder used to ask for a
+    # "CONFIRMED defect" and the author invented downstream consumers (logging, activity records,
+    # pushover) for an additive change. State only what a baseline run shows, else "behavior to add".
+    _am = _aids()
+    defect = a.defect or (_am.defect_todo_text(getattr(a, "property", "") or "") if _am
+                          else _DEFECT_TODO_FALLBACK)
     entry = a.entry_point or f"TODO -- {a.target}:<line>"
     prop = a.property or (
         "TODO -- state the property the change must satisfy, behaviourally.")
@@ -2615,9 +2642,19 @@ def build_python(root: Path, a):
     tgt.parent.mkdir(parents=True, exist_ok=True)
     if not tgt.exists():
         tgt.write_text('"""TODO -- the target under test."""\n')
-    (root / a.fixture_rel).write_text(PY_FIXTURE.format(
+    _fx = PY_FIXTURE.format(
         label=a.label, target_py=a.target, mark=SCAFFOLD_MARK,
-        fixture_rel=a.fixture_rel))
+        fixture_rel=a.fixture_rel)
+    # HEAVY-GLOBAL TARGET (2026-10-09, aw-codec-floor s2b): a big module / one with module-level IO
+    # globals gets the worked example (load -> patch every IO global -> call; frame-local probe) as an
+    # inert comment block in the stub, so the author sees it before writing a case.
+    try:
+        _am = _aids()
+        if _am is not None and tgt.is_file():
+            _fx = _am.inject_heavy_into_fixture(_fx, a.target, tgt.read_text(errors="replace"))
+    except Exception as _e:  # pragma: no cover - guidance is optional, never block a scaffold
+        print(f"  (heavy-target fixture guidance not added: {_e})", file=sys.stderr)
+    (root / a.fixture_rel).write_text(_fx)
     (root / "verify.sh").write_text(PY_VERIFY.format(
         label=a.label, target=a.target, fixture_rel=a.fixture_rel))
 
@@ -4289,6 +4326,12 @@ def main():
             print(f"git worktree add failed: {err.strip()}{hint}",
                   file=sys.stderr)
             return 2
+        try:        # RE-SCAFFOLD at this path: any harness-admission state/snapshot of a previous incarnation is stale
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import harness_admission as _ha_mod
+            _ha_mod.clear_state(dest)
+        except Exception:
+            pass
         _wt_cleanup = (repo, dest, branch)
         _recorded_base = (base_sha, _base_note)
         root, mode = dest, f"worktree of {repo.name} on {branch}"
