@@ -76,6 +76,8 @@ check("(a) a verbatim literal is not a near miss", hg.literal_near_miss("normali
 check("(a) a brand-new identifier is not a near miss", hg.literal_near_miss("cancelledMarked", BODY) is None)
 check("(a) a SUBSTITUTION (= true vs = false) is not a near miss: that is a legitimate new literal",
       hg.literal_near_miss("cancelled = true", BODY) is None)
+check("(a) a NEW identifier that merely extends an existing word is not a near miss (aw-codec-floor candidate_names vs candidates)",
+      hg.literal_near_miss("candidate_names", "continue  # only individual-episode torrents are candidates\n") is None)
 check("(a) short tokens never qualify", hg.literal_near_miss("cost", BODY) is None)
 d = repo_with(BODY, TASK)
 fs = hg.literal_near_miss_findings(d, TASK, "app/route.ts")

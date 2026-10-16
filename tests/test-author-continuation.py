@@ -473,8 +473,20 @@ def run():
             # a check that leaves junk behind, exactly like a killed one would
             (wt / "auto-harness-check.py").write_text(
                 "open('LEFTOVER.txt','w').write('x')\n")
-            out, reason = m._harness_check_output(
-                wt, "python3 auto-harness-check.py", "build.py")
+            # Pin the LOCAL lane: this scenario proves the local `git status --porcelain`
+            # comparison. With the CPU lane live the check can be shipped to the Unraid
+            # runner (a copy), so the leftover never lands in this tree -- an environmental
+            # flip unrelated to the detector.
+            _cl = os.environ.get("CPU_LANE")
+            os.environ["CPU_LANE"] = "off"
+            try:
+                out, reason = m._harness_check_output(
+                    wt, "python3 auto-harness-check.py", "build.py")
+            finally:
+                if _cl is None:
+                    os.environ.pop("CPU_LANE", None)
+                else:
+                    os.environ["CPU_LANE"] = _cl
             ok("a check that DIRTIES the tree is reported as contamination",
                reason is not None,
                "the porcelain comparison must actually produce the signal")

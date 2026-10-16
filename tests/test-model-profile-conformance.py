@@ -427,6 +427,22 @@ def run_invariants():
                or (k == "repetition_penalty" and o.get(k) == 1.1)
                or (k == "max_tokens" and o.get(k) == 8192)}
         check(f"no legacy hardcoded default leaks ({model})", bad, {})
+    # DISPATCH_SAMPLING=legacy restores the pre-2026-10-08 values (A/B control + rollback); unset = card.
+    _prev = os.environ.get("DISPATCH_SAMPLING")
+    try:
+        os.environ["DISPATCH_SAMPLING"] = "legacy"
+        for role in ("author", "review"):
+            o = mp.build_request_fields("qwen3.6-35b-a3b-vl-mtp-mxfp8", role, "openai")
+            check(f"DISPATCH_SAMPLING=legacy restores old values ({role})",
+                  (o.get("temperature"), o.get("repetition_penalty"), o.get("max_tokens"), "top_k" in o,
+                   "chat_template_kwargs" in o), (0.15, 1.1, 8192, False, False))
+    finally:
+        if _prev is None:
+            os.environ.pop("DISPATCH_SAMPLING", None)
+        else:
+            os.environ["DISPATCH_SAMPLING"] = _prev
+    o = mp.build_request_fields("qwen3.6-35b-a3b-vl-mtp-mxfp8", "author", "openai")
+    check("default (env unset) is the card profile", (o["temperature"], o["top_k"], o["max_tokens"]), (0.6, 20, 32768))
     # alias: declared, lane-scoped, logged, never silent
     got = mp.resolve_alias("qwen3.8:27b-q4_K_M", "darkbloom")
     check("qwen3.8 alias resolves on the darkbloom lane via the PROFILE",

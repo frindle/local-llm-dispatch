@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Penn 2026-10-09 (rt-bg-commitments-guard): superseded failed retry attempts sat as `failed`
+"""The owner 2026-10-09 (rt-bg-commitments-guard): superseded failed retry attempts sat as `failed`
 rows after their chain exited 0. hygiene_sweep -> passed_lineage_actions must resolve rows whose
 lineage PROVABLY passed later (auto-run exit 0 for L / L-sN, or superseded_by chain reaching a
 done exit-0 job) plus the job-form esc-review rows about them -- and nothing else.

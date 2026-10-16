@@ -108,6 +108,26 @@ kind, msg = preflight("definitely-not-a-real-command-xyz")
 check("the pre-existing not-found refusal still fires",
       kind == "refused" and "127" in msg, repr(msg)[:200])
 
+print("=== baseline-red HONESTY (A/B replay discrepancy 7a34a4de3553): red is not always 'fails as designed' ===")
+import contextlib as _cl, io as _io
+def full(verify):
+    with _cl.redirect_stderr(_io.StringIO()):
+        return oq._preflight_verify_full(verify, td)
+(td / "meta.py").write_text(
+    "import sys\nprint('  FAIL: verify.sh PASSES at baseline -- the fixture cannot fail, so it certifies nothing.')\nsys.exit(1)")
+f, why = full("python3 meta.py")
+check("a self-check reporting 'verify.sh PASSES at baseline' is red but NOT stamped as designed",
+      f is True and why and "HARNESS-DEFECT" in why, repr((f, why)))
+(td / "crash.py").write_text("import notamodule_xyz\n")
+f, why = full("python3 crash.py")
+check("an ImportError crash with no assertion output is red but UNPROVEN", f is True and why and "crash" in why, repr((f, why)))
+(td / "assertfail.py").write_text("import sys\nprint('  FAIL: case slugify: expected a-b got a b')\nsys.exit(1)")
+check("a genuine assertion failure keeps the 'fails as designed' reading", full("python3 assertfail.py") == (True, None))
+check("a bare non-zero exit with no crash evidence keeps the 'fails as designed' reading", full("python3 f.py") == (True, None))
+check("a green verify has no suspect reason", full("python3 ok.py") == (False, None))
+check("the bool wrapper (_preflight_verify) is unchanged", preflight("python3 meta.py") == ("allowed", True))
+check("classifier is PURE and total", oq._classify_baseline_red("") is None and oq._classify_baseline_red(None) is None)
+
 # REVERT-TEST (run by hand, recorded here): delete the `_missing` block from
 # _preflight_verify() and the four "refused" checks above FAIL -- the missing-script
 # verify is allowed through and reported as "exits 2 ... fails at baseline by design",

@@ -84,9 +84,10 @@ def fake_online():
     return state["online"], "http://stub", object()
 
 
-def fake_submit(cj, api, wt, cmd, timeout_s, stage, bundle_id, tools, env, cwd_rel, label, claim_timeout_s):
+def fake_submit(cj, api, wt, cmd, timeout_s, stage, bundle_id, tools, env, cwd_rel, label, claim_timeout_s, owner=None):
     calls["submit"] += 1
     state["env"], state["label"], state["cmd"], state["tools"] = env, label, cmd, tools
+    state["owner"] = owner
     if state["submit"] is None:
         raise RuntimeError("stub: no submit behaviour set")
     return state["submit"](wt)
@@ -98,6 +99,7 @@ def fake_marker(stage, bundle_id, timeout_s):
     return lambda code=None: calls.__setitem__("marker_end", calls["marker_end"] + 1)
 
 
+_REAL_SUBMIT = cs._submit
 cs._runner_online, cs._submit, cs._marker = fake_online, fake_submit, fake_marker
 
 
@@ -373,6 +375,116 @@ check("7 gate check: rc=3 'nothing to mutate' (clean abstain) is accepted, not r
 check("7 gate check: empty stdout with another rc, and non-JSON, are still vetoed",
       bool(_chk(R(1, "", "boom"))) and bool(_chk(R(0, "garbage", ""))) and _chk(R(0, '{"verdict": "x"}', "")) is None)
 
+# ---- 8. capability-driven eligibility (2026-10-09): the runner reports node/python/modules/sqlite3 ---------
+import sqlite3 as _sq3      # noqa: E402
+import cpu_dispatch as _cd  # noqa: E402
+os.environ["CPU_LANE_HOST_PYTHON"] = "3.14"
+CAPS = {"node": 26, "python": "3.14", "py_modules": ["flask", "requests", "paramiko"], "sqlite3": True}
+
+wm = make_repo("mockmod")
+Path(wm, "verify.test.ts").write_text('import { mock } from "node:test";\nmock.module("x", { exports: {} });\n')
+sh("git", "add", "-A", cwd=wm)
+ok0, why0 = cs.eligibility(wm, "bash verify.sh")
+check("8 mock.module + legacy/no caps: refused, reason names runner node 22 (as before)",
+      (not ok0) and "runner node 22 API differs from host node" in why0, why0)
+ok1, why1 = cs.eligibility(wm, "bash verify.sh", caps=dict(CAPS, node=22))
+check("8 mock.module + runner reporting node 22: still refused with the REAL version",
+      (not ok1) and "runner node 22 API" in why1, why1)
+ok2, why2 = cs.eligibility(wm, "bash verify.sh", caps=CAPS)
+check("8 mock.module + runner reporting node 26: eligible", ok2, why2)
+
+
+def py_repo(name, body, verify=None):
+    d = TMP / name
+    d.mkdir()
+    sh("git", "init", "-q", "-b", "main", cwd=d)
+    (d / "target-mod.py").write_text(body)
+    (d / "test_fixture.py").write_text("import importlib.util\nimportlib.util.spec_from_file_location('t', 'target-mod.py')\n")
+    (d / "verify.sh").write_text(verify or '#!/bin/bash\npython3 ./test_fixture.py && echo VERIFY_OK\n')
+    sh("git", "add", "-A", cwd=d)
+    sh("git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "b", cwd=d)
+    return str(d)
+
+
+wp = py_repo("pyok", "import os, json\nfrom flask import Flask\nimport requests\ntry:\n    import paramiko\nexcept ImportError:\n    pass\n")
+check("8 python bundle + legacy/no caps: stays local with today's reason",
+      cs.eligibility(wp, "bash verify.sh") == (False, cs._LEGACY_NONODE), cs.eligibility(wp, "bash verify.sh"))
+check("8 python bundle + runner python 3.14 carrying flask/requests/paramiko: eligible",
+      cs.eligibility(wp, "bash verify.sh", caps=CAPS) == (True, ""), cs.eligibility(wp, "bash verify.sh", caps=CAPS))
+okm, whym = cs.eligibility(wp, "bash verify.sh", caps=dict(CAPS, python="3.11"))
+check("8 python minor mismatch: refused, both versions in the reason",
+      (not okm) and "3.11" in whym and "3.14" in whym, whym)
+okx, whyx = cs.eligibility(wp, "bash verify.sh", caps=dict(CAPS, py_modules=["flask"]))
+check("8 module the runner lacks: refused, names the missing modules",
+      (not okx) and "paramiko" in whyx and "requests" in whyx and "flask" not in whyx, whyx)
+check("8 stdlib-only python bundle is eligible", cs.eligibility(py_repo("pystd", "import os, re, sqlite3\n"), "bash verify.sh", caps=CAPS)[0])
+okn, whyn = cs.eligibility(py_repo("pyfn", "import os\ndef f():\n    import numpy\n"), "bash verify.sh", caps=CAPS)
+check("8 a function-local third-party import is seen (numpy): refused", (not okn) and "numpy" in whyn, whyn)
+boot = '#!/bin/bash\n.venv/bin/pip install -q -r requirements.txt >/dev/null 2>&1 || rm -rf .venv\npython3 ./test_fixture.py\n'
+check("8 the scaffold's venv pip bootstrap does not make a python bundle 'needs network'",
+      cs.eligibility(py_repo("pyboot", "import os\n", boot), "bash verify.sh", caps=CAPS)[0])
+okp, whyp = cs.eligibility(py_repo("pypip", "import os\n", "#!/bin/bash\npip install numpy\npython3 ./test_fixture.py\n"), "bash verify.sh", caps=CAPS)
+check("8 any OTHER pip install still needs network -> refused", (not okp) and "pip" in whyp, whyp)
+wq = make_repo("sqlprisma")
+Path(wq, "verify.sh").write_text("#!/bin/bash\nsqlite3 --version\necho VERIFY_OK\n")
+Path(wq, "prisma").mkdir()
+Path(wq, "prisma", "schema.prisma").write_text("// changed\n")       # untracked change under prisma/
+os.environ.pop("CPU_RUNNER_HAS_SQLITE", None)
+check("8 sqlite3 in verify.sh + prisma change: refused for a runner without sqlite3, allowed when it reports it",
+      (not cs.eligibility(wq, "bash verify.sh")[0]) and cs.eligibility(wq, "bash verify.sh", caps=CAPS)[0]
+      and not cs.eligibility(wq, "bash verify.sh", caps=dict(CAPS, sqlite3=False))[0])
+# combine_caps: any legacy runner in the fleet pulls everything down to legacy
+cc = _cd.combine_caps([{"runner": "a", "caps": CAPS}, {"runner": "b"}])
+check("8 combine_caps: a legacy runner in the mix => node 22, no python, no modules, no sqlite3",
+      cc["node"] == 22 and cc["python"] is None and cc["py_modules"] == [] and cc["sqlite3"] is False, cc)
+cc2 = _cd.combine_caps([{"caps": CAPS}, {"caps": dict(CAPS, node=24, py_modules=["flask"])}])
+check("8 combine_caps: weakest node, common module set", cc2["node"] == 24 and cc2["py_modules"] == ["flask"] and cc2["python"] == "3.14", cc2)
+check("8 combine_caps: no runners -> None (unknown == legacy)", _cd.combine_caps([]) is None)
+
+# end to end through run_stage: the python bundle runs on the runner only when the runner says it can
+cs._runner_caps = lambda api, cj: state.get("caps")
+reset()
+state["submit"] = lambda w: res(0, "REMOTE")
+state["caps"] = None
+r = cs.run_stage(wp, "bash verify.sh", 60, "py-legacy", "b8", LOCAL)
+check("8 run_stage python bundle, legacy runner: local, never submitted, today's reason",
+      r.ran_on == "local" and calls["submit"] == 0 and "not a node project" in r.why, (r.why, calls))
+reset()
+state["submit"] = lambda w: res(0, "REMOTE")
+state["caps"] = CAPS
+r = cs.run_stage(wp, "bash verify.sh", 60, "py-caps", "b8", LOCAL)
+check("8 run_stage python bundle, runner reports python 3.14 + modules: runs on the runner",
+      r.ran_on == "runner" and r.stdout == "REMOTE" and calls["submit"] == 1, (r.why, calls))
+reset()
+state["online"] = False
+state["caps"] = CAPS
+r = cs.run_stage(wt, "bash verify.sh", 60, "mm-offline", "b8", LOCAL)
+check("8 runner unreachable: still the loud local fallback ('no CPU runner online')",
+      r.ran_on == "local" and "no CPU runner online" in r.why, r.why)
+reset()
+
+# the queue store: caps are recorded, expire, and an OLD runners table is migrated in place
+_old = TMP / "old-lane"
+_old.mkdir()
+_c = _sq3.connect(str(_old / "jobs.sqlite"))
+_c.executescript("CREATE TABLE runners(runner_id TEXT PRIMARY KEY, last_seen REAL, claims INTEGER DEFAULT 0);"
+                 "INSERT INTO runners VALUES('legacy', 1.0, 3);")
+_c.commit()
+_c.close()
+_now = [1000.0]
+_st = cpu_lane.Store(_old, clock=lambda: _now[0])
+_st.claim("new", 30, caps=CAPS)
+_st.claim("legacy", 30)
+_by = {x["runner"]: x for x in _st.summary()["runners"]}
+check("8 store: old runners table migrated; caps recorded for the reporting runner, none for the legacy one",
+      _by["new"].get("caps") == CAPS and "caps" not in _by["legacy"], _by)
+_now[0] += cpu_lane.CAPS_FRESH_S + 5
+_st.claim("new", 30)          # a later claim WITHOUT caps (e.g. a downgraded image) must not keep stale caps
+check("8 store: caps expire after CAPS_FRESH_S without a re-report (a downgraded image cannot inherit them)",
+      "caps" not in {x["runner"]: x for x in _st.summary()["runners"]}["new"])
+_st.claim("new", 30, caps="not-a-dict")
+check("8 store: a malformed caps value is ignored", "caps" not in {x["runner"]: x for x in _st.summary()["runners"]}["new"])
+
 # ---- 6. call sites ------------------------------------------------------------------------------
 site = {
     "ollama-dispatch-auto": ["cpu_stage", "_cpu_lane_run(", "\"harness-check\""],
@@ -385,15 +497,131 @@ for f, needles in site.items():
     miss = [n for n in needles if n not in t]
     check(f"6 call site {f} routes its CPU stage through cpu_stage", not miss, miss)
 t = (BIN / "ollama-dispatch-preflight").read_text()
-# the two remaining raw calls are the harness-audit determinism re-runs and the trivial-solution
+# (2026-10-10: both audits now ride the lane -- snapshots include the battery's rewritten target)
+# the two formerly raw calls were the harness-audit determinism re-runs and the trivial-solution
 # battery (WARN-only gate E/D, wave3): the battery rewrites the target in THIS worktree, so it must
 # stay local; the whole-stage verifies (baseline/final) all go through sh_lane.
-check("6 preflight: raw self.sh(self.a.verify) only in the two local audit sites (determinism, trivial battery)",
-      t.count("self.sh(self.a.verify)") <= 2 and "runs.append(self.sh(self.a.verify))" in t
-      and "lambda: self.sh(self.a.verify)" in t)
+check("6 preflight: the audit re-runs (determinism, trivial battery) go through the lane (sh_lane), no raw self.sh(self.a.verify)",
+      t.count("self.sh(self.a.verify)") <= 2
+      and 'runs.append(self.sh_lane(self.a.verify, "audit-determinism"))' in t
+      and 'lambda: self.sh_lane(self.a.verify, "audit-trivial")' in t)
 t = (BIN / "gate-on-complete.py").read_text()
 check("6 gate: measure_relevance no longer runs verify-relevance with a bare subprocess.run",
       "r = subprocess.run(cmd, capture_output=True, text=True,\n                           timeout=RELEVANCE_BUDGET_S + 900)\n        rec = json.loads" not in t)
+
+# ---- 9  ROUTING: the Mac takes a CPU-lane stage ONLY when Unraid is saturated (bounded wait) or down/ineligible
+os.environ.pop("CPU_LANE_SATURATION_WAIT_S", None)
+check("9 routing: runner alive + inside the saturation window => keep waiting (busy is not a reason to go local)",
+      cs.routing_decision(True, 5, 1200) == "wait" and cs.routing_decision(True, 1199, 1200) == "wait")
+check("9 routing: runner alive but waited past the saturation threshold => local:saturated",
+      cs.routing_decision(True, 1201, 1200) == "local:saturated")
+check("9 routing: runner heartbeat stale => local:runner-down immediately, regardless of wait",
+      cs.routing_decision(False, 0, 1200) == "local:runner-down")
+check("9 default saturation wait is bounded and far above the old 60s claim timeout",
+      600 <= cs.saturation_wait_s() <= 3600 and cs.effective_claim_timeout(60) == cs.saturation_wait_s())
+os.environ["CPU_LANE_SATURATION_WAIT_S"] = "45"
+check("9 CPU_LANE_SATURATION_WAIT_S overrides; the caller's larger value is a floor",
+      cs.effective_claim_timeout(60) == 60 and cs.effective_claim_timeout(10) == 45)
+os.environ.pop("CPU_LANE_SATURATION_WAIT_S", None)
+_seen = {}
+class _FakeCJ:
+    @staticmethod
+    def submit_cpu_job(*a, **kw):
+        _seen.update(kw)
+        return types.SimpleNamespace(exit_code=0)
+_REAL_SUBMIT(_FakeCJ, "http://x", "/wt", "true", 10, "verify", "b", {}, {}, None, "l", 60)
+check("9 _submit hands cpu_job the saturation wait (not the caller's 60s) and a runner-down probe",
+      _seen.get("claim_timeout_s") == cs.saturation_wait_s() and callable(_seen.get("should_abort")), _seen)
+_orig_ro = cs._runner_online
+cs._runner_online = lambda: (False, "http://x", None)
+check("9 the probe reports a stale runner", bool(cs._runner_down_probe()()))
+cs._runner_online = lambda: (True, "http://x", None)
+check("9 the probe is silent while the runner heartbeat is fresh", cs._runner_down_probe()() is None)
+cs._runner_online = _orig_ro
+# cpu_job: a truthy should_abort while pending cancels the job and falls back (RuntimeError with fallback=False)
+_cj = cs._runner_online and __import__("cpu_job")
+_calls = []
+def _fake_http(api, tok, method, path, body=None, raw=None, timeout=30):
+    _calls.append((method, path))
+    if path == "/api/cpu/health":
+        return 200, {}
+    if method == "POST" and path == "/api/cpu/jobs":
+        return 201, {"id": "j1"}
+    if method == "GET":
+        return 200, {"status": "pending"}
+    return 200, {}
+_oh, _omp = _cj._http, _cj.make_payload
+_cj._http, _cj.make_payload = _fake_http, (lambda wt, mode: (b"p", None, "bundle"))
+wab = make_repo("abortwt")
+try:
+    _cj.submit_cpu_job(wab, "true", 10, api="http://x", token="t", claim_timeout_s=9999, poll_s=0.01,
+                       fallback=False, should_abort=lambda: "runner offline")
+    _err = ""
+except RuntimeError as e:
+    _err = str(e)
+finally:
+    _cj._http, _cj.make_payload = _oh, _omp
+check("9 cpu_job: a stale-runner abort cancels the pending job and falls back long before the claim timeout",
+      "runner offline" in _err and ("DELETE", "/api/cpu/jobs/j1") in _calls, (_err, _calls))
+
+# ---- 10  PRISMA: the scaffold's dead `npx --yes prisma` branches must not push a prisma-less repo to the Mac
+wnp = make_repo("noprisma")
+Path(wnp, "verify.sh").write_text("#!/bin/bash\nif [ -f prisma/schema.prisma ]; then npx --yes prisma generate; fi\necho VERIFY_OK\n")
+sh("git", "add", "-A", cwd=wnp)
+check("10 verify.sh naming `npx --yes prisma` in a repo with NO prisma schema is runner-eligible",
+      cs.eligibility(wnp, "bash verify.sh", caps=CAPS)[0], cs.eligibility(wnp, "bash verify.sh", caps=CAPS))
+wyp = make_repo("withprisma")
+Path(wyp, "verify.sh").write_text("#!/bin/bash\nnpx --yes prisma generate\necho VERIFY_OK\n")
+Path(wyp, "prisma").mkdir()
+Path(wyp, "prisma", "schema.prisma").write_text("// s\n")
+okw, whw = cs.eligibility(wyp, "bash verify.sh", caps=CAPS)
+check("10 same verify.sh WITH a prisma schema and prisma absent from the lockfile still stays local (needs network)",
+      (not okw) and "prisma" in whw, whw)
+
+# ---- 11  SATURATION: runners report slots; the queue derives busy / saturated (Mac-only-when-saturated signal)
+_sat_dir = TMP / "sat"
+_sst = cpu_lane.Store(_sat_dir)
+def _mk(n):
+    j = _sst.create({"cmd": "true", "cwd": ".", "timeout_s": 60}, "l%d" % n, "verify", "bs")
+    _sst.put_blob(j, "payload", __import__("io").BytesIO(b"x"), 1)
+    _sst.ready(j)
+    return j
+for _i in range(2):
+    _mk(_i)
+_sst.claim("r1", 30, slots=2)
+_r1 = lambda: {x["runner"]: x for x in _sst.summary()["runners"]}["r1"]
+check("11 one of two slots busy: not saturated", (_r1().get("slots"), _r1().get("busy"), _r1().get("saturated")) == (2, 1, False), _r1())
+_sst.claim("r1", 30, slots=2)
+check("11 both slots busy: saturated (Mac may take work); same runner id holds several claims", (_r1().get("busy"), _r1().get("saturated")) == (2, True), _r1())
+_sst.claim("old", 30)
+check("11 a runner that never reports slots has no saturation fields (legacy)",
+      "saturated" not in {x["runner"]: x for x in _sst.summary()["runners"]}["old"])
+
+# ---- 12  OWNER provenance: a CPU row must say WHO submitted it (bare 12-hex worktree hashes were unattributable)
+_ab = "/Users/x/.ollama-dispatch/ab-sampling/v2/wt/d698b2cdbee3"
+check("12 owner_label: ab-sampling replay worktree", "ab-sampling v2 d698b2cdbee3" in cs.owner_label(_ab, "relevance"), cs.owner_label(_ab))
+check("12 owner_label: slice worktree names the slice", cs.owner_label("/w/wt-slice-rt-amazon-s1-extract", "x") == "slice rt-amazon-s1-extract", cs.owner_label("/w/wt-slice-rt-amazon-s1-extract"))
+os.environ["CPU_LANE_OWNER"] = "my-tool: thing"
+check("12 owner_label: env CPU_LANE_OWNER wins", cs.owner_label(_ab) == "my-tool: thing")
+os.environ.pop("CPU_LANE_OWNER")
+check("12 owner_label never raises on junk", isinstance(cs.owner_label(None), str))
+reset()
+state["submit"] = lambda w: res(0, "REMOTE")
+r = cs.run_stage(wt, "bash verify.sh", 60, "own-stage", "b12", LOCAL)
+check("12 run_stage hands the owner to the runner submit", bool(state.get("owner")) and Path(str(wt)).name in state["owner"], state.get("owner"))
+_ost = cpu_lane.Store(TMP / "own")
+_oj = _ost.create({"cmd": "true", "cwd": ".", "timeout_s": 60, "owner": "preflight: ab-sampling v2 d698b2cdbee3"}, "relevance@abc", "relevance", "d698b2cdbee3")
+_ost.put_blob(_oj, "payload", __import__("io").BytesIO(b"x"), 1)
+_ost.ready(_oj)
+check("12 cpu-lane summary exposes owner on pending rows", _ost.summary()["pending"][0].get("owner") == "preflight: ab-sampling v2 d698b2cdbee3", _ost.summary()["pending"])
+_oj2 = _ost.create({"cmd": "true"}, "old", "verify", "bx")
+_ost.put_blob(_oj2, "payload", __import__("io").BytesIO(b"x"), 1)
+_ost.ready(_oj2)
+check("12 spec without owner (old producer) -> owner '' (fail-open)", [x["owner"] for x in _ost.summary()["pending"] if x["label"] == "old"] == [""])
+os.environ["CPU_LANE_LOCAL_RUN_DIR"] = str(TMP / "lrd"); os.environ.pop("CPU_LANE_LOG_OFF", None)
+_end = cs.local_run_begin("audit-trivial", "d698b2cdbee3", "why", 60, owner="OWN-X")
+check("12 local_running records carry the owner", [x.get("owner") for x in cs.local_running()] == ["OWN-X"], cs.local_running())
+_end()
 
 print()
 print("CPU_STAGE_TEST_OK" if all(RESULTS) else "CPU_STAGE_TEST_FAILED (%d of %d failed)" % (RESULTS.count(False), len(RESULTS)))
