@@ -135,29 +135,11 @@ MISSING=0
 
 regrade() {    # cell rep wt log verify -> one REGRADE_CSV row (independent of the worker's say-so)
   local CELL="$1" REP="$2" WT="$3" LOG="$4" VERIFY="$5" VR TW CR HE CEIL TR
-  if ( cd "$WT" && eval "$VERIFY" >/dev/null 2>&1 ); then VR=pass; else VR=fail; fi
+  # bounded: the verify runs model-edited code (a catastrophic-backtracking regex or a loop in it
+  # would otherwise hang the whole queue row after the cell finished)
+  if ( cd "$WT" && timeout 300 bash -c "$VERIFY" >/dev/null 2>&1 < /dev/null ); then VR=pass; else VR=fail; fi
   TR=$(grep -o "/Users/user/bin/ollama-worker-logs/[0-9TZ]*\.json" "$LOG" 2>/dev/null | tail -1)
-  TW=$(python3 - "$TR" <<'EOF' 2>/dev/null || echo na
-import json, re, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    print("na"); sys.exit()
-n = 0
-for m in d.get("messages") or []:
-    for tc in m.get("tool_calls") or []:
-        f = tc.get("function") or {}
-        a = f.get("arguments")
-        a = a if isinstance(a, str) else json.dumps(a)
-        if "test_release_group" not in a:
-            continue
-        if f.get("name") in ("write_file", "edit_file"):
-            n += 1
-        elif f.get("name") == "run_bash" and re.search(r"sed -i|>\s*\S*test_release_group|tee |open\(.*['\"]w", a):
-            n += 1
-print(n)
-EOF
-)
+  TW=$(timeout 60 python3 "$BAKEOFF/bakeoff-v12-testwrites.py" "$TR" 2>/dev/null || echo na)
   CR=$(grep -ac "retry [0-9]*/" "$LOG" 2>/dev/null); CR=${CR:-0}
   HE=$(grep -acE "HTTP Error [45][0-9][0-9]|request failed" "$LOG" 2>/dev/null); HE=${HE:-0}
   CEIL=no; grep -aq "CONTEXT CEILING" "$LOG" 2>/dev/null && CEIL=yes
