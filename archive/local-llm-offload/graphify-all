@@ -1,0 +1,23 @@
+#!/bin/zsh
+# graphify-all [root]  — build/refresh a per-project CODE graph for every repo
+# under <root> (default: ~/Desktop/GitHub Projects), skipping _archive & dotdirs.
+# Code-only (AST): no LLM, no API key, no cost. For doc/image semantic layers,
+# run /graphify --update inside a repo.
+set -o pipefail
+ROOT="${1:-$HOME/Desktop/GitHub Projects}"
+cd "$ROOT" || exit 1
+print "graphify-all: $ROOT"
+built=0; skipped=0
+for d in */; do
+  d="${d%/}"
+  case "$d" in _archive|graphify-out|.*) continue;; esac
+  [ -d "$d" ] || continue
+  out=$(graphify update "$d" 2>&1)
+  line=$(print -r -- "$out" | grep -oE 'Rebuilt: [0-9]+ nodes, [0-9]+ edges, [0-9]+ communities' | head -1)
+  if [ -n "$line" ]; then
+    printf '  %-34s %s\n' "$d" "$line"; built=$((built+1))
+  else
+    printf '  %-34s (no code graph)\n' "$d"; skipped=$((skipped+1))
+  fi
+done
+print "graphify-all done: $built built, $skipped skipped"
