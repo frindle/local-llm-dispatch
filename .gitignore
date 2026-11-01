@@ -17,3 +17,4 @@ decisions.jsonl*
 hosts.json
 config.toml
 graphify-out/
+* [0-9].plist
